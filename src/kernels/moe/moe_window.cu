@@ -58,6 +58,7 @@ struct Geom {
 // Per-shape GEMV geometry, best measured on the 3090 (cp3_moe_tune.log v6).
 template <class Shape> struct Tune;
 template <> struct Tune<FlashNext> {
+    static constexpr int BLOCKS_PER_SM = 2;   // 3 measured worse: 4-tile warps -15%, 8-tile warps spill (TRACKER #28)
     using GateUp = Geom<8, 1, 2, 8>;       // 8 k-split warps x 8 tiles
     using Down = Geom<4, 2, 2, 8>;         // 4 k-split warps x 2 groups x 8 tiles
 };
@@ -481,7 +482,7 @@ __device__ Item decode_item(int item, int n_slots)
 }
 
 template <class Shape>
-__global__ __launch_bounds__(THREADS, 2) void window_kernel(Weights W, const float * __restrict__ x,
+__global__ __launch_bounds__(THREADS, Tune<Shape>::BLOCKS_PER_SM) void window_kernel(Weights W, const float * __restrict__ x,
                                                             const int * __restrict__ ids,
                                                             const float * __restrict__ wts, int n_rows,
                                                             float * __restrict__ out, Workspace<Shape> ws,
