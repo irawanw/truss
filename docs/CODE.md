@@ -10,8 +10,11 @@ are added. A change that breaks one of them needs a line in `TRACKER.md` saying 
 | a trellis codec (tile format + codebook) | `src/kernels/trellis/codec_<name>.cuh` | `codec_mul1.cuh` |
 | shared device helpers | `src/kernels/trellis/` | `mma.cuh`, `hadamard.cuh` |
 | one fused op | `src/kernels/<op>/<op>.{cuh,cu}` | `moe/moe_window.cu` |
+| model file reader (host C++, zero-copy mmap) | `src/formats/<format>.{h,cc}` | `gguf.h` |
 | correctness test, one binary per op | `tests/unit/<op>_test.cu` | `moe_window_test.cu` |
+| check against an independent reader/tool (script) | `tests/unit/<what>_check.py` | `gguf_reader_check.py` |
 | microbenchmark or ablation | `tools/tk-bench/<name>.cu` | `ceiling.cu` |
+| model file tools (catalog, pack converter) | `tools/tk-pack/<name>.cc` | `inspect.cc` |
 | codec study or prototype codec (not used by `src/`) | `tools/codec-lab/` | `viterbi_mse.cu`, `proto_v2pair.cuh` |
 | results, logs, reports | `~/ML_projects/flashnext/<date>_truss_cpN/` (STORAGE.md), never in this repo | |
 

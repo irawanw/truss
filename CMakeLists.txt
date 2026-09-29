@@ -15,6 +15,12 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # llama-paw's ggml, used by tests only, as the reference implementation
 set(LLAMA_PAW_DIR $ENV{HOME}/llama-paw CACHE PATH "llama-paw checkout (reference for tests)")
 
+# ---- formats: model file readers (host only)
+add_library(truss_formats STATIC
+  src/formats/gguf.cc)
+target_include_directories(truss_formats PUBLIC src)
+target_compile_options(truss_formats PRIVATE -Wall -Wextra)
+
 # ---- engine kernels
 add_library(truss_kernels STATIC
   src/kernels/moe/moe_window.cu)
@@ -32,6 +38,10 @@ add_executable(tk-bench-ceiling tools/tk-bench/ceiling.cu)
 target_include_directories(tk-bench-ceiling PRIVATE src)
 add_executable(tk-bench-moe-trace tools/tk-bench/moe_trace.cu)
 target_link_libraries(tk-bench-moe-trace PRIVATE truss_kernels)
+
+# ---- tools/tk-pack: model file catalog, pack converter
+add_executable(tk-pack-inspect tools/tk-pack/inspect.cc)
+target_link_libraries(tk-pack-inspect PRIVATE truss_formats)
 
 # ---- tools/codec-lab: codebook studies (quantization MSE vs the Gaussian bound)
 add_executable(tk-codec-lab tools/codec-lab/viterbi_mse.cu)

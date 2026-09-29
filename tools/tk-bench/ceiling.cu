@@ -176,6 +176,8 @@ int main()
     float * d_out;
     CK(cudaMalloc(&d_out, 64));
 
+    run_decode<Mul1<1>, 1, 8, FULL>("full", sms, d_out);
+    run_decode<Mul1<1>, 1, 8, NO_MMA>("no-mma", sms, d_out);
     run_decode<Mul1<2>, 2, 8, FULL>("full", sms, d_out);
     run_decode<Mul1<2>, 2, 8, NO_MMA>("no-mma", sms, d_out);
     run_decode<Mul1<2>, 2, 8, MMA_ONLY>("mma-only", sms, d_out);

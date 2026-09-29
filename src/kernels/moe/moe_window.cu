@@ -348,6 +348,7 @@ __device__ __forceinline__ void gemv_dispatch(int2 meta, const ProjView & P, con
 {
     const uint32_t * B32 = (const uint32_t *) (P.trellis + meta.y);
     switch (meta.x) {
+        case 1: gemv_item<Mul1<1>, G>(A, a_stride, rows, B32, C, k_off, k_slices, size_n, grp, red, ready); break;
         case 2: gemv_item<Mul1<2>, G>(A, a_stride, rows, B32, C, k_off, k_slices, size_n, grp, red, ready); break;
         case 3: gemv_item<Mul1<3>, G>(A, a_stride, rows, B32, C, k_off, k_slices, size_n, grp, red, ready); break;
         case 4: gemv_item<Mul1<4>, G>(A, a_stride, rows, B32, C, k_off, k_slices, size_n, grp, red, ready); break;

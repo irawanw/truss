@@ -1,7 +1,7 @@
 // Timeline of one MoE window launch from the kernel's own trace (truss::moe::TraceEvent): where the time goes
 // between dependency waits, the three item kinds, and the tail. Random trellis weights; correctness is the unit
 // test's job (tests/unit/moe_window_test).
-// usage: tk-bench-moe-trace [n_rows] [K: 0 = mixed 2..4]
+// usage: tk-bench-moe-trace [n_rows] [K: 0 = mixed 1..4]
 #include "kernels/moe/moe_window.cuh"
 
 #include <algorithm>
@@ -42,7 +42,7 @@ int main(int argc, char ** argv)
         std::vector<int32_t> meta(2 * E);
         size_t words = 0;
         for (int e = 0; e < E; ++e) {
-            meta[2 * e] = kfix ? kfix : 2 + (e + p) % 3;
+            meta[2 * e] = kfix ? kfix : 1 + (e + p) % 4;
             meta[2 * e + 1] = (int32_t) words;
             words += (size_t) in * out * meta[2 * e] / 16;
         }

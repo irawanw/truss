@@ -1,6 +1,6 @@
 // truss::moe::window: correctness vs llama-paw's unfused PAW_X3 chain (mm_id gate/up -> swiglu -> mm_id down ->
 // moe_reduce) on the same random trellis weights, and timing inside a CUDA graph.
-// Shape: Flash-Next layer (2560 x 640, 512 experts, top-10). Env: TRUSS_KFIX (0 = mixed 2..4), TRUSS_REPS.
+// Shape: Flash-Next layer (2560 x 640, 512 experts, top-10). Env: TRUSS_KFIX (0 = mixed 1..4), TRUSS_REPS.
 // usage: moe_window_test [n_rows ...]
 #include "kernels/moe/moe_window.cuh"
 
@@ -39,7 +39,7 @@ static int run_case(ggml_backend_t backend, int64_t n_tokens, std::mt19937 & rng
         const int64_t ntiles = (ph[p].in / 16) * (ph[p].out / 16);
         int64_t words = 0;
         for (int64_t e = 0; e < n_expert; ++e) {
-            ph[p].meta[2 * e] = kfix ? (int32_t) kfix : 2 + (int32_t) ((e + p) % 3);
+            ph[p].meta[2 * e] = kfix ? (int32_t) kfix : 1 + (int32_t) ((e + p) % 4);
             ph[p].meta[2 * e + 1] = (int32_t) words;
             words += 16 * ph[p].meta[2 * e] * ntiles;
         }
@@ -174,7 +174,7 @@ static int run_case(ggml_backend_t backend, int64_t n_tokens, std::mt19937 & rng
     const bool ok_replay = check();
     const bool ok = ok_first && ok_replay;
     printf("rows=%-2lld K=%s uniq=%-3lld %.1f MB | rel_rms %.5f cos %.8f %s | %.1f us/layer, %.0f GB/s (%.0f%% of 936)\n",
-           (long long) n_tokens, kfix ? std::to_string(kfix).c_str() : "mix2-4", (long long) uniq, tbytes / 1e6,
+           (long long) n_tokens, kfix ? std::to_string(kfix).c_str() : "mix1-4", (long long) uniq, tbytes / 1e6,
            worst_rel, worst_cos, ok ? "PASS" : ok_first ? "FAIL(replay)" : "FAIL", ms * 1e3, tbytes / (ms * 1e-3) / 1e9,
            100.0 * tbytes / (ms * 1e-3) / 936e9);
 

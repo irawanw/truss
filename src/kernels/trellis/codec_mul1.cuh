@@ -1,4 +1,4 @@
-// Trellis codec "mul1" (PAW X3 / exllamav3 EXL3 tiles, integer rates K = 2, 3, 4).
+// Trellis codec "mul1" (PAW X3 / exllamav3 EXL3 tiles, integer rates K = 1, 2, 3, 4).
 //
 // Tile: 16x16 weights, 256 16-bit trellis states shifted K bits per weight, stored as 8*K uint32. Weight value =
 // mul1 codebook of its state: bytesum(state * 0x83DCD12D) mapped to fp16 by one hfma2.
@@ -67,6 +67,21 @@ __device__ __forceinline__ void states8_k4(uint32_t a, uint32_t b, FragB & f0, F
     codebook8(w0, w1, w2, w3, w4, w5, w6, w7, f0, f1);
 }
 
+__device__ __forceinline__ void states8_k1(uint32_t a, uint32_t b, int t_offset, FragB & f0, FragB & f1)
+{
+    uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
+    b = fshift(b, a, (~t_offset) & 24);
+    w7 = b & 0xffff;
+    TRUSS_BFE16_IMM(w6, b, 1);
+    TRUSS_BFE16_IMM(w5, b, 2);
+    TRUSS_BFE16_IMM(w4, b, 3);
+    TRUSS_BFE16_IMM(w3, b, 4);
+    TRUSS_BFE16_IMM(w2, b, 5);
+    TRUSS_BFE16_IMM(w1, b, 6);
+    TRUSS_BFE16_IMM(w0, b, 7);
+    codebook8(w0, w1, w2, w3, w4, w5, w6, w7, f0, f1);
+}
+
 __device__ __forceinline__ void states8_k2(uint32_t a, uint32_t b, int t_offset, FragB & f0, FragB & f1)
 {
     uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
@@ -104,16 +119,20 @@ __device__ __forceinline__ void states8_k3(uint32_t a, uint32_t b, int s2, FragB
 
 template <int K>
 struct Mul1 {
-    static_assert(K >= 2 && K <= 4, "mul1: integer rates 2..4 (K1 and fractional rates not implemented)");
+    static_assert(K >= 1 && K <= 4, "mul1: integer rates 1..4 (fractional rates not implemented)");
     static constexpr const char * NAME = "mul1";
     static constexpr int TILE_WORDS = 8 * K;
-    static constexpr int TILES_PER_VEC = K == 2 ? 2 : 1;
+    static constexpr int TILES_PER_VEC = K == 1 ? 4 : K == 2 ? 2 : 1;
     static constexpr int VEC_WORDS = TILE_WORDS * TILES_PER_VEC;
 
     int lane, src_a = 0, src_b = 0, s2 = 0;
 
     __device__ explicit Mul1(int lane_) : lane(lane_)
     {
+        if constexpr (K == 1) {
+            src_b = lane >> 2;
+            src_a = (src_b + 7) & 7;
+        }
         if constexpr (K == 2) {
             const int i1 = lane >> 1;
             src_b = i1;
@@ -138,6 +157,11 @@ struct Mul1 {
         if constexpr (K == 4) {
             const uint32_t a = __shfl_sync(0xffffffffu, w, (lane + 31) & 31);
             mul1_detail::states8_k4(a, w, f0, f1);
+        } else if constexpr (K == 1) {
+            const int base = sub << 3;
+            const uint32_t b = __shfl_sync(0xffffffffu, w, base + src_b);
+            const uint32_t a = __shfl_sync(0xffffffffu, w, base + src_a);
+            mul1_detail::states8_k1(a, b, lane << 3, f0, f1);
         } else if constexpr (K == 2) {
             const int base = sub << 4;
             const uint32_t b = __shfl_sync(0xffffffffu, w, base + src_b);
