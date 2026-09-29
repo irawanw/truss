@@ -16,6 +16,7 @@ are added. A change that breaks one of them needs a line in `TRACKER.md` saying 
 | check against an independent reader/tool (script) | `tests/unit/<what>_check.py` | `gguf_reader_check.py` |
 | microbenchmark or ablation | `tools/tk-bench/<name>.cu` | `ceiling.cu` |
 | model file tools (catalog, pack converter) | `tools/tk-pack/<name>.cc` | `inspect.cc` |
+| parity: reference activations, model slices | `tools/tk-parity/` | `llama_dump.cpp`, `slice_gguf.py` |
 | codec study or prototype codec (not used by `src/`) | `tools/codec-lab/` | `viterbi_mse.cu`, `proto_v2pair.cuh` |
 | results, logs, reports | `~/ML_projects/flashnext/<date>_truss_cpN/` (STORAGE.md), never in this repo | |
 

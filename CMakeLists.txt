@@ -51,5 +51,12 @@ target_link_libraries(tk-bench-moe-trace PRIVATE truss_kernels)
 add_executable(tk-pack-inspect tools/tk-pack/inspect.cc)
 target_link_libraries(tk-pack-inspect PRIVATE truss_models)
 
+# ---- tools/tk-parity: reference activations from llama-paw (CP2 layer parity)
+add_executable(tk-parity-llama-dump tools/tk-parity/llama_dump.cpp)
+target_include_directories(tk-parity-llama-dump PRIVATE ${LLAMA_PAW_DIR}/include ${LLAMA_PAW_DIR}/ggml/include)
+target_link_directories(tk-parity-llama-dump PRIVATE ${LLAMA_PAW_DIR}/build/bin)
+target_link_libraries(tk-parity-llama-dump PRIVATE llama ggml ggml-base ggml-cpu)
+set_target_properties(tk-parity-llama-dump PROPERTIES BUILD_RPATH ${LLAMA_PAW_DIR}/build/bin)
+
 # ---- tools/codec-lab: codebook studies (quantization MSE vs the Gaussian bound)
 add_executable(tk-codec-lab tools/codec-lab/viterbi_mse.cu)
