@@ -32,7 +32,8 @@ target_link_libraries(truss_core PUBLIC truss_formats CUDA::cudart)
 # ---- reference ops: plain fp32, the definition the fast kernels are tested against
 add_library(truss_reference STATIC
   src/kernels/reference/ref_linear.cu
-  src/kernels/reference/ref_norm.cu)
+  src/kernels/reference/ref_norm.cu
+  src/kernels/reference/ref_trellis.cu)
 target_link_libraries(truss_reference PUBLIC truss_core)
 
 # ---- models: hyperparameters, weight binding, reference forward per architecture
@@ -58,7 +59,7 @@ set_target_properties(moe_window_test PROPERTIES BUILD_RPATH ${LLAMA_PAW_DIR}/bu
 # ---- tests/layer: model blocks vs llama-paw activations
 add_executable(qwen4exp_parity tests/layer/qwen4exp_parity.cu)
 target_include_directories(qwen4exp_parity PRIVATE .)
-target_link_libraries(qwen4exp_parity PRIVATE truss_models)
+target_link_libraries(qwen4exp_parity PRIVATE truss_models truss_kernels)
 
 # ---- tools/tk-bench: microbenchmarks
 add_executable(tk-bench-ceiling tools/tk-bench/ceiling.cu)

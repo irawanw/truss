@@ -74,7 +74,7 @@ __global__ void linear_q8_0_q8_1_kernel(const void * W, const float * x, float *
 
 }  // namespace
 
-void linear(const DTensor & W, const float * x, float * y, int rows, cudaStream_t s, ActQuant aq)
+void linear(const DTensor & W, const float * x, float * y, int rows, cudaStream_t s, Numerics num)
 {
     const int in = (int) W.ne[0], out = (int) W.ne[1];
     if (W.ne[2] != 1 || W.ne[3] != 1) throw std::runtime_error("ref::linear: weight is not 2-D");
@@ -84,7 +84,7 @@ void linear(const DTensor & W, const float * x, float * y, int rows, cudaStream_
         case gguf::Type::F16: linear_kernel<gguf::Type::F16><<<blocks, threads, 0, s>>>(W.data, x, y, rows, in, out); break;
         case gguf::Type::Q8_0:
             if (in % 32) throw std::runtime_error("ref::linear: Q8_0 row not a multiple of 32");
-            if (aq == ActQuant::Q8_1)
+            if (num == Numerics::LLAMA)
                 linear_q8_0_q8_1_kernel<<<blocks, threads, 0, s>>>(W.data, x, y, rows, in, out);
             else
                 linear_kernel<gguf::Type::Q8_0><<<blocks, threads, 0, s>>>(W.data, x, y, rows, in, out);

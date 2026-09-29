@@ -24,6 +24,10 @@ public:
         return p;
     }
     void reset() { used_ = 0; }
+    // scoped reuse inside a loop: everything allocated after mark() is released by release(mark). Safe on one
+    // stream: later kernels that reuse the space run after the earlier ones.
+    size_t mark() const { return used_; }
+    void release(size_t m) { used_ = m; }
 
 private:
     void * base_ = nullptr;
