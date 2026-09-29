@@ -68,7 +68,7 @@ __global__ __launch_bounds__(256) void decode_bench(int iters, float * out)
 
 // per_sm_cap > 0 limits resident blocks per SM (dynamic shared memory as ballast) to study occupancy.
 // Reports the median of 5 timed runs (clocks on this box move 10-15% between runs).
-template <class Codec, int bits, int WNT, int mode>
+template <class Codec, int WNT, int mode>
 static void run_decode(const char * name, int sms, float * d_out, int per_sm_cap = 0)
 {
     auto kern = decode_bench<Codec, WNT, mode>;
@@ -99,7 +99,8 @@ static void run_decode(const char * name, int sms, float * d_out, int per_sm_cap
     std::sort(t.begin(), t.end());
     const double w = (double) blocks * 8 * iters * WNT * 256;
     const double wps = w / (t[2] * 1e-3);
-    printf("decode %-13s K%d WNT%-2d %-9s regs %3d blk/SM %d | %6.2f Tw/s = %5.0f GB/s at K%d (%3.0f%% of 936) spread %.0f%%\n",
+    const double bits = Codec::TILE_WORDS * 32.0 / 256;     // bits per weight, from the tile size
+    printf("decode %-13s K%-3g WNT%-2d %-9s regs %3d blk/SM %d | %6.2f Tw/s = %5.0f GB/s at K%g (%3.0f%% of 936) spread %.0f%%\n",
            Codec::NAME, bits, WNT, name, fa.numRegs, per_sm, wps / 1e12, wps * bits / 8 / 1e9, bits,
            100.0 * wps * bits / 8 / 936e9, 100.0 * (t[4] - t[0]) / t[2]);
 }
@@ -177,28 +178,30 @@ int main()
     float * d_out;
     CK(cudaMalloc(&d_out, 64));
 
-    run_decode<Mul1<1>, 1, 8, FULL>("full", sms, d_out);
-    run_decode<Mul1<1>, 1, 8, NO_MMA>("no-mma", sms, d_out);
-    run_decode<Mul1<2>, 2, 8, FULL>("full", sms, d_out);
-    run_decode<Mul1<2>, 2, 8, NO_MMA>("no-mma", sms, d_out);
-    run_decode<Mul1<2>, 2, 8, MMA_ONLY>("mma-only", sms, d_out);
-    run_decode<Mul1<2>, 2, 2, FULL>("full", sms, d_out);
-    run_decode<Mul1<2>, 2, 4, FULL>("full", sms, d_out);
-    run_decode<Mul1<2>, 2, 8, FULL>("full 2/SM", sms, d_out, 2);
-    run_decode<Mul1<3>, 3, 8, FULL>("full 2/SM", sms, d_out, 2);
-    run_decode<Mul1<3>, 3, 4, FULL>("full", sms, d_out);
-    run_decode<Mul1<4>, 4, 4, FULL>("full", sms, d_out);
-    run_decode<Mul1<3>, 3, 8, FULL>("full", sms, d_out);
-    run_decode<Mul1<3>, 3, 8, NO_MMA>("no-mma", sms, d_out);
-    run_decode<Mul1<4>, 4, 8, FULL>("full", sms, d_out);
-    run_decode<Mul1<4>, 4, 8, NO_MMA>("no-mma", sms, d_out);
-    run_decode<lab::V2One<2>, 2, 8, FULL>("full", sms, d_out);
-    run_decode<lab::V2One<2>, 2, 8, NO_MMA>("no-mma", sms, d_out);
-    run_decode<lab::V2One<2>, 2, 8, FULL>("full 2/SM", sms, d_out, 2);
-    run_decode<lab::V2Pair<2>, 2, 8, FULL>("full", sms, d_out);
-    run_decode<lab::V2Pair<2>, 2, 8, NO_MMA>("no-mma", sms, d_out);
-    run_decode<lab::V2Pair<3>, 3, 8, FULL>("full", sms, d_out);
-    run_decode<lab::V2Pair<4>, 4, 8, FULL>("full", sms, d_out);
+    run_decode<Mul1<1>, 8, FULL>("full", sms, d_out);
+    run_decode<Mul1<1>, 8, NO_MMA>("no-mma", sms, d_out);
+    run_decode<Mul1<2>, 8, FULL>("full", sms, d_out);
+    run_decode<Mul1<2>, 8, NO_MMA>("no-mma", sms, d_out);
+    run_decode<Mul1<2>, 8, MMA_ONLY>("mma-only", sms, d_out);
+    run_decode<Mul1<2>, 2, FULL>("full", sms, d_out);
+    run_decode<Mul1<2>, 4, FULL>("full", sms, d_out);
+    run_decode<Mul1<2>, 8, FULL>("full 2/SM", sms, d_out, 2);
+    run_decode<Mul1<3>, 8, FULL>("full 2/SM", sms, d_out, 2);
+    run_decode<Mul1<3>, 4, FULL>("full", sms, d_out);
+    run_decode<Mul1<4>, 4, FULL>("full", sms, d_out);
+    run_decode<Mul1<3>, 8, FULL>("full", sms, d_out);
+    run_decode<Mul1<3>, 8, NO_MMA>("no-mma", sms, d_out);
+    run_decode<Mul1<4>, 8, FULL>("full", sms, d_out);
+    run_decode<Mul1<4>, 8, NO_MMA>("no-mma", sms, d_out);
+    run_decode<lab::V2One<2>, 8, FULL>("full", sms, d_out);       // K1
+    run_decode<lab::V2One<3>, 8, FULL>("full", sms, d_out);       // K1.5
+    run_decode<lab::V2One<4>, 8, FULL>("full", sms, d_out);       // K2
+    run_decode<lab::V2One<4>, 8, NO_MMA>("no-mma", sms, d_out);
+    run_decode<lab::V2One<5>, 8, FULL>("full", sms, d_out);       // K2.5
+    run_decode<lab::V2Pair<2>, 8, FULL>("full", sms, d_out);
+    run_decode<lab::V2Pair<2>, 8, NO_MMA>("no-mma", sms, d_out);
+    run_decode<lab::V2Pair<3>, 8, FULL>("full", sms, d_out);
+    run_decode<lab::V2Pair<4>, 8, FULL>("full", sms, d_out);
 
     const size_t bytes = (size_t) 1 << 30;
     char * buf;

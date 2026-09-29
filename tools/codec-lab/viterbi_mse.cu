@@ -6,7 +6,8 @@
 // plain (free start state, no tail biting), the same for every codebook, so results compare codebooks, and
 // sit slightly below exllamav3's tail-biting numbers.
 //
-// usage: tk-codec-lab [n_tiles]      (paired: every codebook sees the same data)
+// usage: tk-codec-lab [n_tiles]              all codebooks, all rates (paired: every codebook sees the same data)
+//        tk-codec-lab search [n_tiles]       v2one family h = ((s*A+B) & M) ^ X over M, X, A at K1.5 / K2 / K2.5
 #include <cuda_fp16.h>
 
 #include <algorithm>
@@ -156,8 +157,40 @@ static std::vector<Codebook> codebooks()
 
 // ---------------------------------------------------------------------------------------------------------
 
+static std::vector<Codebook> v2one_family()
+{
+    auto one = [] (uint32_t a, uint32_t b, uint32_t M, uint32_t X) {
+        return [=] (uint32_t s, float * o) {
+            const uint32_t h = ((a * s + b) & M) ^ X;
+            o[0] = h2f((uint16_t) h); o[1] = h2f((uint16_t) (h >> 16));
+        };
+    };
+    std::vector<Codebook> cbs;
+    // M keeps the sign, the mantissa and a subset R of the 5 exponent bits (random per state); X sets the other
+    // exponent bits. Any R and fixed pattern: octaves need not be contiguous (e.g. tiny values near zero).
+    for (uint32_t R = 1; R < 32; ++R) {
+        const int nr = __builtin_popcount(R);
+        if (nr > 3) continue;
+        const uint32_t fixed_bits = 31u & ~R;
+        for (uint32_t F = 0; F < 32; ++F) {
+            if (F & ~fixed_bits) continue;
+            const uint32_t m16 = 0x8000u | (R << 10) | 0x3ffu, x16 = F << 10;
+            // skip patterns that can make inf/nan (exponent 31) or only subnormals
+            bool bad = false;
+            for (uint32_t r = 0; r < 32; ++r) if (!(r & ~R) && ((r | F) == 31)) bad = true;
+            if (bad) continue;
+            char name[64];
+            snprintf(name, sizeof name, "v2one R%02x F%02x M%04x X%04x", R, F, m16, x16);
+            cbs.push_back({ name, 2, one(0x83DCD12Du, 0x6A09E667u, m16 * 0x10001u, x16 * 0x10001u), "1 IMAD 1 LOP3" });
+        }
+    }
+    return cbs;
+}
+
 int main(int argc, char ** argv)
 {
+    const bool search = argc > 1 && std::string(argv[1]) == "search";
+    if (search) { --argc; ++argv; }
     const int n_tiles = argc > 1 ? atoi(argv[1]) : 64;
     std::vector<float> hx((size_t) n_tiles * TILE);
     { std::mt19937 r(1234); std::normal_distribution<float> nd; for (auto & v : hx) v = nd(r); }
@@ -188,14 +221,20 @@ int main(int argc, char ** argv)
         return s / ((double) n_tiles * TILE);
     };
 
-    const double rates[] = { 1.5, 2.0, 2.5, 3.0, 3.5, 4.0 };
+    std::vector<double> rates = { 1.5, 2.0, 2.5, 3.0, 3.5, 4.0 };
+    if (search) rates = { 1.5, 2.0, 2.5 };
     printf("%d tiles x %d iid N(0,1); MSE at best scale; bound = 2^-2K\n", n_tiles, TILE);
     printf("%-30s %-34s", "codebook", "decode cost per V weights");
     for (double K : rates) printf("   K%.1f     ", K);
     printf("\n%-30s %-34s", "Gaussian bound", "");
     for (double K : rates) printf("  %.5f   ", std::pow(2.0, -2 * K));
     printf("\n");
-    for (const Codebook & cb : codebooks()) {
+    std::vector<Codebook> list = codebooks();
+    if (search) {
+        list.resize(1);                          // mul1 as the reference row
+        for (auto & c : v2one_family()) list.push_back(c);
+    }
+    for (const Codebook & cb : list) {
         std::vector<float> h((size_t) NSTATE * cb.V);
         for (uint32_t s = 0; s < NSTATE; ++s) cb.f(s, &h[(size_t) s * cb.V]);
         double ms = 0, m = 0;
