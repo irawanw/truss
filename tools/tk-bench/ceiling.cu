@@ -5,6 +5,7 @@
 //  B) stream ceiling: read rate of candidate access patterns over a 1 GiB buffer.
 // usage: tk-bench-ceiling (codec: mul1)
 #include "kernels/trellis/codec_mul1.cuh"
+#include "../codec-lab/proto_v2one.cuh"
 #include "../codec-lab/proto_v2pair.cuh"
 
 #include <cstdio>
@@ -191,6 +192,9 @@ int main()
     run_decode<Mul1<3>, 3, 8, NO_MMA>("no-mma", sms, d_out);
     run_decode<Mul1<4>, 4, 8, FULL>("full", sms, d_out);
     run_decode<Mul1<4>, 4, 8, NO_MMA>("no-mma", sms, d_out);
+    run_decode<lab::V2One<2>, 2, 8, FULL>("full", sms, d_out);
+    run_decode<lab::V2One<2>, 2, 8, NO_MMA>("no-mma", sms, d_out);
+    run_decode<lab::V2One<2>, 2, 8, FULL>("full 2/SM", sms, d_out, 2);
     run_decode<lab::V2Pair<2>, 2, 8, FULL>("full", sms, d_out);
     run_decode<lab::V2Pair<2>, 2, 8, NO_MMA>("no-mma", sms, d_out);
     run_decode<lab::V2Pair<3>, 3, 8, FULL>("full", sms, d_out);
