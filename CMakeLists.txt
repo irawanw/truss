@@ -17,9 +17,17 @@ set(LLAMA_PAW_DIR $ENV{HOME}/llama-paw CACHE PATH "llama-paw checkout (reference
 
 # ---- formats: model file readers (host only)
 add_library(truss_formats STATIC
-  src/formats/gguf.cc)
+  src/formats/gguf.cc
+  src/formats/trellis_table.cc)
 target_include_directories(truss_formats PUBLIC src)
 target_compile_options(truss_formats PRIVATE -Wall -Wextra)
+
+# ---- models: hyperparameters and weight binding per architecture (host only)
+add_library(truss_models STATIC
+  src/model/qwen4exp/config.cc
+  src/model/qwen4exp/weights.cc)
+target_link_libraries(truss_models PUBLIC truss_formats)
+target_compile_options(truss_models PRIVATE -Wall -Wextra)
 
 # ---- engine kernels
 add_library(truss_kernels STATIC
@@ -41,7 +49,7 @@ target_link_libraries(tk-bench-moe-trace PRIVATE truss_kernels)
 
 # ---- tools/tk-pack: model file catalog, pack converter
 add_executable(tk-pack-inspect tools/tk-pack/inspect.cc)
-target_link_libraries(tk-pack-inspect PRIVATE truss_formats)
+target_link_libraries(tk-pack-inspect PRIVATE truss_models)
 
 # ---- tools/codec-lab: codebook studies (quantization MSE vs the Gaussian bound)
 add_executable(tk-codec-lab tools/codec-lab/viterbi_mse.cu)

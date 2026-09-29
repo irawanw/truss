@@ -11,6 +11,7 @@ are added. A change that breaks one of them needs a line in `TRACKER.md` saying 
 | shared device helpers | `src/kernels/trellis/` | `mma.cuh`, `hadamard.cuh` |
 | one fused op | `src/kernels/<op>/<op>.{cuh,cu}` | `moe/moe_window.cu` |
 | model file reader (host C++, zero-copy mmap) | `src/formats/<format>.{h,cc}` | `gguf.h` |
+| model family: hyperparameters, weight binding (and later the step) | `src/model/<family>/` | `qwen4exp/weights.cc` |
 | correctness test, one binary per op | `tests/unit/<op>_test.cu` | `moe_window_test.cu` |
 | check against an independent reader/tool (script) | `tests/unit/<what>_check.py` | `gguf_reader_check.py` |
 | microbenchmark or ablation | `tools/tk-bench/<name>.cu` | `ceiling.cu` |

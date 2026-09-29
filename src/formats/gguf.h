@@ -68,6 +68,8 @@ public:
     double get_float(std::string_view key) const;       // also accepts an integer value
     const std::string & get_string(std::string_view key) const;
     const std::vector<int64_t> & get_ints(std::string_view key) const;
+    const std::vector<double> & get_floats(std::string_view key) const;
+    const std::vector<bool> & get_bools(std::string_view key) const;
 
     const std::vector<std::string> & shard_paths() const { return paths_; }
 

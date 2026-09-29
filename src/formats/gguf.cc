@@ -315,4 +315,14 @@ const std::vector<int64_t> & File::get_ints(std::string_view key) const
     return typed<std::vector<int64_t>>(*this, key, "an integer array");
 }
 
+const std::vector<double> & File::get_floats(std::string_view key) const
+{
+    return typed<std::vector<double>>(*this, key, "a float array");
+}
+
+const std::vector<bool> & File::get_bools(std::string_view key) const
+{
+    return typed<std::vector<bool>>(*this, key, "a bool array");
+}
+
 }  // namespace truss::gguf
