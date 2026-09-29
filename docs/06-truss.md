@@ -112,3 +112,22 @@ Kill rules:
 - Engine code and design: `~/trellis-kernel` (this repo).
 - Experiments and data: `~/ML_projects/flashnext/<YYYYMMDD>_truss_cp<N>/`, scripts `flashnext/scripts/flashnext_truss_*`.
 - GPU: GPU 2 only (user, 2026-09-29). Check it is free before every run; stop if a renter takes it.
+
+## CP4 note (2026-09-30): fill the MoE window's bubbles inside the layer kernel
+
+v7a (CP3a) runs each GEMV item at the decode ceiling. A 4-row K2 window still loses ~30 µs to organisation:
+routing plus input Hadamard at the start (~12–15 µs) and the dependency tail (~10–15 µs); see TRACKER #26. None of
+this can be removed inside a stand-alone MoE kernel. The layer kernel reuses v7a's queue and counters and adds
+items that don't depend on routing:
+
+| Work (per layer, Flash-Next GGUF) | Size | Depends on |
+|---|---|---|
+| Router `ffn_gate_inp`, 2560×512, **F32** | 5.2 MB (2.6 MB as fp16 in the TRUSS pack) | FFN input x |
+| Shared expert, 2560×640 ×3, Q8_0 | 5.2 MB | x |
+| `hc_ffn_down` / `hc_ffn_up`, 10240×320 each, Q8_0 | 3.5 MB each | before x / after combine |
+
+Order of work:
+1. Routing, then the Hadamard of the routed inputs, run on a few blocks.
+2. Meanwhile, the other blocks stream the shared expert.
+3. Routed gate/up and down items follow.
+4. The shared expert's output joins the combine.
