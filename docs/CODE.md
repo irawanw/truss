@@ -13,6 +13,9 @@ are added. A change that breaks one of them needs a line in `TRACKER.md` saying 
 | model file reader (host C++, zero-copy mmap) | `src/formats/<format>.{h,cc}` | `gguf.h` |
 | model family: hyperparameters, weight binding (and later the step) | `src/model/<family>/` | `qwen4exp/weights.cc` |
 | correctness test, one binary per op | `tests/unit/<op>_test.cu` | `moe_window_test.cu` |
+| model blocks vs llama-paw activations | `tests/layer/<family>_parity.cu` | `qwen4exp_parity.cu` |
+| plain fp32 reference ops (the definition fast kernels are tested against) | `src/kernels/reference/` | `ref_linear.cu` |
+| device memory for model tensors, scratch, CUDA checks | `src/core/` | `device_tensors.h` |
 | check against an independent reader/tool (script) | `tests/unit/<what>_check.py` | `gguf_reader_check.py` |
 | microbenchmark or ablation | `tools/tk-bench/<name>.cu` | `ceiling.cu` |
 | model file tools (catalog, pack converter) | `tools/tk-pack/<name>.cc` | `inspect.cc` |

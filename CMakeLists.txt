@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.24)
 set(CMAKE_CUDA_COMPILER /usr/local/cuda-12.6/bin/nvcc CACHE FILEPATH "box's pinned CUDA toolkit")
 set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING "sm_86: RTX 3090 / 3060")
 project(truss LANGUAGES CXX CUDA)
+find_package(CUDAToolkit REQUIRED)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)
@@ -22,12 +23,25 @@ add_library(truss_formats STATIC
 target_include_directories(truss_formats PUBLIC src)
 target_compile_options(truss_formats PRIVATE -Wall -Wextra)
 
-# ---- models: hyperparameters and weight binding per architecture (host only)
+# ---- core: device memory for model tensors, scratch
+add_library(truss_core STATIC
+  src/core/device_tensors.cc)
+target_include_directories(truss_core PUBLIC src)
+target_link_libraries(truss_core PUBLIC truss_formats CUDA::cudart)
+
+# ---- reference ops: plain fp32, the definition the fast kernels are tested against
+add_library(truss_reference STATIC
+  src/kernels/reference/ref_linear.cu
+  src/kernels/reference/ref_norm.cu)
+target_link_libraries(truss_reference PUBLIC truss_core)
+
+# ---- models: hyperparameters, weight binding, reference forward per architecture
 add_library(truss_models STATIC
   src/model/qwen4exp/config.cc
-  src/model/qwen4exp/weights.cc)
-target_link_libraries(truss_models PUBLIC truss_formats)
-target_compile_options(truss_models PRIVATE -Wall -Wextra)
+  src/model/qwen4exp/weights.cc
+  src/model/qwen4exp/reference.cu)
+target_link_libraries(truss_models PUBLIC truss_formats truss_reference)
+target_compile_options(truss_models PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra>)
 
 # ---- engine kernels
 add_library(truss_kernels STATIC
@@ -40,6 +54,11 @@ target_include_directories(moe_window_test PRIVATE ${LLAMA_PAW_DIR}/ggml/include
 target_link_directories(moe_window_test PRIVATE ${LLAMA_PAW_DIR}/build/bin)
 target_link_libraries(moe_window_test PRIVATE truss_kernels ggml ggml-base ggml-cuda)
 set_target_properties(moe_window_test PROPERTIES BUILD_RPATH ${LLAMA_PAW_DIR}/build/bin)
+
+# ---- tests/layer: model blocks vs llama-paw activations
+add_executable(qwen4exp_parity tests/layer/qwen4exp_parity.cu)
+target_include_directories(qwen4exp_parity PRIVATE .)
+target_link_libraries(qwen4exp_parity PRIVATE truss_models)
 
 # ---- tools/tk-bench: microbenchmarks
 add_executable(tk-bench-ceiling tools/tk-bench/ceiling.cu)
