@@ -8,6 +8,7 @@
 #include "../codec-lab/proto_v2pair.cuh"
 
 #include <cstdio>
+#include <algorithm>
 #include <cstdlib>
 #include <vector>
 
@@ -64,27 +65,42 @@ __global__ __launch_bounds__(256) void decode_bench(int iters, float * out)
     if (s == 1234.5f) out[0] = s;   // keeps the work alive
 }
 
+// per_sm_cap > 0 limits resident blocks per SM (dynamic shared memory as ballast) to study occupancy.
+// Reports the median of 5 timed runs (clocks on this box move 10-15% between runs).
 template <class Codec, int bits, int WNT, int mode>
-static void run_decode(const char * name, int sms, float * d_out)
+static void run_decode(const char * name, int sms, float * d_out, int per_sm_cap = 0)
 {
+    auto kern = decode_bench<Codec, WNT, mode>;
+    size_t ballast = 0;
+    if (per_sm_cap > 0) {
+        CK(cudaFuncSetAttribute(kern, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+        ballast = 100 * 1024 / (per_sm_cap + 1) + 1024;
+        CK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) ballast));
+    }
     int per_sm = 0;
-    CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, decode_bench<Codec, WNT, mode>, 256, 0));
+    CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kern, 256, ballast));
     cudaFuncAttributes fa;
-    CK(cudaFuncGetAttributes(&fa, decode_bench<Codec, WNT, mode>));
+    CK(cudaFuncGetAttributes(&fa, kern));
     const int blocks = sms * per_sm * 8, iters = 2000;
     cudaEvent_t e0, e1;
     CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
-    decode_bench<Codec, WNT, mode><<<blocks, 256>>>(10, d_out);
-    CK(cudaEventRecord(e0));
-    decode_bench<Codec, WNT, mode><<<blocks, 256>>>(iters, d_out);
-    CK(cudaEventRecord(e1));
-    CK(cudaEventSynchronize(e1));
-    float ms;
-    CK(cudaEventElapsedTime(&ms, e0, e1));
+    kern<<<blocks, 256, ballast>>>(10, d_out);
+    std::vector<float> t;
+    for (int r = 0; r < 5; ++r) {
+        CK(cudaEventRecord(e0));
+        kern<<<blocks, 256, ballast>>>(iters, d_out);
+        CK(cudaEventRecord(e1));
+        CK(cudaEventSynchronize(e1));
+        float ms;
+        CK(cudaEventElapsedTime(&ms, e0, e1));
+        t.push_back(ms);
+    }
+    std::sort(t.begin(), t.end());
     const double w = (double) blocks * 8 * iters * WNT * 256;
-    const double wps = w / (ms * 1e-3);
-    printf("decode %-13s K%d WNT%-2d %-9s regs %3d blk/SM %d | %6.2f Tw/s = %5.0f GB/s at K%d (%3.0f%% of 936)\n", Codec::NAME, bits, WNT,
-           name, fa.numRegs, per_sm, wps / 1e12, wps * bits / 8 / 1e9, bits, 100.0 * wps * bits / 8 / 936e9);
+    const double wps = w / (t[2] * 1e-3);
+    printf("decode %-13s K%d WNT%-2d %-9s regs %3d blk/SM %d | %6.2f Tw/s = %5.0f GB/s at K%d (%3.0f%% of 936) spread %.0f%%\n",
+           Codec::NAME, bits, WNT, name, fa.numRegs, per_sm, wps / 1e12, wps * bits / 8 / 1e9, bits,
+           100.0 * wps * bits / 8 / 936e9, 100.0 * (t[4] - t[0]) / t[2]);
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -164,6 +180,11 @@ int main()
     run_decode<Mul1<2>, 2, 8, NO_MMA>("no-mma", sms, d_out);
     run_decode<Mul1<2>, 2, 8, MMA_ONLY>("mma-only", sms, d_out);
     run_decode<Mul1<2>, 2, 2, FULL>("full", sms, d_out);
+    run_decode<Mul1<2>, 2, 4, FULL>("full", sms, d_out);
+    run_decode<Mul1<2>, 2, 8, FULL>("full 2/SM", sms, d_out, 2);
+    run_decode<Mul1<3>, 3, 8, FULL>("full 2/SM", sms, d_out, 2);
+    run_decode<Mul1<3>, 3, 4, FULL>("full", sms, d_out);
+    run_decode<Mul1<4>, 4, 4, FULL>("full", sms, d_out);
     run_decode<Mul1<3>, 3, 8, FULL>("full", sms, d_out);
     run_decode<Mul1<3>, 3, 8, NO_MMA>("no-mma", sms, d_out);
     run_decode<Mul1<4>, 4, 8, FULL>("full", sms, d_out);

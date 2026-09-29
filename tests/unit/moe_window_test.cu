@@ -112,27 +112,33 @@ static int run_case(ggml_backend_t backend, int64_t n_tokens, std::mt19937 & rng
     // NaN-fill the workspace and output so any output the kernels skip fails the check (stale data once passed)
     CK(cudaMemset(ws, 0xff, truss::moe::workspace_bytes<Shape>()));
     CK(cudaMemset(d_out, 0xff, sizeof(float) * n_tokens * n_embd));
+    truss::moe::workspace_init<Shape>(ws, st);
     truss::moe::window<Shape>(W, (const float *) t_x->data, (const int *) t_ids->data, (const float *) t_w->data,
                       (int) n_tokens, d_out, ws, st);
     CK(cudaStreamSynchronize(st));
     CK(cudaGetLastError());
 
-    std::vector<float> a(n_tokens * n_embd), b(ggml_nelements(ref));
-    CK(cudaMemcpy(a.data(), d_out, sizeof(float) * a.size(), cudaMemcpyDeviceToHost));
+    std::vector<float> b(ggml_nelements(ref));
     ggml_backend_tensor_get(ref, b.data(), 0, ggml_nbytes(ref));
     double worst_rel = 0.0, worst_cos = 1.0;
     int64_t nonfinite = 0;
-    for (int64_t t = 0; t < n_tokens; ++t) {
-        double dd = 0, rr = 0, aa = 0, ar = 0;
-        for (int64_t i = 0; i < n_embd; ++i) {
-            const double av = a[t * n_embd + i], bv = b[t * n_embd + i];
-            nonfinite += !std::isfinite(av);
-            dd += (av - bv) * (av - bv); rr += bv * bv; aa += av * av; ar += av * bv;
+    auto check = [&] {
+        std::vector<float> a(n_tokens * n_embd);
+        CK(cudaMemcpy(a.data(), d_out, sizeof(float) * a.size(), cudaMemcpyDeviceToHost));
+        worst_rel = 0.0; worst_cos = 1.0; nonfinite = 0;
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            double dd = 0, rr = 0, aa = 0, ar = 0;
+            for (int64_t i = 0; i < n_embd; ++i) {
+                const double av = a[t * n_embd + i], bv = b[t * n_embd + i];
+                nonfinite += !std::isfinite(av);
+                dd += (av - bv) * (av - bv); rr += bv * bv; aa += av * av; ar += av * bv;
+            }
+            worst_rel = std::max(worst_rel, std::sqrt(dd / std::max(rr, 1e-30)));
+            worst_cos = std::min(worst_cos, ar / std::sqrt(std::max(aa * rr, 1e-30)));
         }
-        worst_rel = std::max(worst_rel, std::sqrt(dd / std::max(rr, 1e-30)));
-        worst_cos = std::min(worst_cos, ar / std::sqrt(std::max(aa * rr, 1e-30)));
-    }
-    const bool ok = !nonfinite && worst_rel <= 0.02 && worst_cos >= 0.9998;
+        return !nonfinite && worst_rel <= 0.02 && worst_cos >= 0.9998;
+    };
+    const bool ok_first = check();
 
     // bytes the window must read: each distinct routed expert once, all three projections, at its rate
     std::vector<char> seen(n_expert, 0);
@@ -161,9 +167,15 @@ static int run_case(ggml_backend_t backend, int64_t n_tokens, std::mt19937 & rng
     float ms = 0;
     CK(cudaEventElapsedTime(&ms, e0, e1));
     ms /= reps;
+    // the counters reset themselves: the output after all replays must still match
+    CK(cudaMemset(d_out, 0xff, sizeof(float) * n_tokens * n_embd));
+    CK(cudaGraphLaunch(ge, st));
+    CK(cudaStreamSynchronize(st));
+    const bool ok_replay = check();
+    const bool ok = ok_first && ok_replay;
     printf("rows=%-2lld K=%s uniq=%-3lld %.1f MB | rel_rms %.5f cos %.8f %s | %.1f us/layer, %.0f GB/s (%.0f%% of 936)\n",
            (long long) n_tokens, kfix ? std::to_string(kfix).c_str() : "mix2-4", (long long) uniq, tbytes / 1e6,
-           worst_rel, worst_cos, ok ? "PASS" : "FAIL", ms * 1e3, tbytes / (ms * 1e-3) / 1e9,
+           worst_rel, worst_cos, ok ? "PASS" : ok_first ? "FAIL(replay)" : "FAIL", ms * 1e3, tbytes / (ms * 1e-3) / 1e9,
            100.0 * tbytes / (ms * 1e-3) / 936e9);
 
     cudaGraphExecDestroy(ge); cudaGraphDestroy(g); cudaStreamDestroy(st); cudaFree(d_out);

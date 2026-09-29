@@ -30,6 +30,8 @@ set_target_properties(moe_window_test PROPERTIES BUILD_RPATH ${LLAMA_PAW_DIR}/bu
 # ---- tools/tk-bench: microbenchmarks
 add_executable(tk-bench-ceiling tools/tk-bench/ceiling.cu)
 target_include_directories(tk-bench-ceiling PRIVATE src)
+add_executable(tk-bench-moe-trace tools/tk-bench/moe_trace.cu)
+target_link_libraries(tk-bench-moe-trace PRIVATE truss_kernels)
 
 # ---- tools/codec-lab: codebook studies (quantization MSE vs the Gaussian bound)
 add_executable(tk-codec-lab tools/codec-lab/viterbi_mse.cu)
