@@ -126,6 +126,12 @@ items that don't depend on routing:
 | Shared expert, 2560×640 ×3, Q8_0 | 5.2 MB | x |
 | `hc_ffn_down` / `hc_ffn_up`, 10240×320 each, Q8_0 | 3.5 MB each | before x / after combine |
 
+Correction (2026-09-30, from llama-paw `build_hc_mix`): the FFN input x *is* the `hc_ffn` mix
+(`mean_c(norm(res_c) * sigmoid(up(silu(down(norm(res)) / hc))))`), so `hc_ffn_down`/`up` and the router run
+*before* routing and cannot fill its bubbles. Of this table only the shared expert (and the shared-expert gate)
+runs beside the routed experts; the next layer's `hc_attn` needs the combined residual. The bubble filler is
+therefore ~5.2 MB (~6 µs) per layer, not ~17 MB.
+
 Order of work:
 1. Routing, then the Hadamard of the routed inputs, run on a few blocks.
 2. Meanwhile, the other blocks stream the shared expert.
