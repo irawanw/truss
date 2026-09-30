@@ -51,7 +51,8 @@ target_link_libraries(truss_encode PUBLIC truss_core)
 
 # ---- engine kernels
 add_library(truss_kernels STATIC
-  src/kernels/moe/moe_window.cu)
+  src/kernels/moe/moe_window.cu
+  src/kernels/moe/moe_prefill.cu)
 target_include_directories(truss_kernels PUBLIC src)
 
 # ---- tests (tests/unit: one binary per op, exit code = pass/fail)
@@ -60,6 +61,9 @@ target_include_directories(moe_window_test PRIVATE ${LLAMA_PAW_DIR}/ggml/include
 target_link_directories(moe_window_test PRIVATE ${LLAMA_PAW_DIR}/build/bin)
 target_link_libraries(moe_window_test PRIVATE truss_kernels ggml ggml-base ggml-cuda)
 set_target_properties(moe_window_test PROPERTIES BUILD_RPATH ${LLAMA_PAW_DIR}/build/bin)
+
+add_executable(moe_prefill_test tests/unit/moe_prefill_test.cu)
+target_link_libraries(moe_prefill_test PRIVATE truss_kernels)
 
 add_executable(codec_v2one_test tests/unit/codec_v2one_test.cu)
 target_link_libraries(codec_v2one_test PRIVATE truss_encode)

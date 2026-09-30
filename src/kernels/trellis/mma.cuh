@@ -27,4 +27,17 @@ __device__ __forceinline__ void mma_w(const FragB & f0, const FragB & f1, half2 
         : "r"(p0[0]), "r"(p1[0]), "r"(p0[1]), "r"(p1[1]), "r"(b0), "r"(b1));
 }
 
+// fp32 accumulator of one tile x 8 rows: c[0], c[1] = (column lane/4, rows 2q, 2q+1); c[2], c[3] = column lane/4 + 8
+// (prefill GEMM: long K sums stay in fp32; on GA102 fp32 accumulation runs at the same tensor rate as fp16)
+__device__ __forceinline__ void mma_w_f32(const FragB & f0, const FragB & f1, half2 act_lo, half2 act_hi, float (&c)[4])
+{
+    const uint32_t * p0 = reinterpret_cast<const uint32_t *>(&f0);
+    const uint32_t * p1 = reinterpret_cast<const uint32_t *>(&f1);
+    const uint32_t b0 = *reinterpret_cast<uint32_t *>(&act_lo);
+    const uint32_t b1 = *reinterpret_cast<uint32_t *>(&act_hi);
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(p0[0]), "r"(p1[0]), "r"(p0[1]), "r"(p1[1]), "r"(b0), "r"(b1));
+}
+
 }  // namespace truss
