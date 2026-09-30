@@ -1,87 +1,53 @@
-# trellis-kernel — "Loom"
+# TRUSS (trellis-kernel)
 
-A decode engine for **EXL3-format trellis models** (PAW X3 GGUF and EXL3 safetensors) on
-**RTX 3090 / RTX 3060 (Ampere, sm_86)**, and nothing else. Status: **plan only**, 2026-09-27.
+Our own inference engine for **trellis-quantized MoE models on one RTX 3090** (Ampere, sm_86). First model:
+**Qwen3.8 Flash-Next PAW X3.1** (qwen4exp, 48 layers, 512 experts, 37 GiB of 2.63-bpw trellis experts + Q8_0 dense),
+served on GPU 2 of this box through an OpenAI-compatible API. Next models: PAW X3.1 27B, PAW 35B.
 
-| file | what |
-|---|---|
-| [PLAN.md](PLAN.md) | phases, gates, kill criteria, calendar, risks |
-| [docs/01-evidence-the-wall.md](docs/01-evidence-the-wall.md) | everything we have measured: where the time goes, what is closed |
-| [docs/02-landscape.md](docs/02-landscape.md) | exllamav3, sglang-exl3, TensorFold, llama-paw: speeds and what each does |
-| [docs/03-levers.md](docs/03-levers.md) | every speed lever that keeps accuracy, with evidence and exactness class |
-| [docs/04-architecture.md](docs/04-architecture.md) | engine design, code layout, tests, how it grows |
-| [docs/05-flashnext-1gpu-2gpu.md](docs/05-flashnext-1gpu-2gpu.md) | Flash-Next: Strata result, the 2× rule, 1-GPU pack S1 vs 2-GPU pack D2 (PLAN Phase 7) |
+## Status (2026-09-30, measured on GPU 2)
 
-## Verdict
+| | TRUSS | Strata (same box) |
+|---|---|---|
+| prefill, bench tool, 4K / 8K / 16K / 32K prompt | 2,263 / 2,499 / 2,548 / 2,321 tok/s | 960–1,330 |
+| prefill, server + code-agent bench, ~4K / ~32K | 938–1,403 / 1,508–1,778 tok/s | 960–1,330 |
+| decode (serving bring-up) | 13–15 tok/s | 84–107 |
+| quality: full-model KL vs llama-paw Q8 logits | 0.0131 (= llama's own run-to-run floor 0.0115) | expert error 2× ours |
 
-**The wall.** Our trellis matmul is limited by instructions per weight, not by memory. Deleting
-all weight traffic still leaves 73–88% of its time. Specifically:
+Every number has a row in [TRACKER.md](TRACKER.md) with the command that produced it.
 
-- the kernel skeleton is about half the time;
-- 3-bit and K3.5 window extraction is expensive;
-- there are 397 launches per token.
+## Start here
 
-Around the matmul sits about 7 ms/token of framework cost (other kernels, idle gaps), plus
-6.7 ms of host time per speculative round. The new X3.1 model (K3.5) **has no fast kernels in
-llama-paw at all**, and its speed has never been measured.
+- **[docs/reference/](docs/reference/README.md)** — every source file: what it computes, API and shapes, layouts,
+  numerics, invariants, tests, tunables, how to change it. Start with its README (data flow of one forward pass).
+- [docs/CODE.md](docs/CODE.md) — code rules: where files go, extension points, kernel and test rules.
+- [TRACKER.md](TRACKER.md) — every experiment and measurement, checkpoints (CP0–CP9), the "Do not repeat" list.
+- [docs/06-truss.md](docs/06-truss.md) — design; `docs/01..05`, `PLAN.md` — the evidence and plans that led here.
 
-**The competition is ahead, and it proves the headroom is real.**
+## Quickstart
 
-- SGLang with the sglang-exl3 plugin decodes a 3.0 bpw EXL3 27B at **52.4 tok/s** without a
-  drafter, and **225 tok/s** on code with DFlash2, on one 3090.
-- Its linears take 13.3 ms against exllamav3's 19.2. That is roughly 686 GB/s at 3 bits, where
-  our 3-bit shapes run at 428–471.
-- llama-paw does 40.7 (B3.5) and 100.45 with DFlash2.
+```bash
+cmake -S . -B build -G Ninja && cmake --build build
+M=~/ML_projects/flashnext/20260918_ngram_q8/data/qwen38-flash-next-paw-x3-q8_0-00001-of-00002.gguf
+TOK=/data/www/Qwen3.8-27B-DFlash2-EXL3-5.0bpw/models/Qwen3.8-27B-EXL3-3.5bpw/tokenizer.json
+CUDA_VISIBLE_DEVICES=2 python3 -m server.app --model $M --tokenizer $TOK --port 8090 --n-ctx 65536 --chunk 8192
+curl localhost:8090/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":64,"temperature":0}'
+```
 
-**Why a DGX Spark reaches ~100 tok/s when a 3090 has 3.7× its bandwidth**
-(`docs/02-landscape.md`):
+Tests and benchmarks: [docs/reference/tests-tools.md](docs/reference/tests-tools.md).
 
-- TensorFold's Spark result is a large **speculative multiplier**, not more hardware: 12.9 serial
-  → 49.6 on standard coding replies, and up to 126.9 on long structured prompts. It comes from
-  three things:
-  - verifying 12 rows costs only 1.09× one row on a Spark;
-  - draft trees plus copy chains commit 4.7–12 tokens per round;
-  - the host is hidden.
-- On our 3090 the same row count costs 1.52×, we use a chain (3.48 tokens/round), and 6.7 ms of
-  host time per round is exposed.
-- **My earlier plan played it safe by treating 3.48 tokens/round as the drafter's limit. It is
-  not: trees, copies and a flat verify curve are engine features.**
+## Layout
 
-**What a new engine can and cannot do (arithmetic, in `PLAN.md` §2):**
-
-- **Serial decode:** no engine can exceed **74.9 tok/s** on X3.1 on a 3090 (the read ceiling).
-  Loom's realistic range is 50–58 tok/s, +5% to +25% over the best existing stack at equal bits.
-- **Speculative decode, where the big gain is:** a TensorFold-class design on a 3090, on our
-  **trellis** file, points to **~150–175 tok/s on ordinary coding replies** (190–200 only in the
-  best case) and roughly 1.5–2.5× that on long structured output and file edits. Compare
-  llama-paw's 100.45 and sglang-exl3's 225 on its own code prompts. The trellis sensitivity
-  table is in `PLAN.md` §2.
-- The key unknowns are whether the 3090's verify curve flattens (≤ 1.2× at 12–16 rows is
-  physically available but unproven) and whether our Q2_K drafter's candidates are good enough.
-  Phase 0 measures both, including running TensorFold itself on a 3090.
-- If raw serial speed were the only goal, the cheapest path would be to export X3.1 to EXL3 and
-  run it in exllamav3. Phase 0 measures that too.
-
-**Why our own engine**, if Phase 0 agrees:
-
-1. trellis K3.5 kernels built for flat verify, which no engine has;
-2. exact tree speculation with GDN tree recurrence on our formats;
-3. the RTX 3060;
-4. the Flash-Next MoE on 2×3090;
-5. escaping a 19.5k-line llama.cpp overlay that broke silently on the last upstream port.
-
-Phase 1 has a hard kill gate. If the new kernel is not ≥ 1.10× the best existing trellis kernel
-after three iterations, the engine stops and the kernel work goes into llama-paw instead.
-
-## First action
-
-`PLAN.md` Phase 0 (2–4 days, measurement only):
-
-1. X3.1 speed in llama-paw;
-2. X3.1 exported to EXL3 and measured in exllamav3;
-3. a per-shape kernel baseline table at 1–16 rows;
-4. platform probes;
-5. **TensorFold itself on a 3090**, with its round trace;
-6. the tree ceiling of our own drafter, offline.
-
-No engine code until decision D0 is written.
+```
+include/truss/truss.h      C API (libtruss.so)
+src/formats/               GGUF reader, trellis expert tables
+src/core/                  device tensors, scratch, error checks
+src/kernels/<op>/          fast kernels (trellis, moe, dense, dsa, gdn, hc, ffn, ple, sampling) + reference/
+src/model/qwen4exp/        config, weight binding, PLE hashing, reference forward, fast Forward
+src/runtime/               expert residency and PCIe streaming
+src/api/                   C API implementation
+src/encode/                pack-time trellis encoders
+server/                    OpenAI-compatible server (Python, ctypes)
+tests/unit, tests/layer    op tests; model blocks and chains vs llama-paw and the fp32 reference
+tools/                     benchmarks, parity dumps and KL, pack inspection, codec lab
+```

@@ -3,6 +3,14 @@
 The layout is `docs/04-architecture.md` §8. These rules keep it from needing a refactor as models, codecs and GPUs
 are added. A change that breaks one of them needs a line in `TRACKER.md` saying why.
 
+## Documentation (every file, kept current)
+
+Every source file has an entry in `docs/reference/` (the page for its directory): what it computes, API with shapes
+and units, data layouts, numerics, invariants, the test that proves it, tunables with the TRACKER row behind each
+value, and how to extend or replace it. **A change to a file updates its entry in the same commit**; a new file gets
+an entry when it is created. The file's own header comment says what it is and why it is shaped that way; the
+reference page adds how it fits with the rest.
+
 ## Where things go
 
 | what | where | example |
@@ -23,6 +31,9 @@ are added. A change that breaks one of them needs a line in `TRACKER.md` saying 
 | parity: reference activations, model slices | `tools/tk-parity/` | `llama_dump.cpp`, `slice_gguf.py` |
 | codec study or prototype codec (not used by `src/`) | `tools/codec-lab/` | `viterbi_mse.cu`, `proto_v2pair.cuh` |
 | results, logs, reports | `~/ML_projects/flashnext/<date>_truss_cpN/` (STORAGE.md), never in this repo | |
+| engine runtime (residency, scheduling) | `src/runtime/<name>.{h,cu}` | `expert_store.cu` |
+| public C API / its implementation | `include/truss/truss.h` / `src/api/` | `truss_c.cu` |
+| HTTP server | `server/` (Python, binds libtruss.so) | `app.py` |
 
 Build: `cmake -S . -B build -G Ninja && cmake --build build`. A new file is one line in `CMakeLists.txt`.
 
