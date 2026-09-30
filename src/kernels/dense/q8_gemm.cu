@@ -185,6 +185,44 @@ __global__ void dequant_kernel(const int8_t * __restrict__ q, const half * __res
     o[1] = __floats2half2_rn(v.z * s, v.w * s);
 }
 
+// one warp per output o; lane l takes 32-blocks l, l + 32, ...; each block = 8 dp4a per activation row
+template <int ROWS>
+__global__ void __launch_bounds__(128) gemv_kernel(const int8_t * __restrict__ q, const half * __restrict__ d, int in,
+                                                   int out, const int8_t * __restrict__ xq, const half * __restrict__ xd,
+                                                   float * __restrict__ y)
+{
+    const int o = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (o >= out) return;
+    const int nb = in / 32;
+    float acc[ROWS] = {};
+    for (int b = lane; b < nb; b += 32) {
+        const int4 * wp = reinterpret_cast<const int4 *>(q + (size_t) o * in + b * 32);
+        const int4 w0 = __ldg(wp), w1 = __ldg(wp + 1);
+        const float dw = __half2float(d[(size_t) o * nb + b]);
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            const int4 * xp = reinterpret_cast<const int4 *>(xq + (size_t) r * in + b * 32);
+            const int4 x0 = __ldg(xp), x1 = __ldg(xp + 1);
+            int s = 0;
+            s = __dp4a(w0.x, x0.x, s), s = __dp4a(w0.y, x0.y, s), s = __dp4a(w0.z, x0.z, s), s = __dp4a(w0.w, x0.w, s);
+            s = __dp4a(w1.x, x1.x, s), s = __dp4a(w1.y, x1.y, s), s = __dp4a(w1.z, x1.z, s), s = __dp4a(w1.w, x1.w, s);
+            acc[r] += (float) s * (dw * __half2float(xd[(size_t) r * nb + b]));
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r) {
+        float v = acc[r];
+        for (int m = 16; m; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
+        if (lane == 0) y[(size_t) r * out + o] = v;
+    }
+}
+
+template <int ROWS>
+void gemv_rows(const Q8Matrix & W, const int8_t * xq, const half * xd, float * y, cudaStream_t stream)
+{
+    gemv_kernel<ROWS><<<(W.out + 3) / 4, 128, 0, stream>>>(W.q, W.d, W.in, W.out, xq, xd, y);
+}
+
 // one block per row
 __global__ void rows_kernel(const int8_t * __restrict__ q, const half * __restrict__ d, const int * ids, int in,
                             float * out)
@@ -195,6 +233,23 @@ __global__ void rows_kernel(const int8_t * __restrict__ q, const half * __restri
 }
 
 }  // namespace
+
+void q8_gemv(const Q8Matrix & W, const int8_t * xq, const half * xd, int rows, float * y, cudaStream_t stream)
+{
+    if (W.in % 32) throw std::runtime_error("q8_gemv: in must be a multiple of 32");
+    switch (rows) {
+    case 1: gemv_rows<1>(W, xq, xd, y, stream); break;
+    case 2: gemv_rows<2>(W, xq, xd, y, stream); break;
+    case 3: gemv_rows<3>(W, xq, xd, y, stream); break;
+    case 4: gemv_rows<4>(W, xq, xd, y, stream); break;
+    case 5: gemv_rows<5>(W, xq, xd, y, stream); break;
+    case 6: gemv_rows<6>(W, xq, xd, y, stream); break;
+    case 7: gemv_rows<7>(W, xq, xd, y, stream); break;
+    case 8: gemv_rows<8>(W, xq, xd, y, stream); break;
+    default: throw std::runtime_error("q8_gemv: rows must be 1.." + std::to_string(GEMV_ROWS));
+    }
+    TRUSS_CUDA(cudaGetLastError());
+}
 
 void q8_rows(const Q8Matrix & W, const int * ids, int n, float * out, cudaStream_t stream)
 {

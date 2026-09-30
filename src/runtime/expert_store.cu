@@ -99,8 +99,12 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
                 cold_total_ += Y.cold[p];
             }
             size_t cold_pos = 0;
+            Y.cold_off[p].assign(t.n_expert, -1);
+            Y.bytes[p].resize(t.n_expert);
             for (int e = 0; e < t.n_expert; ++e) {
                 const size_t bytes = expert_bytes(t, e);
+                Y.bytes[p][e] = bytes;
+                if (!hot[l][e]) Y.cold_off[p][e] = (int64_t) cold_pos;
                 const uint8_t * from = src + t.offset[e] * 2;
                 uint8_t * at;
                 if (hot[l][e]) {
@@ -160,6 +164,27 @@ void ExpertStore::prefetch(int l)
     for (int p = 0; p < 3; ++p)
         if (Y.cold[p])
             TRUSS_CUDA(cudaMemcpyAsync(base_[p] + s * slot_words_[p], Y.host[p], Y.cold[p], cudaMemcpyHostToDevice, copy_));
+    TRUSS_CUDA(cudaEventRecord(copied_[s], copy_));
+}
+
+void ExpertStore::fetch(int l, const int * ids, int n)
+{
+    const Layer & Y = layers_.at(l);
+    const int s = l % 2;
+    if (released_recorded_[s]) TRUSS_CUDA(cudaStreamWaitEvent(copy_, released_[s], 0));
+    std::vector<uint8_t> seen(Y.n_expert, 0);
+    for (int i = 0; i < n; ++i) {
+        const int e = ids[i];
+        if (e < 0 || e >= Y.n_expert) throw std::out_of_range("ExpertStore::fetch: expert id " + std::to_string(e));
+        if (seen[e] || Y.cold_off[0][e] < 0) continue;
+        seen[e] = 1;
+        for (int p = 0; p < 3; ++p) {
+            const int64_t off = Y.cold_off[p][e];
+            TRUSS_CUDA(cudaMemcpyAsync(reinterpret_cast<uint8_t *>(base_[p] + s * slot_words_[p]) + off,
+                                       static_cast<const uint8_t *>(Y.host[p]) + off, Y.bytes[p][e],
+                                       cudaMemcpyHostToDevice, copy_));
+        }
+    }
     TRUSS_CUDA(cudaEventRecord(copied_[s], copy_));
 }
 

@@ -1,19 +1,24 @@
-// qwen4exp::Prefill (the fast layer chain) on the 8-layer slice.
+// qwen4exp::Forward (the fast layer chain) on the 8-layer slice. The short and long checks against the fp32
+// reference run the engine with Activations::FP16 (the same math); the default Q8_1 activations are llama-paw's
+// rounding, checked by q8_gemm_test and the full-model KL (tk-parity-kl).
 //   short <dump>  12-token llama dump: after every layer, the residual vs llama's l_last and vs the fp32 reference
 //                 chain (qwen4exp::reference blocks, FP32 numerics, from llama's hc_init). Gate vs reference 5e-3:
 //                 the engine rounds activations to fp16 before each GEMM and fp16 P in attention.
 //   stream <dump> all experts resident vs a 2 GiB expert budget (most experts streamed per layer through the
 //                 ExpertStore slots): bit-identical residuals.
+//   decode <dump> prompt minus its last 32 tokens as chunks, then those 32 as decode steps (1 token each, one step of
+//                 3): logits vs one chunk over the whole prompt. The paths differ in kernels (gemv vs GEMM, moe_window
+//                 vs moe_prefill, fetched vs streamed experts): gate KL <= 1e-3 and top-1 agreement >= 90%.
 //   long <dump>   the 3,659-token dump: the next layer's attention-side mix of the engine's residual (reference
 //                 hc_mix) vs llama's hc_mixed; chunked (2,048 + rest) vs one chunk, which must agree to 1e-4
 //                 (caches and carried state); timing.
-// usage: qwen4exp_prefill <slice.gguf> short|stream|long <dump dir>
+// usage: qwen4exp_forward <slice.gguf> short|stream|decode|long <dump dir>
 #include "core/cuda_check.h"
 #include "core/device_tensors.h"
 #include "core/scratch.h"
 #include "model/qwen4exp/config.h"
 #include "model/qwen4exp/ple.h"
-#include "model/qwen4exp/prefill.h"
+#include "model/qwen4exp/forward.h"
 #include "model/qwen4exp/reference.h"
 #include "model/qwen4exp/weights.h"
 #include "tests/layer/dump.h"
@@ -55,7 +60,7 @@ std::string at(const char * base, int l, const char * suffix = "")
 }
 
 // every layer's residual of one prompt through the engine, in chunks of `chunk`
-std::vector<std::vector<float>> run_engine(q::Prefill & p, const std::vector<int32_t> & tok, int chunk, int n_layer,
+std::vector<std::vector<float>> run_engine(q::Forward & p, const std::vector<int32_t> & tok, int chunk, int n_layer,
                                            size_t row, double * seconds)
 {
     std::vector<std::vector<float>> out(n_layer, std::vector<float>(tok.size() * row));
@@ -137,7 +142,7 @@ std::vector<const gguf::Tensor *> all_but_ple_table(const gguf::File & f, const 
     return up;
 }
 
-double run_timed(q::Prefill & p, const std::vector<int32_t> & tok, int chunk)
+double run_timed(q::Forward & p, const std::vector<int32_t> & tok, int chunk)
 {
     const auto t0 = std::chrono::steady_clock::now();
     for (size_t s = 0; s < tok.size(); s += chunk) p.run(tok.data() + s, (int) std::min<size_t>(chunk, tok.size() - s));
@@ -167,7 +172,7 @@ int main(int argc, char ** argv)
         if (mode == "short") {
             std::vector<std::vector<float>> eng;
             {
-                q::Prefill p(c, w, 512, 512);
+                q::Forward p(c, w, 512, 512, 0, q::Activations::FP16);
                 double sec;
                 eng = run_engine(p, tok, 512, c.n_layer, row, &sec);
             }
@@ -197,7 +202,7 @@ int main(int argc, char ** argv)
             int hot_all, hot_str;
             size_t cold;
             for (int pass = 0; pass < 2; ++pass) {
-                q::Prefill p(c, w, T, (T + 3) / 4 * 4, pass ? 2ull << 30 : 0);
+                q::Forward p(c, w, T, (T + 3) / 4 * 4, pass ? 2ull << 30 : 0);
                 (pass ? streamed : all) = run_engine(p, tok, (T + 3) / 4 * 4, c.n_layer, row, pass ? &t_str : &t_all);
                 (pass ? hot_str : hot_all) = p.hot_experts();
                 if (pass) cold = p.cold_bytes();
@@ -208,16 +213,65 @@ int main(int argc, char ** argv)
             fails += diff != 0;
             std::printf("hot experts per layer: %d (all resident) vs %d (2 GiB budget, %.2f GB streamed per chunk): %ld "
                         "residual values differ  %s\n", hot_all, hot_str, cold / 1e9, diff, diff ? "FAIL" : "PASS");
+        } else if (mode == "decode") {
+            const int n_dec = 32, P = T - n_dec, V = c.n_vocab;
+            float * d_logits;
+            TRUSS_CUDA(cudaMalloc(&d_logits, (size_t) n_dec * V * 4));
+            std::vector<float> one((size_t) n_dec * V), dec((size_t) n_dec * V);
+            {
+                q::Forward p(c, w, T, (T + 3) / 4 * 4);
+                p.run(tok.data(), T);
+                p.head(P, n_dec, d_logits);
+                TRUSS_CUDA(cudaMemcpy(one.data(), d_logits, one.size() * 4, cudaMemcpyDeviceToHost));
+            }
+            double step_ms = 0;
+            int steps = 0;
+            {
+                q::Forward p(c, w, T, 2048);
+                for (int s0 = 0; s0 < P; s0 += 2048) p.run(tok.data() + s0, std::min(2048, P - s0));
+                for (int i = P; i < T;) {
+                    const int n = i == P + 10 ? 3 : 1;   // one 3-token step (a verify window)
+                    const auto t0 = std::chrono::steady_clock::now();
+                    p.run(tok.data() + i, n);
+                    p.head(0, n, d_logits);
+                    TRUSS_CUDA(cudaMemcpy(dec.data() + (size_t) (i - P) * V, d_logits, (size_t) n * V * 4,
+                                          cudaMemcpyDeviceToHost));
+                    if (n == 1) step_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), ++steps;
+                    i += n;
+                }
+            }
+            double kl = 0;
+            int same = 0;
+            for (int i = 0; i < n_dec; ++i) {
+                const float * a = one.data() + (size_t) i * V, * b = dec.data() + (size_t) i * V;
+                const float ma = *std::max_element(a, a + V), mb = *std::max_element(b, b + V);
+                double za = 0, zb = 0;
+                for (int v = 0; v < V; ++v) za += std::exp(a[v] - ma), zb += std::exp(b[v] - mb);
+                double k = 0;
+                for (int v = 0; v < V; ++v) {
+                    const double la = a[v] - ma - std::log(za), lb = b[v] - mb - std::log(zb);
+                    k += std::exp(la) * (la - lb);
+                }
+                kl += k;
+                same += std::max_element(a, a + V) - a == std::max_element(b, b + V) - b;
+            }
+            kl /= n_dec;
+            const bool ok = kl <= 1e-3 && same >= n_dec * 9 / 10;
+            fails += !ok;
+            std::printf("decode %d tokens after a %d-token prompt: KL vs one chunk %.2e, top-1 same %d/%d, %.1f ms per "
+                        "1-token step (%d layers, with head and logits copy)  %s\n", n_dec, P, kl, same, n_dec,
+                        step_ms / steps, c.n_layer, ok ? "PASS" : "FAIL");
+            cudaFree(d_logits);
         } else if (mode == "long") {
             const int chunk = 2048;
             std::vector<std::vector<float>> one, two;
             double t_one, t_two;
             {
-                q::Prefill p(c, w, T, (T + 3) / 4 * 4);
+                q::Forward p(c, w, T, (T + 3) / 4 * 4, 0, q::Activations::FP16);
                 one = run_engine(p, tok, T, c.n_layer, row, &t_one);
             }
             {
-                q::Prefill p(c, w, T, chunk);
+                q::Forward p(c, w, T, chunk, 0, q::Activations::FP16);
                 two = run_engine(p, tok, chunk, c.n_layer, row, &t_two);
             }
             const DeviceTensors dev(all_but_ple_table(*file, w));
@@ -252,18 +306,18 @@ int main(int argc, char ** argv)
             }
             std::printf("time with per-layer copies: one chunk %.3f s, chunked %.3f s\n", t_one, t_two);
             {
-                q::Prefill p(c, w, T, chunk);
+                q::Forward p(c, w, T, chunk);
                 run_timed(p, tok, chunk);   // warm-up (cuBLAS heuristics, first-touch)
             }
             for (int ch : { 1024, 2048, 4096 }) {
                 const int mc = std::min(ch, (T + 3) / 4 * 4);
-                q::Prefill p(c, w, T, mc);
+                q::Forward p(c, w, T, mc);
                 const double sec = run_timed(p, tok, mc);
                 std::printf("prefill %d tokens in chunks of %d: %.1f ms = %.0f tok/s on %d layers (%.1f us/token/layer)\n",
                             T, mc, sec * 1e3, T / sec, c.n_layer, sec * 1e6 / T / c.n_layer);
             }
         } else {
-            throw std::runtime_error("mode must be short, stream or long");
+            throw std::runtime_error("mode must be short, stream, decode or long");
         }
         std::printf("%s\n", fails ? "FAIL" : "PASS");
         return fails ? 1 : 0;

@@ -13,6 +13,8 @@
 //     ...          moe ops on weights(l)
 //     release(l)   the slot may be overwritten once compute gets here
 //     prefetch(l + 2), which reuses the slot after release(l)
+// A decode step, whose routing is known only at its layer, calls fetch(l, ids) (the few cold experts it uses) right
+// before acquire(l) instead of prefetching whole layers.
 #pragma once
 #include "formats/trellis_table.h"
 #include "kernels/moe/moe_weights.cuh"
@@ -41,7 +43,9 @@ public:
     ExpertStore & operator=(const ExpertStore &) = delete;
 
     moe::Weights weights(int layer) const;
-    void prefetch(int layer);                                      // on the store's copy stream
+    void prefetch(int layer);                                      // all cold experts, on the store's copy stream
+    // decode: only the cold experts among ids[0 .. n) (host), same slot places; used instead of prefetch
+    void fetch(int layer, const int * ids, int n);
     void acquire(int layer, cudaStream_t compute);
     void release(int layer, cudaStream_t compute);
 
@@ -53,6 +57,8 @@ private:
     struct Layer {
         size_t cold[3] = {};                                        // cold bytes per projection
         const void * host[3] = {};                                  // pinned source of the cold experts
+        std::vector<int64_t> cold_off[3];                           // [expert] byte offset in host / slot, -1: hot
+        std::vector<size_t> bytes[3];                               // [expert]
         int32_t * meta[3] = {};                                     // device (K, word offset from the slot-0 base)
         const half * suh[3] = {}, * svh[3] = {};
         int n_expert = 0;

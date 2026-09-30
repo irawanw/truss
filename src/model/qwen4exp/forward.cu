@@ -1,4 +1,4 @@
-#include "model/qwen4exp/prefill.h"
+#include "model/qwen4exp/forward.h"
 
 #include "core/cublas_check.h"
 #include "core/cuda_check.h"
@@ -12,6 +12,7 @@
 #include "kernels/gdn/gdn_prepare.cuh"
 #include "kernels/hc/hc_prefill.cuh"
 #include "kernels/moe/moe_prefill.cuh"
+#include "kernels/moe/moe_window.cuh"
 #include "kernels/ple/ple_prefill.cuh"
 #include "model/qwen4exp/ple.h"
 #include "runtime/expert_store.h"
@@ -33,7 +34,7 @@ namespace {
 
 void require(bool ok, const std::string & what)
 {
-    if (!ok) throw std::runtime_error("qwen4exp::Prefill: " + what);
+    if (!ok) throw std::runtime_error("qwen4exp::Forward: " + what);
 }
 
 template <class X> X * dmalloc(size_t n, bool zero = true)
@@ -46,7 +47,7 @@ template <class X> X * dmalloc(size_t n, bool zero = true)
 
 }  // namespace
 
-struct Prefill::Impl {
+struct Forward::Impl {
     const Config & c;
     const Weights & w;
     const int n_ctx, max_chunk;
@@ -58,11 +59,14 @@ struct Prefill::Impl {
     Scratch scratch;                                     // per-chunk temporaries, reset per layer
     half * w16 = nullptr;                                // q8_gemm_a16's dequantized weight
     size_t w16_elems = 0;
-    void * moe_ws = nullptr;
+    void * moe_ws = nullptr;                             // moe::prefill (prompt chunks)
+    void * window_ws = nullptr;                          // moe::window (decode steps)
+    int * ids_host = nullptr;                            // pinned: a decode step's routing, for the expert fetch
     float * res = nullptr;                               // [max_chunk][hc][d]
 
     struct LayerState {
         half * k = nullptr, * v = nullptr, * idx_k = nullptr;   // DSA caches
+        float * idx_partial = nullptr;                          // raw indexer keys of the open block
         float * state = nullptr, * conv = nullptr;              // GDN recurrence, conv rows
         float * ple_hist = nullptr;
     };
@@ -82,6 +86,9 @@ struct Prefill::Impl {
         upload();
         res = alloc<float>((size_t) max_chunk * c.hc_dim());
         moe_ws = alloc<unsigned char>(moe::prefill_workspace_bytes<MoeShape>(max_chunk));
+        window_ws = alloc<unsigned char>(moe::workspace_bytes<MoeShape>());
+        moe::workspace_init<MoeShape>(window_ws, s);
+        TRUSS_CUDA(cudaMallocHost(&ids_host, sizeof(int) * moe::MAX_ROWS * MoeShape::TOPK));
         st.resize(c.n_layer);
         const int R = DsaShape::RATIO;
         for (int l = 0; l < c.n_layer; ++l) {
@@ -90,6 +97,7 @@ struct Prefill::Impl {
                 L.k = alloc<half>((size_t) n_ctx * c.n_head_kv * c.head_dim);
                 L.v = alloc<half>((size_t) n_ctx * c.n_head_kv * c.head_dim);
                 L.idx_k = alloc<half>((size_t) (n_ctx / R) * c.idx_head_dim);
+                L.idx_partial = alloc<float>((size_t) (R - 1) * c.idx_head_dim);
             } else {
                 L.state = alloc<float>((size_t) c.ssm_v_heads * c.ssm_state * c.ssm_state);
                 L.conv = alloc<float>((size_t) (c.ssm_conv - 1) * c.conv_dim());
@@ -113,6 +121,7 @@ struct Prefill::Impl {
     ~Impl()
     {
         for (void * p : owned) cudaFree(p);
+        if (ids_host) cudaFreeHost(ids_host);
         if (blas) cublasDestroy(blas);
         if (s) cudaStreamDestroy(s);
     }
@@ -223,7 +232,8 @@ struct Prefill::Impl {
         int8_t * xq = scratch.alloc<int8_t>((size_t) rows * W.in);
         half * xd = scratch.alloc<half>((size_t) rows * W.in / 32);
         dense::q8_quantize_act(x, rows, W.in, xq, xd, s);
-        dense::q8_gemm(W, xq, xd, rows, y, s);
+        if (rows <= dense::GEMV_ROWS) dense::q8_gemv(W, xq, xd, rows, y, s);
+        else dense::q8_gemm(W, xq, xd, rows, y, s);
         scratch.release(m);
     }
 
@@ -326,8 +336,8 @@ struct Prefill::Impl {
         dsa::rope_table<DsaShape>(pos0, T, c.rope_base, cs, s);
         dsa::prepare_qkv<DsaShape>(qfull, k, v, f32(a.q_norm), f32(a.k_norm), cs, pos0, T, c.rms_eps, q16, gate, L.k,
                                    L.v, s);
-        dsa::prepare_index<DsaShape>(iq, ik, f32(a.idx_q_norm), f32(a.idx_k_norm), cs, pos0, T, c.rms_eps, iq16,
-                                     L.idx_k, s);
+        dsa::prepare_index<DsaShape>(iq, ik, f32(a.idx_q_norm), f32(a.idx_k_norm), cs, c.rope_base, pos0, T, c.rms_eps,
+                                     L.idx_partial, iq16, L.idx_k, s);
         const size_t ws_bytes = dsa::select_workspace_bytes<DsaShape>(T, pos0 + T);
         void * ws = scratch.alloc<unsigned char>(ws_bytes);
         dsa::select<DsaShape>(iq16, L.idx_k, pos0, T, blocks, n_blocks, ws, ws_bytes, s);
@@ -335,6 +345,9 @@ struct Prefill::Impl {
         lin(a.out, att16, T, out);
         scratch.release(m);
     }
+
+    // a few rows (a decode step or a small verify window): experts are fetched per routing, not streamed per layer
+    static bool decode_step(int T) { return T <= moe::MAX_ROWS; }
 
     void ffn(int l, const Moe & mo, const float * in, const half * in16, int T, float * out)
     {
@@ -347,10 +360,19 @@ struct Prefill::Impl {
         half * mid16 = scratch.alloc<half>((size_t) T * F);
         lin32(mo.router, in, T, logits);
         ffn::route(logits, T, E, K, ids, wts, s);
-        experts->acquire(l, s);
-        moe::prefill<MoeShape>(experts->weights(l), in, ids, wts, T, routed, moe_ws, max_chunk, s);
-        experts->release(l, s);
-        if (l + 2 < c.n_layer) experts->prefetch(l + 2);
+        if (decode_step(T)) {   // fetch the few cold experts this step routes to, then the window kernel
+            TRUSS_CUDA(cudaMemcpyAsync(ids_host, ids, sizeof(int) * T * K, cudaMemcpyDeviceToHost, s));
+            TRUSS_CUDA(cudaStreamSynchronize(s));
+            experts->fetch(l, ids_host, T * K);
+            experts->acquire(l, s);
+            moe::window<MoeShape>(experts->weights(l), in, ids, wts, T, routed, window_ws, s);
+            experts->release(l, s);
+        } else {                // whole layers stream ahead (prefetch(l + 2) while this layer computes)
+            experts->acquire(l, s);
+            moe::prefill<MoeShape>(experts->weights(l), in, ids, wts, T, routed, moe_ws, max_chunk, s);
+            experts->release(l, s);
+            if (l + 2 < c.n_layer) experts->prefetch(l + 2);
+        }
         lin(mo.shexp_gate, in16, T, g);
         lin(mo.shexp_up, in16, T, u);
         ffn::swiglu(g, u, T * F, mid16, s);
@@ -399,14 +421,14 @@ struct Prefill::Impl {
     {
         require(T > 0 && T <= max_chunk, "chunk of " + std::to_string(T) + " tokens (max " + std::to_string(max_chunk) + ")");
         require(pos0 + T <= n_ctx, "sequence longer than n_ctx");
-        require(pos0 % DsaShape::RATIO == 0, "a chunk after one whose length is not a multiple of the DSA ratio");
         scratch.reset();
         int * ids = scratch.alloc<int>(T);
         float * emb = scratch.alloc((size_t) T * c.d_model);
         TRUSS_CUDA(cudaMemcpyAsync(ids, tokens, (size_t) T * 4, cudaMemcpyHostToDevice, s));
         dense::q8_rows(q8.at(w.token_embd), ids, T, emb, s);
         hc::expand(emb, T, c.hc, c.d_model, res, s);
-        for (int l = 0; l < std::min(2, c.n_layer); ++l) experts->prefetch(l);
+        if (!decode_step(T))
+            for (int l = 0; l < std::min(2, c.n_layer); ++l) experts->prefetch(l);
         const size_t base = scratch.mark();
         for (int l = 0; l < c.n_layer; ++l) {
             scratch.release(base);
@@ -437,28 +459,28 @@ struct Prefill::Impl {
     }
 };
 
-Prefill::Prefill(const Config & c, const Weights & w, int n_ctx, int max_chunk, size_t expert_budget, Activations act)
+Forward::Forward(const Config & c, const Weights & w, int n_ctx, int max_chunk, size_t expert_budget, Activations act)
     : m_(std::make_unique<Impl>(c, w, n_ctx, max_chunk, expert_budget, act))
 {
 }
 
-Prefill::~Prefill() = default;
+Forward::~Forward() = default;
 
-cudaStream_t Prefill::stream() const { return m_->s; }
+cudaStream_t Forward::stream() const { return m_->s; }
 
-int Prefill::hot_experts() const { return m_->n_hot; }
+int Forward::hot_experts() const { return m_->n_hot; }
 
-size_t Prefill::cold_bytes() const { return m_->experts->cold_bytes(); }
+size_t Forward::cold_bytes() const { return m_->experts->cold_bytes(); }
 
-void Prefill::head(int first, int n, float * logits) { m_->head(first, n, logits); }
+void Forward::head(int first, int n, float * logits) { m_->head(first, n, logits); }
 
-void Prefill::reset()
+void Forward::reset()
 {
     m_->reset();
     pos_ = 0;
 }
 
-void Prefill::run(const int32_t * tokens, int T, const LayerHook & hook)
+void Forward::run(const int32_t * tokens, int T, const LayerHook & hook)
 {
     m_->run(tokens, pos_, T, hook);
     pos_ += T;

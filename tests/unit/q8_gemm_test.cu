@@ -80,6 +80,17 @@ int run(const Shape & sh, int rows, int time_rows, std::mt19937 & rng, cublasHan
     }
     const double rel = std::sqrt(num / den);
 
+    // q8_gemv (decode rows) vs q8_gemm on the same quantized activations: only the fp32 summation order differs
+    double rel_gemv = 0;
+    for (int r : { 1, 4, dense::GEMV_ROWS }) {
+        dense::q8_gemv(W, xq, xd, r, yr, nullptr);
+        std::vector<float> g((size_t) r * sh.out);
+        TRUSS_CUDA(cudaMemcpy(g.data(), yr, g.size() * 4, cudaMemcpyDeviceToHost));
+        double n2 = 0, d2 = 0;
+        for (size_t i = 0; i < g.size(); ++i) n2 += (g[i] - (double) a[i]) * (g[i] - (double) a[i]), d2 += (double) a[i] * a[i];
+        rel_gemv = std::max(rel_gemv, std::isfinite(n2) ? std::sqrt(n2 / d2) : INFINITY);
+    }
+
     auto rel_of = [&](const float * dev_a, const float * dev_b) {
         std::vector<float> u((size_t) rows * sh.out), v(u.size());
         TRUSS_CUDA(cudaMemcpy(u.data(), dev_a, u.size() * 4, cudaMemcpyDeviceToHost));
@@ -98,7 +109,7 @@ int run(const Shape & sh, int rows, int time_rows, std::mt19937 & rng, cublasHan
     ref::linear(T, d_x, yr, rows, nullptr, ref::Numerics::FP32);
     TRUSS_CUDA(cudaDeviceSynchronize());
     const double rel16 = rel_of(y, yr);
-    const bool ok = finite && rel <= 1e-5 && rel16 <= 3e-4;
+    const bool ok = finite && rel <= 1e-5 && rel16 <= 3e-4 && rel_gemv <= 1e-6;
 
     dense::q8_quantize_act(d_x, time_rows, sh.in, xq, xd, nullptr);
     cudaEvent_t e0, e1, e2;
@@ -137,11 +148,24 @@ int run(const Shape & sh, int rows, int time_rows, std::mt19937 & rng, cublasHan
         }
         prefix_rel = std::sqrt(n2 / d2);
     }
+    float ms_gv;
+    {
+        cudaEvent_t g0, g1;
+        cudaEventCreate(&g0);
+        cudaEventCreate(&g1);
+        cudaEventRecord(g0);
+        for (int r = 0; r < reps; ++r) dense::q8_gemv(W, xq, xd, 1, y, nullptr);
+        cudaEventRecord(g1);
+        TRUSS_CUDA(cudaEventSynchronize(g1));
+        cudaEventElapsedTime(&ms_gv, g0, g1);
+        ms_gv /= reps;
+    }
     const double ops = 2.0 * time_rows * sh.in * sh.out;
     std::printf("%-9s %5d x %5d rel q8 %.1e a16 %.1e %s | rows %d: q8 %.3f ms %3.0f TOPS (+quantize %.3f) | a16 %.3f ms "
-                "%3.0f TFLOPS | a16 %d vs %d rows: %ld values differ, rel %.1e\n", sh.name, sh.in, sh.out, rel, rel16,
+                "%3.0f TFLOPS | a16 %d vs %d rows: %ld values differ, rel %.1e | gemv rel %.1e, 1 row %.1f us %.0f GB/s\n",
+                sh.name, sh.in, sh.out, rel, rel16,
                 ok ? "PASS" : "FAIL", time_rows, ms, ops / ms / 1e9, msq, ms16, ops / ms16 / 1e9, time_rows, rows,
-                prefix_diff, prefix_rel);
+                prefix_diff, prefix_rel, rel_gemv, ms_gv * 1e3, (double) sh.in * sh.out * 1.0625 / (ms_gv * 1e6));
     cudaFree(d_blocks); cudaFree(wq); cudaFree(wd); cudaFree(xq); cudaFree(xd); cudaFree(d_x); cudaFree(d_xh); cudaFree(w16); cudaFree(y);
     cudaFree(yr);
     return ok ? 0 : 1;

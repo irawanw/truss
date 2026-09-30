@@ -1,4 +1,4 @@
-// Full-model logits of qwen4exp::Prefill vs a llama-perplexity --kl-divergence-base file (the Q8 teacher's
+// Full-model logits of qwen4exp::Forward vs a llama-perplexity --kl-divergence-base file (the Q8 teacher's
 // log-probs), with llama-perplexity's own formulas: per chunk of n_ctx tokens (a fresh sequence each, no BOS for
 // qwen4exp), positions n_ctx/2 .. n_ctx-2 predict the next token; KL(base || ours) over the base's tokens with log
 // prob > -16, top-1 agreement, and both perplexities.
@@ -8,7 +8,7 @@
 // usage: tk-parity-kl <model.gguf> <base.logits> [chunks=8] [first chunk=0] [q8|fp16]   (dense activations, default q8)
 #include "core/cuda_check.h"
 #include "model/qwen4exp/config.h"
-#include "model/qwen4exp/prefill.h"
+#include "model/qwen4exp/forward.h"
 #include "model/qwen4exp/weights.h"
 
 #include <algorithm>
@@ -97,7 +97,7 @@ int main(int argc, char ** argv)
         if (c.n_vocab != n_vocab) throw std::runtime_error("vocabulary size differs from the base file");
         float * d_logits;   // before the engine, whose expert budget takes the memory left
         TRUSS_CUDA(cudaMalloc(&d_logits, (size_t) n_scored * n_vocab * 4));
-        q::Prefill p(c, w, n_ctx, (n_ctx + 3) / 4 * 4, 0, act);
+        q::Forward p(c, w, n_ctx, (n_ctx + 3) / 4 * 4, 0, act);
         std::printf("experts: %d of %d per layer resident, %.2f GB streamed per chunk\n", p.hot_experts(), c.n_expert,
                     p.cold_bytes() / 1e9);
         std::vector<float> logits((size_t) n_scored * n_vocab);

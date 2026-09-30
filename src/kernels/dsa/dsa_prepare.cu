@@ -46,6 +46,24 @@ __device__ void norm_rope(float (&x)[E], const float * gamma, const float2 * cs,
     }
 }
 
+// norm_rope with this lane's rotation given directly
+template <int E, int ROPE_DIMS> __device__ void norm_rope_at(float (&x)[E], const float * gamma, float2 r, float eps)
+{
+    static_assert(ROPE_DIMS == 64, "rotary pair in one lane");
+    constexpr int N = 32 * E;
+    const int lane = threadIdx.x % 32;
+    float acc = 0.f;
+#pragma unroll
+    for (int j = 0; j < E; ++j) acc += x[j] * x[j];
+    for (int o = 16; o; o /= 2) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    const float inv = rsqrtf(acc / N + eps);
+#pragma unroll
+    for (int j = 0; j < E; ++j) x[j] *= inv * gamma[32 * j + lane];
+    const float a = x[0], b = x[1];
+    x[0] = a * r.x - b * r.y;
+    x[1] = a * r.y + b * r.x;
+}
+
 template <class Shape>
 __global__ void qkv_kernel(const float * qfull, const float * k, const float * v, const float * q_norm,
                            const float * k_norm, const float2 * cs, int pos0, int T, float eps, half * q16,
@@ -80,11 +98,12 @@ __global__ void qkv_kernel(const float * qfull, const float * k, const float * v
 
 template <class Shape>
 __global__ void index_kernel(const float * idx_q, const float * idx_k, const float * q_norm, const float * k_norm,
-                             const float2 * cs, int pos0, int T, float eps, half * idx_q16, half * idx_k_cache)
+                             const float2 * cs, float rope_base, int pos0, int T, float eps, const float * partial,
+                             half * idx_q16, half * idx_k_cache)
 {
     constexpr int IH = Shape::IH, ID = Shape::ID, E = ID / 32, R = Shape::RATIO, HALF = Shape::ROPE_DIMS / 2;
-    const int64_t r = (int64_t) blockIdx.x * WARPS + threadIdx.x / 32;   // (token, head) of q, then block of k
-    const int lane = threadIdx.x % 32, nb = T / R;
+    const int64_t r = (int64_t) blockIdx.x * WARPS + threadIdx.x / 32;   // (token, head) of q, then completed block
+    const int lane = threadIdx.x % 32, b_lo = pos0 / R, nb = (pos0 + T) / R - b_lo;
     if (r >= (int64_t) T * IH + nb) return;
     float x[E];
     if (r < (int64_t) T * IH) {
@@ -95,16 +114,33 @@ __global__ void index_kernel(const float * idx_q, const float * idx_k, const flo
         for (int j = 0; j < E; ++j) idx_q16[r * ID + 32 * j + lane] = __float2half(x[j]);
         return;
     }
-    const int b = (int) (r - (int64_t) T * IH);   // chunk-local block
+    const int b = b_lo + (int) (r - (int64_t) T * IH);
 #pragma unroll
     for (int j = 0; j < E; ++j) {
         float acc = 0.f;
-        for (int e = 0; e < R; ++e) acc += idx_k[((int64_t) b * R + e) * ID + 32 * j + lane];
+        for (int e = 0; e < R; ++e) {
+            const int p = R * b + e;   // cells before the chunk come from the carried partial block
+            acc += p >= pos0 ? idx_k[(int64_t) (p - pos0) * ID + 32 * j + lane] : partial[e * ID + 32 * j + lane];
+        }
         x[j] = acc * (1.f / R);
     }
-    norm_rope<E, Shape::ROPE_DIMS>(x, k_norm, cs + (int64_t) b * R * HALF, eps);
+    // the block start may precede the chunk's rope table: its own fp64 angle
+    const double theta = (double) (R * b) * pow((double) rope_base, -2.0 * lane / Shape::ROPE_DIMS);
+    const float2 rot = make_float2((float) cos(theta), (float) sin(theta));
+    norm_rope_at<E, Shape::ROPE_DIMS>(x, k_norm, rot, eps);
 #pragma unroll
-    for (int j = 0; j < E; ++j) idx_k_cache[((int64_t) pos0 / R + b) * ID + 32 * j + lane] = __float2half(x[j]);
+    for (int j = 0; j < E; ++j) idx_k_cache[(int64_t) b * ID + 32 * j + lane] = __float2half(x[j]);
+}
+
+// partial <- raw keys of the block open after the chunk (cells R floor((pos0 + T) / R) .. pos0 + T - 1)
+template <class Shape> __global__ void partial_kernel(const float * idx_k, int pos0, int T, float * partial)
+{
+    constexpr int ID = Shape::ID, R = Shape::RATIO;
+    const int start = (pos0 + T) / R * R;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;   // (cell of the open block, dim)
+    if (i >= (R - 1) * ID) return;
+    const int p = start + i / ID;
+    if (p >= pos0 && p < pos0 + T) partial[i] = idx_k[(int64_t) (p - pos0) * ID + i % ID];
 }
 
 }  // namespace
@@ -130,14 +166,16 @@ void prepare_qkv(const float * qfull, const float * k, const float * v, const fl
 
 template <class Shape>
 void prepare_index(const float * idx_q, const float * idx_k, const float * q_norm, const float * k_norm,
-                   const float2 * cs, int pos0, int T, float eps, half * idx_q16, half * idx_k_cache,
-                   cudaStream_t stream)
+                   const float2 * cs, float rope_base, int pos0, int T, float eps, float * partial, half * idx_q16,
+                   half * idx_k_cache, cudaStream_t stream)
 {
     static_assert(Shape::ID % 32 == 0, "indexer head dim in lane strides");
-    if (pos0 % Shape::RATIO) throw std::invalid_argument("dsa::prepare_index: chunk must start on a block boundary");
-    const int64_t rows = (int64_t) T * Shape::IH + T / Shape::RATIO;
-    index_kernel<Shape><<<grid(rows), THREADS, 0, stream>>>(idx_q, idx_k, q_norm, k_norm, cs, pos0, T, eps, idx_q16,
-                                                            idx_k_cache);
+    const int nb = (pos0 + T) / Shape::RATIO - pos0 / Shape::RATIO;
+    const int64_t rows = (int64_t) T * Shape::IH + nb;
+    index_kernel<Shape><<<grid(rows), THREADS, 0, stream>>>(idx_q, idx_k, q_norm, k_norm, cs, rope_base, pos0, T, eps,
+                                                            partial, idx_q16, idx_k_cache);
+    const int n = (Shape::RATIO - 1) * Shape::ID;
+    partial_kernel<Shape><<<(n + 255) / 256, 256, 0, stream>>>(idx_k, pos0, T, partial);
     TRUSS_CUDA(cudaGetLastError());
 }
 
@@ -145,6 +183,6 @@ template void rope_table<FlashNext>(int, int, float, float2 *, cudaStream_t);
 template void prepare_qkv<FlashNext>(const float *, const float *, const float *, const float *, const float *,
                                      const float2 *, int, int, float, half *, float *, half *, half *, cudaStream_t);
 template void prepare_index<FlashNext>(const float *, const float *, const float *, const float *, const float2 *,
-                                       int, int, float, half *, half *, cudaStream_t);
+                                       float, int, int, float, float *, half *, half *, cudaStream_t);
 
 }  // namespace truss::dsa

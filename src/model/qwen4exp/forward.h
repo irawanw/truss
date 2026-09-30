@@ -7,7 +7,7 @@
 // GDN recurrent state and conv rows, PLE conv history, the PLE n-gram window.
 //
 // Routed experts live in a runtime::ExpertStore: as many as fit stay resident, the rest stream over PCIe per layer,
-// overlapped with the previous layer's compute. The math is qwen4exp::reference's; tests/layer/qwen4exp_prefill
+// overlapped with the previous layer's compute. The math is qwen4exp::reference's; tests/layer/qwen4exp_forward
 // checks it layer by layer.
 #pragma once
 #include "model/qwen4exp/config.h"
@@ -28,21 +28,21 @@ namespace truss::qwen4exp {
 // an unquantized anchor decides which is closer to the real model.
 enum class Activations { FP16, Q8_1 };
 
-class Prefill {
+class Forward {
 public:
     // n_ctx: the longest sequence; max_chunk: the most tokens per run() call (a multiple of the DSA block ratio)
-    // c and w must outlive the Prefill (w references the file mapping the weights are uploaded from)
+    // c and w must outlive the Forward (w references the file mapping the weights are uploaded from)
     // expert_budget: device bytes for routed experts (0: all memory left after everything else, minus a margin)
-    Prefill(const Config & c, const Weights & w, int n_ctx, int max_chunk, size_t expert_budget = 0,
+    Forward(const Config & c, const Weights & w, int n_ctx, int max_chunk, size_t expert_budget = 0,
             Activations act = Activations::Q8_1);
-    ~Prefill();
-    Prefill(const Prefill &) = delete;
-    Prefill & operator=(const Prefill &) = delete;
+    ~Forward();
+    Forward(const Forward &) = delete;
+    Forward & operator=(const Forward &) = delete;
 
     // called after each layer with the device residual [T][hc][d_model] of the current chunk
     using LayerHook = std::function<void(int layer, const float * res, int T)>;
 
-    // The next T tokens of the sequence. T <= max_chunk; T % DSA ratio == 0 except on the last chunk.
+    // The next T tokens of the sequence (any T <= max_chunk: a prompt chunk, or one decoded token).
     void run(const int32_t * tokens, int T, const LayerHook & hook = nullptr);
 
     // logits [n][n_vocab] (device, fp32) of rows first .. first + n - 1 of the last chunk: the head hc mix, then
