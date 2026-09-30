@@ -27,7 +27,7 @@ Read first: [TRACKER.md](../TRACKER.md) rows #56–#60 (every measurement below 
 | token embedding on host, 40K context | 45.7 | 579d73d (#60) |
 | Strata draft vocab (40,525 ids) + draft min-p 0.5 | 49.1–49.4 | **uncommitted** |
 | CPU tier, 150 rarest experts/layer (NVMe subset), share 0.5 | **59.1** | **uncommitted** |
-| CPU tier, full archive (HDD), share 0.7 | pending (run in flight at handover) | uncommitted |
+| CPU tier, full archive (HDD), share 0.7 | **35.6** (plain 13.0): PCIe 50 MB/pass, **CPU now the wall** (~75 ms/pass) | uncommitted |
 
 Per-pass profile at 59 tok/s (≈50 ms/pass, 3.1 tok/pass): GPU waits on PCIe copies ~22 ms (153 demand + 70
 prefetched experts = 413 MB), GPU compute ~21 ms (dense GEMV 9, experts 4.6, router 2), GPU waits on CPU ~4 ms.
@@ -94,9 +94,10 @@ cpu_q4,cpu_subset}.py`. Card: `20260930_truss_tg/README.md` (update it with #60/
 1. **Grow the CPU tier to cover the mid-usage experts** (target: CPU takes most misses, PCIe the rest, both overlapped).
    Storage options for the user: (a) allow ~46 GB more on NVMe (below the 50 GB-free rule), (b) load the full q4s
    archive from HDD into RAM at server start (~5 min once), (c) derive the CPU copies of mid-usage experts from the
-   trellis pack at load on the GPU (no disk, but +~12% error on those experts vs BF16-q4s). Measure the pending
-   share-0.7 run first to confirm the gain.
-2. **Optimize the CPU expert kernel to DRAM bandwidth**: `cpu_expert_test` timing 4 rows × 8 experts 0.93 ms (8
+   trellis pack at load on the GPU (no disk, but +~12% error on those experts vs BF16-q4s). **Measured at share 0.7
+   (full archive): PCIe drops to 50 MB/pass but spec falls to 35.6 tok/s — the CPU expert kernel is too slow, so do
+   step 2 first**, then grow the CPU share while tok/s rises.
+2. **Optimize the CPU expert kernel to DRAM bandwidth (now the top priority)**: `cpu_expert_test` timing 4 rows × 8 experts 0.93 ms (8
    threads); probe 16 threads 52 GB/s. Targets: pin threads, spin briefly before sleeping (wake latency per layer),
    prefetch rows, larger row chunks for 4-row windows; report % of measured DRAM peak.
 3. **CUDA graph of the decode pass** on top of the doorbell path (positions from device memory), removing ~2,400
