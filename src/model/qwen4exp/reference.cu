@@ -330,3 +330,95 @@ void gdn(const Ctx & x, const Gdn & g, const float * in, int T, float * out, con
 }
 
 }  // namespace truss::qwen4exp::reference
+
+// ---------------------------------------------------------------------------------------------------------------
+// DSA mixer
+
+namespace truss::qwen4exp::reference {
+
+namespace {
+
+// qfull [T][H][2 D] = per head [q | gate] -> q, gate [T][H][D]
+__global__ void split_qgate_kernel(const float * qfull, float * q, float * gate, int T, int H, int D)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * H * D) return;
+    const int th = i / D, e = i % D;
+    q[i] = qfull[(size_t) th * 2 * D + e];
+    gate[i] = qfull[(size_t) th * 2 * D + D + e];
+}
+
+// kb[b] = mean of k[r b .. r b + r - 1] (summed in order, then scaled, as llama)
+__global__ void pool_kernel(const float * k, float * kb, int nb, int r, int d)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nb * d) return;
+    const int b = i / d, e = i % d;
+    float acc = 0.f;
+    for (int j = 0; j < r; ++j) acc += k[((size_t) b * r + j) * d + e];
+    kb[i] = acc * (1.f / (float) r);
+}
+
+__global__ void positions_kernel(int * pos, int n, int step)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) pos[i] = i * step;
+}
+
+}  // namespace
+
+void dsa(const Ctx & x, const Dsa & a, int ratio, const float * in, int T, float * out, const DsaTrace * trace)
+{
+    const Config & c = x.c;
+    const int H = c.n_head, Hkv = c.n_head_kv, D = c.head_dim, Hi = c.idx_heads, Di = c.idx_head_dim;
+    const int nb = T / ratio;
+    auto buf = [&](float * t, size_t n) { return t ? t : x.scratch.alloc(n); };
+    float * qfull = x.scratch.alloc((size_t) T * H * 2 * D);
+    float * q = buf(trace ? trace->q : nullptr, (size_t) T * H * D);
+    float * gate = x.scratch.alloc((size_t) T * H * D);
+    float * k = buf(trace ? trace->k : nullptr, (size_t) T * Hkv * D);
+    float * v = buf(trace ? trace->v : nullptr, (size_t) T * Hkv * D);
+    float * iq = buf(trace ? trace->idx_q : nullptr, (size_t) T * Hi * Di);
+    float * ik_raw = x.scratch.alloc((size_t) T * Di);
+    float * ik = buf(trace ? trace->idx_k : nullptr, (size_t) (nb > 0 ? nb : 1) * Di);
+    float * att = buf(trace ? trace->pregate : nullptr, (size_t) T * H * D);
+    float * gated = buf(trace ? trace->gated : nullptr, (size_t) T * H * D);
+    int * pos = x.scratch.alloc<int>(T), * bpos = x.scratch.alloc<int>(nb > 0 ? nb : 1);
+    uint8_t * sel = x.scratch.alloc<uint8_t>((size_t) T * T);
+    positions_kernel<<<blocks(T), 256, 0, x.stream>>>(pos, T, 1);
+    positions_kernel<<<blocks(nb), 256, 0, x.stream>>>(bpos, nb, ratio);
+
+    // q (+ gate), k, v: per-head RMSNorm, rope on the first rope_dims
+    ref::linear(x.dev(a.q), in, qfull, T, x.stream, x.num);
+    split_qgate_kernel<<<blocks((int64_t) T * H * D), 256, 0, x.stream>>>(qfull, q, gate, T, H, D);
+    ref::rms_norm(q, x.dev(a.q_norm).as<float>(), 1, q, T * H, D, c.rms_eps, x.stream);
+    ref::linear(x.dev(a.k), in, k, T, x.stream, x.num);
+    ref::rms_norm(k, x.dev(a.k_norm).as<float>(), 1, k, T * Hkv, D, c.rms_eps, x.stream);
+    ref::linear(x.dev(a.v), in, v, T, x.stream, x.num);
+    if (trace && trace->q_normed)
+        TRUSS_CUDA(cudaMemcpyAsync(trace->q_normed, q, sizeof(float) * T * H * D, cudaMemcpyDeviceToDevice, x.stream));
+    if (trace && trace->k_normed)
+        TRUSS_CUDA(cudaMemcpyAsync(trace->k_normed, k, sizeof(float) * T * Hkv * D, cudaMemcpyDeviceToDevice, x.stream));
+    ref::rope_neox(q, T, H, D, c.rope_dims, pos, c.rope_base, x.stream);
+    ref::rope_neox(k, T, Hkv, D, c.rope_dims, pos, c.rope_base, x.stream);
+
+    // indexer: raw keys pooled per complete block, then normed and roped at the block start; queries per head
+    ref::linear(x.dev(a.idx_k), in, ik_raw, T, x.stream, x.num);
+    if (nb > 0) {
+        pool_kernel<<<blocks((int64_t) nb * Di), 256, 0, x.stream>>>(ik_raw, ik, nb, ratio, Di);
+        ref::rms_norm(ik, x.dev(a.idx_k_norm).as<float>(), 1, ik, nb, Di, c.rms_eps, x.stream);
+        ref::rope_neox(ik, nb, 1, Di, c.rope_dims, bpos, c.rope_base, x.stream);
+    }
+    ref::linear(x.dev(a.idx_q), in, iq, T, x.stream, x.num);
+    ref::rms_norm(iq, x.dev(a.idx_q_norm).as<float>(), 1, iq, T * Hi, Di, c.rms_eps, x.stream);
+    ref::rope_neox(iq, T, Hi, Di, c.rope_dims, pos, c.rope_base, x.stream);
+    ref::qsa_select(iq, ik, T, Hi, Di, ratio, c.idx_top_k / ratio, sel, x.stream);
+
+    ref::masked_attention(q, k, v, sel, att, T, H, Hkv, D, 1.f / std::sqrt((float) D), x.stream);
+    TRUSS_CUDA(cudaMemcpyAsync(gated, att, sizeof(float) * T * H * D, cudaMemcpyDeviceToDevice, x.stream));
+    mul_sigmoid_kernel<<<blocks((int64_t) T * H * D), 256, 0, x.stream>>>(gated, gate, T * H * D);
+    ref::linear(x.dev(a.out), gated, out, T, x.stream, x.num);
+    TRUSS_CUDA(cudaGetLastError());
+}
+
+}  // namespace truss::qwen4exp::reference

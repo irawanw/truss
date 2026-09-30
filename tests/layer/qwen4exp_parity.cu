@@ -5,7 +5,9 @@
 // differs from llama-paw by its activation rounding (~0.5% per matmul), which would hide real mismatches.
 // Gates (TRACKER #34): 1e-3 where llama's rounding is reproduced (hyper-connections, router); 3e-3 on the FFN
 // paths, whose remaining rounding inside llama's ops is not reproduced (llama-paw itself sits 1.0-1.65e-3 from the
-// fp32 reference there). A wrong formula shows up as O(1e-1..1).
+// fp32 reference there). Mixer output projections (TRACKER #45, #47): their Q8_1 activation rounding amplifies the
+// ~3e-4 upstream difference 5-13x, so the end-to-end check uses GATE_AMP = 1e-2 and each projection is also checked
+// alone on llama's own input at GATE. A wrong formula shows up as O(1e-1..1).
 // usage: qwen4exp_parity <slice.gguf> <dump dir>
 #include "core/cuda_check.h"
 #include "core/device_tensors.h"
@@ -27,7 +29,7 @@ namespace q = truss::qwen4exp;
 
 namespace {
 
-constexpr double GATE = 1e-3, GATE_FFN = 3e-3;
+constexpr double GATE = 1e-3, GATE_FFN = 3e-3, GATE_AMP = 1e-2;
 
 struct Checker {
     int fails = 0, cases = 0;
@@ -145,10 +147,38 @@ int main(int argc, char ** argv)
                 chk.check(at("gdn conv+silu", l), conv.p, dump.get(at("conv_output_silu", l)));
                 chk.check(at("gdn delta rule", l), core.p, dump.get(at("attn_output", l)));
                 chk.check(at("gdn gated norm", l), normed.p, dump.get(at("final_output", l)));
-                chk.check(at("gdn out", l), out.p, dump.get(at("linear_attn_out", l)), GATE_FFN);
+                chk.check(at("gdn out", l), out.p, dump.get(at("linear_attn_out", l)), GATE_AMP);
                 DevBuf lin(dump.get(at("final_output", l)));   // out projection alone, on llama's input
                 ref::linear(dev(L.gdn.out), lin.p, out.p, T, nullptr, ref::Numerics::LLAMA);
                 chk.check(at("gdn out (llama input)", l), out.p, dump.get(at("linear_attn_out", l)));
+                scratch.reset();
+            }
+            if (L.mixer == q::Mixer::DSA) {   // DSA mixer on llama's attention-side mix
+                const int H = c.n_head, Hkv = c.n_head_kv, D = c.head_dim, ratio = (int) c.compress_ratio[l];
+                const int nb = T / ratio;
+                DevBuf in(dump.get(at("hc_mixed", l, "#1"))), qn((size_t) T * H * D), kn((size_t) T * Hkv * D),
+                    qr((size_t) T * H * D), kr((size_t) T * Hkv * D), v((size_t) T * Hkv * D),
+                    iq((size_t) T * c.idx_heads * c.idx_head_dim), ik((size_t) std::max(nb, 1) * c.idx_head_dim),
+                    pre((size_t) T * H * D), gated((size_t) T * H * D), out((size_t) T * c.d_model);
+                q::reference::DsaTrace tr;
+                tr.q_normed = qn.p; tr.k_normed = kn.p; tr.q = qr.p; tr.k = kr.p; tr.v = v.p; tr.idx_q = iq.p;
+                tr.idx_k = ik.p; tr.pregate = pre.p; tr.gated = gated.p;
+                q::reference::dsa(x, L.dsa, ratio, in.p, T, out.p, &tr);
+                chk.check(at("dsa q normed", l), qn.p, dump.get(at("Qcur_normed", l)));
+                chk.check(at("dsa k normed", l), kn.p, dump.get(at("Kcur_normed", l)));
+                chk.check(at("dsa q roped", l), qr.p, dump.get(at("Qcur", l)));
+                chk.check(at("dsa k roped", l), kr.p, dump.get(at("Kcur", l, "#2")));
+                chk.check(at("dsa v", l), v.p, dump.get(at("Vcur", l)));
+                chk.check(at("dsa indexer q", l), iq.p, dump.get(at("indexer_q", l)));
+                test::DumpTensor ikw = dump.get(at("indexer_k", l));   // cache blocks: keep the complete ones
+                ikw.f.resize((size_t) nb * c.idx_head_dim);
+                chk.check(at("dsa indexer k", l), ik.p, ikw);
+                chk.check(at("dsa attention", l), pre.p, dump.get(at("attn_pregate", l)));
+                chk.check(at("dsa gated", l), gated.p, dump.get(at("attn_gated", l)));
+                chk.check(at("dsa out", l), out.p, dump.get(at("attn_output", l)), GATE_AMP);
+                DevBuf lg(dump.get(at("attn_gated", l)));   // out projection alone, on llama's input
+                ref::linear(dev(L.dsa.out), lg.p, out.p, T, nullptr, ref::Numerics::LLAMA);
+                chk.check(at("dsa out (llama input)", l), out.p, dump.get(at("attn_output", l)));
                 scratch.reset();
             }
             {   // FFN-side mix: input is the residual after the attention combine

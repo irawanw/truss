@@ -51,4 +51,23 @@ void l2_norm(const float * x, float * y, int rows, int n, float eps, cudaStream_
 void gated_delta_rule(const float * q, const float * k, const float * v, const float * g, const float * beta,
                       float * state, float * out, int T, int Hk, int Hv, int S, cudaStream_t s);
 
+// --- attention ops, ref_attn.cu
+
+// RoPE, NEOX pairing, in place on the first n_rot dims of each head: x [rows][heads][hd], row r at position pos[r];
+// pair (i, i + n_rot / 2) rotates by pos * base^(-2 i / n_rot). (qwen4exp's interleaved multi-section rope reduces to
+// this for text, where all section positions are equal.)
+void rope_neox(float * x, int rows, int heads, int hd, int n_rot, const int * pos, float base, cudaStream_t s);
+
+// Block-sparse selection (qwen4exp QSA, one sequence from position 0): complete blocks of r tokens have one key each,
+// idx_k [n_blocks][d]; query t scores the complete blocks it sees (r b + r - 1 <= t) with sum over heads of
+// relu(q_h . k_b) (idx_q [T][heads][d]), keeps the top_blocks best (ties: the later block), plus its tail
+// [r floor((t + 1) / r), t]. sel [T][T] = 1 for each attended cell, else 0.
+void qsa_select(const float * idx_q, const float * idx_k, int T, int heads, int d, int r, int top_blocks,
+                uint8_t * sel, cudaStream_t s);
+
+// out[t][h] = sum_j softmax_j(scale q[t][h] . k[j][h / (Hq / Hkv)]) v[j][same kv head] over cells j with
+// sel[t][j] (causal is up to sel). q [T][Hq][d], k, v [T][Hkv][d], out [T][Hq][d].
+void masked_attention(const float * q, const float * k, const float * v, const uint8_t * sel, float * out, int T,
+                      int Hq, int Hkv, int d, float scale, cudaStream_t s);
+
 }  // namespace truss::ref

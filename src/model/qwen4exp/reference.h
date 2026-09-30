@@ -48,6 +48,24 @@ struct GdnTrace {                          // optional intermediates for parity 
 // head h % key heads); RMSNorm(head) * sigmoid(z); out projection -> out [T][d_model]
 void gdn(const Ctx & x, const Gdn & g, const float * in, int T, float * out, const GdnTrace * trace = nullptr);
 
+// --- DSA mixer (llama-paw build_layer_attn + build_qsa_top_k), input = the hc_attn mix, one sequence from
+// position 0. Attention is restricted to the indexer's selection (ref::qsa_select: top idx_top_k / ratio complete
+// blocks plus the tail), which TRUSS defines as whole blocks; llama-paw's token-level top-k of idx_top_k + ratio - 1
+// cells can add up to ratio - 1 cells of one more block, picked nondeterministically (CUB top-k), when the tail is
+// short. Identical when every visible block fits the budget (prompts <= idx_top_k + ratio - 1 tokens).
+
+struct DsaTrace {                          // optional intermediates for parity tests (each may be null)
+    float * q_normed = nullptr;            // [T][n_head][head_dim], before rope
+    float * k_normed = nullptr;            // [T][n_head_kv][head_dim], before rope
+    float * q = nullptr, * k = nullptr, * v = nullptr;   // after rope (q, k)
+    float * idx_q = nullptr;               // [T][idx_heads][idx_head_dim], normed + roped
+    float * idx_k = nullptr;               // [T / ratio][idx_head_dim], pooled complete blocks, normed + roped
+    float * pregate = nullptr;             // [T][n_head][head_dim], attention output
+    float * gated = nullptr;               // pregate * sigmoid(gate)
+};
+
+void dsa(const Ctx & x, const Dsa & a, int ratio, const float * in, int T, float * out, const DsaTrace * trace = nullptr);
+
 // --- FFN (llama-paw build_layer_ffn): routed trellis experts + gated shared expert, input = the hc_ffn mix
 
 struct Routing {                           // host, [T][n_expert_used]
