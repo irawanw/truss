@@ -129,6 +129,28 @@ int main(int argc, char ** argv)
                 chk.check(at("hc_mix attn", l), mixed.p, dump.get(at("hc_mixed", l, "#1")));
                 chk.check(at("hc_inject attn", l), inj.p, dump.get(at("hc_inject", l)));
             }
+            if (L.mixer == q::Mixer::GDN) {   // GDN mixer on llama's attention-side mix
+                const int kd = c.key_dim(), vd = c.value_dim(), C = 2 * kd + vd, Hv = c.ssm_v_heads;
+                DevBuf in(dump.get(at("hc_mixed", l, "#1"))), qkv((size_t) T * C), z((size_t) T * vd),
+                    gate((size_t) T * Hv), beta((size_t) T * Hv), conv((size_t) T * C), core((size_t) T * vd),
+                    normed((size_t) T * vd), out((size_t) T * c.d_model);
+                q::reference::GdnTrace tr;
+                tr.qkv = qkv.p; tr.z = z.p; tr.gate = gate.p; tr.beta = beta.p; tr.conv = conv.p; tr.core = core.p;
+                tr.normed = normed.p;
+                q::reference::gdn(x, L.gdn, in.p, T, out.p, &tr);
+                chk.check(at("gdn qkv", l), qkv.p, dump.get(at("linear_attn_qkv_mixed", l)));
+                chk.check(at("gdn z", l), z.p, dump.get(at("z", l)));
+                chk.check(at("gdn gate", l), gate.p, dump.get(at("gate", l)));
+                chk.check(at("gdn beta", l), beta.p, dump.get(at("beta_sigmoid", l)));
+                chk.check(at("gdn conv+silu", l), conv.p, dump.get(at("conv_output_silu", l)));
+                chk.check(at("gdn delta rule", l), core.p, dump.get(at("attn_output", l)));
+                chk.check(at("gdn gated norm", l), normed.p, dump.get(at("final_output", l)));
+                chk.check(at("gdn out", l), out.p, dump.get(at("linear_attn_out", l)), GATE_FFN);
+                DevBuf lin(dump.get(at("final_output", l)));   // out projection alone, on llama's input
+                ref::linear(dev(L.gdn.out), lin.p, out.p, T, nullptr, ref::Numerics::LLAMA);
+                chk.check(at("gdn out (llama input)", l), out.p, dump.get(at("linear_attn_out", l)));
+                scratch.reset();
+            }
             {   // FFN-side mix: input is the residual after the attention combine
                 DevBuf res(dump.get(at("hc_combine", l))), mixed((size_t) T * c.d_model), inj((size_t) T * c.hc);
                 q::reference::hc_mix(x, L.hc_ffn, res.p, T, mixed.p, inj.p);

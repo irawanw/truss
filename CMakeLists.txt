@@ -33,6 +33,7 @@ target_link_libraries(truss_core PUBLIC truss_formats CUDA::cudart)
 add_library(truss_reference STATIC
   src/kernels/reference/ref_linear.cu
   src/kernels/reference/ref_norm.cu
+  src/kernels/reference/ref_ssm.cu
   src/kernels/reference/ref_trellis.cu)
 target_link_libraries(truss_reference PUBLIC truss_core)
 

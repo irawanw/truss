@@ -34,4 +34,21 @@ void hadamard128(float * x, int64_t n, cudaStream_t s);
 // (n, k) of the tile per the tensor-core fragment order (codec_mul1.cuh). No Hadamard, no suh/svh.
 void trellis_dequant(const uint16_t * words, int K, int in, int out, float * W, cudaStream_t s);
 
+// --- recurrent (gated delta net) ops, ref_ssm.cu
+
+// Causal depthwise conv over tokens, then SiLU: y[t][c] = silu(sum_j w[c][j] * x[t - (kc - 1) + j][c]) with rows
+// before t = 0 taken from `state` [kc - 1][C] (the previous tokens, oldest first; nullptr = zeros). w: [C][kc].
+void causal_conv_silu(const float * x, const float * w, const float * state, float * y, int T, int C, int kc,
+                      cudaStream_t s);
+
+// y = x / sqrt(sum(x^2) + eps) per row of n (llama's GDN l2 norm: rms_norm(eps / n) / sqrt(n)); in place allowed.
+void l2_norm(const float * x, float * y, int rows, int n, float eps, cudaStream_t s);
+
+// Gated delta rule, one sequence, token by token. q, k: [T][Hk][S], v: [T][Hv][S], g, beta: [T][Hv]; value head h
+// reads key head h % Hk. Per head, with state S [S_k][S_v]:
+//   S = exp(g) S;  S += k (beta (v - S^T k))^T;  o = S^T q / sqrt(S)
+// out: [T][Hv][S]. state: [Hv][S_k][S_v] in/out (nullptr: zero start, final state discarded).
+void gated_delta_rule(const float * q, const float * k, const float * v, const float * g, const float * beta,
+                      float * state, float * out, int T, int Hk, int Hv, int S, cudaStream_t s);
+
 }  // namespace truss::ref

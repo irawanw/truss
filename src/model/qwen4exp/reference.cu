@@ -258,3 +258,75 @@ void ffn(const Ctx & x, const Moe & m, const float * in, int T, float * out)
 }
 
 }  // namespace truss::qwen4exp::reference
+
+// ---------------------------------------------------------------------------------------------------------------
+// GDN mixer
+
+namespace truss::qwen4exp::reference {
+
+namespace {
+
+// gate[t][h] = softplus(alpha + dt_bias[h]) * a[h] (ggml softplus: x > 20 -> x); beta = sigmoid(beta)
+__global__ void gdn_gates_kernel(float * alpha, float * beta, const float * dt_bias, const float * a, int T, int H)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * H) return;
+    const int h = i % H;
+    const float v = alpha[i] + dt_bias[h];
+    alpha[i] = (v > 20.f ? v : log1pf(expf(v))) * a[h];
+    beta[i] = sigmoid(beta[i]);
+}
+
+// columns [c0, c0 + n) of each row of src [T][ld] -> dst [T][n]
+__global__ void take_cols_kernel(const float * src, float * dst, int T, int ld, int c0, int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < T * n) dst[i] = src[(size_t) (i / n) * ld + c0 + i % n];
+}
+
+__global__ void mul_sigmoid_kernel(float * y, const float * z, int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] *= sigmoid(z[i]);
+}
+
+}  // namespace
+
+void gdn(const Ctx & x, const Gdn & g, const float * in, int T, float * out, const GdnTrace * trace)
+{
+    const Config & c = x.c;
+    const int S = c.ssm_state, Hk = c.ssm_groups, Hv = c.ssm_v_heads, kd = c.key_dim(), vd = c.value_dim();
+    const int C = 2 * kd + vd;
+    auto buf = [&](float * t, size_t n) { return t ? t : x.scratch.alloc(n); };
+    float * qkv = buf(trace ? trace->qkv : nullptr, (size_t) T * C);
+    float * z = buf(trace ? trace->z : nullptr, (size_t) T * vd);
+    float * gate = buf(trace ? trace->gate : nullptr, (size_t) T * Hv);
+    float * beta = buf(trace ? trace->beta : nullptr, (size_t) T * Hv);
+    float * conv = buf(trace ? trace->conv : nullptr, (size_t) T * C);
+    float * core = buf(trace ? trace->core : nullptr, (size_t) T * vd);
+    float * normed = buf(trace ? trace->normed : nullptr, (size_t) T * vd);
+    float * q = x.scratch.alloc((size_t) T * kd), * k = x.scratch.alloc((size_t) T * kd);
+    float * v = x.scratch.alloc((size_t) T * vd);
+
+    ref::linear(x.dev(g.qkv), in, qkv, T, x.stream, x.num);
+    ref::linear(x.dev(g.gate), in, z, T, x.stream, x.num);
+    ref::linear(x.dev(g.alpha), in, gate, T, x.stream, x.num);
+    ref::linear(x.dev(g.beta), in, beta, T, x.stream, x.num);
+    gdn_gates_kernel<<<blocks((int64_t) T * Hv), 256, 0, x.stream>>>(gate, beta, x.dev(g.dt_bias).as<float>(),
+                                                                     x.dev(g.a).as<float>(), T, Hv);
+    ref::causal_conv_silu(qkv, x.dev(g.conv1d).as<float>(), nullptr, conv, T, C, c.ssm_conv, x.stream);
+    // conv channels: q [key_dim], k [key_dim], v [value_dim]
+    take_cols_kernel<<<blocks((int64_t) T * kd), 256, 0, x.stream>>>(conv, q, T, C, 0, kd);
+    take_cols_kernel<<<blocks((int64_t) T * kd), 256, 0, x.stream>>>(conv, k, T, C, kd, kd);
+    take_cols_kernel<<<blocks((int64_t) T * vd), 256, 0, x.stream>>>(conv, v, T, C, 2 * kd, vd);
+    ref::l2_norm(q, q, T * Hk, S, c.rms_eps, x.stream);
+    ref::l2_norm(k, k, T * Hk, S, c.rms_eps, x.stream);
+    ref::gated_delta_rule(q, k, v, gate, beta, nullptr, core, T, Hk, Hv, S, x.stream);
+    // gated RMSNorm over each head (gamma [head]), times sigmoid(z)
+    ref::rms_norm(core, x.dev(g.norm).as<float>(), 1, normed, T * Hv, S, c.rms_eps, x.stream);
+    mul_sigmoid_kernel<<<blocks((int64_t) T * vd), 256, 0, x.stream>>>(normed, z, T * vd);
+    ref::linear(x.dev(g.out), normed, out, T, x.stream, x.num);
+    TRUSS_CUDA(cudaGetLastError());
+}
+
+}  // namespace truss::qwen4exp::reference

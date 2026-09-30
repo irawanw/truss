@@ -31,6 +31,23 @@ void hc_mix(const Ctx & x, const HyperConnection & h, const float * res, int T, 
 // res[t][c] += block_out[t] * 2 * sigmoid(inject[t][c] / hc)
 void hc_combine(const Ctx & x, float * res, const float * block_out, const float * inject, int T);
 
+// --- GDN mixer (llama-paw build_layer_attn_linear), input = the hc_attn mix. One sequence starting at position 0
+// (zero conv and recurrent state).
+
+struct GdnTrace {                          // optional intermediates for parity tests (each may be null)
+    float * qkv = nullptr;                 // [T][2 key_dim + value_dim], before the conv
+    float * z = nullptr;                   // [T][value_dim], output gate input
+    float * gate = nullptr;                // [T][v_heads], softplus(alpha + dt_bias) * a
+    float * beta = nullptr;                // [T][v_heads], sigmoid
+    float * conv = nullptr;                // [T][2 key_dim + value_dim], after conv + silu
+    float * core = nullptr;                // [T][v_heads][head], delta rule output
+    float * normed = nullptr;              // [T][value_dim], gated RMSNorm output
+};
+
+// qkv, z, alpha, beta projections; causal conv + silu; l2-normed q, k; gated delta rule (value head h reads key
+// head h % key heads); RMSNorm(head) * sigmoid(z); out projection -> out [T][d_model]
+void gdn(const Ctx & x, const Gdn & g, const float * in, int T, float * out, const GdnTrace * trace = nullptr);
+
 // --- FFN (llama-paw build_layer_ffn): routed trellis experts + gated shared expert, input = the hc_ffn mix
 
 struct Routing {                           // host, [T][n_expert_used]
