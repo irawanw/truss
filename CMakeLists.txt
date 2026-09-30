@@ -52,7 +52,8 @@ target_link_libraries(truss_encode PUBLIC truss_core)
 # ---- engine kernels
 add_library(truss_kernels STATIC
   src/kernels/moe/moe_window.cu
-  src/kernels/moe/moe_prefill.cu)
+  src/kernels/moe/moe_prefill.cu
+  src/kernels/dense/q8_gemm.cu)
 target_include_directories(truss_kernels PUBLIC src)
 
 # ---- tests (tests/unit: one binary per op, exit code = pass/fail)
@@ -64,6 +65,9 @@ set_target_properties(moe_window_test PROPERTIES BUILD_RPATH ${LLAMA_PAW_DIR}/bu
 
 add_executable(moe_prefill_test tests/unit/moe_prefill_test.cu)
 target_link_libraries(moe_prefill_test PRIVATE truss_kernels)
+
+add_executable(q8_gemm_test tests/unit/q8_gemm_test.cu)
+target_link_libraries(q8_gemm_test PRIVATE truss_kernels truss_reference)
 
 add_executable(codec_v2one_test tests/unit/codec_v2one_test.cu)
 target_link_libraries(codec_v2one_test PRIVATE truss_encode)

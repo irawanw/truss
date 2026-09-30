@@ -1,0 +1,192 @@
+// Dense Q8 GEMM (see q8_gemm.cuh).
+//
+// Block tile: 128 weight rows (outputs) x 128 activation rows (tokens), k chunks of 64 (two Q8 blocks), double
+// buffered with cp.async. 8 warps as 2 (outputs) x 4 (tokens): a warp computes 64 outputs x 32 tokens = 4 x 4 mma
+// tiles, weights as the A operand (m16 x k32), activations as B (k32 x n8). Per Q8 block the int32 tile results are
+// scaled and folded into fp32 accumulators: acc += float(c) * d_w * d_x.
+#include "q8_gemm.cuh"
+
+#include "core/cuda_check.h"
+
+#include <stdexcept>
+#include <string>
+
+namespace truss::dense {
+namespace {
+
+constexpr int THREADS = 256;
+constexpr int BM = 128, BN = 128, KC = 64;     // outputs, tokens, k per stage
+constexpr int WM = 64, WN = 32;                // warp tile
+constexpr int SK = KC + 16;                    // shared row stride (bytes): rows g = 0..7 x k words q hit 32 banks
+constexpr int STAGE = (BM + BN) * SK;          // bytes of int8 per stage
+static_assert((BM / WM) * (BN / WN) * 32 == THREADS, "8 warps");
+
+struct BlockQ8_0 {
+    half d;
+    int8_t qs[32];
+};
+static_assert(sizeof(BlockQ8_0) == 34);
+
+__global__ void repack_kernel(const BlockQ8_0 * __restrict__ b, int nb, int8_t * __restrict__ q, half * __restrict__ d)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;   // block index (row-major over [out][in / 32])
+    if (i >= nb) return;
+    d[i] = b[i].d;
+    for (int j = 0; j < 32; ++j) q[(size_t) i * 32 + j] = b[i].qs[j];
+}
+
+// one warp per 32-block of a row
+__global__ void quantize_kernel(const float * __restrict__ x, int n_blocks, int8_t * __restrict__ q,
+                                half * __restrict__ d)
+{
+    const int blk = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x % 32;
+    if (blk >= n_blocks) return;
+    const float v = x[(size_t) blk * 32 + lane];
+    float amax = fabsf(v);
+    for (int m = 16; m; m >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, m));
+    const float s = amax / 127.f;
+    q[(size_t) blk * 32 + lane] = (int8_t) (amax == 0.f ? 0 : (int) roundf(v / s));
+    if (lane == 0) d[blk] = __float2half(s);
+}
+
+__device__ __forceinline__ void cp16(void * dst, const void * src, bool valid)
+{
+    const unsigned s = (unsigned) __cvta_generic_to_shared(dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(src), "r"(valid ? 16 : 0));
+}
+
+__device__ __forceinline__ void mma_s8(const uint32_t (&a)[4], const uint32_t (&b)[2], int (&c)[4])
+{
+    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+        : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(0), "r"(0), "r"(0), "r"(0));
+}
+
+__global__ __launch_bounds__(THREADS) void gemm_kernel(Q8Matrix W, const int8_t * __restrict__ xq,
+                                                       const half * __restrict__ xd, int rows, float * __restrict__ y)
+{
+    __shared__ __align__(16) int8_t sq[2][STAGE];            // [stage][W rows | x rows][SK]
+    __shared__ float sd[2][BM + BN][KC / 32];                 // scales of the stage's two blocks
+
+    const int o0 = blockIdx.x * BM, t0 = blockIdx.y * BN;
+    const int K = W.in, KB = K / 32;
+    const int wid = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int wm = (wid / (BN / WN)) * WM, wn = (wid % (BN / WN)) * WN;
+    const int g = lane >> 2, q = lane & 3;
+
+    auto issue = [&](int kc, int s) {
+        // 16-byte vectors: (BM + BN) rows x KC / 16
+        for (int i = threadIdx.x; i < (BM + BN) * (KC / 16); i += THREADS) {
+            const int r = i / (KC / 16), v = i % (KC / 16);
+            const bool is_w = r < BM;
+            const int row = is_w ? o0 + r : t0 + r - BM;
+            const bool ok = row < (is_w ? W.out : rows);
+            const int8_t * src = (is_w ? W.q : xq) + (size_t) (ok ? row : 0) * K + kc * KC + v * 16;
+            cp16(&sq[s][r * SK + v * 16], src, ok);
+        }
+        for (int i = threadIdx.x; i < (BM + BN) * (KC / 32); i += THREADS) {
+            const int r = i / (KC / 32), b = i % (KC / 32);
+            const bool is_w = r < BM;
+            const int row = is_w ? o0 + r : t0 + r - BM;
+            const bool ok = row < (is_w ? W.out : rows);
+            sd[s][r][b] = ok ? __half2float((is_w ? W.d : xd)[(size_t) row * KB + kc * (KC / 32) + b]) : 0.f;
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+
+    float acc[WM / 16][WN / 8][4] = {};
+    const int NK = K / KC;
+    issue(0, 0);
+    for (int kc = 0; kc < NK; ++kc) {
+        const int s = kc & 1;
+        if (kc + 1 < NK) {
+            issue(kc + 1, s ^ 1);
+            asm volatile("cp.async.wait_group 1;\n" ::);
+        } else {
+            asm volatile("cp.async.wait_group 0;\n" ::);
+        }
+        __syncthreads();
+        const int8_t * A = sq[s] + wm * SK;          // this warp's weight rows
+        const int8_t * B = sq[s] + (BM + wn) * SK;   // this warp's token rows
+#pragma unroll
+        for (int kb = 0; kb < KC / 32; ++kb) {
+            uint32_t a[WM / 16][4], b[WN / 8][2];
+#pragma unroll
+            for (int m = 0; m < WM / 16; ++m) {
+                const int8_t * p = A + (m * 16 + g) * SK + kb * 32 + 4 * q;
+                a[m][0] = *(const uint32_t *) p;
+                a[m][1] = *(const uint32_t *) (p + 8 * SK);
+                a[m][2] = *(const uint32_t *) (p + 16);
+                a[m][3] = *(const uint32_t *) (p + 8 * SK + 16);
+            }
+#pragma unroll
+            for (int n = 0; n < WN / 8; ++n) {
+                const int8_t * p = B + (n * 8 + g) * SK + kb * 32 + 4 * q;
+                b[n][0] = *(const uint32_t *) p;
+                b[n][1] = *(const uint32_t *) (p + 16);
+            }
+            float dw[WM / 16][2], dx[WN / 8][2];
+#pragma unroll
+            for (int m = 0; m < WM / 16; ++m) {
+                dw[m][0] = sd[s][wm + m * 16 + g][kb];
+                dw[m][1] = sd[s][wm + m * 16 + g + 8][kb];
+            }
+#pragma unroll
+            for (int n = 0; n < WN / 8; ++n) {
+                dx[n][0] = sd[s][BM + wn + n * 8 + 2 * q][kb];
+                dx[n][1] = sd[s][BM + wn + n * 8 + 2 * q + 1][kb];
+            }
+#pragma unroll
+            for (int m = 0; m < WM / 16; ++m)
+#pragma unroll
+                for (int n = 0; n < WN / 8; ++n) {
+                    int c[4];
+                    mma_s8(a[m], b[n], c);
+                    // c: (output g, tokens 2q, 2q+1), (output g + 8, same tokens)
+                    acc[m][n][0] += (float) c[0] * (dw[m][0] * dx[n][0]);
+                    acc[m][n][1] += (float) c[1] * (dw[m][0] * dx[n][1]);
+                    acc[m][n][2] += (float) c[2] * (dw[m][1] * dx[n][0]);
+                    acc[m][n][3] += (float) c[3] * (dw[m][1] * dx[n][1]);
+                }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int m = 0; m < WM / 16; ++m)
+#pragma unroll
+        for (int n = 0; n < WN / 8; ++n)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int o = o0 + wm + m * 16 + g + (i >> 1) * 8, t = t0 + wn + n * 8 + 2 * q + (i & 1);
+                if (o < W.out && t < rows) y[(size_t) t * W.out + o] = acc[m][n][i];
+            }
+}
+
+}  // namespace
+
+void q8_repack(const void * blocks, int in, int out, int8_t * q, half * d, cudaStream_t stream)
+{
+    if (in % 64) throw std::runtime_error("q8_repack: in must be a multiple of 64, got " + std::to_string(in));
+    const int nb = in / 32 * out;
+    repack_kernel<<<(nb + 255) / 256, 256, 0, stream>>>((const BlockQ8_0 *) blocks, nb, q, d);
+    TRUSS_CUDA(cudaGetLastError());
+}
+
+void q8_quantize_act(const float * x, int rows, int in, int8_t * xq, half * xd, cudaStream_t stream)
+{
+    if (in % 32) throw std::runtime_error("q8_quantize_act: in must be a multiple of 32");
+    const int nb = rows * (in / 32);
+    quantize_kernel<<<(nb * 32 + 255) / 256, 256, 0, stream>>>(x, nb, xq, xd);
+    TRUSS_CUDA(cudaGetLastError());
+}
+
+void q8_gemm(const Q8Matrix & W, const int8_t * xq, const half * xd, int rows, float * y, cudaStream_t stream)
+{
+    if (W.in % KC) throw std::runtime_error("q8_gemm: in must be a multiple of 64, got " + std::to_string(W.in));
+    const dim3 grid((W.out + BM - 1) / BM, (rows + BN - 1) / BN);
+    gemm_kernel<<<grid, THREADS, 0, stream>>>(W, xq, xd, rows, y);
+    TRUSS_CUDA(cudaGetLastError());
+}
+
+}  // namespace truss::dense
