@@ -12,5 +12,9 @@ namespace truss::gdn {
 // state may be nullptr (zero start, final state discarded)
 void delta_rule(const float * q, const float * k, const float * v, const float * g, const float * beta, float * state,
                 float * out, int T, int Hk, int Hv, cudaStream_t stream);
+// start from state_in, final state to state_out (may be the same buffer; either may be nullptr). A verify window
+// writes to a second buffer so rejected rows leave the committed state untouched (Forward::verify).
+void delta_rule(const float * q, const float * k, const float * v, const float * g, const float * beta,
+                const float * state_in, float * state_out, float * out, int T, int Hk, int Hv, cudaStream_t stream);
 
 }  // namespace truss::gdn

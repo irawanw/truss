@@ -77,7 +77,9 @@ add_library(truss_kernels STATIC
   src/kernels/hc/hc_prefill.cu
   src/kernels/ffn/ffn_ops.cu
   src/kernels/ple/ple_prefill.cu
-  src/kernels/sampling/argmax.cu)
+  src/kernels/sampling/argmax.cu
+  src/kernels/spec/rollback.cu
+  src/kernels/mtp/mtp_ops.cu)
 target_include_directories(truss_kernels PUBLIC src)
 target_link_libraries(truss_kernels PUBLIC CUDA::cublas)
 
@@ -138,5 +140,7 @@ add_executable(tk-bench-decode tools/tk-bench/decode.cu)
 target_link_libraries(tk-bench-decode PRIVATE truss_engine)
 add_executable(tk-profile tools/tk-bench/profile.cu)
 target_link_libraries(tk-profile PRIVATE truss_engine)
+add_executable(tk-bench-spec tools/tk-bench/spec.cu)
+target_link_libraries(tk-bench-spec PRIVATE truss_engine)
 add_executable(tk-parity-kl tools/tk-parity/kl_vs_base.cu)
 target_link_libraries(tk-parity-kl PRIVATE truss_engine)

@@ -41,8 +41,9 @@ __device__ __forceinline__ int row_of(int qd, int m, int e) { return 16 * m + 4 
 
 __global__ __launch_bounds__(WARPS * 32) void delta_rule_kernel(const float * __restrict__ q, const float * __restrict__ k,
                                                                const float * __restrict__ v, const float * __restrict__ g,
-                                                               const float * __restrict__ beta, float * __restrict__ state,
-                                                               float * __restrict__ out, int T, int Hk, int Hv)
+                                                               const float * __restrict__ beta, const float * state_in,
+                                                               float * state_out, float * __restrict__ out, int T, int Hk,
+                                                               int Hv)
 {
     __shared__ __align__(16) Chunk ch[2];
     const int h = blockIdx.x, hk = h % Hk, lane = threadIdx.x % 32, wid = threadIdx.x / 32;
@@ -53,7 +54,7 @@ __global__ __launch_bounds__(WARPS * 32) void delta_rule_kernel(const float * __
     for (int m = 0; m < 8; ++m)
 #pragma unroll
         for (int e = 0; e < 4; ++e)
-            s[4 * m + e] = state ? state[((size_t) h * S + row_of(qd, m, e)) * S + col] : 0.f;
+            s[4 * m + e] = state_in ? state_in[((size_t) h * S + row_of(qd, m, e)) * S + col] : 0.f;
     const float scale = rsqrtf((float) S);
 
     // tokens [t0, t0 + n) -> ch[b]; rows past T are not loaded (never read)
@@ -120,21 +121,28 @@ __global__ __launch_bounds__(WARPS * 32) void delta_rule_kernel(const float * __
         }
         __syncthreads();
     }
-    if (state)
+    if (state_out)
 #pragma unroll
         for (int m = 0; m < 8; ++m)
 #pragma unroll
-            for (int e = 0; e < 4; ++e) state[((size_t) h * S + row_of(qd, m, e)) * S + col] = s[4 * m + e];
+            for (int e = 0; e < 4; ++e) state_out[((size_t) h * S + row_of(qd, m, e)) * S + col] = s[4 * m + e];
 }
 
 }  // namespace
 
+void delta_rule(const float * q, const float * k, const float * v, const float * g, const float * beta,
+                const float * state_in, float * state_out, float * out, int T, int Hk, int Hv, cudaStream_t stream)
+{
+    if (Hv % Hk) throw std::runtime_error("gdn::delta_rule: value heads must be a multiple of key heads");
+    delta_rule_kernel<<<dim3(Hv, S / COLS), WARPS * 32, 0, stream>>>(q, k, v, g, beta, state_in, state_out, out, T, Hk,
+                                                                     Hv);
+    TRUSS_CUDA(cudaGetLastError());
+}
+
 void delta_rule(const float * q, const float * k, const float * v, const float * g, const float * beta, float * state,
                 float * out, int T, int Hk, int Hv, cudaStream_t stream)
 {
-    if (Hv % Hk) throw std::runtime_error("gdn::delta_rule: value heads must be a multiple of key heads");
-    delta_rule_kernel<<<dim3(Hv, S / COLS), WARPS * 32, 0, stream>>>(q, k, v, g, beta, state, out, T, Hk, Hv);
-    TRUSS_CUDA(cudaGetLastError());
+    delta_rule(q, k, v, g, beta, state, state, out, T, Hk, Hv, stream);
 }
 
 }  // namespace truss::gdn

@@ -34,6 +34,9 @@ When a query sees ≤ 512 blocks it attends to everything (plain causal attentio
 One warp per normalized row; element i of a row lives in lane i % 32, so the rotary pair (p, p+32) is in one lane
 (`static_assert(ROPE_DIMS == 64)`).
 
+`carry_partial<Shape>(idx_k raw [T][ID], pos0, T, partial)`: the indexer's open-block rows for cells in the chunk
+(what `prepare_index` does at a chunk's end), used by `Forward::accept` over a restored snapshot.
+
 ## `src/kernels/dsa/dsa_prefill.{cuh,cu}` — selection and attention
 
 `dsa::FlashNext { H = 24, HKV = 2, D = 256, IH = 4, ID = 128, RATIO = 4, TOP_BLOCKS = 512, ROPE_DIMS = 64 }`.
@@ -101,7 +104,9 @@ out = RMSNorm_head(o) ⊙ γ ⊙ sigmoid(z)   → out projection
 ## `src/kernels/gdn/gdn_prefill.{cuh,cu}` — the recurrence
 
 `gdn::delta_rule(q, k, v, g, beta, state, out, T, Hk, Hv, stream)`: exact token-sequential recurrence (fp32), the
-contract of `ref::gated_delta_rule`; `state` [Hv][128][128] in/out (nullptr: zero start, discarded). Block = (value
+contract of `ref::gated_delta_rule`; `state` [Hv][128][128] in/out (nullptr: zero start, discarded). Overload
+`delta_rule(..., state_in, state_out, ...)` reads one buffer and writes another (a verify window keeps the committed
+state; `Forward::accept`). Block = (value
 head, 32 state columns) = 4 warps × 8 columns; a column is held by 4 lanes × 32 rows, so reductions are 2 shuffle
 levels. Per token: s·k and s·q reduce together, k·q is computed once per token at staging;
 o = a (s·q) + (k·q) δ. k/q/v/g/β are staged through shared memory in cp.async chunks of 8 tokens.

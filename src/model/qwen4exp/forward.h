@@ -36,6 +36,8 @@ struct ForwardOptions {
                                               // same hot count per layer in index order. Decode speed depends on it.
     size_t ring_bytes = 4ull << 30;           // ExpertStore ring: decode's FIFO of fetched experts (~2,500 at 4 GiB),
                                               // prefill's two stream slots (grown to fit them if smaller)
+    const Mtp * mtp = nullptr;                // MTP draft block (bind_mtp; must outlive the Forward): draft() works
+    int spec_rows = 0;                        // > 0: verify() / accept() for windows of up to spec_rows (<= 8) rows
 };
 
 class Forward {
@@ -54,6 +56,18 @@ public:
     // The next T tokens of the sequence (any T <= max_chunk: a prompt chunk, or one decoded token).
     void run(const int32_t * tokens, int T, const LayerHook & hook = nullptr);
 
+    // Speculative decoding (Options::spec_rows > 0). verify() runs a window of T <= spec_rows tokens (the next token
+    // and the drafts after it) without committing it: head() then gives every row's logits. accept(n) keeps the
+    // first n rows (1 <= n <= T) and rolls the recurrent state (GDN state and conv rows, PLE history, the DSA
+    // indexer's open block) back to them; caches indexed by position need no rollback. Exactly one accept() per
+    // verify(); position() advances by n.
+    void verify(const int32_t * tokens, int T);
+    void accept(int n);
+
+    // MTP drafts (Options::mtp): n greedy guesses for the tokens after `next`, the token at position(). The MTP block
+    // reads the last committed row's hidden state; every run() / accept() keeps the MTP layer's own cache in step.
+    void draft(int32_t next, int n, int32_t * out);
+
     // logits [n][n_vocab] (device, fp32) of rows first .. first + n - 1 of the last chunk: the head hc mix, then
     // the output projection
     void head(int first, int n, float * logits);
@@ -64,10 +78,12 @@ public:
     int position() const { return pos_; }   // tokens consumed so far
     int hot_experts() const;                // resident experts, all layers
     size_t cold_bytes() const;              // streamed per chunk
-    const runtime::ExpertStore & experts() const;   // residency and fetch statistics
+    const runtime::ExpertStore & experts() const;   // residency and fetch statistics (the MTP block, when present,
+                                                    // is store layer n_layer)
 
     // Routing profile: while on, every run() adds each routed (layer, expert) to a device table; route_counts()
-    // returns it as [layer][expert] float (the usage file format, ExpertStore::load_usage) and profiling stays on.
+    // returns it as [layer][expert] float (the usage file format, ExpertStore::load_usage; n_layer + 1 layers with an
+    // MTP block) and profiling stays on.
     void profile_routes(bool on);
     std::vector<float> route_counts() const;
     cudaStream_t stream() const;

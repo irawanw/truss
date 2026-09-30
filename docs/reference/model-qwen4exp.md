@@ -40,6 +40,12 @@ so a converter change fails at load instead of computing garbage. Names follow l
 `src/models/qwen4exp.cpp` (`blk.N.attn_qkv.weight`, `blk.N.ffn_gate_exps.m3_trellis`, `per_layer_token_embd.q8`, ...).
 The MTP layer (blk.48 in MTP packs) is not bound yet (CP5).
 
+**MTP block.** `bind_mtp(file, config)` → `Mtp { Layer layer (DSA mixer, routed experts, no PLE); eh_proj [2d → d],
+enorm [d], hnorm [hc_dim] }` from a separate file (`flashnext_truss_mtp_pack.py`: blk.48 dense tensors from the Q8_0
+MTP pack, its 512 experts re-encoded to X3 K3 by `flashnext_truss_mtp_encode.py` with exllamav3 and an identity
+Hessian, weight NMSE 0.017). It uses the main model's token_embd, output and hc_head (llama-paw `graph_mtp`). The
+per-layer binding is one function (`bind_layer`) shared by `bind` and `bind_mtp`.
+
 ## `ple.h`, `ple.cc` — PLE rows on the host
 
 - `ple_rows(config, tokens, T, rows [T][16])`: for n = 2..3 the window (token, n−1 predecessors) is hashed,
@@ -71,6 +77,8 @@ run(tokens, T, hook = nullptr)   // append T tokens (a prompt chunk or a decode 
 head(first, n, logits)           // logits [n][vocab] (device fp32) for rows of the last chunk; Q8_1: one
                                  // q8_gemv/q8_gemm over the vocab; FP16: q8_gemm_a16 in vocab tiles
 reset()                          // new sequence
+verify(tokens, T); accept(n)     // speculative window (Options::spec_rows): T rows tentative, keep the first n
+draft(next, n, out)              // MTP drafts (Options::mtp) for the tokens after `next`
 position(), hot_experts() (all layers), cold_bytes(), stream(), experts() (the ExpertStore: stats)
 profile_routes(on), route_counts()   // routing profile [layer][expert] (the usage file; tk-profile)
 ```
@@ -95,6 +103,23 @@ profile_routes(on), route_counts()   // routing profile [layer][expert] (the usa
   experts, then `moe::window` (T ≤ 8) or `moe::prefill`; otherwise whole layers stream (`prefetch(0), prefetch(1)`
   at chunk start, `prefetch(l + 2)` after layer l's experts).
 - Chunks may start at any position (DSA partial blocks, GDN conv rows, PLE history and window are carried).
+
+**Speculative decoding (Options::spec_rows, Options::mtp).**
+- `verify(tokens, T ≤ spec_rows)` runs the window like a chunk but tentative: each GDN layer's delta rule writes to the
+  layer's second state buffer; GDN conv rows, the DSA indexer's open block and PLE history are snapshotted, and the
+  window's raw rows (qkv, alpha, beta; indexer keys; PLE normed rows) saved. `head()` gives every row's logits.
+- `accept(n)`: all rows → swap the GDN buffers; fewer → restore the snapshots and redo only the small recurrent parts
+  for rows 0..n−1 (`gdn::prepare` + `delta_rule` in place, `dsa::carry_partial`, `spec::tail_rows`). K/V and
+  indexer-block caches are position-indexed and are rewritten before any query reads them. The PLE token window
+  advances by n.
+- MTP: every committed chunk (run or accept) also runs the MTP block at its positions, each from the previous
+  position's target hidden state (`pending_h` for the first; position 0 skipped), so the MTP cache matches the true
+  states. `draft(next, n)` chains single-row MTP steps from `pending_h`: embed token → join → eh_proj → DSA layer →
+  experts (store layer 48) → head → device argmax → next step; its cache rows and indexer block are tentative (the
+  block is snapshotted and restored; the rows are rewritten by the next commit).
+- Without an MTP usage profile the MTP layer's experts rank above every layer's, so all 512 stay resident.
+- Measured (TRACKER #58): greedy output identical to plain decode; 2.91 tokens per pass with 3 drafts; 38 tok/s
+  (plain 32): each 4-row pass fetches ~363 experts (640 MB, ~47 ms of PCIe) — the miss bytes are the wall.
 
 **Tunables.** `FETCH_ROWS = 32` (a 67-token prompt spent 2.1 s streaming ~24 GB before this); the expert budget
 margin `768 MiB`; `max_chunk` (constructor; larger chunks amortize the per-layer expert stream: 4K 2,263 tok/s,

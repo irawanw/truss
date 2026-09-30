@@ -56,4 +56,14 @@ struct Weights {
 // Throws std::runtime_error naming the tensor on a missing tensor, a shape mismatch or an unused tensor.
 Weights bind(const gguf::File & f, const Config & c);
 
+// The MTP (multi-token prediction) draft block, blk.<n_layer> of its own file (flashnext_truss_mtp_pack.py): a DSA
+// layer with routed experts, plus the join of the next token's embedding with the previous hidden state,
+//     res = eh_proj [RMSNorm(embed(token)) * enorm | RMSNorm_per_stream(h) * hnorm]   (per hc stream)
+// It uses the main model's token_embd, output and hc_head (llama-paw graph_mtp).
+struct Mtp {
+    Layer layer;
+    T eh_proj = nullptr, enorm = nullptr, hnorm = nullptr;
+};
+Mtp bind_mtp(const gguf::File & f, const Config & c);
+
 }  // namespace truss::qwen4exp

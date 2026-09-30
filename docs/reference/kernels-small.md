@@ -68,3 +68,17 @@ No unit test per small op: each is checked inside the layer chain. `qwen4exp_par
 they implement against llama-paw; `qwen4exp_forward short/long` checks the engine chain (these kernels + the fast
 GEMMs) against the fp32 reference chain at every layer (2.6–3.4e-4 at 12 tokens). A bug here shows up there as a
 jump at the layer or block that uses the op.
+
+---
+
+## `src/kernels/spec/rollback.{cuh,cu}` — verify-window rollback
+
+`tail_rows(old [H][w], H, rows [n][w], n, w, out)`: out = the last H rows of concat(old, rows). Carried row histories
+(GDN conv rows, PLE conv history) after accepting n of a window's rows, from the pre-window snapshot and the saved
+window rows (`Forward::accept`). `out` must not alias the inputs.
+
+## `src/kernels/mtp/mtp_ops.{cuh,cu}` — MTP block input
+
+`join(emb [T][d], enorm [d], hn16 [T][hc][d], T, hc, d, eps, out16 [T][hc][2d])`: per stream `[RMSNorm(emb)·enorm |
+hn]`, the eh_proj input (llama-paw `graph_mtp`: `concat(e_norm repeated over streams, h_norm)`). `hn16` is the previous
+hidden state normed per stream and scaled by hnorm (`hc::norm`). One block per token.

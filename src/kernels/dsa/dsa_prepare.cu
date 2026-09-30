@@ -179,6 +179,14 @@ void prepare_index(const float * idx_q, const float * idx_k, const float * q_nor
     TRUSS_CUDA(cudaGetLastError());
 }
 
+template <class Shape> void carry_partial(const float * idx_k, int pos0, int T, float * partial, cudaStream_t stream)
+{
+    const int n = (Shape::RATIO - 1) * Shape::ID;
+    partial_kernel<Shape><<<(n + 255) / 256, 256, 0, stream>>>(idx_k, pos0, T, partial);
+    TRUSS_CUDA(cudaGetLastError());
+}
+
+template void carry_partial<FlashNext>(const float *, int, int, float *, cudaStream_t);
 template void rope_table<FlashNext>(int, int, float, float2 *, cudaStream_t);
 template void prepare_qkv<FlashNext>(const float *, const float *, const float *, const float *, const float *,
                                      const float2 *, int, int, float, half *, float *, half *, half *, cudaStream_t);

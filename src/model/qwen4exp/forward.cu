@@ -13,7 +13,10 @@
 #include "kernels/hc/hc_prefill.cuh"
 #include "kernels/moe/moe_prefill.cuh"
 #include "kernels/moe/moe_window.cuh"
+#include "kernels/mtp/mtp_ops.cuh"
 #include "kernels/ple/ple_prefill.cuh"
+#include "kernels/sampling/argmax.cuh"
+#include "kernels/spec/rollback.cuh"
 #include "model/qwen4exp/ple.h"
 #include "runtime/expert_store.h"
 
@@ -64,6 +67,7 @@ struct Forward::Impl {
         void * moe_ws;                                   // moe::prefill
         int moe_rows;                                    // rows moe_ws was sized for
         float * res;                                     // [rows][hc][d]
+        float * mh, * mres;                              // MTP block: input hidden rows, its residual [rows][hc][d]
     };
     Scratch small_scratch;
     Buffers small{}, big{}, cur{};
@@ -78,48 +82,109 @@ struct Forward::Impl {
     struct LayerState {
         half * k = nullptr, * v = nullptr, * idx_k = nullptr;   // DSA caches
         float * idx_partial = nullptr;                          // raw indexer keys of the open block
-        float * state = nullptr, * conv = nullptr;              // GDN recurrence, conv rows
+        float * state_buf[2] = {};                              // GDN recurrence (two with speculation: a verify
+        int cur = 0;                                            // window writes the other one)
+        float * conv = nullptr;                                 // GDN conv rows
         float * ple_hist = nullptr;
+        // verify-window rollback (Options::spec_rows): snapshots before the window and the window's raw rows
+        float * conv_snap = nullptr, * raw_qkv = nullptr, * raw_alpha = nullptr, * raw_beta = nullptr;
+        float * partial_snap = nullptr, * raw_ik = nullptr;
+        float * hist_snap = nullptr, * normed_rows = nullptr;
+        float * state() const { return state_buf[cur]; }
     };
     std::vector<LayerState> st;
+    LayerState mst;                                      // the MTP block's DSA caches
+    const Mtp * mtp = nullptr;
+    const int spec_rows;
+    float * pending_h = nullptr;                         // MTP: hidden state [hc][d] of the last committed row
+    bool has_pending = false;
+    float * mtp_partial_snap = nullptr;                  // MTP indexer open block before a draft chain
+    float * mtp_logits = nullptr;                        // [n_vocab]
+    int * draft_ids = nullptr;                           // device [spec_rows]
+    int32_t * draft_host = nullptr;                      // pinned
+    struct Verify {                                      // the window verify() left uncommitted
+        bool open = false;
+        int pos0 = 0, T = 0;
+        std::vector<int32_t> tokens;
+    } vw;
     std::unique_ptr<runtime::ExpertStore> experts;
     int n_hot = 0;                                       // resident experts, all layers
     std::vector<int32_t> tail;                           // the last ple_ngram - 1 tokens seen (PLE window)
 
     const Activations act;
+    int n_store = 0;                                     // ExpertStore layers: n_layer (+ 1 with the MTP block)
 
     Impl(const Config & cc, const Weights & ww, int nc, int mc, const Options & o)
         : c(cc), w(ww), n_ctx(nc), max_chunk(mc), small_scratch(scratch_bytes(cc, std::min(mc, FETCH_ROWS), nc)),
-          act(o.act)
+          act(o.act), spec_rows(o.spec_rows)
     {
         check_shapes();
+        mtp = o.mtp;
         TRUSS_CUDA(cudaStreamCreate(&s));
         TRUSS_CUBLAS(cublasCreate(&blas));
         upload();
         const int small_rows = std::min(max_chunk, FETCH_ROWS);
+        mtp = o.mtp;
+        require(spec_rows >= 0 && spec_rows <= moe::MAX_ROWS, "spec_rows must be 0.." + std::to_string(moe::MAX_ROWS));
         small = { &small_scratch, alloc<unsigned char>(moe::prefill_workspace_bytes<MoeShape>(small_rows)), small_rows,
-                  alloc<float>((size_t) small_rows * c.hc_dim()) };
+                  alloc<float>((size_t) small_rows * c.hc_dim()), nullptr, nullptr };
+        if (mtp) {
+            small.mh = alloc<float>((size_t) small_rows * c.hc_dim());
+            small.mres = alloc<float>((size_t) small_rows * c.hc_dim());
+            pending_h = alloc<float>(c.hc_dim());
+            mtp_partial_snap = alloc<float>((size_t) (DsaShape::RATIO - 1) * c.idx_head_dim);
+            mtp_logits = alloc<float>(c.n_vocab);
+            draft_ids = alloc<int>(moe::MAX_ROWS + 1);
+            TRUSS_CUDA(cudaMallocHost(&draft_host, sizeof(int32_t) * (moe::MAX_ROWS + 1)));
+        }
         use(small);
         window_ws = alloc<unsigned char>(moe::workspace_bytes<MoeShape>());
         moe::workspace_init<MoeShape>(window_ws, s);
         TRUSS_CUDA(cudaMallocHost(&ids_host, sizeof(int) * FETCH_ROWS * MoeShape::TOPK));
         st.resize(c.n_layer);
         const int R = DsaShape::RATIO;
+        const int W = spec_rows;
+        auto dsa_state = [&](LayerState & L) {
+            L.k = alloc<half>((size_t) n_ctx * c.n_head_kv * c.head_dim);
+            L.v = alloc<half>((size_t) n_ctx * c.n_head_kv * c.head_dim);
+            L.idx_k = alloc<half>((size_t) (n_ctx / R) * c.idx_head_dim);
+            L.idx_partial = alloc<float>((size_t) (R - 1) * c.idx_head_dim);
+        };
         for (int l = 0; l < c.n_layer; ++l) {
             LayerState & L = st[l];
             if (c.mixer[l] == Mixer::DSA) {
-                L.k = alloc<half>((size_t) n_ctx * c.n_head_kv * c.head_dim);
-                L.v = alloc<half>((size_t) n_ctx * c.n_head_kv * c.head_dim);
-                L.idx_k = alloc<half>((size_t) (n_ctx / R) * c.idx_head_dim);
-                L.idx_partial = alloc<float>((size_t) (R - 1) * c.idx_head_dim);
+                dsa_state(L);
+                if (W) L.partial_snap = alloc<float>((size_t) (R - 1) * c.idx_head_dim), L.raw_ik = alloc<float>((size_t) W * c.idx_head_dim);
             } else {
-                L.state = alloc<float>((size_t) c.ssm_v_heads * c.ssm_state * c.ssm_state);
+                const size_t sz = (size_t) c.ssm_v_heads * c.ssm_state * c.ssm_state;
+                L.state_buf[0] = alloc<float>(sz);
+                if (W) L.state_buf[1] = alloc<float>(sz);
                 L.conv = alloc<float>((size_t) (c.ssm_conv - 1) * c.conv_dim());
+                if (W) {
+                    L.conv_snap = alloc<float>((size_t) (c.ssm_conv - 1) * c.conv_dim());
+                    L.raw_qkv = alloc<float>((size_t) W * c.conv_dim());
+                    L.raw_alpha = alloc<float>((size_t) W * c.ssm_v_heads);
+                    L.raw_beta = alloc<float>((size_t) W * c.ssm_v_heads);
+                }
             }
-            if (c.is_ple(l)) L.ple_hist = alloc<float>((size_t) (c.ple_conv - 1) * c.ple_ngram * c.hc_dim());
+            if (c.is_ple(l)) {
+                const size_t hist = (size_t) (c.ple_conv - 1) * c.ple_ngram * c.hc_dim();
+                L.ple_hist = alloc<float>(hist);
+                if (W) L.hist_snap = alloc<float>(hist), L.normed_rows = alloc<float>((size_t) W * c.hc_dim());
+            }
         }
+        if (mtp) dsa_state(mst);
         std::vector<runtime::ExpertLayer> tables;
         for (const Layer & L : w.layers) tables.push_back({ &L.moe.gate, &L.moe.up, &L.moe.down });
+        if (mtp) tables.push_back({ &mtp->layer.moe.gate, &mtp->layer.moe.up, &mtp->layer.moe.down });
+        n_store = (int) tables.size();
+        std::vector<float> usage = o.expert_usage;
+        if (mtp && usage.size() == (size_t) c.n_layer * c.n_expert) {
+            // no MTP profile: the MTP block runs once per draft (3-4 times per verify pass), so its experts rank
+            // above every layer's (all resident when they fit; TRACKER #58)
+            const float top = *std::max_element(usage.begin(), usage.end());
+            usage.insert(usage.end(), c.n_expert, 4.f * top + 1.f);
+        }
         size_t expert_budget = o.expert_budget;
         if (!expert_budget) {
             size_t free_b, total_b;
@@ -131,14 +196,20 @@ struct Forward::Impl {
         runtime::ExpertStore::Sizes z;
         z.ring_bytes = o.ring_bytes;
         if (max_chunk > FETCH_ROWS) z.stream_extra = big_bytes();
-        const runtime::ExpertStore::HotSet hot = runtime::ExpertStore::plan(tables, expert_budget, z, o.expert_usage);
+        const runtime::ExpertStore::HotSet hot = runtime::ExpertStore::plan(tables, expert_budget, z, usage);
         for (const auto & h : hot) n_hot += (int) std::count(h.begin(), h.end(), 1);
         experts = std::make_unique<runtime::ExpertStore>(tables, hot, z);
         if (max_chunk > FETCH_ROWS) {   // the prompt path's buffers, carved from the ring's spare region
             auto * p = static_cast<unsigned char *>(experts->spare());
             const size_t sb = scratch_bytes(c, max_chunk, n_ctx), wb = align(moe::prefill_workspace_bytes<MoeShape>(max_chunk));
             big_scratch = std::make_unique<Scratch>(p, sb);
-            big = { big_scratch.get(), p + align(sb), max_chunk, reinterpret_cast<float *>(p + align(sb) + wb) };
+            const size_t rb = align(sizeof(float) * max_chunk * c.hc_dim());
+            big = { big_scratch.get(), p + align(sb), max_chunk, reinterpret_cast<float *>(p + align(sb) + wb), nullptr,
+                    nullptr };
+            if (mtp) {
+                big.mh = reinterpret_cast<float *>(p + align(sb) + wb + rb);
+                big.mres = reinterpret_cast<float *>(p + align(sb) + wb + 2 * rb);
+            }
         }
     }
 
@@ -146,6 +217,7 @@ struct Forward::Impl {
     {
         for (void * p : owned) cudaFree(p);
         if (ids_host) cudaFreeHost(ids_host);
+        if (draft_host) cudaFreeHost(draft_host);
         if (blas) cublasDestroy(blas);
         if (s) cudaStreamDestroy(s);
     }
@@ -156,7 +228,12 @@ struct Forward::Impl {
     size_t big_bytes() const
     {
         return align(scratch_bytes(c, max_chunk, n_ctx)) + align(moe::prefill_workspace_bytes<MoeShape>(max_chunk)) +
-               align(sizeof(float) * max_chunk * c.hc_dim());
+               (mtp ? 3 : 1) * align(sizeof(float) * max_chunk * c.hc_dim());
+    }
+
+    void copy(float * dst, const float * src, size_t n)
+    {
+        TRUSS_CUDA(cudaMemcpyAsync(dst, src, n * sizeof(float), cudaMemcpyDeviceToDevice, s));
     }
 
     void use(const Buffers & b)
@@ -186,8 +263,10 @@ struct Forward::Impl {
                            (size_t) c.idx_heads * c.idx_head_dim * 6 + c.idx_head_dim * 4 + DsaShape::ROPE_DIMS * 4 +
                            DsaShape::TOP_BLOCKS * 4 + 4;
         const size_t ffn = (size_t) c.n_expert * 4 + c.n_expert_used * 8 + dm * 8 + (size_t) c.d_ff_shexp * 10 + 4;
+        // MTP join: hn16, rstd, [e | hn] fp16 and its Q8_1 form (the widest GEMM input when present)
+        const size_t mtp = hcd * 2 + c.hc * 4 + (size_t) c.hc * 2 * dm * (2 + 1) + (size_t) c.hc * 2 * dm / 16;
         const size_t q8_act = hcd + hcd / 16;   // Activations::Q8_1: the widest GEMM input, quantized
-        const size_t per_token = base + std::max({ mix, ple, gdn, dsa, ffn }) + q8_act;
+        const size_t per_token = base + std::max({ mix, ple, gdn, dsa, ffn, mtp }) + q8_act;
         const size_t fixed = dsa::select_workspace_bytes<DsaShape>(T, n_ctx) + dsa::attention_workspace_bytes<DsaShape>(T) +
                              (64ull << 20);   // + alignment slack
         return (size_t) T * per_token + fixed;
@@ -217,7 +296,14 @@ struct Forward::Impl {
         auto add_hc = [&](const HyperConnection & h) { add(h.norm), add(h.down), add(h.up), add(h.inject); };
         add(w.token_embd), add(w.output);
         add_hc(w.hc_head);
-        for (const Layer & L : w.layers) {
+        std::vector<const Layer *> layers;
+        for (const Layer & L : w.layers) layers.push_back(&L);
+        if (mtp) {
+            layers.push_back(&mtp->layer);
+            add(mtp->eh_proj), add(mtp->enorm), add(mtp->hnorm);
+        }
+        for (const Layer * Lp : layers) {
+            const Layer & L = *Lp;
             add_hc(L.hc_attn), add_hc(L.hc_ffn);
             for (T t : { L.gdn.qkv, L.gdn.gate, L.gdn.conv1d, L.gdn.dt_bias, L.gdn.a, L.gdn.beta, L.gdn.alpha,
                          L.gdn.norm, L.gdn.out })
@@ -307,7 +393,7 @@ struct Forward::Impl {
         sc->release(m);
     }
 
-    void ple(const Ple & p, LayerState & L, const int32_t * tokens, int T)
+    void ple(const Ple & p, LayerState & L, const int32_t * tokens, int T, bool tentative)
     {
         // n-gram window across chunks: hash [tail | chunk] and keep the chunk's rows
         const int H = c.ple_heads(), E = H * c.ple_head_dim, n_prev = (int) tail.size();
@@ -328,13 +414,16 @@ struct Forward::Impl {
         lin(p.key, e16, T, key);
         lin(p.value, e16, T, value);
         ple::gate(key, res, f32(p.norm_key), f32(p.norm_query), T, c.hc, c.d_model, c.rms_eps, gate, s);
+        const size_t hist = (size_t) (c.ple_conv - 1) * c.ple_ngram * c.hc_dim();
+        if (tentative) copy(L.hist_snap, L.ple_hist, hist);
         ple::apply(value, gate, f32(p.norm_conv), d(p.conv1d).as<half>(), L.ple_hist, T, c.hc, c.d_model, c.ple_conv,
                    c.ple_ngram, c.rms_eps, normed, res, s);
+        if (tentative) copy(L.normed_rows, normed, (size_t) T * c.hc_dim());
         TRUSS_CUDA(cudaStreamSynchronize(s));   // emb16 is a host temporary
         sc->release(m);
     }
 
-    void gdn(const Gdn & g, LayerState & L, const half * in16, int T, float * out)
+    void gdn(const Gdn & g, LayerState & L, const half * in16, int T, float * out, bool tentative)
     {
         const size_t m = sc->mark();
         const gdn::Dims dm{ c.ssm_groups, c.ssm_v_heads, c.ssm_state, c.ssm_conv };
@@ -349,15 +438,22 @@ struct Forward::Impl {
         lin(g.gate, in16, T, z);
         lin(g.alpha, in16, T, alpha);
         lin(g.beta, in16, T, beta_raw);
+        if (tentative) {   // accept() may redo the accepted rows from these
+            copy(L.conv_snap, L.conv, (size_t) (c.ssm_conv - 1) * c.conv_dim());
+            copy(L.raw_qkv, qkv, (size_t) T * c.conv_dim());
+            copy(L.raw_alpha, alpha, (size_t) T * Hv);
+            copy(L.raw_beta, beta_raw, (size_t) T * Hv);
+        }
         gdn::prepare(dm, qkv, f32(g.conv1d), L.conv, alpha, beta_raw, f32(g.dt_bias), f32(g.a), T, c.rms_eps, q, k, v,
                      gt, beta, s);
-        gdn::delta_rule(q, k, v, gt, beta, L.state, core, T, c.ssm_groups, Hv, s);
+        gdn::delta_rule(q, k, v, gt, beta, L.state(), tentative ? L.state_buf[1 - L.cur] : L.state(), core, T,
+                        c.ssm_groups, Hv, s);
         gdn::output_norm(dm, core, z, f32(g.norm), T, c.rms_eps, o16, s);
         lin(g.out, o16, T, out);
         sc->release(m);
     }
 
-    void dsa(const Dsa & a, LayerState & L, const half * in16, int pos0, int T, float * out)
+    void dsa(const Dsa & a, LayerState & L, const half * in16, int pos0, int T, float * out, bool tentative)
     {
         const size_t m = sc->mark();
         const int H = c.n_head, D = c.head_dim, Hkv = c.n_head_kv, IH = c.idx_heads, ID = c.idx_head_dim;
@@ -374,6 +470,10 @@ struct Forward::Impl {
         lin(a.v, in16, T, v);
         lin(a.idx_q, in16, T, iq);
         lin(a.idx_k, in16, T, ik);
+        if (tentative) {
+            copy(L.partial_snap, L.idx_partial, (size_t) (DsaShape::RATIO - 1) * c.idx_head_dim);
+            copy(L.raw_ik, ik, (size_t) T * c.idx_head_dim);
+        }
         dsa::rope_table<DsaShape>(pos0, T, c.rope_base, cs, s);
         dsa::prepare_qkv<DsaShape>(qfull, k, v, f32(a.q_norm), f32(a.k_norm), cs, pos0, T, c.rms_eps, q16, gate, L.k,
                                    L.v, s);
@@ -395,7 +495,8 @@ struct Forward::Impl {
     static constexpr int FETCH_ROWS = 32;
     static bool fetch_mode(int T) { return T <= FETCH_ROWS; }
 
-    void ffn(int l, const Moe & mo, const float * in, const half * in16, int T, float * out)
+    // stream: this chunk streams whole layers (prompt chunk, stream mode); else it fetches (decode, windows)
+    void ffn(int l, const Moe & mo, const float * in, const half * in16, int T, float * out, bool stream)
     {
         const size_t m = sc->mark();
         const int E = c.n_expert, K = c.n_expert_used, F = c.d_ff_shexp, dm = c.d_model;
@@ -407,7 +508,7 @@ struct Forward::Impl {
         lin32(mo.router, in, T, logits);
         ffn::route(logits, T, E, K, ids, wts, s);
         if (route_counts) ffn::count(ids, T * K, route_counts + (size_t) l * E, s);
-        if (fetch_mode(T)) {   // fetch the few cold experts this chunk routes to
+        if (!stream) {   // fetch the few cold experts this chunk routes to
             TRUSS_CUDA(cudaMemcpyAsync(ids_host, ids, sizeof(int) * T * K, cudaMemcpyDeviceToHost, s));
             TRUSS_CUDA(cudaStreamSynchronize(s));
             experts->fetch(l, ids_host, T * K, s);
@@ -419,7 +520,7 @@ struct Forward::Impl {
             experts->acquire(l, s);
             moe::prefill<MoeShape>(experts->weights(l), in, ids, wts, T, routed, cur.moe_ws, cur.moe_rows, s);
             experts->release(l, s);
-            if (l + 2 < c.n_layer) experts->prefetch(l + 2);
+            if (l + 2 < n_store) experts->prefetch(l + 2);   // the MTP block streams after the last layer
         }
         lin(mo.shexp_gate, in16, T, g);
         lin(mo.shexp_up, in16, T, u);
@@ -437,11 +538,19 @@ struct Forward::Impl {
     {
         require(first >= 0 && n > 0 && first + n <= last_T, "head rows outside the last chunk");
         sc->reset();   // run()'s temporaries are dead; the residual is not in the scratch
+        head_rows(res + (size_t) first * c.hc_dim(), n, logits);
+    }
+
+    // logits [n][vocab] of residual rows [n][hc][d]: the head hc mix, then the output projection
+    void head_rows(const float * rows, int n, float * logits)
+    {
+        const size_t m = sc->mark();
         float * mixed = sc->alloc((size_t) n * c.d_model);
         half * mixed16 = sc->alloc<half>((size_t) n * c.d_model);
-        hc_mix(w.hc_head, res + (size_t) first * c.hc_dim(), n, mixed, mixed16, nullptr);
+        hc_mix(w.hc_head, rows, n, mixed, mixed16, nullptr);
         if (act == Activations::Q8_1) {   // q8_gemv / q8_gemm write the whole vocab (decode: 0.9 ms vs 4 ms, #56)
             lin(w.output, mixed16, n, logits);
+            sc->release(m);
             return;
         }
         // FP16: the output matrix in vocab tiles that fit the dequantized-weight scratch
@@ -455,26 +564,32 @@ struct Forward::Impl {
             TRUSS_CUDA(cudaMemcpy2DAsync(logits + v0, (size_t) O.out * 4, part, (size_t) nv * 4, (size_t) nv * 4, n,
                                          cudaMemcpyDeviceToDevice, s));
         }
+        sc->release(m);
     }
 
     void reset()
     {
         for (int l = 0; l < c.n_layer; ++l) {
             const LayerState & L = st[l];
-            if (L.state) TRUSS_CUDA(cudaMemsetAsync(L.state, 0, sizeof(float) * c.ssm_v_heads * c.ssm_state * c.ssm_state, s));
+            if (L.state()) TRUSS_CUDA(cudaMemsetAsync(L.state(), 0, sizeof(float) * c.ssm_v_heads * c.ssm_state * c.ssm_state, s));
             if (L.conv) TRUSS_CUDA(cudaMemsetAsync(L.conv, 0, sizeof(float) * (c.ssm_conv - 1) * c.conv_dim(), s));
             if (L.ple_hist)
                 TRUSS_CUDA(cudaMemsetAsync(L.ple_hist, 0, sizeof(float) * (c.ple_conv - 1) * c.ple_ngram * c.hc_dim(), s));
         }
         tail.clear();
         last_T = 0;
+        has_pending = false;
+        vw.open = false;
     }
 
-    void run(const int32_t * tokens, int pos0, int T, const LayerHook & hook)
+    // One chunk of the target model at positions pos0 .. pos0 + T - 1. tentative: a verify window (accept() commits).
+    void run_chunk(const int32_t * tokens, int pos0, int T, const LayerHook & hook, bool tentative)
     {
         require(T > 0 && T <= max_chunk, "chunk of " + std::to_string(T) + " tokens (max " + std::to_string(max_chunk) + ")");
         require(pos0 + T <= n_ctx, "sequence longer than n_ctx");
-        if (fetch_mode(T)) {
+        require(!vw.open, "run()/verify() before accept() of the previous verify()");
+        const bool stream = !fetch_mode(T);
+        if (!stream) {
             use(small);
         } else {   // the ring becomes the stream slots and this chunk's buffers
             experts->begin_stream(s);
@@ -486,8 +601,8 @@ struct Forward::Impl {
         TRUSS_CUDA(cudaMemcpyAsync(ids, tokens, (size_t) T * 4, cudaMemcpyHostToDevice, s));
         dense::q8_rows(q8.at(w.token_embd), ids, T, emb, s);
         hc::expand(emb, T, c.hc, c.d_model, res, s);
-        if (!fetch_mode(T))
-            for (int l = 0; l < std::min(2, c.n_layer); ++l) experts->prefetch(l);
+        if (stream)
+            for (int l = 0; l < std::min(2, n_store); ++l) experts->prefetch(l);
         const size_t base = sc->mark();
         for (int l = 0; l < c.n_layer; ++l) {
             sc->release(base);
@@ -495,13 +610,13 @@ struct Forward::Impl {
             float * mixed = sc->alloc((size_t) T * c.d_model), * out = sc->alloc((size_t) T * c.d_model);
             float * inject = sc->alloc((size_t) T * c.hc);
             half * mixed16 = sc->alloc<half>((size_t) T * c.d_model);
-            if (c.is_ple(l)) ple(L.ple, st[l], tokens, T);
+            if (c.is_ple(l)) ple(L.ple, st[l], tokens, T, tentative);
             hc_mix(L.hc_attn, res, T, mixed, mixed16, inject);
-            if (L.mixer == Mixer::GDN) gdn(L.gdn, st[l], mixed16, T, out);
-            else dsa(L.dsa, st[l], mixed16, pos0, T, out);
+            if (L.mixer == Mixer::GDN) gdn(L.gdn, st[l], mixed16, T, out, tentative);
+            else dsa(L.dsa, st[l], mixed16, pos0, T, out, tentative);
             hc::combine(res, out, inject, T, c.hc, c.d_model, s);
             hc_mix(L.hc_ffn, res, T, mixed, mixed16, inject);
-            ffn(l, L.moe, mixed, mixed16, T, out);
+            ffn(l, L.moe, mixed, mixed16, T, out, stream);
             hc::combine(res, out, inject, T, c.hc, c.d_model, s);
             if (hook) {
                 TRUSS_CUDA(cudaStreamSynchronize(s));
@@ -509,12 +624,138 @@ struct Forward::Impl {
             }
         }
         last_T = T;
-        if (!c.ple_layers.empty()) {   // keep the window's predecessors for the next chunk
-            std::vector<int32_t> seq(tail);
-            seq.insert(seq.end(), tokens, tokens + T);
-            const size_t keep = std::min<size_t>(seq.size(), c.ple_ngram - 1);
-            tail.assign(seq.end() - keep, seq.end());
+        if (tentative) {
+            vw = { true, pos0, T, std::vector<int32_t>(tokens, tokens + T) };
+            return;
         }
+        commit_tail(tokens, T);
+        if (mtp) mtp_commit(tokens, pos0, T, stream);
+    }
+
+    void commit_tail(const int32_t * tokens, int T)   // the PLE window's predecessors for the next chunk
+    {
+        if (c.ple_layers.empty()) return;
+        std::vector<int32_t> seq(tail);
+        seq.insert(seq.end(), tokens, tokens + T);
+        const size_t keep = std::min<size_t>(seq.size(), c.ple_ngram - 1);
+        tail.assign(seq.end() - keep, seq.end());
+    }
+
+    // Commit the first n rows of the open verify window: every recurrent state as if only those rows had run.
+    void accept(int n)
+    {
+        require(vw.open, "accept() without verify()");
+        require(n >= 1 && n <= vw.T, "accept(" + std::to_string(n) + ") of a " + std::to_string(vw.T) + "-row window");
+        vw.open = false;
+        const bool all = n == vw.T;
+        const size_t m = sc->mark();
+        const gdn::Dims dm{ c.ssm_groups, c.ssm_v_heads, c.ssm_state, c.ssm_conv };
+        for (int l = 0; l < c.n_layer; ++l) {
+            LayerState & L = st[l];
+            const Layer & W = w.layers[l];
+            if (W.mixer == Mixer::GDN) {
+                if (all) {   // the window's final state is the other buffer
+                    L.cur ^= 1;
+                } else {     // conv rows and state from before the window, then the accepted rows again
+                    const int kd = c.key_dim(), vd = c.value_dim(), Hv = c.ssm_v_heads;
+                    float * q = sc->alloc((size_t) n * kd), * k = sc->alloc((size_t) n * kd), * v = sc->alloc((size_t) n * vd);
+                    float * gt = sc->alloc((size_t) n * Hv), * beta = sc->alloc((size_t) n * Hv), * core = sc->alloc((size_t) n * vd);
+                    copy(L.conv, L.conv_snap, (size_t) (c.ssm_conv - 1) * c.conv_dim());
+                    gdn::prepare(dm, L.raw_qkv, f32(W.gdn.conv1d), L.conv, L.raw_alpha, L.raw_beta, f32(W.gdn.dt_bias),
+                                 f32(W.gdn.a), n, c.rms_eps, q, k, v, gt, beta, s);
+                    gdn::delta_rule(q, k, v, gt, beta, L.state(), L.state(), core, n, c.ssm_groups, Hv, s);
+                    sc->release(m);
+                }
+            } else if (!all) {   // the indexer's open block: the snapshot plus the accepted rows' raw keys
+                copy(L.idx_partial, L.partial_snap, (size_t) (DsaShape::RATIO - 1) * c.idx_head_dim);
+                dsa::carry_partial<DsaShape>(L.raw_ik, vw.pos0, n, L.idx_partial, s);
+            }
+            if (c.is_ple(l) && !all)
+                spec::tail_rows(L.hist_snap, (c.ple_conv - 1) * c.ple_ngram, L.normed_rows, n, c.hc_dim(), L.ple_hist, s);
+        }
+        commit_tail(vw.tokens.data(), n);
+        last_T = n;
+        if (mtp) mtp_commit(vw.tokens.data(), vw.pos0, n, false);
+    }
+
+    // ---- MTP block (Options::mtp)
+
+    // The MTP block on T rows: hidden states h [T][hc][d] (device), next tokens d_ids [T] (device) at MTP positions
+    // pos0 .. pos0 + T - 1; its residual in cur.mres; logits of the last row into mtp_logits when asked.
+    void mtp_rows(const float * h, const int * d_ids, int pos0, int T, bool stream, bool logits)
+    {
+        const Layer & L = mtp->layer;
+        const int hc = c.hc, dm = c.d_model;
+        float * mres = cur.mres;
+        const size_t m = sc->mark();
+        float * emb = sc->alloc((size_t) T * dm), * rstd = sc->alloc((size_t) T * hc);
+        half * hn16 = sc->alloc<half>((size_t) T * c.hc_dim()), * cat16 = sc->alloc<half>((size_t) T * hc * 2 * dm);
+        dense::q8_rows(q8.at(w.token_embd), d_ids, T, emb, s);
+        hc::norm(h, f32(mtp->hnorm), T, hc, dm, c.rms_eps, hn16, rstd, s);
+        mtp::join(emb, f32(mtp->enorm), hn16, T, hc, dm, c.rms_eps, cat16, s);
+        lin(mtp->eh_proj, cat16, T * hc, mres);   // per stream: [2d] -> [d]
+        const size_t base = sc->mark();
+        float * mixed = sc->alloc((size_t) T * dm), * out = sc->alloc((size_t) T * dm);
+        float * inject = sc->alloc((size_t) T * hc);
+        half * mixed16 = sc->alloc<half>((size_t) T * dm);
+        hc_mix(L.hc_attn, mres, T, mixed, mixed16, inject);
+        dsa(L.dsa, mst, mixed16, pos0, T, out, false);
+        hc::combine(mres, out, inject, T, hc, dm, s);
+        hc_mix(L.hc_ffn, mres, T, mixed, mixed16, inject);
+        ffn(c.n_layer, L.moe, mixed, mixed16, T, out, stream);
+        hc::combine(mres, out, inject, T, hc, dm, s);
+        (void) base;
+        if (logits) head_rows(mres + (size_t) (T - 1) * c.hc_dim(), 1, mtp_logits);
+        sc->release(m);
+    }
+
+    // After committing rows at positions pos0 .. pos0 + T - 1 (tokens, host): the MTP block at those positions, each
+    // from the previous position's hidden state (pending for the first, the target's residual rows after), so its
+    // cache matches a run over the true hidden states. Position 0 has no previous state and is skipped.
+    void mtp_commit(const int32_t * tokens, int pos0, int T, bool stream)
+    {
+        const size_t row = c.hc_dim();
+        const int skip = has_pending ? 0 : 1;   // only position 0 lacks a pending state
+        const int n = T - skip;
+        if (n > 0) {
+            float * mh = cur.mh;
+            if (!skip) copy(mh, pending_h, row);
+            if (T > 1) copy(mh + (size_t) (1 - skip) * row, res, (size_t) (T - 1) * row);
+            const size_t m = sc->mark();
+            int * d_ids = sc->alloc<int>(n);
+            TRUSS_CUDA(cudaMemcpyAsync(d_ids, tokens + skip, sizeof(int32_t) * n, cudaMemcpyHostToDevice, s));
+            mtp_rows(mh, d_ids, pos0 + skip, n, stream, false);
+            TRUSS_CUDA(cudaStreamSynchronize(s));   // tokens may be a host temporary
+            sc->release(m);
+        }
+        copy(pending_h, res + (size_t) (T - 1) * row, row);
+        has_pending = true;
+    }
+
+    // n greedy drafts after `next` (the token at position pos): a chain of single-row MTP steps, each from the
+    // previous step's residual and argmax. The chain's cache rows and indexer block are tentative: the snapshot is
+    // restored at the end, and mtp_commit rewrites those positions from the target's states.
+    void draft(int32_t next, int pos, int n, int32_t * out)
+    {
+        require(mtp && has_pending, "draft() needs an MTP block and a committed position");
+        require(n >= 1 && n <= moe::MAX_ROWS, "draft count");
+        require(!vw.open, "draft() before accept()");
+        use(small);
+        sc->reset();
+        const size_t row = c.hc_dim();
+        copy(mtp_partial_snap, mst.idx_partial, (size_t) (DsaShape::RATIO - 1) * c.idx_head_dim);
+        draft_host[0] = next;
+        TRUSS_CUDA(cudaMemcpyAsync(draft_ids, draft_host, sizeof(int32_t), cudaMemcpyHostToDevice, s));
+        copy(cur.mh, pending_h, row);
+        for (int i = 0; i < n; ++i) {
+            mtp_rows(cur.mh, draft_ids + i, pos + i, 1, false, true);
+            sampling::argmax(mtp_logits, c.n_vocab, draft_ids + i + 1, s);
+            if (i + 1 < n) copy(cur.mh, cur.mres, row);
+        }
+        copy(mst.idx_partial, mtp_partial_snap, (size_t) (DsaShape::RATIO - 1) * c.idx_head_dim);
+        TRUSS_CUDA(cudaMemcpyAsync(draft_host, draft_ids + 1, sizeof(int32_t) * n, cudaMemcpyDeviceToHost, s));
+        TRUSS_CUDA(cudaStreamSynchronize(s));
+        std::copy(draft_host, draft_host + n, out);
     }
 };
 
@@ -536,7 +777,7 @@ const runtime::ExpertStore & Forward::experts() const { return *m_->experts; }
 void Forward::profile_routes(bool on)
 {
     Impl & m = *m_;
-    if (on && !m.route_counts) m.route_counts = m.alloc<float>((size_t) m.c.n_layer * m.c.n_expert);   // zeroed
+    if (on && !m.route_counts) m.route_counts = m.alloc<float>((size_t) m.n_store * m.c.n_expert);   // zeroed
     if (!on && m.route_counts) {
         TRUSS_CUDA(cudaStreamSynchronize(m.s));
         TRUSS_CUDA(cudaFree(m.route_counts));
@@ -548,7 +789,7 @@ void Forward::profile_routes(bool on)
 std::vector<float> Forward::route_counts() const
 {
     const Impl & m = *m_;
-    std::vector<float> out((size_t) m.c.n_layer * m.c.n_expert, 0.f);
+    std::vector<float> out((size_t) m.n_store * m.c.n_expert, 0.f);
     if (m.route_counts) {
         TRUSS_CUDA(cudaStreamSynchronize(m.s));
         TRUSS_CUDA(cudaMemcpy(out.data(), m.route_counts, out.size() * 4, cudaMemcpyDeviceToHost));
@@ -566,8 +807,24 @@ void Forward::reset()
 
 void Forward::run(const int32_t * tokens, int T, const LayerHook & hook)
 {
-    m_->run(tokens, pos_, T, hook);
+    m_->run_chunk(tokens, pos_, T, hook, false);
     pos_ += T;
 }
+
+void Forward::verify(const int32_t * tokens, int T)
+{
+    if (!m_->spec_rows || T > m_->spec_rows)
+        throw std::runtime_error("qwen4exp::Forward: verify() of " + std::to_string(T) + " rows (spec_rows " +
+                                 std::to_string(m_->spec_rows) + ")");
+    m_->run_chunk(tokens, pos_, T, nullptr, true);
+}
+
+void Forward::accept(int n)
+{
+    m_->accept(n);
+    pos_ += n;
+}
+
+void Forward::draft(int32_t next, int n, int32_t * out) { m_->draft(next, pos_, n, out); }
 
 }  // namespace truss::qwen4exp

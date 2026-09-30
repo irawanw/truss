@@ -30,4 +30,9 @@ void prepare_index(const float * idx_q, const float * idx_k, const float * q_nor
                    const float2 * cs, float rope_base, int pos0, int T, float eps, float * partial, half * idx_q16,
                    half * idx_k_cache, cudaStream_t stream);
 
+// partial <- the raw keys of the block open after cells pos0 .. pos0 + T - 1 that lie in that range (idx_k raw
+// [T][ID]); rows of cells before pos0 keep what partial held. prepare_index does this at the end of a chunk; a
+// rolled-back verify window redoes it for its accepted rows over the restored snapshot (Forward::accept).
+template <class Shape> void carry_partial(const float * idx_k, int pos0, int T, float * partial, cudaStream_t stream);
+
 }  // namespace truss::dsa
