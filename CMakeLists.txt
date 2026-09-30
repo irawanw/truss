@@ -47,6 +47,11 @@ add_library(truss_models STATIC
 target_link_libraries(truss_models PUBLIC truss_formats truss_reference)
 target_compile_options(truss_models PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra>)
 
+# ---- engine: model steps on the fast kernels
+add_library(truss_engine STATIC
+  src/model/qwen4exp/prefill.cu)
+target_link_libraries(truss_engine PUBLIC truss_models truss_kernels)
+
 # ---- pack-time encoders (Viterbi), used by the pack converter
 add_library(truss_encode STATIC
   src/encode/v2one_encode.cu)
@@ -58,7 +63,12 @@ add_library(truss_kernels STATIC
   src/kernels/moe/moe_prefill.cu
   src/kernels/dense/q8_gemm.cu
   src/kernels/gdn/gdn_prefill.cu
-  src/kernels/dsa/dsa_prefill.cu)
+  src/kernels/dsa/dsa_prefill.cu
+  src/kernels/dsa/dsa_prepare.cu
+  src/kernels/gdn/gdn_prepare.cu
+  src/kernels/hc/hc_prefill.cu
+  src/kernels/ffn/ffn_ops.cu
+  src/kernels/ple/ple_prefill.cu)
 target_include_directories(truss_kernels PUBLIC src)
 target_link_libraries(truss_kernels PUBLIC CUDA::cublas)
 
@@ -110,3 +120,8 @@ set_target_properties(tk-parity-llama-dump PROPERTIES BUILD_RPATH ${LLAMA_PAW_DI
 
 # ---- tools/codec-lab: codebook studies (quantization MSE vs the Gaussian bound)
 add_executable(tk-codec-lab tools/codec-lab/viterbi_mse.cu)
+add_executable(qwen4exp_prefill tests/layer/qwen4exp_prefill.cu)
+target_include_directories(qwen4exp_prefill PRIVATE .)
+target_link_libraries(qwen4exp_prefill PRIVATE truss_engine)
+add_executable(tk-bench-prefill tools/tk-bench/prefill.cu)
+target_link_libraries(tk-bench-prefill PRIVATE truss_engine)

@@ -117,7 +117,17 @@ int run_case(int T, const RandomLayer & L, std::mt19937 & rng)
     }
     const double rel = std::sqrt(num / den);
     // moe_window accumulates in fp16 per 2 k slices (TRACKER #16); the gate covers its rounding, not a wrong formula
-    const bool ok = !nonfinite && rel <= 5e-3 && worst <= 2e-2;
+    // prefix invariance: a row's output must not depend on the other rows of the chunk (chunked prefill == one shot)
+    int64_t prefix_diff = 0;
+    const int Th = T / 2;
+    if (Th > 0) {
+        TRUSS_CUDA(cudaMemset(d_ref, 0xff, sizeof(float) * T * D));
+        moe::prefill<Shape>(L.W, d_x, d_ids, d_w, Th, d_ref, ws, T, nullptr);
+        std::vector<float> h((size_t) Th * D);
+        TRUSS_CUDA(cudaMemcpy(h.data(), d_ref, h.size() * 4, cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < h.size(); ++i) prefix_diff += h[i] != a[i];
+    }
+    const bool ok = !nonfinite && rel <= 5e-3 && worst <= 2e-2 && prefix_diff == 0;
 
     const int reps = (int) env_int("TRUSS_REPS", 10);
     cudaEvent_t e0, e1;
@@ -132,8 +142,9 @@ int run_case(int T, const RandomLayer & L, std::mt19937 & rng)
     cudaEventElapsedTime(&ms, e0, e1);
     ms /= reps;
     const double flop = 2.0 * T * TOPK * 3.0 * D * Shape::D_FF;
-    std::printf("T=%-5d rel %.2e worst token %.2e nonfinite %lld %s | %.2f ms/layer, %.1f TFLOPS, %.1f us/token/layer\n",
-                T, rel, worst, (long long) nonfinite, ok ? "PASS" : "FAIL", ms, flop / (ms * 1e-3) / 1e12,
+    std::printf("T=%-5d rel %.2e worst token %.2e nonfinite %lld, first T/2 rows alone differ in %lld values %s | "
+                "%.2f ms/layer, %.1f TFLOPS, %.1f us/token/layer\n",
+                T, rel, worst, (long long) nonfinite, (long long) prefix_diff, ok ? "PASS" : "FAIL", ms, flop / (ms * 1e-3) / 1e12,
                 ms * 1e3 / T);
     cudaFree(d_ids); cudaFree(d_w); cudaFree(d_x); cudaFree(d_out); cudaFree(d_ref); cudaFree(ws); cudaFree(wws);
     return ok ? 0 : 1;

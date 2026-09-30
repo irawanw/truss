@@ -6,6 +6,7 @@
 // scaled and folded into fp32 accumulators: acc += float(c) * d_w * d_x.
 #include "q8_gemm.cuh"
 
+#include "core/cublas_check.h"
 #include "core/cuda_check.h"
 
 #include <cublas_v2.h>
@@ -15,12 +16,6 @@
 
 namespace truss::dense {
 namespace {
-
-#define TRUSS_CUBLAS(x)                                                                                              \
-    do {                                                                                                             \
-        const cublasStatus_t st_ = (x);                                                                              \
-        if (st_ != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cuBLAS error " + std::to_string((int) st_) + ": " #x); \
-    } while (0)
 
 constexpr int THREADS = 256;
 constexpr int BM = 128, BN = 128, KC = 64;     // outputs, tokens, k per stage
@@ -187,7 +182,22 @@ __global__ void dequant_kernel(const int8_t * __restrict__ q, const half * __res
     o[1] = __floats2half2_rn(v.z * s, v.w * s);
 }
 
+// one block per row
+__global__ void rows_kernel(const int8_t * __restrict__ q, const half * __restrict__ d, const int * ids, int in,
+                            float * out)
+{
+    const size_t r = (size_t) ids[blockIdx.x];
+    for (int i = threadIdx.x; i < in; i += blockDim.x)
+        out[(size_t) blockIdx.x * in + i] = q[r * in + i] * __half2float(d[r * (in / 32) + i / 32]);
+}
+
 }  // namespace
+
+void q8_rows(const Q8Matrix & W, const int * ids, int n, float * out, cudaStream_t stream)
+{
+    rows_kernel<<<n, 256, 0, stream>>>(W.q, W.d, ids, W.in, out);
+    TRUSS_CUDA(cudaGetLastError());
+}
 
 void q8_gemm_a16(const Q8Matrix & W, const half * x, int rows, float * y, half * w16, cublasHandle_t cublas,
                  cudaStream_t stream)

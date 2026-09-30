@@ -27,6 +27,7 @@ struct FlashNext {                    // Qwen3.8 Flash-Next DSA layers
     static constexpr int H = 24, HKV = 2, D = 256;                   // attention heads, head dim
     static constexpr int IH = 4, ID = 128;                           // indexer heads, head dim
     static constexpr int RATIO = 4, TOP_BLOCKS = 2048 / RATIO;       // idx_top_k = 2048 cells
+    static constexpr int ROPE_DIMS = 64;                             // NEOX rope on the first 64 dims of each head
 };
 
 // workspace for select() at context length n_ctx (queries are processed in groups that fit it)

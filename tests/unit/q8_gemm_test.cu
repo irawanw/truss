@@ -122,10 +122,26 @@ int run(const Shape & sh, int rows, int time_rows, std::mt19937 & rng, cublasHan
     ms /= reps;
     msq /= reps;
     ms16 /= reps;
+    // prefix invariance of a16: rows 0 .. rows-1 of the time_rows call vs a rows-row call
+    long prefix_diff = 0;
+    double prefix_rel = 0;
+    {
+        std::vector<float> big((size_t) rows * sh.out), small(big.size());
+        TRUSS_CUDA(cudaMemcpy(big.data(), y, big.size() * 4, cudaMemcpyDeviceToHost));
+        dense::q8_gemm_a16(W, d_xh, rows, y, w16, cublas, nullptr);
+        TRUSS_CUDA(cudaMemcpy(small.data(), y, small.size() * 4, cudaMemcpyDeviceToHost));
+        double n2 = 0, d2 = 0;
+        for (size_t i = 0; i < big.size(); ++i) {
+            prefix_diff += big[i] != small[i];
+            n2 += (double) (big[i] - small[i]) * (big[i] - small[i]), d2 += (double) small[i] * small[i];
+        }
+        prefix_rel = std::sqrt(n2 / d2);
+    }
     const double ops = 2.0 * time_rows * sh.in * sh.out;
     std::printf("%-9s %5d x %5d rel q8 %.1e a16 %.1e %s | rows %d: q8 %.3f ms %3.0f TOPS (+quantize %.3f) | a16 %.3f ms "
-                "%3.0f TFLOPS\n", sh.name, sh.in, sh.out, rel, rel16, ok ? "PASS" : "FAIL", time_rows, ms, ops / ms / 1e9,
-                msq, ms16, ops / ms16 / 1e9);
+                "%3.0f TFLOPS | a16 %d vs %d rows: %ld values differ, rel %.1e\n", sh.name, sh.in, sh.out, rel, rel16,
+                ok ? "PASS" : "FAIL", time_rows, ms, ops / ms / 1e9, msq, ms16, ops / ms16 / 1e9, time_rows, rows,
+                prefix_diff, prefix_rel);
     cudaFree(d_blocks); cudaFree(wq); cudaFree(wd); cudaFree(xq); cudaFree(xd); cudaFree(d_x); cudaFree(d_xh); cudaFree(w16); cudaFree(y);
     cudaFree(yr);
     return ok ? 0 : 1;

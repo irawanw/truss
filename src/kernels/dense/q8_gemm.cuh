@@ -40,4 +40,7 @@ void q8_gemm(const Q8Matrix & W, const int8_t * xq, const half * xd, int rows, f
 void q8_gemm_a16(const Q8Matrix & W, const half * x, int rows, float * y, half * w16, cublasHandle_t cublas,
                  cudaStream_t stream);
 
+// out fp32 [n][W.in] = rows ids[0 .. n) of W (q * d), e.g. the token embedding
+void q8_rows(const Q8Matrix & W, const int * ids, int n, float * out, cudaStream_t stream);
+
 }  // namespace truss::dense
