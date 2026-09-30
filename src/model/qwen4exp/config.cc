@@ -75,7 +75,11 @@ Config Config::from_gguf(const gguf::File & f)
     c.ple_heads_per_ngram = I("ple.heads_per_ngram");
     c.ple_head_offsets = f.get_ints("qwen4exp.ple.head_offsets");
     c.ple_head_vocab = f.get_ints("qwen4exp.ple.head_vocab_sizes");
+    c.ple_multipliers = f.get_ints("qwen4exp.ple.layer_multipliers");
+    c.ple_eos = I("ple.eos_token_id");
     if (c.ple_head_offsets.size() != c.ple_head_vocab.size()) fail("PLE head offsets / sizes differ in length");
+    if ((int) c.ple_head_offsets.size() != c.ple_heads()) fail("PLE head count != (ngram_size - 1) * heads_per_ngram");
+    if ((int) c.ple_multipliers.size() != c.ple_ngram) fail("PLE layer_multipliers length != ngram_size");
     return c;
 }
 

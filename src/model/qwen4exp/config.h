@@ -41,6 +41,9 @@ struct Config {
     std::vector<int64_t> ple_layers;
     int ple_head_dim, ple_conv, ple_ngram, ple_heads_per_ngram;
     std::vector<int64_t> ple_head_offsets, ple_head_vocab;
+    std::vector<int64_t> ple_multipliers;  // n-gram hash: one per window position (ple_ngram)
+    int64_t ple_eos;                       // resets the n-gram window (not the tokenizer's EOS)
+    int ple_heads() const { return (ple_ngram - 1) * ple_heads_per_ngram; }
     bool is_ple(int layer) const;
 
     // Throws if the architecture is not qwen4exp or a key is missing or inconsistent.

@@ -14,6 +14,7 @@
 #include "core/scratch.h"
 #include "kernels/moe/moe_window.cuh"
 #include "model/qwen4exp/config.h"
+#include "model/qwen4exp/ple.h"
 #include "model/qwen4exp/reference.h"
 #include "model/qwen4exp/weights.h"
 #include "tests/layer/dump.h"
@@ -125,10 +126,29 @@ int main(int argc, char ** argv)
             scratch.reset();
             // attention-side mix: its input is the previous layer's output (PLE layers: after the PLE block)
             const std::string res_in = l == 0 ? "hc_init" : at("l_last", l - 1);
-            if (!c.is_ple(l)) {
+            {
                 DevBuf res(dump.get(res_in)), mixed((size_t) T * c.d_model), inj((size_t) T * c.hc);
+                if (c.is_ple(l)) {   // PLE block on llama's residual: host rows + gather, then the device block
+                    const std::vector<int32_t> tok = dump.tokens();
+                    const int E = c.ple_heads() * c.ple_head_dim;
+                    std::vector<int32_t> rows((size_t) T * c.ple_heads());
+                    std::vector<float> emb((size_t) T * E);
+                    q::ple_rows(c, tok.data(), T, rows.data());
+                    q::ple_gather(c, w, rows.data(), T, emb.data());
+                    DevBuf d_emb(emb.size()), gate((size_t) T * c.hc), gated((size_t) T * c.hc_dim()),
+                        conv((size_t) T * c.hc_dim());
+                    TRUSS_CUDA(cudaMemcpy(d_emb.p, emb.data(), emb.size() * 4, cudaMemcpyHostToDevice));
+                    chk.check("ple emb (hash + gather)", d_emb.p, dump.get("ple_embd"));
+                    const q::reference::PleTrace tr{ gate.p, gated.p, conv.p };
+                    q::reference::ple(x, L.ple, d_emb.p, res.p, T, &tr);
+                    chk.check(at("ple gate", l), gate.p, dump.get(at("ple_gate", l)));
+                    chk.check(at("ple gated value", l), gated.p, dump.get(at("ple_gated_value", l)));
+                    chk.check(at("ple conv+silu", l), conv.p, dump.get(at("ple_conv_out", l)));
+                }
                 q::reference::hc_mix(x, L.hc_attn, res.p, T, mixed.p, inj.p);
-                chk.check(at("hc_mix attn", l), mixed.p, dump.get(at("hc_mixed", l, "#1")));
+                // after PLE the mix runs on our PLE output (2.5e-4 from llama's; its Q8_1 projections amplify that
+                // ~8x: 1.9e-3, vs 9.2e-4 on llama's own PLE output, TRACKER #50)
+                chk.check(at("hc_mix attn", l), mixed.p, dump.get(at("hc_mixed", l, "#1")), c.is_ple(l) ? GATE_AMP : GATE);
                 chk.check(at("hc_inject attn", l), inj.p, dump.get(at("hc_inject", l)));
             }
             if (L.mixer == q::Mixer::GDN) {   // GDN mixer on llama's attention-side mix

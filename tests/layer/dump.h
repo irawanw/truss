@@ -40,6 +40,17 @@ public:
 
     bool has(const std::string & name) const { return index_.count(name) != 0; }
 
+    // the prompt, as llama_dump writes it beside the index (raw int32)
+    std::vector<int32_t> tokens() const
+    {
+        std::ifstream f(dir_ + "/tokens.i32", std::ios::binary | std::ios::ate);
+        if (!f) throw std::runtime_error("dump: no tokens.i32 in " + dir_);
+        std::vector<int32_t> t((size_t) f.tellg() / 4);
+        f.seekg(0);
+        f.read(reinterpret_cast<char *>(t.data()), t.size() * 4);
+        return t;
+    }
+
     DumpTensor get(const std::string & name) const
     {
         const auto it = index_.find(name);

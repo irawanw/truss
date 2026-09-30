@@ -421,4 +421,78 @@ void dsa(const Ctx & x, const Dsa & a, int ratio, const float * in, int T, float
     TRUSS_CUDA(cudaGetLastError());
 }
 
+namespace {
+
+// gate[t][h] = sigmoid(sign(s) sqrt(max(|s|, 1e-6))), s = key[t][h] . query[t][h] / sqrt(d); one warp per (t, h)
+__global__ void ple_gate_kernel(const float * key, const float * query, float * gate, int rows, int d)
+{
+    const int r = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (r >= rows) return;
+    double acc = 0;
+    for (int i = lane; i < d; i += 32) acc += (double) key[(size_t) r * d + i] * query[(size_t) r * d + i];
+    for (int o = 16; o > 0; o /= 2) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (lane == 0) {
+        const float sc = (float) acc / sqrtf((float) d);
+        const float sg = sc > 0.f ? 1.f : sc < 0.f ? -1.f : 0.f;
+        gate[r] = sigmoid(sg * sqrtf(fmaxf(fabsf(sc), 1e-6f)));
+    }
+}
+
+// gated[t][h][i] = value[t][i] * gate[t][h]
+__global__ void ple_gated_kernel(const float * value, const float * gate, float * gated, int T, int hc, int d)
+{
+    const int64_t n = (int64_t) T * hc * d;
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int64_t t = i / ((int64_t) hc * d), h = i / d % hc, c = i % d;
+    gated[i] = value[t * d + c] * gate[t * hc + h];
+}
+
+// conv[t][c] = silu(sum_k w[c][k] x[t - (K - 1 - k) dil][c]) (zero before position 0); w fp16 [C][K]
+__global__ void ple_conv_kernel(const float * x, const half * w, float * conv, int T, int C, int K, int dil)
+{
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t) T * C) return;
+    const int t = (int) (i / C), c = (int) (i % C);
+    float acc = 0.f;
+    for (int k = 0; k < K; ++k) {
+        const int src = t - (K - 1 - k) * dil;
+        if (src >= 0) acc += __half2float(w[(size_t) c * K + k]) * x[(size_t) src * C + c];
+    }
+    conv[i] = acc * sigmoid(acc);
+}
+
+__global__ void ple_add_kernel(float * res, const float * gated, const float * conv, int64_t n)
+{
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) res[i] += gated[i] + conv[i];
+}
+
+}  // namespace
+
+void ple(const Ctx & x, const Ple & p, const float * emb, float * res, int T, const PleTrace * trace)
+{
+    const Config & c = x.c;
+    const int d = c.d_model, hc = c.hc;
+    const int64_t n = (int64_t) T * hc * d;
+    auto buf = [&](float * t, size_t cnt) { return t ? t : x.scratch.alloc(cnt); };
+    float * key = x.scratch.alloc(n), * query = x.scratch.alloc(n), * value = x.scratch.alloc((size_t) T * d);
+    float * gate = buf(trace ? trace->gate : nullptr, (size_t) T * hc);
+    float * gated = buf(trace ? trace->gated : nullptr, n);
+    float * normed = x.scratch.alloc(n);
+    float * conv = buf(trace ? trace->conv : nullptr, n);
+
+    ref::linear(x.dev(p.key), emb, key, T, x.stream, x.num);
+    ref::linear(x.dev(p.value), emb, value, T, x.stream, x.num);
+    ref::rms_norm(key, x.dev(p.norm_key).as<float>(), hc, key, T * hc, d, c.rms_eps, x.stream);
+    ref::rms_norm(res, x.dev(p.norm_query).as<float>(), hc, query, T * hc, d, c.rms_eps, x.stream);
+    ple_gate_kernel<<<(T * hc + 7) / 8, 256, 0, x.stream>>>(key, query, gate, T * hc, d);
+    ple_gated_kernel<<<blocks(n), 256, 0, x.stream>>>(value, gate, gated, T, hc, d);
+    ref::rms_norm(gated, x.dev(p.norm_conv).as<float>(), hc, normed, T * hc, d, c.rms_eps, x.stream);
+    ple_conv_kernel<<<blocks(n), 256, 0, x.stream>>>(normed, x.dev(p.conv1d).as<half>(), conv, T, hc * d, c.ple_conv,
+                                                    c.ple_ngram);
+    ple_add_kernel<<<blocks(n), 256, 0, x.stream>>>(res, gated, conv, n);
+    TRUSS_CUDA(cudaGetLastError());
+}
+
 }  // namespace truss::qwen4exp::reference

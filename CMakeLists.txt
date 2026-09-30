@@ -41,6 +41,7 @@ target_link_libraries(truss_reference PUBLIC truss_core)
 # ---- models: hyperparameters, weight binding, reference forward per architecture
 add_library(truss_models STATIC
   src/model/qwen4exp/config.cc
+  src/model/qwen4exp/ple.cc
   src/model/qwen4exp/weights.cc
   src/model/qwen4exp/reference.cu)
 target_link_libraries(truss_models PUBLIC truss_formats truss_reference)

@@ -68,6 +68,20 @@ struct DsaTrace {                          // optional intermediates for parity 
 
 void dsa(const Ctx & x, const Dsa & a, int ratio, const float * in, int T, float * out, const DsaTrace * trace = nullptr);
 
+// --- PLE block (llama-paw build_ple), before the hc mix of a PLE layer. One sequence from position 0 (zero conv
+// history). emb [T][ple_heads * ple_head_dim] from ple_gather.
+
+struct PleTrace {                          // optional intermediates for parity tests (each may be null)
+    float * gate = nullptr;                // [T][hc]
+    float * gated = nullptr;               // [T][hc][d_model], value * gate
+    float * conv = nullptr;                // [T][hc][d_model], after conv + silu
+};
+
+// key = norm_hc(W_key emb), query = norm_hc(res), value = W_value emb; per stream s = key.query / sqrt(d),
+// gate = sigmoid(sign(s) sqrt(max(|s|, 1e-6))); gated = value * gate; conv = silu(depthwise causal conv of
+// norm_hc(gated), kernel ple_conv, dilation ple_ngram); res += gated + conv. norm_hc = RMSNorm per stream.
+void ple(const Ctx & x, const Ple & p, const float * emb, float * res, int T, const PleTrace * trace = nullptr);
+
 // --- FFN (llama-paw build_layer_ffn): routed trellis experts + gated shared expert, input = the hc_ffn mix
 
 struct Routing {                           // host, [T][n_expert_used]
