@@ -1,8 +1,9 @@
 // MoE prefill (see moe_prefill.cuh). Kernels, in order, on one stream:
 //   route_count / route_scan / route_place   (token, choice) pairs sorted by expert, stable (token order inside an
 //                                            expert): pair_tok, pair_w, and pair_pos[t * TOPK + s] = sorted index
-//   gate_up   item (expert, 64-row block, 128 D_FF columns): A_p = H128(x * suh_p) built in shared memory per
-//             128-wide k chunk (no activation buffer), gate and up GEMMs, then the mid step as the epilogue:
+//   prep      A_p[pair] = H128(x[token] * suh_p[expert]), p = gate, up; in token order (x read once, coalesced).
+//             Building it inside the GEMM instead repeats it in all 5 column blocks: 23 vs 36 TFLOPS (TRACKER #42)
+//   gate_up   item (expert, 64-row block, 128 D_FF columns): gate and up GEMMs, then the mid step as the epilogue:
 //             A_d = H128(silu(H128(C_g) * svh_g) * H128(C_u) * svh_u * suh_d)   (its 128 columns = one H block)
 //   down      item (expert, 64-row block, 256 D_MODEL columns): C_d = w * H128(A_d . W_d) * svh_d, fp16
 //   combine   out[t] = sum over s in routing order of C_d[pair_pos[t, s]]
@@ -24,12 +25,12 @@
 namespace truss::moe {
 namespace {
 
-constexpr int THREADS = 256, WARPS = THREADS / 32;
+constexpr int THREADS = 128, WARPS = THREADS / 32;
 constexpr int BM = 64;                  // rows per item
-constexpr int KC = 128;                 // k chunk = one Hadamard block
+constexpr int KC = 64;                  // k depth of one staged activation chunk (double-buffered, cp.async)
 constexpr int AS = KC + 8;              // shared row stride (halfs): 8 rows x 4 k pairs hit 32 distinct banks
 constexpr int WNT = 4;                  // weight tiles per warp
-constexpr int RG = 4;                   // 8-row groups per warp (32 rows)
+constexpr int RG = 8;                   // 8-row groups per warp (all 64 rows of the item)
 constexpr int ROUTE_CHUNK = 2048;       // pairs per routing warp
 constexpr int MAX_EXPERTS = 1024;
 
@@ -117,6 +118,21 @@ __global__ void route_place(const int * __restrict__ ids, const float * __restri
 // ---------------------------------------------------------------------------------------------------------
 // GEMM pieces
 
+// async copy of rows [0, BM) x k [0, KC) of a fp16 matrix (row stride ld) into shared [BM][AS]; rows >= n_rows are
+// zero-filled (no global read)
+__device__ __forceinline__ void stage_async(half * dst, const half * src, int ld, int n_rows)
+{
+    constexpr int V = KC / 8;   // 16-byte vectors per row
+    for (int i = threadIdx.x; i < BM * V; i += THREADS) {
+        const int r = i / V, v = i % V;
+        const half * g = src + (size_t) (r < n_rows ? r : 0) * ld + v * 8;
+        const unsigned d = (unsigned) __cvta_generic_to_shared(dst + r * AS + v * 8);
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(d), "l"(g), "r"(r < n_rows ? 16 : 0));
+    }
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+template <int N> __device__ __forceinline__ void stage_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+
 struct ItemRows {
     int e, row0, rows, pair0;
 };
@@ -150,7 +166,7 @@ __device__ __forceinline__ void mma_chunk(const half * __restrict__ As, int n_rg
     const int lane = threadIdx.x % 32;
     const Codec codec(lane);
     const bool lane_loads = codec.loads(lane);
-    // all words of the chunk first: 8 slices x LOADS in flight
+    // all words of the chunk first: KS slices x LOADS in flight
     uint32_t w[KS][LOADS];
 #pragma unroll
     for (int ks = 0; ks < KS; ++ks) {
@@ -187,72 +203,101 @@ __device__ __forceinline__ void mma_chunk_k(int K, const half * As, int n_rg, co
     }
 }
 
-// accumulators of a warp -> shared C[32 rows][cs] at column offset col0 (row = 8 g + 2 q (+1), col = 16 t + lane/4
-// (+8))
-__device__ __forceinline__ void store_acc(const float (&acc)[WNT][RG][4], float * C, int cs, int col0)
+// rows [32 h, 32 h + 32) of a warp's accumulators -> shared C[32 rows][cs] at column offset col0
+// (row = 8 g + 2 q (+1), col = 16 t + lane/4 (+8))
+__device__ __forceinline__ void store_acc(const float (&acc)[WNT][RG][4], int h, float * C, int cs, int col0)
 {
     const int lane = threadIdx.x % 32, g8 = lane >> 2, q2 = 2 * (lane & 3);
 #pragma unroll
     for (int t = 0; t < WNT; ++t)
 #pragma unroll
-        for (int g = 0; g < RG; ++g)
+        for (int g = 0; g < RG; ++g) {
+            if (g / 4 != h) continue;
 #pragma unroll
             for (int i = 0; i < 4; ++i)
-                C[(g * 8 + q2 + (i & 1)) * cs + col0 + t * 16 + g8 + (i >> 1) * 8] = acc[t][g][i];
+                C[((g % 4) * 8 + q2 + (i & 1)) * cs + col0 + t * 16 + g8 + (i >> 1) * 8] = acc[t][g][i];
+        }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// prep: warp task = (token, choice, 128-column block), both projections
+
+template <class Shape>
+__global__ __launch_bounds__(THREADS) void prep_kernel(Weights W, const float * __restrict__ x,
+                                                       const int * __restrict__ ids, const int * __restrict__ pair_pos,
+                                                       int n_tokens, half * __restrict__ A_gu, size_t proj_stride)
+{
+    constexpr int D = Shape::D_MODEL, TOPK = Shape::TOPK, HB = D / 128;
+    const int lane = threadIdx.x % 32;
+    const int task = blockIdx.x * WARPS + threadIdx.x / 32;
+    if (task >= n_tokens * HB * TOPK) return;
+    const int t = task / (HB * TOPK), hb = (task / TOPK) % HB, s = task % TOPK;
+    const int c0 = hb * 128 + lane * 4, e = ids[t * TOPK + s], dst = pair_pos[t * TOPK + s];
+    const float4 v = *(const float4 *) (x + (size_t) t * D + c0);
+    const half2 x01 = __floats2half2_rn(v.x, v.y), x23 = __floats2half2_rn(v.z, v.w);
+    for (int p = 0; p < 2; ++p) {
+        // fp16 pre-scale by suh, fp32 Hadamard, fp16 (as moe_window's H step and the reference)
+        const uint2 sc = *(const uint2 *) (W.proj[p].suh + (size_t) e * D + c0);
+        const half2 p01 = __hmul2(x01, *(const half2 *) &sc.x), p23 = __hmul2(x23, *(const half2 *) &sc.y);
+        float h0 = __low2float(p01), h1 = __high2float(p01), h2 = __low2float(p23), h3 = __high2float(p23);
+        had4x32(h0, h1, h2, h3, lane);
+        half2 * o = (half2 *) (A_gu + p * proj_stride + (size_t) dst * D + c0);
+        o[0] = __floats2half2_rn(h0, h1);
+        o[1] = __floats2half2_rn(h2, h3);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------
 // gate/up + mid
 
 template <class Shape>
-__global__ __launch_bounds__(THREADS) void gate_up_kernel(Weights W, const float * __restrict__ x,
-                                                          const int * __restrict__ e_off, const int * __restrict__ rb_off,
-                                                          const int * __restrict__ pair_tok, half * __restrict__ A_d)
+__global__ __launch_bounds__(THREADS) void gate_up_kernel(Weights W, const half * __restrict__ A_gu,
+                                                          size_t proj_stride, const int * __restrict__ e_off,
+                                                          const int * __restrict__ rb_off, half * __restrict__ A_d)
 {
     constexpr int D = Shape::D_MODEL, F = Shape::D_FF, CB = F / 128, CS = 128 + 4;
-    static_assert(D % KC == 0 && F % 128 == 0, "Hadamard blocks");
-    static_assert(WARPS == 8 && 2 * WNT * 16 == 128, "8 warps = 2 proj x 2 column halves (of 128) x 2 row halves");
-    constexpr int SMEM_A = 2 * BM * AS * 2, SMEM_C = 2 * 32 * CS * 4;
+    static_assert(D % KC == 0 && F % 128 == 0, "k chunks; Hadamard blocks");
+    static_assert(WARPS == 4 && 2 * WNT * 16 == 128, "4 warps = 2 proj x 2 column halves (of 128)");
+    constexpr int STAGE = 2 * BM * AS;   // halfs: [proj][64 rows][AS]
+    constexpr int SMEM_A = 2 * STAGE * 2, SMEM_C = 2 * 32 * CS * 4;
     __shared__ __align__(16) char smem[SMEM_A > SMEM_C ? SMEM_A : SMEM_C];
-    half * As = (half *) smem;     // [proj][64 rows][AS]
+    half * As = (half *) smem;     // [buffer][proj][64 rows][AS]
     float * Cs = (float *) smem;   // epilogue: [proj][32 rows][CS]
 
     ItemRows it;
     const int cb = blockIdx.x % CB;
     if (!item_rows(blockIdx.x / CB, W.n_expert, e_off, rb_off, it)) return;
     const int wid = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int proj = wid >> 2, colh = (wid >> 1) & 1, rowh = wid & 1;
-    const int K = W.proj[proj].meta[2 * it.e];
-    const uint32_t * B32 = (const uint32_t *) (W.proj[proj].trellis + W.proj[proj].meta[2 * it.e + 1]);
-    const int n_rg = max(0, min(RG, (it.rows - rowh * 32 + 7) / 8));
+    const int proj = wid >> 1, colh = wid & 1;
+    const ProjView & P = proj ? W.proj[1] : W.proj[0];   // not W.proj[proj]: a runtime index puts W in local memory
+    const int K = P.meta[2 * it.e];
+    const uint32_t * B32 = (const uint32_t *) (P.trellis + P.meta[2 * it.e + 1]);
+    const int n_rg = (it.rows + 7) / 8;
 
+    const half * src = A_gu + (size_t) it.pair0 * D;
+    auto issue = [&](int kc) {
+        half * b = As + (kc & 1) * STAGE;
+        stage_async(b, src + kc * KC, D, it.rows);
+        stage_async(b + BM * AS, src + proj_stride + kc * KC, D, it.rows);
+    };
     float acc[WNT][RG][4] = {};
-    for (int kc = 0; kc < D / KC; ++kc) {
-        // stage A_p rows: fp16 pre-scale by suh, fp32 Hadamard, fp16 (as moe_window's H step and the reference)
-        for (int task = wid; task < 2 * BM; task += WARPS) {
-            const int p = task / BM, r = task % BM, c0 = kc * KC + lane * 4;
-            half2 * dst = (half2 *) (As + (p * BM + r) * AS + lane * 4);
-            if (r < it.rows) {
-                const float4 v = *(const float4 *) (x + (size_t) pair_tok[it.pair0 + r] * D + c0);
-                const uint2 sc = *(const uint2 *) (W.proj[p].suh + (size_t) it.e * D + c0);
-                const half2 p01 = __hmul2(__floats2half2_rn(v.x, v.y), *(const half2 *) &sc.x);
-                const half2 p23 = __hmul2(__floats2half2_rn(v.z, v.w), *(const half2 *) &sc.y);
-                float h0 = __low2float(p01), h1 = __high2float(p01), h2 = __low2float(p23), h3 = __high2float(p23);
-                had4x32(h0, h1, h2, h3, lane);
-                dst[0] = __floats2half2_rn(h0, h1);
-                dst[1] = __floats2half2_rn(h2, h3);
-            } else {
-                dst[0] = dst[1] = __float2half2_rn(0.f);
-            }
+    constexpr int NK = D / KC;
+    issue(0);
+    for (int kc = 0; kc < NK; ++kc) {
+        if (kc + 1 < NK) {
+            issue(kc + 1);
+            stage_wait<2>();   // this chunk's two groups done, the next chunk's two in flight
+        } else {
+            stage_wait<0>();
         }
         __syncthreads();
-        mma_chunk_k(K, As + (proj * BM + rowh * 32) * AS, n_rg, B32, kc, cb * 8 + colh * 4, F / 16, acc);
+        mma_chunk_k(K, As + (kc & 1) * STAGE + proj * BM * AS, n_rg, B32, kc, cb * 8 + colh * 4, F / 16, acc);
         __syncthreads();
     }
 
     // mid epilogue, one row half at a time through shared memory
     for (int rh = 0; rh < 2; ++rh) {
-        if (rowh == rh) store_acc(acc, Cs + proj * 32 * CS, CS, colh * 64);
+        store_acc(acc, rh, Cs + proj * 32 * CS, CS, colh * 64);
         __syncthreads();
         for (int r = wid; r < 32; r += WARPS) {
             const int row = rh * 32 + r;
@@ -288,36 +333,41 @@ __global__ __launch_bounds__(THREADS) void down_kernel(Weights W, const half * _
                                                        const float * __restrict__ pair_w, half * __restrict__ C_d)
 {
     constexpr int D = Shape::D_MODEL, F = Shape::D_FF, BN = 4 * WNT * 16, CB = D / BN, CS = BN + 4;
-    static_assert(F % KC == 0 && D % BN == 0 && BN % 128 == 0, "Hadamard blocks");
-    constexpr int SMEM_A = BM * AS * 2, SMEM_C = 32 * CS * 4;
+    static_assert(F % KC == 0 && D % BN == 0 && BN % 128 == 0, "k chunks; Hadamard blocks");
+    constexpr int STAGE = BM * AS;
+    constexpr int SMEM_A = 2 * STAGE * 2, SMEM_C = 32 * CS * 4;
     __shared__ __align__(16) char smem[SMEM_A > SMEM_C ? SMEM_A : SMEM_C];
-    half * As = (half *) smem;     // [64 rows][AS]
+    half * As = (half *) smem;     // [buffer][64 rows][AS]
     float * Cs = (float *) smem;   // epilogue: [32 rows][CS]
 
     ItemRows it;
     const int cb = blockIdx.x % CB;
     if (!item_rows(blockIdx.x / CB, W.n_expert, e_off, rb_off, it)) return;
     const int wid = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int colq = wid >> 1, rowh = wid & 1;
+    const int colq = wid;
     const ProjView & P = W.proj[2];
     const int K = P.meta[2 * it.e];
     const uint32_t * B32 = (const uint32_t *) (P.trellis + P.meta[2 * it.e + 1]);
-    const int n_rg = max(0, min(RG, (it.rows - rowh * 32 + 7) / 8));
+    const int n_rg = (it.rows + 7) / 8;
 
+    const half * src = A_d + (size_t) it.pair0 * F;
     float acc[WNT][RG][4] = {};
-    for (int kc = 0; kc < F / KC; ++kc) {
-        for (int r = wid; r < BM; r += WARPS) {
-            uint2 v = make_uint2(0u, 0u);
-            if (r < it.rows) v = *(const uint2 *) (A_d + (size_t) (it.pair0 + r) * F + kc * KC + lane * 4);
-            *(uint2 *) (As + r * AS + lane * 4) = v;
+    constexpr int NK = F / KC;
+    stage_async(As, src, F, it.rows);
+    for (int kc = 0; kc < NK; ++kc) {
+        if (kc + 1 < NK) {
+            stage_async(As + ((kc + 1) & 1) * STAGE, src + (kc + 1) * KC, F, it.rows);
+            stage_wait<1>();
+        } else {
+            stage_wait<0>();
         }
         __syncthreads();
-        mma_chunk_k(K, As + rowh * 32 * AS, n_rg, B32, kc, cb * (BN / 16) + colq * WNT, D / 16, acc);
+        mma_chunk_k(K, As + (kc & 1) * STAGE, n_rg, B32, kc, cb * (BN / 16) + colq * WNT, D / 16, acc);
         __syncthreads();
     }
 
     for (int rh = 0; rh < 2; ++rh) {
-        if (rowh == rh) store_acc(acc, Cs, CS, colq * WNT * 16);
+        store_acc(acc, rh, Cs, CS, colq * WNT * 16);
         __syncthreads();
         for (int task = wid; task < 32 * (BN / 128); task += WARPS) {
             const int r = task / (BN / 128), hb = task % (BN / 128), row = rh * 32 + r;
@@ -360,6 +410,7 @@ struct PrefillWorkspace {
     int * e_off;       // [MAX_EXPERTS + 1]
     int * rb_off;      // [MAX_EXPERTS + 1]
     int * pair_tok;    // [pairs]
+    half * A_gu;       // [2][pairs][D_MODEL]
     float * pair_w;    // [pairs]
     int * pair_pos;    // [pairs]
     half * A_d;        // [pairs][D_FF]
@@ -377,6 +428,7 @@ struct PrefillWorkspace {
         pair_tok = (int *) take(sizeof(int) * pairs);
         pair_w = (float *) take(sizeof(float) * pairs);
         pair_pos = (int *) take(sizeof(int) * pairs);
+        A_gu = (half *) take(sizeof(half) * 2 * pairs * Shape::D_MODEL);
         A_d = (half *) take(sizeof(half) * pairs * Shape::D_FF);
         C_d = (half *) take(sizeof(half) * pairs * Shape::D_MODEL);
         bytes = (size_t) (p - (char *) base);
@@ -406,8 +458,12 @@ void prefill(const Weights & W, const float * x, const int * ids, const float * 
     route_place<<<chunks, 32, E * sizeof(int), stream>>>(ids, wts, pairs, E, Shape::TOPK, w.chunk_cnt, w.e_off,
                                                          w.pair_tok, w.pair_w, w.pair_pos);
     const int max_rb = (pairs + BM - 1) / BM + E;   // sum over experts of ceil(rows / BM)
-    gate_up_kernel<Shape><<<max_rb * (Shape::D_FF / 128), THREADS, 0, stream>>>(W, x, w.e_off, w.rb_off, w.pair_tok,
-                                                                                w.A_d);
+    const size_t proj_stride = (size_t) max_tokens * Shape::TOPK * Shape::D_MODEL;
+    const int prep_tasks = n_tokens * (Shape::D_MODEL / 128) * Shape::TOPK;
+    prep_kernel<Shape><<<(prep_tasks + WARPS - 1) / WARPS, THREADS, 0, stream>>>(W, x, ids, w.pair_pos, n_tokens,
+                                                                                  w.A_gu, proj_stride);
+    gate_up_kernel<Shape><<<max_rb * (Shape::D_FF / 128), THREADS, 0, stream>>>(W, w.A_gu, proj_stride, w.e_off,
+                                                                                w.rb_off, w.A_d);
     down_kernel<Shape><<<max_rb * (Shape::D_MODEL / (4 * WNT * 16)), THREADS, 0, stream>>>(W, w.A_d, w.e_off, w.rb_off,
                                                                                          w.pair_w, w.C_d);
     const int n4 = n_tokens * (Shape::D_MODEL / 4);
