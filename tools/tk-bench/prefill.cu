@@ -34,9 +34,9 @@ int main(int argc, char ** argv)
         std::vector<int32_t> tok(n);
         for (auto & t : tok) t = (int32_t) (rng() % 150000);
         for (int pass = 0; pass < 2; ++pass) {
-            q::Forward p(c, w, n, chunk, budget, act);
-            if (!pass) std::printf("experts: %d of %d per layer resident, %.2f GB streamed per chunk\n", p.hot_experts(),
-                                   c.n_expert, p.cold_bytes() / 1e9);
+            q::Forward p(c, w, n, chunk, { budget, act });
+            if (!pass) std::printf("experts: %d of %d resident, %.2f GB streamed per chunk\n", p.hot_experts(),
+                                   c.n_expert * c.n_layer, p.cold_bytes() / 1e9);
             const auto t0 = std::chrono::steady_clock::now();
             for (int s = 0; s < n; s += chunk) p.run(tok.data() + s, std::min(chunk, n - s));
             TRUSS_CUDA(cudaStreamSynchronize(p.stream()));

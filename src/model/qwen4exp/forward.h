@@ -28,13 +28,19 @@ namespace truss::qwen4exp {
 // an unquantized anchor decides which is closer to the real model.
 enum class Activations { FP16, Q8_1 };
 
+struct ForwardOptions {
+    size_t expert_budget = 0;                 // device bytes for routed experts (0: all memory left, minus a margin)
+    Activations act = Activations::Q8_1;
+    std::vector<float> expert_usage;          // routed counts [layer][expert] (ExpertStore::load_usage); empty: the
+                                              // same hot count per layer in index order. Decode speed depends on it.
+};
+
 class Forward {
 public:
+    using Options = ForwardOptions;
     // n_ctx: the longest sequence; max_chunk: the most tokens per run() call (a multiple of the DSA block ratio)
     // c and w must outlive the Forward (w references the file mapping the weights are uploaded from)
-    // expert_budget: device bytes for routed experts (0: all memory left after everything else, minus a margin)
-    Forward(const Config & c, const Weights & w, int n_ctx, int max_chunk, size_t expert_budget = 0,
-            Activations act = Activations::Q8_1);
+    Forward(const Config & c, const Weights & w, int n_ctx, int max_chunk, const Options & o = {});
     ~Forward();
     Forward(const Forward &) = delete;
     Forward & operator=(const Forward &) = delete;
@@ -53,7 +59,7 @@ public:
     void reset();
 
     int position() const { return pos_; }   // tokens consumed so far
-    int hot_experts() const;                // resident experts per layer
+    int hot_experts() const;                // resident experts, all layers
     size_t cold_bytes() const;              // streamed per chunk
     cudaStream_t stream() const;
 

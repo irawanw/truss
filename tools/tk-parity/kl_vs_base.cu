@@ -97,8 +97,8 @@ int main(int argc, char ** argv)
         if (c.n_vocab != n_vocab) throw std::runtime_error("vocabulary size differs from the base file");
         float * d_logits;   // before the engine, whose expert budget takes the memory left
         TRUSS_CUDA(cudaMalloc(&d_logits, (size_t) n_scored * n_vocab * 4));
-        q::Forward p(c, w, n_ctx, (n_ctx + 3) / 4 * 4, 0, act);
-        std::printf("experts: %d of %d per layer resident, %.2f GB streamed per chunk\n", p.hot_experts(), c.n_expert,
+        q::Forward p(c, w, n_ctx, (n_ctx + 3) / 4 * 4, { 0, act });
+        std::printf("experts: %d of %d resident, %.2f GB streamed per chunk\n", p.hot_experts(), c.n_expert * c.n_layer,
                     p.cold_bytes() / 1e9);
         std::vector<float> logits((size_t) n_scored * n_vocab);
         std::vector<uint16_t> base((size_t) n_scored * nv);

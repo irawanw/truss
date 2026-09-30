@@ -23,6 +23,7 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace truss::runtime {
@@ -33,9 +34,12 @@ class ExpertStore {
 public:
     using HotSet = std::vector<std::vector<uint8_t>>;                 // [layer][expert] = 1: resident
 
-    // The same number of hot experts in every layer (experts in index order), the most whose device bytes (hot,
-    // two slots, scales, meta) fit `budget`.
-    static HotSet plan(const std::vector<ExpertLayer> & layers, size_t budget);
+    // The hot set whose device bytes (hot, two slots, scales, meta) fit `budget`. With `usage` (routed counts,
+    // [layer][expert] flattened): greedy by count per byte over all layers, so layers get different hot counts
+    // (decode fetches only misses, TRACKER #56). Without: the same count in every layer, index order.
+    static HotSet plan(const std::vector<ExpertLayer> & layers, size_t budget, const std::vector<float> & usage = {});
+    // usage file: n_layer * n_expert little-endian float32, layer-major (flashnext_truss_usage.py writes it)
+    static std::vector<float> load_usage(const std::string & path, int n_layer, int n_expert);
 
     ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet & hot);
     ~ExpertStore();

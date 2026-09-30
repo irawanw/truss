@@ -64,11 +64,13 @@ llama-paw function it follows. Checked by `qwen4exp_parity` (160/160, block by b
 **API.**
 
 ```
-Forward(config, weights, n_ctx, max_chunk, expert_budget = 0 (= all free memory − 768 MiB), Activations = Q8_1)
+Forward(config, weights, n_ctx, max_chunk, Options{ expert_budget = 0 (= all free memory − 768 MiB),
+                                             act = Q8_1, expert_usage = {} (ExpertStore::plan) })
 run(tokens, T, hook = nullptr)   // append T tokens (a prompt chunk or a decode step); hook(layer, res, T) per layer
-head(first, n, logits)           // logits [n][vocab] (device fp32) for rows of the last chunk
+head(first, n, logits)           // logits [n][vocab] (device fp32) for rows of the last chunk; Q8_1: one
+                                 // q8_gemv/q8_gemm over the vocab; FP16: q8_gemm_a16 in vocab tiles
 reset()                          // new sequence
-position(), hot_experts(), cold_bytes(), stream()
+position(), hot_experts() (all layers), cold_bytes(), stream()
 ```
 
 `config` and `weights` must outlive it (weights point into the file mapping). Single stream; not thread-safe.

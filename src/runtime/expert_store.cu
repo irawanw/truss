@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -44,17 +45,103 @@ void * device_alloc(size_t bytes, std::vector<void *> & owned)
 
 }  // namespace
 
-ExpertStore::HotSet ExpertStore::plan(const std::vector<ExpertLayer> & layers, size_t budget)
+ExpertStore::HotSet ExpertStore::plan(const std::vector<ExpertLayer> & layers, size_t budget,
+                                      const std::vector<float> & usage)
 {
-    const int n_expert = layers.empty() ? 0 : layers[0][0]->n_expert;
-    int n_hot = n_expert;
-    while (n_hot > 0 && plan_bytes(layers, n_hot) > budget) --n_hot;
-    if (plan_bytes(layers, n_hot) > budget)
+    const int L = (int) layers.size(), n_expert = layers.empty() ? 0 : layers[0][0]->n_expert;
+    if (plan_bytes(layers, 0) > budget)
         throw std::runtime_error("ExpertStore::plan: " + std::to_string(budget >> 20) + " MiB cannot hold even the slots (" +
                                  std::to_string(plan_bytes(layers, 0) >> 20) + " MiB)");
-    HotSet hot(layers.size(), std::vector<uint8_t>(n_expert, 0));
-    for (auto & h : hot) std::fill(h.begin(), h.begin() + n_hot, 1);
+    HotSet hot(L, std::vector<uint8_t>(n_expert, 0));
+    if (usage.empty()) {   // the same count in every layer, index order
+        int n_hot = n_expert;
+        while (n_hot > 0 && plan_bytes(layers, n_hot) > budget) --n_hot;
+        for (auto & h : hot) std::fill(h.begin(), h.begin() + n_hot, 1);
+        return hot;
+    }
+    if (usage.size() != (size_t) L * n_expert)
+        throw std::invalid_argument("ExpertStore::plan: usage has " + std::to_string(usage.size()) + " values, expected " +
+                                    std::to_string((size_t) L * n_expert));
+    // Greedy by routed count per byte over all (layer, expert): the most hits for the budget. Device bytes = hot +
+    // 2 slots (each the largest cold part of any layer, per projection) + scales + meta. A layer with few hot experts
+    // makes both slots large, so every layer first gets its top `floor` experts; the floor with the most hot usage
+    // wins (a pure greedy kept 5,428 experts where index order kept 7,104, TRACKER #56).
+    std::vector<std::array<size_t, 3>> size(L * (size_t) n_expert);
+    std::vector<std::array<size_t, 3>> cold_all(L);
+    size_t fixed = 0;
+    for (int l = 0; l < L; ++l)
+        for (int p = 0; p < 3; ++p) {
+            const formats::ExpertTable & t = *layers[l][p];
+            fixed += scale_bytes(t) + meta_bytes(t);
+            for (int e = 0; e < n_expert; ++e) {
+                size[(size_t) l * n_expert + e][p] = expert_bytes(t, e);
+                cold_all[l][p] += expert_bytes(t, e);
+            }
+        }
+    auto bytes_of = [&](int i) { return size[i][0] + size[i][1] + size[i][2]; };
+    auto better = [&](int a, int b) { return (double) usage[a] / bytes_of(a) > (double) usage[b] / bytes_of(b); };
+    std::vector<int> order(size.size());               // global rank
+    for (size_t i = 0; i < order.size(); ++i) order[i] = (int) i;
+    std::stable_sort(order.begin(), order.end(), better);
+    std::vector<std::vector<int>> by_layer(L);         // per-layer rank
+    for (int i : order) by_layer[i / n_expert].push_back(i);
+
+    auto fill = [&](int floor, HotSet & h) -> double {   // returns the hot usage, h = the hot set
+        std::vector<std::array<size_t, 3>> cold = cold_all;
+        for (auto & x : h) std::fill(x.begin(), x.end(), 0);
+        auto total = [&](size_t hot_bytes) {
+            size_t slot = 0;
+            for (int p = 0; p < 3; ++p) {
+                size_t m = 0;
+                for (int l = 0; l < L; ++l) m = std::max(m, cold[l][p]);
+                slot += m;
+            }
+            return fixed + hot_bytes + 2 * slot;
+        };
+        size_t hot_bytes = 0;
+        double used = 0;
+        auto take = [&](int i) {
+            const int l = i / n_expert;
+            for (int p = 0; p < 3; ++p) cold[l][p] -= size[i][p];
+            hot_bytes += bytes_of(i);
+            h[l][i % n_expert] = 1;
+            used += usage[i];
+        };
+        for (int l = 0; l < L; ++l)
+            for (int j = 0; j < floor; ++j) take(by_layer[l][j]);
+        if (total(hot_bytes) > budget) return -1;
+        for (int i : order) {
+            const int l = i / n_expert;
+            if (h[l][i % n_expert]) continue;
+            for (int p = 0; p < 3; ++p) cold[l][p] -= size[i][p];
+            const bool fits = total(hot_bytes + bytes_of(i)) <= budget;
+            for (int p = 0; p < 3; ++p) cold[l][p] += size[i][p];
+            if (fits) take(i);
+        }
+        return used;
+    };
+    double best = -1;
+    HotSet trial = hot;
+    for (int floor = 0; floor <= n_expert; floor += 8) {
+        const double used = fill(floor, trial);
+        if (used < 0) break;
+        if (used > best) best = used, hot = trial;
+    }
     return hot;
+}
+
+std::vector<float> ExpertStore::load_usage(const std::string & path, int n_layer, int n_expert)
+{
+    std::vector<float> u((size_t) n_layer * n_expert);
+    FILE * f = std::fopen(path.c_str(), "rb");
+    if (!f) throw std::runtime_error("ExpertStore::load_usage: cannot open " + path);
+    const size_t got = std::fread(u.data(), sizeof(float), u.size(), f);
+    const bool extra = std::fgetc(f) != EOF;
+    std::fclose(f);
+    if (got != u.size() || extra)
+        throw std::runtime_error("ExpertStore::load_usage: " + path + " is not " + std::to_string(n_layer) + " x " +
+                                 std::to_string(n_expert) + " float32");
+    return u;
 }
 
 ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet & hot)

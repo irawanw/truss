@@ -28,7 +28,7 @@ class Engine:
     """The model plus the sequence in it; generate() is the only way in and holds the lock."""
 
     def __init__(self, a):
-        self.model = Model(a.model, a.n_ctx, a.chunk)
+        self.model = Model(a.model, a.n_ctx, a.chunk, a.expert_usage)
         self.chat = Chat(a.tokenizer, self.model.meta_string("tokenizer.chat_template"))
         self.stop_ids = {i for i in (self.model.meta_int("tokenizer.ggml.eos_token_id"),
                                      self.chat.token_id("<|im_end|>"), self.chat.token_id("<|endoftext|>"))
@@ -235,6 +235,8 @@ def main():
     ap.add_argument("--tokenizer", required=True, help="HF tokenizer.json of the model family")
     ap.add_argument("--n-ctx", type=int, default=65536)
     ap.add_argument("--chunk", type=int, default=8192, help="prompt tokens per GPU pass")
+    ap.add_argument("--expert-usage", default=None, help="routed counts per expert (float32 [layer][expert]); "
+                    "keeps the most-used experts in VRAM (decode speed)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--name", default="flash-next-truss")

@@ -72,13 +72,13 @@ struct Forward::Impl {
     };
     std::vector<LayerState> st;
     std::unique_ptr<runtime::ExpertStore> experts;
-    int n_hot = 0;
+    int n_hot = 0;                                       // resident experts, all layers
     std::vector<int32_t> tail;                           // the last ple_ngram - 1 tokens seen (PLE window)
 
     const Activations act;
 
-    Impl(const Config & cc, const Weights & ww, int nc, int mc, size_t expert_budget, Activations a)
-        : c(cc), w(ww), n_ctx(nc), max_chunk(mc), scratch(scratch_bytes(cc, mc, nc)), act(a)
+    Impl(const Config & cc, const Weights & ww, int nc, int mc, const Options & o)
+        : c(cc), w(ww), n_ctx(nc), max_chunk(mc), scratch(scratch_bytes(cc, mc, nc)), act(o.act)
     {
         check_shapes();
         TRUSS_CUDA(cudaStreamCreate(&s));
@@ -106,6 +106,7 @@ struct Forward::Impl {
         }
         std::vector<runtime::ExpertLayer> tables;
         for (const Layer & L : w.layers) tables.push_back({ &L.moe.gate, &L.moe.up, &L.moe.down });
+        size_t expert_budget = o.expert_budget;
         if (!expert_budget) {
             size_t free_b, total_b;
             TRUSS_CUDA(cudaMemGetInfo(&free_b, &total_b));
@@ -113,8 +114,8 @@ struct Forward::Impl {
             require(free_b > MARGIN, "no device memory left for the routed experts");
             expert_budget = free_b - MARGIN;
         }
-        const runtime::ExpertStore::HotSet hot = runtime::ExpertStore::plan(tables, expert_budget);
-        n_hot = (int) std::count(hot[0].begin(), hot[0].end(), 1);
+        const runtime::ExpertStore::HotSet hot = runtime::ExpertStore::plan(tables, expert_budget, o.expert_usage);
+        for (const auto & h : hot) n_hot += (int) std::count(h.begin(), h.end(), 1);
         experts = std::make_unique<runtime::ExpertStore>(tables, hot);
     }
 
@@ -395,7 +396,11 @@ struct Forward::Impl {
         float * mixed = scratch.alloc((size_t) n * c.d_model);
         half * mixed16 = scratch.alloc<half>((size_t) n * c.d_model);
         hc_mix(w.hc_head, res + (size_t) first * c.hc_dim(), n, mixed, mixed16, nullptr);
-        // the output matrix in vocab tiles that fit the dequantized-weight scratch
+        if (act == Activations::Q8_1) {   // q8_gemv / q8_gemm write the whole vocab (decode: 0.9 ms vs 4 ms, #56)
+            lin(w.output, mixed16, n, logits);
+            return;
+        }
+        // FP16: the output matrix in vocab tiles that fit the dequantized-weight scratch
         const dense::Q8Matrix & O = q8.at(w.output);
         const int tile = (int) std::min<size_t>(O.out, w16_elems / O.in) / 64 * 64;
         float * part = scratch.alloc((size_t) n * tile);
@@ -463,8 +468,8 @@ struct Forward::Impl {
     }
 };
 
-Forward::Forward(const Config & c, const Weights & w, int n_ctx, int max_chunk, size_t expert_budget, Activations act)
-    : m_(std::make_unique<Impl>(c, w, n_ctx, max_chunk, expert_budget, act))
+Forward::Forward(const Config & c, const Weights & w, int n_ctx, int max_chunk, const Options & o)
+    : m_(std::make_unique<Impl>(c, w, n_ctx, max_chunk, o))
 {
 }
 

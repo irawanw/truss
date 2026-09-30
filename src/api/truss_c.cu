@@ -8,6 +8,7 @@
 #include "model/qwen4exp/config.h"
 #include "model/qwen4exp/forward.h"
 #include "model/qwen4exp/weights.h"
+#include "runtime/expert_store.h"
 
 #include <cuda_runtime.h>
 
@@ -69,7 +70,7 @@ void eval(truss_model & m, const int32_t * tokens, int n)
 
 extern "C" {
 
-truss_model * truss_open(const char * gguf_path, int n_ctx, int max_chunk)
+truss_model * truss_open(const char * gguf_path, int n_ctx, int max_chunk, const char * expert_usage)
 {
     return guarded(
         [&]() -> truss_model * {
@@ -84,7 +85,10 @@ truss_model * truss_open(const char * gguf_path, int n_ctx, int max_chunk)
             if (m->max_chunk <= 0 || n_ctx <= 0) throw std::invalid_argument("n_ctx and max_chunk must be positive");
             TRUSS_CUDA(cudaMalloc(&m->logits, sizeof(float) * m->config.n_vocab));
             TRUSS_CUDA(cudaMalloc(&m->next, sizeof(int)));
-            m->fwd = std::make_unique<q::Forward>(m->config, m->weights, n_ctx, m->max_chunk);
+            q::Forward::Options o;
+            if (expert_usage && *expert_usage)
+                o.expert_usage = runtime::ExpertStore::load_usage(expert_usage, m->config.n_layer, m->config.n_expert);
+            m->fwd = std::make_unique<q::Forward>(m->config, m->weights, n_ctx, m->max_chunk, o);
             return m.release();
         },
         nullptr);

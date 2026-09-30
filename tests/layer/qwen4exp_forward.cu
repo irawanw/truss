@@ -29,6 +29,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -172,7 +173,7 @@ int main(int argc, char ** argv)
         if (mode == "short") {
             std::vector<std::vector<float>> eng;
             {
-                q::Forward p(c, w, 512, 512, 0, q::Activations::FP16);
+                q::Forward p(c, w, 512, 512, { 0, q::Activations::FP16 });
                 double sec;
                 eng = run_engine(p, tok, 512, c.n_layer, row, &sec);
             }
@@ -197,22 +198,32 @@ int main(int argc, char ** argv)
                             ok ? "PASS" : "FAIL");
             }
         } else if (mode == "stream") {
-            std::vector<std::vector<float>> all, streamed;
-            double t_all, t_str;
-            int hot_all, hot_str;
-            size_t cold;
-            for (int pass = 0; pass < 2; ++pass) {
-                q::Forward p(c, w, T, (T + 3) / 4 * 4, pass ? 2ull << 30 : 0);
-                (pass ? streamed : all) = run_engine(p, tok, (T + 3) / 4 * 4, c.n_layer, row, pass ? &t_str : &t_all);
-                (pass ? hot_str : hot_all) = p.hot_experts();
-                if (pass) cold = p.cold_bytes();
+            // all resident vs a 2 GiB budget, first with the index-order hot set, then with a scattered one (random
+            // usage counts: different hot counts per layer, holes in the expert order)
+            std::mt19937 urng(7);
+            std::vector<float> usage((size_t) c.n_layer * c.n_expert);
+            for (float & u : usage) u = (float) (urng() % 1000);
+            std::vector<std::vector<float>> all;
+            for (int pass = 0; pass < 3; ++pass) {
+                q::Forward::Options o;
+                if (pass) o.expert_budget = 2ull << 30;
+                if (pass == 2) o.expert_usage = usage;
+                q::Forward p(c, w, T, (T + 3) / 4 * 4, o);
+                double t;
+                std::vector<std::vector<float>> got = run_engine(p, tok, (T + 3) / 4 * 4, c.n_layer, row, &t);
+                if (!pass) {
+                    all = got;
+                    std::printf("all resident: %d experts\n", p.hot_experts());
+                    continue;
+                }
+                long diff = 0;
+                for (int l = 0; l < c.n_layer; ++l)
+                    for (size_t i = 0; i < all[l].size(); ++i) diff += all[l][i] != got[l][i];
+                fails += diff != 0;
+                std::printf("2 GiB budget, %s hot set: %d experts resident, %.2f GB streamed per chunk: %ld residual "
+                            "values differ  %s\n", pass == 1 ? "index-order" : "usage-ranked", p.hot_experts(),
+                            p.cold_bytes() / 1e9, diff, diff ? "FAIL" : "PASS");
             }
-            long diff = 0;
-            for (int l = 0; l < c.n_layer; ++l)
-                for (size_t i = 0; i < all[l].size(); ++i) diff += all[l][i] != streamed[l][i];
-            fails += diff != 0;
-            std::printf("hot experts per layer: %d (all resident) vs %d (2 GiB budget, %.2f GB streamed per chunk): %ld "
-                        "residual values differ  %s\n", hot_all, hot_str, cold / 1e9, diff, diff ? "FAIL" : "PASS");
         } else if (mode == "decode") {
             const int n_dec = 32, P = T - n_dec, V = c.n_vocab;
             float * d_logits;
@@ -267,11 +278,11 @@ int main(int argc, char ** argv)
             std::vector<std::vector<float>> one, two;
             double t_one, t_two;
             {
-                q::Forward p(c, w, T, (T + 3) / 4 * 4, 0, q::Activations::FP16);
+                q::Forward p(c, w, T, (T + 3) / 4 * 4, { 0, q::Activations::FP16 });
                 one = run_engine(p, tok, T, c.n_layer, row, &t_one);
             }
             {
-                q::Forward p(c, w, T, chunk, 0, q::Activations::FP16);
+                q::Forward p(c, w, T, chunk, { 0, q::Activations::FP16 });
                 two = run_engine(p, tok, chunk, c.n_layer, row, &t_two);
             }
             const DeviceTensors dev(all_but_ple_table(*file, w));

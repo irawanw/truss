@@ -15,8 +15,10 @@ extern "C" {
 
 typedef struct truss_model truss_model;
 
-/* n_ctx: longest sequence; max_chunk: tokens per GPU pass of a prompt (larger = faster prefill, more memory). */
-truss_model * truss_open(const char * gguf_path, int n_ctx, int max_chunk);
+/* n_ctx: longest sequence; max_chunk: tokens per GPU pass of a prompt (larger = faster prefill, more memory).
+   expert_usage: NULL, or a file of routed counts [layer][expert] float32 (flashnext_truss_usage.py); with it the
+   most-used experts stay in VRAM, which sets decode speed. */
+truss_model * truss_open(const char * gguf_path, int n_ctx, int max_chunk, const char * expert_usage);
 void truss_close(truss_model * m);
 const char * truss_last_error(void);
 

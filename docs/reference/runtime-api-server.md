@@ -24,7 +24,8 @@ contiguous in slot order.
 
 | call | does |
 |---|---|
-| `ExpertStore::plan(layers, budget)` | hot set = the first N experts (index order) of every layer, the largest N whose bytes (hot + 2 slots + scales + meta) fit `budget` |
+| `ExpertStore::plan(layers, budget, usage = {})` | hot set whose bytes (hot + 2 slots + scales + meta) fit `budget`. Without usage: the first N experts of every layer (index order). With usage (routed counts [layer][expert]): every layer first gets its top `floor` experts by count per byte, then greedy by count per byte over all layers; the floor (swept in steps of 8) with the most hot usage wins — a layer with few hot experts would make both slots large |
+| `ExpertStore::load_usage(path, n_layer, n_expert)` | reads a usage file: n_layer · n_expert float32, layer-major (`flashnext_truss_usage.py` writes it from a routing capture) |
 | `ExpertStore(layers, hot)` | builds arenas, pinned cold copies, meta tables; uploads suh/svh (all resident) |
 | `weights(l)` | `moe::Weights` for layer l |
 | `prefetch(l)` | copy all of layer l's cold experts into slot l%2 on the store's copy stream, after the slot's last user released it |
@@ -40,8 +41,8 @@ kernel → `release`. Events per slot keep copies and compute ordered across chu
 **Measured.** Full model, 4K chunk: 204/512 experts hot, 23.6 GB streamed per chunk, PCIe 1.75 s vs compute ~1.8 s,
 overlapped → 2,263 tok/s (TRACKER #52). Streamed == resident bit-exact (`qwen4exp_forward stream`).
 
-**Limits / next.** The hot set is index order: for decode, a usage-ranked hot set (CP0b census: 92.7% hit with a
-static set) would cut per-token fetches by ~10×. `plan()` is the only place to change it. The fetch path is
+**Limits / next.** The two slots are sized for whole-layer prefill streaming (~1.2 GB at 150 hot/layer) and are
+dead weight in decode, so a usage-ranked set fits fewer experts than it could (TRACKER #56). The fetch path is
 synchronous per layer (routing must be read back first).
 
 ---
@@ -52,7 +53,7 @@ One `truss_model` = one model file, one sequence, on the current CUDA device (`C
 
 | function | contract |
 |---|---|
-| `truss_open(gguf, n_ctx, max_chunk)` | load (architecture must be `qwen4exp`); NULL on error. `max_chunk` rounded down to a multiple of 4 |
+| `truss_open(gguf, n_ctx, max_chunk, expert_usage)` | load (architecture must be `qwen4exp`); NULL on error. `max_chunk` rounded down to a multiple of 4. `expert_usage`: NULL or a usage file (`ExpertStore::load_usage`) for the hot set |
 | `truss_close(m)` | free everything |
 | `truss_last_error()` | message of the last failure on this thread |
 | `truss_n_vocab`, `truss_n_ctx`, `truss_position` | sizes; tokens in the sequence |
@@ -93,7 +94,8 @@ This is the format `flashnext_strata_bench.py` parses; run the server with `--lo
 runs unchanged against it.
 
 **Run.** `CUDA_VISIBLE_DEVICES=2 python3 -m server.app --model <gguf shard 1> --tokenizer <tokenizer.json>
-[--n-ctx 65536] [--chunk 8192] [--port 8080] [--log file] [--log-tag tag]`. The Flash-Next tokenizer.json in use:
+[--n-ctx 65536] [--chunk 8192] [--expert-usage file] [--port 8080] [--log file] [--log-tag tag]`. Usage file in use:
+`~/ML_projects/flashnext/20260930_truss_tg/data/usage_chatcode64.f32` (32K chatcode tokens). The Flash-Next tokenizer.json in use:
 `/data/www/Qwen3.8-27B-DFlash2-EXL3-5.0bpw/models/Qwen3.8-27B-EXL3-3.5bpw/tokenizer.json` (same 248,077 tokens as
 the GGUF; checked token-for-token against llama-tokenize on 7.5K tokens of code with special tokens).
 

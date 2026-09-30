@@ -15,12 +15,13 @@ class TrussError(RuntimeError):
 
 
 class Model:
-    def __init__(self, gguf_path: str, n_ctx: int, max_chunk: int, lib_path: str = _DEFAULT_LIB):
+    def __init__(self, gguf_path: str, n_ctx: int, max_chunk: int, expert_usage: str | None = None,
+                 lib_path: str = _DEFAULT_LIB):
         lib = ctypes.CDLL(os.path.abspath(lib_path))
         c_int, c_i64, p = ctypes.c_int, ctypes.c_int64, ctypes.c_void_p
         i32p, f32p = ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_float)
         sig = {
-            "truss_open": (p, [ctypes.c_char_p, c_int, c_int]),
+            "truss_open": (p, [ctypes.c_char_p, c_int, c_int, ctypes.c_char_p]),
             "truss_close": (None, [p]),
             "truss_last_error": (ctypes.c_char_p, []),
             "truss_n_vocab": (c_int, [p]),
@@ -36,7 +37,7 @@ class Model:
             fn = getattr(lib, name)
             fn.restype, fn.argtypes = res, args
         self._lib = lib
-        self._m = lib.truss_open(gguf_path.encode(), n_ctx, max_chunk)
+        self._m = lib.truss_open(gguf_path.encode(), n_ctx, max_chunk, expert_usage.encode() if expert_usage else None)
         if not self._m:
             raise TrussError(self._error())
         self.n_vocab = lib.truss_n_vocab(self._m)

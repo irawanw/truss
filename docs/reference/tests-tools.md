@@ -32,7 +32,7 @@ BASE = /mnt/hdd/ml/flashnext/20260920_dense_codec_requant/data/20260923_q4k_rete
 |---|---|---|
 | `qwen4exp_parity` | every reference block fed llama-paw's own input vs llama's output (hc, GDN, DSA, PLE, router, experts, shared, combine), plus `moe_window` vs llama and fp32; gates 1e-3 / 3e-3 (FFN) / 1e-2 (amplified chains), TRACKER #34 | `qwen4exp_parity $S $D/llama_dump_v1` → 160/160 |
 | `qwen4exp_dsa_long` | DSA at 3,659 tokens: A selection rule on llama's indexer (near-tie swaps ≤ 1e-3), B attention vs llama within 2× its fp16 noise, C end to end, D the fast op on real data | `qwen4exp_dsa_long $S $D/llama_dump_long3k` |
-| `qwen4exp_forward` | the engine chain (modes `short`, `stream`, `decode`, `long`; model-qwen4exp.md) | `qwen4exp_forward $S short $D/llama_dump_v1` etc. |
+| `qwen4exp_forward` | the engine chain (modes `short`, `stream` (all resident == 2 GiB budget with index-order and scattered usage-ranked hot sets, bit-exact), `decode` (needs > 32 tokens: `llama_dump_chunk8`), `long`; model-qwen4exp.md) | `qwen4exp_forward $S short $D/llama_dump_v1`, `... decode $D/llama_dump_chunk8` etc. |
 | `dump.h` | reader for llama_dump output (`get(name)`, `tokens()`) | — |
 
 ## Tools
@@ -40,7 +40,9 @@ BASE = /mnt/hdd/ml/flashnext/20260920_dense_codec_requant/data/20260923_q4k_rete
 | tool | what | run |
 |---|---|---|
 | `tk-bench-prefill` (`tools/tk-bench/prefill.cu`) | full-model or slice prefill throughput (warm-up + timed pass, random tokens); prints hot experts and streamed GB | `tk-bench-prefill $M 4096 4096 [budget MiB] [q8\|fp16]`; under `nsys profile` for the per-kernel split |
-| `tk-bench-ceiling` | decode ceiling per codec rate from registers; stream ceiling per access pattern | `tk-bench-ceiling` |
+| `tk-bench-decode` (`tools/tk-bench/decode.cu`) | greedy decode speed: prompt (N random or `@ids.i32`, e.g. `20260930_truss_tg/data/prompt_code4k.i32` from `flashnext_truss_prompt_ids.py`), then 1-token steps with device argmax; mean/median/min/max ms | `tk-bench-decode $M @prompt.i32 64 65536 8192 [usage\|-] [budget MiB]` |
+| `tk-bench-ceiling` | decode ceiling per codec rate from registers; stream ceiling per access pattern | `tk-bench-decode` (`tools/tk-bench/decode.cu`) | greedy decode speed: prompt (N random or `@ids.i32`, e.g. `20260930_truss_tg/data/prompt_code4k.i32` from `flashnext_truss_prompt_ids.py`), then 1-token steps with device argmax; mean/median/min/max ms | `tk-bench-decode $M @prompt.i32 64 65536 8192 [usage\|-] [budget MiB]` |
+| `tk-bench-ceiling` |
 | `tk-bench-moe-trace` | timeline of one `moe::window` launch from the kernel's own trace | `tk-bench-moe-trace [rows] [K]` |
 | `tk-parity-kl` (`tools/tk-parity/kl_vs_base.cu`) | full-model KL / top-1 / perplexity vs a llama-perplexity `--kl-divergence-base` file | `tk-parity-kl $M $BASE [chunks] [first] [q8\|fp16]` (~8 s per 2048-token chunk) |
 | `tk-parity-llama-dump` | llama-paw activations for parity (one ubatch, every row an output) from a prompt or `@ids.i32` | `tk-parity-llama-dump $S out_dir "<prompt>"` or `@file.i32` |
