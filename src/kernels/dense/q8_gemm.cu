@@ -232,7 +232,42 @@ __global__ void rows_kernel(const int8_t * __restrict__ q, const half * __restri
         out[(size_t) blockIdx.x * in + i] = q[r * in + i] * __half2float(d[r * (in / 32) + i / 32]);
 }
 
+// one warp per output o; lane l reads float4 l, l + 32, ... of W's row; rows in groups of 8 (W re-read per group)
+__global__ void __launch_bounds__(128) f32_gemv_kernel(const float * __restrict__ W, int in, int out,
+                                                       const float * __restrict__ x, int rows, float * __restrict__ y)
+{
+    const int o = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (o >= out) return;
+    const float4 * w = reinterpret_cast<const float4 *>(W + (size_t) o * in);
+    for (int r0 = 0; r0 < rows; r0 += 8) {
+        const int R = min(8, rows - r0);
+        float acc[8] = {};
+        for (int i = lane; i < in / 4; i += 32) {
+            const float4 a = __ldg(w + i);
+#pragma unroll
+            for (int r = 0; r < 8; ++r)
+                if (r < R) {
+                    const float4 b = reinterpret_cast<const float4 *>(x + (size_t) (r0 + r) * in)[i];
+                    acc[r] += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+                }
+        }
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            float v = acc[r];
+            for (int m = 16; m; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
+            if (r < R && lane == 0) y[(size_t) (r0 + r) * out + o] = v;
+        }
+    }
+}
+
 }  // namespace
+
+void f32_gemv(const float * W, int in, int out, const float * x, int rows, float * y, cudaStream_t stream)
+{
+    if (in % 128) throw std::runtime_error("f32_gemv: in must be a multiple of 128");
+    f32_gemv_kernel<<<(out + 3) / 4, 128, 0, stream>>>(W, in, out, x, rows, y);
+    TRUSS_CUDA(cudaGetLastError());
+}
 
 void q8_gemv(const Q8Matrix & W, const int8_t * xq, const half * xd, int rows, float * y, cudaStream_t stream)
 {

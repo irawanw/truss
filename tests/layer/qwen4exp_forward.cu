@@ -251,6 +251,86 @@ int main(int argc, char ** argv)
                             p.cold_bytes() / 1e9, st.misses, diff, ldiff, diff || ldiff ? "FAIL" : "PASS");
             }
             cudaFree(d_logits);
+        } else if (mode == "cpu") {
+            // CPU tier (needs argv[4] = the q4s dir, llama_dump_chunk8; TRUSS_TEST_NO_CPU=1 runs the same without it):
+            // with a 3 GiB budget and the rarest half of the non-resident routing mass on the CPU, 16 single-token
+            // steps, 4 runs of 4 tokens and 4 verify windows of 4 (accepting every row) must give identical logits,
+            // close to all-resident ones.
+            if (argc < 5) throw std::runtime_error("cpu mode: pass the q4s directory");
+            const int n_dec = 16, P = T - n_dec, V = c.n_vocab;
+            require_tokens(T, n_dec + 33);
+            std::mt19937 urng(3);
+            std::vector<float> usage((size_t) c.n_layer * c.n_expert);
+            for (float & u : usage) u = (float) (urng() % 1000);
+            float * d_logits;
+            TRUSS_CUDA(cudaMalloc(&d_logits, (size_t) n_dec * V * 4));
+            std::vector<float> ref((size_t) n_dec * V), step((size_t) n_dec * V), win((size_t) n_dec * V);
+            {
+                q::Forward p(c, w, T, (T + 3) / 4 * 4);   // all resident: the prompt, then the 16 rows as one chunk
+                p.run(tok.data(), P);
+                p.run(tok.data() + P, n_dec);
+                p.head(0, n_dec, d_logits);
+                TRUSS_CUDA(cudaMemcpy(ref.data(), d_logits, ref.size() * 4, cudaMemcpyDeviceToHost));
+            }
+            std::vector<float> chunk4((size_t) n_dec * V);
+            for (int pass = 0; pass < 3; ++pass) {   // 1-token steps, verify windows of 4, plain 4-token runs
+                q::Forward::Options o;
+                o.expert_budget = 3ull << 30, o.ring_bytes = 0, o.expert_usage = usage;
+                if (!getenv("TRUSS_TEST_NO_CPU")) o.cpu_dir = argv[4];
+                o.spec_rows = 4, o.cpu_threads = 8;
+                q::Forward p(c, w, T, 64, o);
+                for (int s0 = 0; s0 < P; s0 += 64) p.run(tok.data() + s0, std::min(64, P - s0));
+                std::vector<float> & out = pass == 2 ? chunk4 : pass ? win : step;
+                for (int i = 0; i < n_dec;) {
+                    if (pass == 2) {
+                        p.run(tok.data() + P + i, 4);
+                        p.head(0, 4, d_logits);
+                        TRUSS_CUDA(cudaMemcpy(out.data() + (size_t) i * V, d_logits, (size_t) 4 * V * 4, cudaMemcpyDeviceToHost));
+                        i += 4;
+                    } else if (!pass) {
+                        p.run(tok.data() + P + i, 1);
+                        p.head(0, 1, d_logits);
+                        TRUSS_CUDA(cudaMemcpy(out.data() + (size_t) i * V, d_logits, (size_t) V * 4, cudaMemcpyDeviceToHost));
+                        ++i;
+                    } else {
+                        p.verify(tok.data() + P + i, 4);
+                        p.head(0, 4, d_logits);
+                        p.accept(4);
+                        TRUSS_CUDA(cudaMemcpy(out.data() + (size_t) i * V, d_logits, (size_t) 4 * V * 4, cudaMemcpyDeviceToHost));
+                        i += 4;
+                    }
+                }
+            }
+            // bit-exact: every decode-path op is row-invariant (the router too, dense::f32_gemv, TRACKER #60)
+            double dn = 0, dd = 0;
+            for (size_t i = 0; i < step.size(); ++i) dn += (double) (step[i] - win[i]) * (step[i] - win[i]), dd += (double) step[i] * step[i];
+            const double diff = std::sqrt(dn / std::max(dd, 1e-30));
+            auto relv = [&](const std::vector<float> & a, const std::vector<float> & b) {
+                double n = 0, d = 0;
+                for (size_t i = 0; i < a.size(); ++i) n += (double) (a[i] - b[i]) * (a[i] - b[i]), d += (double) a[i] * a[i];
+                return std::sqrt(n / std::max(d, 1e-30));
+            };
+            std::printf("  steps vs 4-token runs rel %.1e, 4-token runs vs verify windows rel %.1e\n", relv(step, chunk4),
+                        relv(chunk4, win));
+            double kl = 0;
+            int same = 0;
+            for (int i = 0; i < n_dec; ++i) {
+                const float * a = ref.data() + (size_t) i * V, * b = step.data() + (size_t) i * V;
+                const float ma = *std::max_element(a, a + V), mb = *std::max_element(b, b + V);
+                double za = 0, zb = 0;
+                for (int v = 0; v < V; ++v) za += std::exp(a[v] - ma), zb += std::exp(b[v] - mb);
+                for (int v = 0; v < V; ++v) {
+                    const double pa = std::exp(a[v] - ma) / za;
+                    if (pa > 0) kl += pa * ((a[v] - ma - std::log(za)) - (b[v] - mb - std::log(zb)));
+                }
+                same += std::max_element(a, a + V) - a == std::max_element(b, b + V) - b;
+            }
+            kl /= n_dec;
+            const bool ok = diff == 0 && relv(step, chunk4) == 0 && kl < 0.05;
+            fails += !ok;
+            std::printf("%s: 1-token steps vs 4-row windows rel %.1e; vs all-resident GPU: KL %.2e, top-1 %d/%d  %s\n",
+                        getenv("TRUSS_TEST_NO_CPU") ? "no CPU tier" : "CPU tier", diff, kl, same, n_dec, ok ? "PASS" : "FAIL");
+            cudaFree(d_logits);
         } else if (mode == "decode") {
             const int n_dec = 32, P = T - n_dec, V = c.n_vocab;
             float * d_logits;

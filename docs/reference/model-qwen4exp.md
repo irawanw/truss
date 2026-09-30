@@ -90,7 +90,7 @@ profile_routes(on), route_counts()   // routing profile [layer][expert] (the usa
 | member | content |
 |---|---|
 | `dev` | `DeviceTensors` for norms, F32/F16 tensors, conv weights (not Q8_0 matrices, not experts) |
-| `q8` | map tensor → `dense::Q8Matrix`, all Q8_0 matrices repacked at load (one staging buffer) |
+| `q8` | map tensor → `dense::Q8Matrix`, all Q8_0 matrices repacked at load (one staging buffer). The token embedding (untied) is repacked through temporaries into pinned mapped host memory: the gather reads one 2.7 KB row per token over PCIe and its 0.68 GB of VRAM goes to the expert cache |
 | `experts` | `runtime::ExpertStore` (hot/cold routed experts; runtime-api-server.md) |
 | `st[l]` | per-layer state: DSA `k`, `v` fp16 [n_ctx][2][256], `idx_k` [n_ctx/4][128], `idx_partial` [3][128]; GDN `state` [48][128][128] fp32, `conv` [3][10240]; PLE `ple_hist` [9][10240] |
 | `small`, `big` (`Buffers`) | per-chunk scratch (`scratch_bytes`: per-token peak of the widest block + DSA select and split-attention workspaces), `moe::prefill` workspace, residual [rows][4][2560]. `small` is resident, sized for 32 rows (decode, verify windows); `big` (max_chunk rows) lives in the ExpertStore ring's spare region and exists only during prompt chunks. `use()` selects one per `run`; the residual persists after `run` for `head` |
@@ -99,6 +99,9 @@ profile_routes(on), route_counts()   // routing profile [layer][expert] (the usa
 
 **Per chunk.** See the table in [README.md](README.md). Mode choices inside:
 - `lin`: Q8_1 → `q8_gemv` (≤ 8 rows) / `q8_gemm`; FP16 → `q8_gemm_a16`. `lin32`: cuBLAS SGEMM for F32 weights.
+  An input read by several projections is quantized once (`quant()` → `Act`, in the caller's scratch scope): GDN
+  qkv/gate/alpha/beta, DSA q/k/v/indexer, hc down + inject, shared gate + up, PLE key + value.
+- MTP drafts may score only token ids < `Options::draft_vocab` (the head reads that share of the output matrix).
 - FFN residency: `fetch_mode(T)` = T ≤ `FETCH_ROWS` (32): read routing back (with layer l+1's router applied to this
   layer's input: pre-gating predicts 72% of its experts; each row's top `hint_k` go to `ExpertStore::prefetch_hint`),
   `ExpertStore::fetch` the routed cold experts, then `moe::window` (T ≤ 8) or `moe::prefill`; otherwise whole layers stream (`prefetch(0), prefetch(1)`

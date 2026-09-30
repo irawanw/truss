@@ -113,3 +113,41 @@ the GGUF; checked token-for-token against llama-tokenize on 7.5K tokens of code 
 
 **Known limits.** Single sequence; no rewind (multi-turn chats whose history re-renders differently start over);
 decode 33 tok/s at #57 (TRACKER #56+ for the speed work).
+
+---
+
+## `src/cpu/expert_q4.h`, `expert_q4.cc` — CPU tier for routed experts (decode)
+
+**Why.** Decode misses cost PCIe bytes (x8, 13.5 GB/s): ~200 MB per generated token with the 2.63-bpw pack, far
+above what 100+ tok/s allows (TRACKER #59). This box's CPU reads RAM at ~50 GB/s even beside the renters, so the rarest
+experts are computed on the host instead. Their 4-bit copies come from the BF16 originals: weight NMSE ~0.009 per
+matrix, about the pack's K4 trellis (0.0097) and far below the K1/K2 (0.375/0.100) the pack gives rare experts — the
+tier lowers error as well as adding miss bandwidth.
+
+**Format q4s** (`flashnext_truss_cpu_q4.py`, one `L<nn>.q4s` per layer, experts in order, `EXPERT_BYTES` = 2,764,800
+each): per matrix [rows][cols] (out × in), blocks of 32 along the input: 16 bytes of nibbles (element i in the low
+nibble of byte i for i < 16, the high nibble of byte i − 16 otherwise; value (nibble − 8)·d) and one fp16 d per
+block (chosen by squared error among amax/7 × {0.85 … 1.1}). Expert = gate q, gate d, up q, up d (640 × 2560), down
+q, down d (2560 × 640).
+
+**API.** `expert_view(bytes)` → `Q4Expert`; `ExpertPool(threads)`; `start(x [T][2560], T ≤ 8, slots {row, expert,
+w}, y [T][2560])` returns at once, `wait()` blocks (the caller works on items meanwhile); `run` = both.
+
+**Work split.** Slots are grouped by expert. Phase 0 items: an expert's gate and up rows in chunks of 64 (10 per
+expert) → h = silu(gate)·up. Phase 1 items: h quantized, down rows in chunks of 256 (10 per expert). Then y[row] =
+Σ over the row's slots in slot order of w·out.
+
+**Numerics.** x and h quantized per 32-block to int8 (d = amax/127, as the GPU's Q8_1), int32 dots (AVX2 maddubs),
+fp32 scaling. Rows are independent and summed in slot order, so a verify window equals single steps
+(`cpu_expert_test`: rel 2e-7 vs a double reference; each row bit-identical to its 1-row call).
+
+**In Forward (Options::cpu_dir, cpu_share, cpu_threads).** At load, per layer, the non-resident experts in ascending
+usage until they hold `cpu_share` of the layer's non-resident routing mass are the CPU set (static: results never
+depend on cache state); their q4s bytes are read into RAM. Decode layers (fetch mode): the FFN input rows and routing
+weights come to the host in the routing sync; CPU slots go to the pool; the GPU kernel gets the same routing with
+those slots masked (weight 0, id of an expert already in the row, so no extra work); the CPU sum is added to the
+routed output before the shared-expert combine. Prompt chunks (stream mode) compute every expert on the GPU from the
+trellis pack. The MTP block has no CPU tier.
+
+**Speed.** `cpu_expert_test` timing: 4 rows × 8 experts in ~0.93 ms with 8 threads + caller (converter running
+beside it). Probe (`tools/tk-bench/cpu_q4.cc`): 8 threads 10.3 experts/ms at 4 rows, 16 threads 16.8.

@@ -25,6 +25,7 @@ GGUF stores Q8_0 as interleaved 34-byte blocks (fp16 d + 32 int8), which cannot 
 | `q8_quantize_act(x, rows, in, xq, xd, stream)` (fp32 or **fp16** x overloads) | x [rows][in] → xq int8 [rows][in], xd fp16 [rows][in/32] | llama's Q8_1: d = amax/127, q = round(x/d) | 0.02–0.6 ms per matmul at 8K rows |
 | `q8_gemm(W, xq, xd, rows, y, stream)` | y fp32 [rows][out] = W·x; any rows/out, `in % 64 == 0` | **exactly llama-paw's** (int32 block dot, fp32 fold `acc += c·d_w·d_x`), = `ref::linear(LLAMA)` to 3e-7 | 65–94 TOPS at 8K rows (TRACKER #43) |
 | `q8_gemv(W, xq, xd, rows ≤ GEMV_ROWS = 8, y, stream)` | same as q8_gemm for decode rows | same, only fp32 summation order differs (= q8_gemm to 1.8e-7) | 740–790 GB/s on the big shapes (~85% of peak) (TRACKER #54) |
+| `f32_gemv(W, in, out, x, rows, y, stream)` | fp32 W [out][in] · x for decode-sized rows (router, shared-expert gate) | one warp per output, fixed reduction order: row-invariant, unlike cuBLAS SGEMM, whose algorithm depends on the row count (it flipped near-tied experts: 1-token steps vs 4-token windows differed by 3% rel in logits, TRACKER #60) | `Forward::lin32` uses it for ≤ 32 rows, cuBLAS above |
 | `q8_gemm_a16(W, x_half, rows, y, w16, cublas, stream)` | fp16 activations: dequantize W to `w16` (scratch, in·out halfs) then `cublasGemmEx` fp16 in / fp32 accumulate | one fp16 rounding of each weight (≤ 2^-12 rel); no activation quantization | 47–71 TFLOPS (TRACKER #44) |
 | `q8_rows(W, ids, n, out, stream)` | out fp32 [n][in] = rows `ids` of W (token embedding) | exact | — |
 

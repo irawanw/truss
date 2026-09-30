@@ -9,6 +9,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <cstdint>
+
 namespace truss::ffn {
 
 // logits [T][E] -> ids, wts [T][k]. E % 32 == 0, E <= 1024, k <= 32.
@@ -20,6 +22,9 @@ void swiglu(const float * g, const float * u, int n, half * mid16, cudaStream_t 
 // out [T][d] = routed + y * sigmoid(gate [T])
 void shared_add(const float * routed, const float * y, const float * gate, int T, int d, float * out,
                 cudaStream_t stream);
+
+// y [n] += x [n]
+void add(float * y, const float * x, int n, cudaStream_t stream);
 
 // counts [E] += how often each id appears in ids [n] (float: a profile of many tokens stays exact up to 2^24 per id)
 void count(const int * ids, int n, float * counts, cudaStream_t stream);

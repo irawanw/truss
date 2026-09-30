@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace truss::qwen4exp {
@@ -38,6 +39,14 @@ struct ForwardOptions {
                                               // prefill's two stream slots (grown to fit them if smaller)
     const Mtp * mtp = nullptr;                // MTP draft block (bind_mtp; must outlive the Forward): draft() works
     int spec_rows = 0;                        // > 0: verify() / accept() for windows of up to spec_rows (<= 8) rows
+    // CPU tier (decode): the rarest non-resident experts of each layer, together cpu_share of the layer's
+    // non-resident routing mass (by expert_usage), are always computed on the host from 4-bit copies (cpu_dir:
+    // L<nn>.q4s from flashnext_truss_cpu_q4.py) by cpu_threads threads, beside the GPU. Empty dir: off.
+    std::string cpu_dir;
+    float cpu_share = 0.5f;
+    int cpu_threads = 12;
+    int draft_vocab = 0;                      // MTP drafts score only token ids < draft_vocab (0: all): the draft head
+                                              // reads that share of the output matrix; verify keeps the output exact
     int hint_k = 4;                           // pre-gated prefetch: per row, the next layer's top hint_k predicted
                                               // experts start copying early (0: off; 3-6 measured equal, TRACKER #59)
 };

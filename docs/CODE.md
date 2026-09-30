@@ -32,6 +32,7 @@ reference page adds how it fits with the rest.
 | codec study or prototype codec (not used by `src/`) | `tools/codec-lab/` | `viterbi_mse.cu`, `proto_v2pair.cuh` |
 | results, logs, reports | `~/ML_projects/flashnext/<date>_truss_cpN/` (STORAGE.md), never in this repo | |
 | engine runtime (residency, scheduling) | `src/runtime/<name>.{h,cu}` | `expert_store.cu` |
+| host-side compute (CPU tier; AVX2/FMA/F16C, `truss_cpu` library) | `src/cpu/<name>.{h,cc}` | `expert_q4.cc` |
 | public C API / its implementation | `include/truss/truss.h` / `src/api/` | `truss_c.cu` |
 | HTTP server | `server/` (Python, binds libtruss.so) | `app.py` |
 

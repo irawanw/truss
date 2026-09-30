@@ -2,7 +2,7 @@
 // way; the token sequences must be identical (verify windows, rollback and the MTP cache must not change the
 // output), and the speculative run's speed and tokens per verify pass are printed. Exit code 1 on a mismatch.
 // usage: tk-bench-spec <model.gguf> <mtp.gguf> @prompt.i32 [tokens=128] [drafts=3] [usage file|-] [n_ctx=65536]
-//                      [chunk=8192]
+//                      [chunk=8192] [draft vocab=0 (all)] [cpu tier dir|-]
 #include "core/cuda_check.h"
 #include "kernels/sampling/argmax.cuh"
 #include "model/qwen4exp/config.h"
@@ -79,9 +79,13 @@ int main(int argc, char ** argv)
         const std::vector<int32_t> tok = read_ids(argv[3]);
         const int N = argc > 4 ? std::atoi(argv[4]) : 128, nd = argc > 5 ? std::atoi(argv[5]) : 3;
         const int n_ctx = argc > 7 ? std::atoi(argv[7]) : 65536, chunk = argc > 8 ? std::atoi(argv[8]) : 8192;
+        const int draft_vocab = argc > 9 ? std::atoi(argv[9]) : 0;
+        const std::string cpu_dir = argc > 10 && std::string(argv[10]) != "-" ? argv[10] : "";
         q::Forward::Options o;
         o.mtp = &mtp;
         o.spec_rows = nd + 1;
+        o.draft_vocab = draft_vocab;
+        o.cpu_dir = cpu_dir;
         if (argc > 6 && std::string(argv[6]) != "-")
             o.expert_usage = runtime::ExpertStore::load_usage(argv[6], c.n_layer, c.n_expert);   // MTP: Forward adds
                                                                                                // the mean layer

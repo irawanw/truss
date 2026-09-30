@@ -74,6 +74,12 @@ __global__ void shared_add_kernel(const float * routed, const float * y, const f
     if (i < (int64_t) T * d) out[i] = routed[i] + y[i] * sigmoid(gate[i / d]);
 }
 
+__global__ void add_kernel(float * y, const float * x, int n)
+{
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] += x[i];
+}
+
 __global__ void count_kernel(const int * ids, int n, float * counts)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -81,6 +87,12 @@ __global__ void count_kernel(const int * ids, int n, float * counts)
 }
 
 }  // namespace
+
+void add(float * y, const float * x, int n, cudaStream_t stream)
+{
+    add_kernel<<<grid(n), THREADS, 0, stream>>>(y, x, n);
+    TRUSS_CUDA(cudaGetLastError());
+}
 
 void count(const int * ids, int n, float * counts, cudaStream_t stream)
 {

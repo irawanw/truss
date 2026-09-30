@@ -23,6 +23,7 @@ BASE = /mnt/hdd/ml/flashnext/20260920_dense_codec_requant/data/20260923_q4k_rete
 | `q8_gemm_test` | 8 dense shapes: q8_gemm vs ref LLAMA, a16 vs ref FP32, gemv vs q8_gemm; a16 prefix variance; timings | 1e-5 / 3e-4 / 1e-6 | `q8_gemm_test [timing rows]` |
 | `gdn_prefill_test` | `gdn::delta_rule` vs `ref::gated_delta_rule` (outputs and final state) | 1e-5 | `gdn_prefill_test [T...]` |
 | `dsa_prefill_test` | `dsa::select` / `dsa::attention` vs reference, incl. a later chunk and the split (≤ 32 rows) path at 1 / 13 / 32 rows; timing to 32K incl. decode steps | see kernels-mixers.md | `dsa_prefill_test` |
+| `cpu_expert_test` | `cpu::ExpertPool` vs a double reference on random q4s experts (1/4/8 rows, shared experts, empty rows); each row equals its 1-row call; timing of 4 rows × 8 experts | rel ≤ 2e-3 (measured 2e-7), rows bit-identical | `cpu_expert_test` |
 | `codec_v2one_test` | v2one pack/decode/encode bit-exact; encoder MSE | lab + 10% | `codec_v2one_test [tiles]` |
 | `gguf_reader_check.py` | `gguf::File` vs gguf-py, every tensor | exact | `python3 tests/unit/gguf_reader_check.py build/tk-pack-inspect $M` |
 
@@ -32,7 +33,7 @@ BASE = /mnt/hdd/ml/flashnext/20260920_dense_codec_requant/data/20260923_q4k_rete
 |---|---|---|
 | `qwen4exp_parity` | every reference block fed llama-paw's own input vs llama's output (hc, GDN, DSA, PLE, router, experts, shared, combine), plus `moe_window` vs llama and fp32; gates 1e-3 / 3e-3 (FFN) / 1e-2 (amplified chains), TRACKER #34 | `qwen4exp_parity $S $D/llama_dump_v1` → 160/160 |
 | `qwen4exp_dsa_long` | DSA at 3,659 tokens: A selection rule on llama's indexer (near-tie swaps ≤ 1e-3), B attention vs llama within 2× its fp16 noise, C end to end, D the fast op on real data | `qwen4exp_dsa_long $S $D/llama_dump_long3k` |
-| `qwen4exp_forward` | the engine chain (modes `short`, `stream` (needs `llama_dump_chunk8`: 64-token prompt chunks through the ring slots, then 48 decode steps through the ring; all resident == 3 GiB budget with index-order + 1 GiB ring and scattered usage-ranked hot set + smallest ring (wraps), residuals and logits bit-exact), `decode` (needs > 32 tokens: `llama_dump_chunk8`), `long`; model-qwen4exp.md) | `qwen4exp_forward $S short $D/llama_dump_v1`, `... decode $D/llama_dump_chunk8` etc. |
+| `qwen4exp_forward` | the engine chain (modes `short`, `stream` (needs `llama_dump_chunk8`: 64-token prompt chunks through the ring slots, then 48 decode steps through the ring; all resident == 3 GiB budget with index-order + 1 GiB ring and scattered usage-ranked hot set + smallest ring (wraps), residuals and logits bit-exact), `decode` (needs > 32 tokens: `llama_dump_chunk8`), `cpu` (CPU tier, argv[4] = q4s dir; `TRUSS_TEST_NO_CPU=1` without it: 1-token steps, 4-token runs and 4-row verify windows must give bit-identical logits; KL vs all-resident), `long`; model-qwen4exp.md) | `qwen4exp_forward $S short $D/llama_dump_v1`, `... decode $D/llama_dump_chunk8` etc. |
 | `dump.h` | reader for llama_dump output (`get(name)`, `tokens()`) | — |
 
 ## Tools
@@ -49,7 +50,7 @@ BASE = /mnt/hdd/ml/flashnext/20260920_dense_codec_requant/data/20260923_q4k_rete
 | `tk-bench-spec` (`tools/tk-bench/spec.cu`) | MTP speculative greedy decode vs plain greedy on the full model: token sequences must be identical (exit 1 otherwise); tok/s both ways, tokens per pass, drafts accepted, experts fetched per pass | `tk-bench-spec $M $MTP @prompt.i32 [tokens=128] [drafts=3] [usage\|-]`; MTP = `20260930_truss_tg/data/mtp_x3/flashnext-mtp-x3k3.gguf` |
 | `tk-bench-ceiling` |
 | `tk-bench-moe-trace` | timeline of one `moe::window` launch from the kernel's own trace | `tk-bench-moe-trace [rows] [K]` |
-| `tk-parity-kl` (`tools/tk-parity/kl_vs_base.cu`) | full-model KL / top-1 / perplexity vs a llama-perplexity `--kl-divergence-base` file | `tk-parity-kl $M $BASE [chunks] [first] [q8\|fp16]` (~8 s per 2048-token chunk) |
+| `tk-parity-kl` (`tools/tk-parity/kl_vs_base.cu`) | full-model KL / top-1 / perplexity vs a llama-perplexity `--kl-divergence-base` file; `step` > 0 scores the second half of each chunk in runs of `step` tokens (≤ 32: the decode path with fetch, ring and CPU tier) | `tk-parity-kl $M $BASE [chunks] [first] [q8\|fp16] [step] [usage\|-] [cpu dir\|-]` (~8 s per 2048-token chunk) |
 | `tk-parity-llama-dump` | llama-paw activations for parity (one ubatch, every row an output) from a prompt or `@ids.i32` | `tk-parity-llama-dump $S out_dir "<prompt>"` or `@file.i32` |
 | `slice_gguf.py` | cut an N-layer slice of a GGUF (hard-links the PLE shard) | `python3 tools/tk-parity/slice_gguf.py ...` |
 | `tk-pack-inspect` | catalog and budget of a model file, trellis table checks, binding check; `list` for the reader check | `tk-pack-inspect $M [list]` |

@@ -35,6 +35,7 @@ namespace {
 
 constexpr int THREADS = 256, WARPS = THREADS / 32;
 constexpr int MAX_EXPERTS = 1024;          // host check only
+constexpr unsigned char SKIP = 0xff;       // pair_slot of a skipped pair (expert id < 0)
 
 __device__ __forceinline__ unsigned long long now_ns()
 {
@@ -140,7 +141,8 @@ struct Route {
 };
 
 // Pair j = (row j / TOPK, choice j % TOPK). A pair opens a slot iff no earlier pair routes to its expert; slots are
-// numbered in scan order (prefix count of openers) and hold their rows in scan order.
+// numbered in scan order (prefix count of openers) and hold their rows in scan order. A pair with expert id < 0 is
+// skipped (no slot, adds nothing): the caller computes it elsewhere (the CPU tier).
 template <class Shape>
 __device__ __noinline__ void build_route(const int * __restrict__ ids, const float * __restrict__ wts, int n_rows,
                             const Weights & W, Route<Shape> & R)
@@ -155,7 +157,7 @@ __device__ __noinline__ void build_route(const int * __restrict__ ids, const flo
     if (j < n_pairs)
         for (int k = 0; k < j; ++k)
             if (s_ids[k] == e) { if (earlier == 0) first = k; ++earlier; }
-    const bool opens = j < n_pairs && first == j;
+    const bool opens = j < n_pairs && e >= 0 && first == j;
     const unsigned ballot = __ballot_sync(0xffffffffu, opens);
     if (lane == 0) s_warp_open[warp] = __popc(ballot);
     __syncthreads();
@@ -174,7 +176,8 @@ __device__ __noinline__ void build_route(const int * __restrict__ ids, const flo
         R.pair_slot[j] = (unsigned char) my_slot;
     }
     __syncthreads();
-    if (j < n_pairs) {
+    if (j < n_pairs && e < 0) R.pair_slot[j] = SKIP;
+    if (j < n_pairs && e >= 0) {
         const int sl = R.pair_slot[first];
         R.pair_slot[j] = (unsigned char) sl;
         R.pair_idx[j] = (unsigned char) earlier;
@@ -443,6 +446,7 @@ __device__ __noinline__ void run_combine(const Route<Shape> & R, int n_rows, int
         float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
         for (int s = 0; s < P::TOPK; ++s) {
             const int j = row * P::TOPK + s, sl = R.pair_slot[j], i = R.pair_idx[j];
+            if (sl == SKIP) continue;
             const Slot & S = R.slot[sl];
             float4 v = __ldcg((const float4 *) (C_d + ((size_t) sl * MAX_ROWS + i) * D + c0));
             const float4 f = h4_to_f4(*(const uint2 *) (svh_d + (size_t) S.expert * D + c0));

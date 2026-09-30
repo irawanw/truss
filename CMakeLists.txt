@@ -49,10 +49,17 @@ target_link_libraries(truss_models PUBLIC truss_formats truss_reference)
 target_compile_options(truss_models PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra>)
 
 # ---- engine: model steps on the fast kernels
+# ---- src/cpu: host-side expert tier (AVX2 + FMA + F16C; the build machine is the run machine)
+find_package(Threads REQUIRED)
+add_library(truss_cpu STATIC src/cpu/expert_q4.cc)
+target_include_directories(truss_cpu PUBLIC src)
+target_compile_options(truss_cpu PRIVATE -O3 -mavx2 -mfma -mf16c)
+target_link_libraries(truss_cpu PUBLIC Threads::Threads)
+
 add_library(truss_engine STATIC
   src/runtime/expert_store.cu
   src/model/qwen4exp/forward.cu)
-target_link_libraries(truss_engine PUBLIC truss_models truss_kernels)
+target_link_libraries(truss_engine PUBLIC truss_models truss_kernels truss_cpu)
 
 # ---- public C API: libtruss.so (include/truss/truss.h), what server/ binds to
 add_library(truss SHARED src/api/truss_c.cu)
@@ -93,6 +100,9 @@ set_target_properties(moe_window_test PROPERTIES BUILD_RPATH ${LLAMA_PAW_DIR}/bu
 add_executable(moe_prefill_test tests/unit/moe_prefill_test.cu)
 target_link_libraries(moe_prefill_test PRIVATE truss_kernels)
 
+add_executable(cpu_expert_test tests/unit/cpu_expert_test.cc)
+target_compile_options(cpu_expert_test PRIVATE -O2 -mavx2 -mfma -mf16c)
+target_link_libraries(cpu_expert_test PRIVATE truss_cpu)
 add_executable(q8_gemm_test tests/unit/q8_gemm_test.cu)
 target_link_libraries(q8_gemm_test PRIVATE truss_kernels truss_reference)
 

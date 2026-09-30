@@ -45,6 +45,11 @@ void q8_gemm_a16(const Q8Matrix & W, const half * x, int rows, float * y, half *
 constexpr int GEMV_ROWS = 8;
 void q8_gemv(const Q8Matrix & W, const int8_t * xq, const half * xd, int rows, float * y, cudaStream_t stream);
 
+// y fp32 [rows][out] = W x for fp32 W [out][in] (ggml [in, out]), x [rows][in]; in % 128 == 0. One warp per output,
+// fixed reduction order: every row's result is independent of `rows` (the router must not change with the batch:
+// cuBLAS picks its SGEMM by row count and 1e-6 flips near-tied experts, TRACKER #60). For decode-sized rows.
+void f32_gemv(const float * W, int in, int out, const float * x, int rows, float * y, cudaStream_t stream);
+
 // out fp32 [n][W.in] = rows ids[0 .. n) of W (q * d), e.g. the token embedding
 void q8_rows(const Q8Matrix & W, const int * ids, int n, float * out, cudaStream_t stream);
 

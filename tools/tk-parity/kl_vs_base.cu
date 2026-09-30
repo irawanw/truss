@@ -5,11 +5,14 @@
 //
 // File: "_logits_", int32 n_ctx, n_vocab, n_chunk, int32 tokens [n_chunk * n_ctx], then per chunk and scored
 // position nv = 2 ((n_vocab + 1) / 2) + 4 uint16: float scale, float min_log_prob, n_vocab quantized log probs.
-// usage: tk-parity-kl <model.gguf> <base.logits> [chunks=8] [first chunk=0] [q8|fp16]   (dense activations, default q8)
+// usage: tk-parity-kl <model.gguf> <base.logits> [chunks=8] [first chunk=0] [q8|fp16] [step=0] [usage|-] [cpu dir|-]
+//   step > 0: the first half of each chunk as one prompt, then the scored half in runs of `step` tokens (<= 32: the
+//   decode path, with expert fetch, the ring and the CPU tier); usage / cpu dir as Forward::Options.
 #include "core/cuda_check.h"
 #include "model/qwen4exp/config.h"
 #include "model/qwen4exp/forward.h"
 #include "model/qwen4exp/weights.h"
+#include "runtime/expert_store.h"
 
 #include <algorithm>
 #include <chrono>
@@ -97,7 +100,12 @@ int main(int argc, char ** argv)
         if (c.n_vocab != n_vocab) throw std::runtime_error("vocabulary size differs from the base file");
         float * d_logits;   // before the engine, whose expert budget takes the memory left
         TRUSS_CUDA(cudaMalloc(&d_logits, (size_t) n_scored * n_vocab * 4));
-        q::Forward p(c, w, n_ctx, (n_ctx + 3) / 4 * 4, { 0, act });
+        const int step = argc > 6 ? std::atoi(argv[6]) : 0;
+        q::Forward::Options o;
+        o.act = act;
+        if (argc > 7 && std::string(argv[7]) != "-") o.expert_usage = runtime::ExpertStore::load_usage(argv[7], c.n_layer, c.n_expert);
+        if (argc > 8 && std::string(argv[8]) != "-") o.cpu_dir = argv[8];
+        q::Forward p(c, w, n_ctx, (n_ctx + 3) / 4 * 4, o);
         std::printf("experts: %d of %d resident, %.2f GB streamed per chunk\n", p.hot_experts(), c.n_expert * c.n_layer,
                     p.cold_bytes() / 1e9);
         std::vector<float> logits((size_t) n_scored * n_vocab);
@@ -109,8 +117,17 @@ int main(int argc, char ** argv)
             const auto t0 = std::chrono::steady_clock::now();
             const int32_t * tok = tokens.data() + (size_t) ch * n_ctx;
             p.reset();
-            p.run(tok, n_ctx);
-            p.head(first, n_scored, d_logits);
+            if (step <= 0) {
+                p.run(tok, n_ctx);
+                p.head(first, n_scored, d_logits);
+            } else {   // prompt, then the scored positions a few tokens at a time
+                p.run(tok, first);
+                for (int pos = first; pos < first + n_scored; pos += step) {
+                    const int T = std::min(step, first + n_scored - pos);
+                    p.run(tok + pos, T);
+                    p.head(0, T, d_logits + (size_t) (pos - first) * n_vocab);
+                }
+            }
             TRUSS_CUDA(cudaMemcpy(logits.data(), d_logits, logits.size() * 4, cudaMemcpyDeviceToHost));
             in.read((char *) base.data(), base.size() * 2);
             if (!in) throw std::runtime_error("base file ends early");

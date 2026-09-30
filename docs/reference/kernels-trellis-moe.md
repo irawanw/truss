@@ -106,6 +106,9 @@ v6); `Plan::GU_KSPLIT = 1` (2 was 5% slower, #24).
 are the prologue (~7 µs), start waits (~7 µs) and tail (~10–15 µs) (#26). `tools/tk-bench/moe_trace.cu` prints the
 timeline from the kernel's own trace.
 
+**Skipped pairs.** A routing pair with expert id < 0 opens no slot and adds nothing (`pair_slot` = SKIP): the
+caller computes that expert elsewhere (the CPU tier passes its slots as −1).
+
 **Tested by.** `moe_window_test` (vs llama-paw's unfused PAW X3 chain, random weights, all K) and the parity test
 (`moe_window kernel-l` lines vs llama and vs the fp32 reference).
 
