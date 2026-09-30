@@ -271,7 +271,7 @@ __global__ __launch_bounds__(THREADS) void gate_up_kernel(Weights W, const half 
     const int proj = wid >> 1, colh = wid & 1;
     const ProjView & P = proj ? W.proj[1] : W.proj[0];   // not W.proj[proj]: a runtime index puts W in local memory
     const int K = P.meta[2 * it.e];
-    const uint32_t * B32 = (const uint32_t *) (P.trellis + P.meta[2 * it.e + 1]);
+    const uint32_t * B32 = (const uint32_t *) (P.trellis + ((int64_t) P.meta[2 * it.e + 1] << P.shift));
     const int n_rg = (it.rows + 7) / 8;
 
     const half * src = A_gu + (size_t) it.pair0 * D;
@@ -347,7 +347,7 @@ __global__ __launch_bounds__(THREADS) void down_kernel(Weights W, const half * _
     const int colq = wid;
     const ProjView & P = W.proj[2];
     const int K = P.meta[2 * it.e];
-    const uint32_t * B32 = (const uint32_t *) (P.trellis + P.meta[2 * it.e + 1]);
+    const uint32_t * B32 = (const uint32_t *) (P.trellis + ((int64_t) P.meta[2 * it.e + 1] << P.shift));
     const int n_rg = (it.rows + 7) / 8;
 
     const half * src = A_d + (size_t) it.pair0 * F;

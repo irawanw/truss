@@ -12,6 +12,7 @@
 #pragma once
 #include "model/qwen4exp/config.h"
 #include "model/qwen4exp/weights.h"
+#include "runtime/expert_store.h"
 
 #include <cuda_runtime.h>
 
@@ -33,6 +34,8 @@ struct ForwardOptions {
     Activations act = Activations::Q8_1;
     std::vector<float> expert_usage;          // routed counts [layer][expert] (ExpertStore::load_usage); empty: the
                                               // same hot count per layer in index order. Decode speed depends on it.
+    size_t ring_bytes = 4ull << 30;           // ExpertStore ring: decode's FIFO of fetched experts (~2,500 at 4 GiB),
+                                              // prefill's two stream slots (grown to fit them if smaller)
 };
 
 class Forward {
@@ -61,6 +64,12 @@ public:
     int position() const { return pos_; }   // tokens consumed so far
     int hot_experts() const;                // resident experts, all layers
     size_t cold_bytes() const;              // streamed per chunk
+    const runtime::ExpertStore & experts() const;   // residency and fetch statistics
+
+    // Routing profile: while on, every run() adds each routed (layer, expert) to a device table; route_counts()
+    // returns it as [layer][expert] float (the usage file format, ExpertStore::load_usage) and profiling stays on.
+    void profile_routes(bool on);
+    std::vector<float> route_counts() const;
     cudaStream_t stream() const;
 
 private:

@@ -12,25 +12,28 @@
 namespace truss::runtime {
 namespace {
 
-size_t expert_bytes(const formats::ExpertTable & t, int e) { return (size_t) t.words(e) * 2; }
+constexpr int SHIFT = 4;                 // meta offsets in 16-word (32-byte) units
+constexpr size_t UNIT = 2u << SHIFT;     // bytes per offset unit
+constexpr size_t ALIGN = 256;            // ring allocations and the slots
 
-size_t scale_bytes(const formats::ExpertTable & t) { return (size_t) t.n_expert * (t.in + t.out) * 2; }
+size_t align_up(size_t x, size_t a = ALIGN) { return (x + a - 1) / a * a; }
 
-size_t meta_bytes(const formats::ExpertTable & t) { return (size_t) t.n_expert * 2 * sizeof(int32_t); }
+// trellis projections are 16*K words per 16x16 tile, so a whole projection is a multiple of 32 bytes
+size_t proj_bytes(const formats::ExpertTable & t, int e) { return (size_t) t.words(e) * 2; }
 
-// device bytes of "the first n_hot experts of every layer resident"
-size_t plan_bytes(const std::vector<ExpertLayer> & layers, int n_hot)
+size_t expert_bytes(const ExpertLayer & L, int e)
 {
-    size_t total = 0, slot[3] = {};
-    for (const ExpertLayer & L : layers)
-        for (int p = 0; p < 3; ++p) {
-            const formats::ExpertTable & t = *L[p];
-            size_t cold = 0;
-            for (int e = 0; e < t.n_expert; ++e) (e < n_hot ? total : cold) += expert_bytes(t, e);
-            slot[p] = std::max(slot[p], cold);
-            total += scale_bytes(t) + meta_bytes(t);
-        }
-    return total + 2 * (slot[0] + slot[1] + slot[2]);
+    return proj_bytes(*L[0], e) + proj_bytes(*L[1], e) + proj_bytes(*L[2], e);
+}
+
+size_t fixed_bytes(const ExpertLayer & L)   // scales + stream and ring meta tables
+{
+    size_t b = 0;
+    for (int p = 0; p < 3; ++p) {
+        const formats::ExpertTable & t = *L[p];
+        b += (size_t) t.n_expert * (t.in + t.out) * 2 + (size_t) t.n_expert * 2 * sizeof(int32_t) * 2;
+    }
+    return b;
 }
 
 void * device_alloc(size_t bytes, std::vector<void *> & owned)
@@ -43,68 +46,92 @@ void * device_alloc(size_t bytes, std::vector<void *> & owned)
     return p;
 }
 
+int32_t unit_offset(const uint8_t * at, const uint8_t * base, int layer)
+{
+    const ptrdiff_t d = at - base;
+    if (d % (ptrdiff_t) UNIT) throw std::logic_error("ExpertStore: expert not aligned to its offset unit");
+    const ptrdiff_t u = d / (ptrdiff_t) UNIT;
+    if (u < INT_MIN || u > INT_MAX)
+        throw std::runtime_error("ExpertStore: layer " + std::to_string(layer) + " expert offset exceeds int32 units");
+    return (int32_t) u;
+}
+
 }  // namespace
 
-ExpertStore::HotSet ExpertStore::plan(const std::vector<ExpertLayer> & layers, size_t budget,
+size_t ExpertStore::ring_size(const std::vector<ExpertLayer> & layers, const HotSet & hot, const Sizes & z)
+{
+    size_t slot = 0;
+    for (size_t l = 0; l < layers.size(); ++l) {
+        size_t cold = 0;
+        for (int e = 0; e < layers[l][0]->n_expert; ++e)
+            if (!hot[l][e]) cold += expert_bytes(layers[l], e);
+        slot = std::max(slot, align_up(cold));
+    }
+    return align_up(std::max(z.ring_bytes, 2 * slot + z.stream_extra));
+}
+
+size_t ExpertStore::device_bytes(const std::vector<ExpertLayer> & layers, const HotSet & hot, const Sizes & z)
+{
+    size_t total = ring_size(layers, hot, z);
+    for (size_t l = 0; l < layers.size(); ++l) {
+        total += fixed_bytes(layers[l]);
+        for (int e = 0; e < layers[l][0]->n_expert; ++e)
+            if (hot[l][e]) total += expert_bytes(layers[l], e);
+    }
+    return total;
+}
+
+ExpertStore::HotSet ExpertStore::plan(const std::vector<ExpertLayer> & layers, size_t budget, const Sizes & z,
                                       const std::vector<float> & usage)
 {
     const int L = (int) layers.size(), n_expert = layers.empty() ? 0 : layers[0][0]->n_expert;
-    if (plan_bytes(layers, 0) > budget)
-        throw std::runtime_error("ExpertStore::plan: " + std::to_string(budget >> 20) + " MiB cannot hold even the slots (" +
-                                 std::to_string(plan_bytes(layers, 0) >> 20) + " MiB)");
     HotSet hot(L, std::vector<uint8_t>(n_expert, 0));
+    if (device_bytes(layers, hot, z) > budget)
+        throw std::runtime_error("ExpertStore::plan: " + std::to_string(budget >> 20) + " MiB cannot hold even the ring (" +
+                                 std::to_string(device_bytes(layers, hot, z) >> 20) + " MiB)");
     if (usage.empty()) {   // the same count in every layer, index order
-        int n_hot = n_expert;
-        while (n_hot > 0 && plan_bytes(layers, n_hot) > budget) --n_hot;
-        for (auto & h : hot) std::fill(h.begin(), h.begin() + n_hot, 1);
+        for (int n = 0; n < n_expert; ++n) {
+            for (auto & h : hot) h[n] = 1;
+            if (device_bytes(layers, hot, z) > budget) {
+                for (auto & h : hot) h[n] = 0;
+                break;
+            }
+        }
         return hot;
     }
     if (usage.size() != (size_t) L * n_expert)
         throw std::invalid_argument("ExpertStore::plan: usage has " + std::to_string(usage.size()) + " values, expected " +
                                     std::to_string((size_t) L * n_expert));
-    // Greedy by routed count per byte over all (layer, expert): the most hits for the budget. Device bytes = hot +
-    // 2 slots (each the largest cold part of any layer, per projection) + scales + meta. A layer with few hot experts
-    // makes both slots large, so every layer first gets its top `floor` experts; the floor with the most hot usage
-    // wins (a pure greedy kept 5,428 experts where index order kept 7,104, TRACKER #56).
-    std::vector<std::array<size_t, 3>> size(L * (size_t) n_expert);
-    std::vector<std::array<size_t, 3>> cold_all(L);
     size_t fixed = 0;
-    for (int l = 0; l < L; ++l)
-        for (int p = 0; p < 3; ++p) {
-            const formats::ExpertTable & t = *layers[l][p];
-            fixed += scale_bytes(t) + meta_bytes(t);
-            for (int e = 0; e < n_expert; ++e) {
-                size[(size_t) l * n_expert + e][p] = expert_bytes(t, e);
-                cold_all[l][p] += expert_bytes(t, e);
-            }
+    std::vector<size_t> size(L * (size_t) n_expert), cold_all(L);
+    for (int l = 0; l < L; ++l) {
+        fixed += fixed_bytes(layers[l]);
+        for (int e = 0; e < n_expert; ++e) {
+            size[(size_t) l * n_expert + e] = expert_bytes(layers[l], e);
+            cold_all[l] += size[(size_t) l * n_expert + e];
         }
-    auto bytes_of = [&](int i) { return size[i][0] + size[i][1] + size[i][2]; };
-    auto better = [&](int a, int b) { return (double) usage[a] / bytes_of(a) > (double) usage[b] / bytes_of(b); };
-    std::vector<int> order(size.size());               // global rank
+    }
+    auto better = [&](int a, int b) { return (double) usage[a] / size[a] > (double) usage[b] / size[b]; };
+    std::vector<int> order(size.size());
     for (size_t i = 0; i < order.size(); ++i) order[i] = (int) i;
     std::stable_sort(order.begin(), order.end(), better);
-    std::vector<std::vector<int>> by_layer(L);         // per-layer rank
+    std::vector<std::vector<int>> by_layer(L);
     for (int i : order) by_layer[i / n_expert].push_back(i);
 
-    auto fill = [&](int floor, HotSet & h) -> double {   // returns the hot usage, h = the hot set
-        std::vector<std::array<size_t, 3>> cold = cold_all;
+    auto fill = [&](int floor, HotSet & h) -> double {   // the hot usage, or -1 if the floor does not fit
+        std::vector<size_t> cold = cold_all;
         for (auto & x : h) std::fill(x.begin(), x.end(), 0);
         auto total = [&](size_t hot_bytes) {
             size_t slot = 0;
-            for (int p = 0; p < 3; ++p) {
-                size_t m = 0;
-                for (int l = 0; l < L; ++l) m = std::max(m, cold[l][p]);
-                slot += m;
-            }
-            return fixed + hot_bytes + 2 * slot;
+            for (int l = 0; l < L; ++l) slot = std::max(slot, align_up(cold[l]));
+            return fixed + hot_bytes + align_up(std::max(z.ring_bytes, 2 * slot + z.stream_extra));
         };
         size_t hot_bytes = 0;
         double used = 0;
         auto take = [&](int i) {
-            const int l = i / n_expert;
-            for (int p = 0; p < 3; ++p) cold[l][p] -= size[i][p];
-            hot_bytes += bytes_of(i);
-            h[l][i % n_expert] = 1;
+            cold[i / n_expert] -= size[i];
+            hot_bytes += size[i];
+            h[i / n_expert][i % n_expert] = 1;
             used += usage[i];
         };
         for (int l = 0; l < L; ++l)
@@ -113,9 +140,9 @@ ExpertStore::HotSet ExpertStore::plan(const std::vector<ExpertLayer> & layers, s
         for (int i : order) {
             const int l = i / n_expert;
             if (h[l][i % n_expert]) continue;
-            for (int p = 0; p < 3; ++p) cold[l][p] -= size[i][p];
-            const bool fits = total(hot_bytes + bytes_of(i)) <= budget;
-            for (int p = 0; p < 3; ++p) cold[l][p] += size[i][p];
+            cold[l] -= size[i];
+            const bool fits = total(hot_bytes + size[i]) <= budget;
+            cold[l] += size[i];
             if (fits) take(i);
         }
         return used;
@@ -144,7 +171,7 @@ std::vector<float> ExpertStore::load_usage(const std::string & path, int n_layer
     return u;
 }
 
-ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet & hot)
+ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet & hot, const Sizes & z)
 {
     const int L = (int) layers.size(), half_l = (L + 1) / 2;
     if ((int) hot.size() != L) throw std::invalid_argument("ExpertStore: hot set has the wrong layer count");
@@ -154,70 +181,86 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
         TRUSS_CUDA(cudaEventCreateWithFlags(&copied_[s], cudaEventDisableTiming));
         TRUSS_CUDA(cudaEventCreateWithFlags(&released_[s], cudaEventDisableTiming));
     }
+    TRUSS_CUDA(cudaEventCreateWithFlags(&compute_mark_, cudaEventDisableTiming));
 
-    for (int p = 0; p < 3; ++p) {
-        // arena: [hot, layers < half_l][slot 0][slot 1][hot, layers >= half_l]
-        size_t hot_lo = 0, hot_hi = 0, slot = 0;
-        for (int l = 0; l < L; ++l) {
-            const formats::ExpertTable & t = *layers[l][p];
-            size_t cold = 0;
-            for (int e = 0; e < t.n_expert; ++e) (hot[l][e] ? (l < half_l ? hot_lo : hot_hi) : cold) += expert_bytes(t, e);
-            slot = std::max(slot, cold);
-            layers_[l].cold[p] = cold;
+    size_t hot_lo = 0, hot_hi = 0;
+    for (int l = 0; l < L; ++l) {
+        Layer & Y = layers_[l];
+        const int E = layers[l][0]->n_expert;
+        Y.n_expert = E;
+        Y.bytes.resize(E);
+        for (int p = 0; p < 3; ++p) Y.part[p].resize(E);
+        for (int e = 0; e < E; ++e) {
+            Y.part[0][e] = 0;
+            Y.part[1][e] = proj_bytes(*layers[l][0], e);
+            Y.part[2][e] = Y.part[1][e] + proj_bytes(*layers[l][1], e);
+            Y.bytes[e] = expert_bytes(layers[l], e);
+            (hot[l][e] ? (l < half_l ? hot_lo : hot_hi) : Y.cold) += Y.bytes[e];
         }
-        auto * arena = static_cast<uint8_t *>(device_alloc(hot_lo + 2 * slot + hot_hi, device_));
-        base_[p] = reinterpret_cast<uint16_t *>(arena + hot_lo);
-        slot_words_[p] = slot / 2;
-        device_bytes_ += hot_lo + 2 * slot + hot_hi;
+    }
+    ring_ = ring_size(layers, hot, z);
+    for (const Layer & Y : layers_) slot_ = std::max(slot_, align_up(Y.cold));
+    auto * arena = static_cast<uint8_t *>(device_alloc(hot_lo + ring_ + hot_hi, device_));
+    base_ = arena + hot_lo;
+    spare_ = z.stream_extra ? base_ + 2 * slot_ : nullptr;
+    device_bytes_ = hot_lo + ring_ + hot_hi;
 
-        uint8_t * next_hot[2] = { arena, arena + hot_lo + 2 * slot };
-        for (int l = 0; l < L; ++l) {
+    uint8_t * next_hot[2] = { arena, arena + hot_lo + ring_ };
+    for (int l = 0; l < L; ++l) {
+        Layer & Y = layers_[l];
+        const int E = Y.n_expert;
+        if (Y.cold) {
+            uint8_t * pinned;
+            TRUSS_CUDA(cudaHostAlloc(reinterpret_cast<void **>(&pinned), Y.cold, cudaHostAllocDefault));
+            pinned_.push_back(pinned);
+            Y.host = pinned;
+            cold_total_ += Y.cold;
+        }
+        TRUSS_CUDA(cudaHostAlloc(reinterpret_cast<void **>(&Y.ring_meta_host), sizeof(int32_t) * 3 * 2 * E,
+                                 cudaHostAllocDefault));
+        pinned_.push_back(Y.ring_meta_host);
+        std::vector<int32_t> smeta(3 * 2 * E);
+        Y.cold_off.assign(E, -1);
+        Y.ring_at.assign(E, -1);
+        uint8_t * slot_dst = base_ + (l % 2) * slot_;
+        size_t cold_pos = 0;
+        for (int e = 0; e < E; ++e) {
+            uint8_t * at;
+            if (hot[l][e]) {
+                uint8_t *& h = next_hot[l < half_l ? 0 : 1];
+                at = h;
+                h += Y.bytes[e];
+            } else {
+                Y.cold_off[e] = (int64_t) cold_pos;
+                at = slot_dst + cold_pos;
+                cold_pos += Y.bytes[e];
+            }
+            for (int p = 0; p < 3; ++p) {
+                const formats::ExpertTable & t = *layers[l][p];
+                const auto * from = reinterpret_cast<const uint8_t *>(t.trellis->data) + t.offset[e] * 2;
+                const size_t pb = proj_bytes(t, e);
+                if (hot[l][e]) TRUSS_CUDA(cudaMemcpy(at + Y.part[p][e], from, pb, cudaMemcpyHostToDevice));
+                else std::memcpy(const_cast<uint8_t *>(Y.host) + Y.cold_off[e] + Y.part[p][e], from, pb);
+                int32_t * sm = smeta.data() + (size_t) p * 2 * E, * rm = Y.ring_meta_host + (size_t) p * 2 * E;
+                sm[2 * e] = rm[2 * e] = t.k[e];
+                sm[2 * e + 1] = unit_offset(at + Y.part[p][e], base_, l);
+                rm[2 * e + 1] = hot[l][e] ? sm[2 * e + 1] : 0;   // cold: set when fetched
+            }
+        }
+        for (int p = 0; p < 3; ++p) {
             const formats::ExpertTable & t = *layers[l][p];
-            Layer & Y = layers_[l];
-            Y.n_expert = t.n_expert;
-            const auto * src = reinterpret_cast<const uint8_t *>(t.trellis->data);
-            std::vector<int32_t> meta(2 * t.n_expert);
-            uint8_t * cold_dst = reinterpret_cast<uint8_t *>(base_[p]) + (l % 2) * slot;
-            uint8_t * pinned = nullptr;
-            if (Y.cold[p]) {
-                TRUSS_CUDA(cudaHostAlloc(reinterpret_cast<void **>(&pinned), Y.cold[p], cudaHostAllocDefault));
-                pinned_.push_back(pinned);
-                Y.host[p] = pinned;
-                cold_total_ += Y.cold[p];
-            }
-            size_t cold_pos = 0;
-            Y.cold_off[p].assign(t.n_expert, -1);
-            Y.bytes[p].resize(t.n_expert);
-            for (int e = 0; e < t.n_expert; ++e) {
-                const size_t bytes = expert_bytes(t, e);
-                Y.bytes[p][e] = bytes;
-                if (!hot[l][e]) Y.cold_off[p][e] = (int64_t) cold_pos;
-                const uint8_t * from = src + t.offset[e] * 2;
-                uint8_t * at;
-                if (hot[l][e]) {
-                    uint8_t *& h = next_hot[l < half_l ? 0 : 1];
-                    at = h;
-                    h += bytes;
-                    TRUSS_CUDA(cudaMemcpy(at, from, bytes, cudaMemcpyHostToDevice));
-                } else {
-                    at = cold_dst + cold_pos;
-                    std::memcpy(pinned + cold_pos, from, bytes);
-                    cold_pos += bytes;
-                }
-                const ptrdiff_t words = (at - reinterpret_cast<uint8_t *>(base_[p])) / 2;
-                if (words < INT_MIN || words > INT_MAX)
-                    throw std::runtime_error("ExpertStore: layer " + std::to_string(l) + " expert offset exceeds int32 words");
-                meta[2 * e] = t.k[e];
-                meta[2 * e + 1] = (int32_t) words;
-            }
-            Y.meta[p] = static_cast<int32_t *>(device_alloc(meta.size() * 4, device_));
-            TRUSS_CUDA(cudaMemcpy(Y.meta[p], meta.data(), meta.size() * 4, cudaMemcpyHostToDevice));
+            Y.stream_meta[p] = static_cast<int32_t *>(device_alloc(sizeof(int32_t) * 2 * E, device_));
+            Y.ring_meta[p] = static_cast<int32_t *>(device_alloc(sizeof(int32_t) * 2 * E, device_));
+            TRUSS_CUDA(cudaMemcpy(Y.stream_meta[p], smeta.data() + (size_t) p * 2 * E, sizeof(int32_t) * 2 * E,
+                                  cudaMemcpyHostToDevice));
+            TRUSS_CUDA(cudaMemcpy(Y.ring_meta[p], Y.ring_meta_host + (size_t) p * 2 * E, sizeof(int32_t) * 2 * E,
+                                  cudaMemcpyHostToDevice));
             auto * suh = static_cast<half *>(device_alloc(t.suh->bytes, device_));
             auto * svh = static_cast<half *>(device_alloc(t.svh->bytes, device_));
             TRUSS_CUDA(cudaMemcpy(suh, t.suh->data, t.suh->bytes, cudaMemcpyHostToDevice));
             TRUSS_CUDA(cudaMemcpy(svh, t.svh->data, t.svh->bytes, cudaMemcpyHostToDevice));
             Y.suh[p] = suh, Y.svh[p] = svh;
-            device_bytes_ += meta.size() * 4 + t.suh->bytes + t.svh->bytes;
+            device_bytes_ += 2 * sizeof(int32_t) * 2 * E + t.suh->bytes + t.svh->bytes;
         }
     }
 }
@@ -231,6 +274,7 @@ ExpertStore::~ExpertStore()
         if (copied_[s]) cudaEventDestroy(copied_[s]);
         if (released_[s]) cudaEventDestroy(released_[s]);
     }
+    if (compute_mark_) cudaEventDestroy(compute_mark_);
     if (copy_) cudaStreamDestroy(copy_);
 }
 
@@ -238,41 +282,105 @@ moe::Weights ExpertStore::weights(int l) const
 {
     const Layer & Y = layers_.at(l);
     moe::Weights w{};
-    for (int p = 0; p < 3; ++p) w.proj[p] = { base_[p], Y.meta[p], Y.suh[p], Y.svh[p] };
+    for (int p = 0; p < 3; ++p) {
+        w.proj[p] = { reinterpret_cast<const uint16_t *>(base_), mode_ == Mode::STREAM ? Y.stream_meta[p] : Y.ring_meta[p],
+                      Y.suh[p], Y.svh[p] };
+        w.proj[p].shift = SHIFT;
+    }
     w.n_expert = Y.n_expert;
     return w;
 }
 
+void ExpertStore::wait_compute(cudaStream_t compute)
+{
+    TRUSS_CUDA(cudaEventRecord(compute_mark_, compute));
+    TRUSS_CUDA(cudaStreamWaitEvent(copy_, compute_mark_, 0));
+}
+
+void ExpertStore::begin_stream(cudaStream_t compute)
+{
+    wait_compute(compute);   // decode kernels may still read the ring the slots overwrite
+    for (const RingEntry & r : fifo_) layers_[r.layer].ring_at[r.expert] = -1;
+    fifo_.clear();
+    head_ = 0;
+    released_recorded_[0] = released_recorded_[1] = false;
+    mode_ = Mode::STREAM;
+}
+
 void ExpertStore::prefetch(int l)
 {
+    if (mode_ != Mode::STREAM) throw std::logic_error("ExpertStore::prefetch outside a begin_stream() chunk");
     const Layer & Y = layers_.at(l);
     const int s = l % 2;
     if (released_recorded_[s]) TRUSS_CUDA(cudaStreamWaitEvent(copy_, released_[s], 0));
-    for (int p = 0; p < 3; ++p)
-        if (Y.cold[p])
-            TRUSS_CUDA(cudaMemcpyAsync(base_[p] + s * slot_words_[p], Y.host[p], Y.cold[p], cudaMemcpyHostToDevice, copy_));
+    if (Y.cold) TRUSS_CUDA(cudaMemcpyAsync(base_ + s * slot_, Y.host, Y.cold, cudaMemcpyHostToDevice, copy_));
     TRUSS_CUDA(cudaEventRecord(copied_[s], copy_));
 }
 
-void ExpertStore::fetch(int l, const int * ids, int n)
+// FIFO allocation: evict the oldest entries overlapping [head, head + bytes) (wrapping to 0 when the tail is too
+// short), copy the expert, point the ring meta at it.
+void ExpertStore::ring_put(int l, int e)
 {
-    const Layer & Y = layers_.at(l);
-    const int s = l % 2;
-    if (released_recorded_[s]) TRUSS_CUDA(cudaStreamWaitEvent(copy_, released_[s], 0));
-    std::vector<uint8_t> seen(Y.n_expert, 0);
+    Layer & Y = layers_[l];
+    const int64_t need = (int64_t) align_up(Y.bytes[e]);
+    if (head_ + need > (int64_t) ring_) {   // wrap: the tail [head, end) goes with its entries
+        while (!fifo_.empty() && fifo_.front().off >= head_) {
+            layers_[fifo_.front().layer].ring_at[fifo_.front().expert] = -1;
+            fifo_.pop_front();
+        }
+        head_ = 0;
+    }
+    while (!fifo_.empty() && fifo_.front().off >= head_ && fifo_.front().off < head_ + need) {
+        layers_[fifo_.front().layer].ring_at[fifo_.front().expert] = -1;
+        fifo_.pop_front();
+    }
+    const int64_t off = head_;
+    head_ += need;
+    fifo_.push_back({ l, e, off });
+    Y.ring_at[e] = off;
+    uint8_t * at = base_ + off;
+    TRUSS_CUDA(cudaMemcpyAsync(at, Y.host + Y.cold_off[e], Y.bytes[e], cudaMemcpyHostToDevice, copy_));
+    for (int p = 0; p < 3; ++p) Y.ring_meta_host[(size_t) p * 2 * Y.n_expert + 2 * e + 1] = unit_offset(at + Y.part[p][e], base_, l);
+    stats_.bytes += Y.bytes[e];
+    ++stats_.misses;
+}
+
+void ExpertStore::fetch(int l, const int * ids, int n, cudaStream_t compute)
+{
+    if (mode_ != Mode::RING) {   // first decode step after a prompt: the ring starts empty over the slots and spare
+        mode_ = Mode::RING;
+        head_ = 0;
+    }
+    wait_compute(compute);   // earlier kernels may read what the ring overwrites
+    Layer & Y = layers_.at(l);
+    ++stats_.fetch_calls;
+    std::vector<int> need;
+    need.reserve(n);
     for (int i = 0; i < n; ++i) {
         const int e = ids[i];
         if (e < 0 || e >= Y.n_expert) throw std::out_of_range("ExpertStore::fetch: expert id " + std::to_string(e));
-        if (seen[e] || Y.cold_off[0][e] < 0) continue;
-        seen[e] = 1;
-        for (int p = 0; p < 3; ++p) {
-            const int64_t off = Y.cold_off[p][e];
-            TRUSS_CUDA(cudaMemcpyAsync(reinterpret_cast<uint8_t *>(base_[p] + s * slot_words_[p]) + off,
-                                       static_cast<const uint8_t *>(Y.host[p]) + off, Y.bytes[p][e],
-                                       cudaMemcpyHostToDevice, copy_));
-        }
+        if (Y.cold_off[e] < 0 || std::find(need.begin(), need.end(), e) != need.end()) continue;
+        need.push_back(e);
     }
-    TRUSS_CUDA(cudaEventRecord(copied_[s], copy_));
+    stats_.experts_asked += (long) need.size();
+    // A copy may evict another expert this call needs: repeat until all are resident. The ring holds thousands of
+    // experts and a call needs at most rows x top-k, so this ends after one extra round.
+    bool changed = false;
+    for (int round = 0;; ++round) {
+        bool missing = false;
+        for (int e : need)
+            if (Y.ring_at[e] < 0) {
+                if (round > 2) throw std::runtime_error("ExpertStore::fetch: ring too small for one layer's experts");
+                ring_put(l, e);
+                missing = changed = true;
+            }
+        if (!missing) break;
+    }
+    if (changed)
+        for (int p = 0; p < 3; ++p)
+            TRUSS_CUDA(cudaMemcpyAsync(Y.ring_meta[p], Y.ring_meta_host + (size_t) p * 2 * Y.n_expert,
+                                       sizeof(int32_t) * 2 * Y.n_expert, cudaMemcpyHostToDevice, copy_));
+    TRUSS_CUDA(cudaEventRecord(copied_[l % 2], copy_));
 }
 
 void ExpertStore::acquire(int l, cudaStream_t compute)

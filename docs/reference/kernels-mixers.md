@@ -42,7 +42,7 @@ One warp per normalized row; element i of a row lives in lane i % 32, so the rot
 |---|---|
 | `select_workspace_bytes<Shape>(max_queries, n_ctx)` | score rows kept at once (≤ 1024) × n_ctx/4 floats |
 | `select<Shape>(idx_q16, idx_k_cache, pos0, T, blocks [T][512], n_blocks [T], ws, ws_bytes, stream)` | per query the chosen block ids, **ascending**, first `n_blocks[t]` used |
-| `attention<Shape>(q16, gate, k_cache, v_cache, blocks, n_blocks, pos0, T, out16 [T][24·256], stream)` | gated attention output in fp16 (the out projection's input) |
+| `attention<Shape>(q16, gate, k_cache, v_cache, blocks, n_blocks, pos0, T, out16 [T][24·256], ws, ws_bytes, stream)` | gated attention output in fp16 (the out projection's input); `ws` = `attention_workspace_bytes<Shape>(T)` (0 above `SPLIT_ROWS` = 32) |
 
 **select.** `score_kernel`: CTA = 64 queries × 64 blocks, 8 warps of 16 queries × 32 blocks, all 4 indexer heads'
 accumulators in registers so relu and the head sum happen before the store; fragments straight from global (the op is
@@ -57,6 +57,11 @@ with cp.async (K and V rows are 512 B contiguous); each warp owns 16 cells of a 
 state (fp32, base 2), S = q·kᵀ and P·V on `mma_f32` with `ldmatrix` (V transposed), P rounded to fp16, the rowsum
 taken over the rounded P. The two warps' states merge through the K/V buffers; the gate is applied in the epilogue.
 Smem row stride 264 halfs (528 B) keeps ldmatrix conflict-free.
+
+**Split form (T ≤ 32: decode steps, verify windows).** One query has only 2 CTAs otherwise (227 µs per decode
+layer at 3.4K context, TRACKER #57). A third grid dimension cuts each query's cells into up to 32 contiguous ranges of
+whole 32-cell tiles; each CTA writes its unnormalized state (o [12][256], m, l) to `ws`, and `combine_kernel` merges
+the ranges in order and applies the gate. Differs from the unsplit form by fp32 reassociation only (same test gates).
 
 **Numerics vs llama-paw.** llama-paw's flash attention accumulates P·V in fp16 (`fattn-mma-f16.cuh`,
 `T_C_VKQ = half2`), ~1e-3..2e-3 from exact at ~2K cells; TRUSS accumulates in fp32 and is 2.5–2.8e-4 from the fp32

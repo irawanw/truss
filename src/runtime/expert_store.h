@@ -1,20 +1,23 @@
-// Routed-expert weights of every MoE layer on one GPU: a hot set stays resident, the rest (cold) lives in pinned
-// host memory and is copied per layer into one of two device slots while the previous layer computes.
+// Routed-expert weights of every MoE layer on one GPU. Three tiers:
+//   hot    a static set (usage-ranked, ExpertStore::plan) resident for the whole run;
+//   ring   one device region that holds either recently fetched cold experts (decode: a FIFO cache) or, during a
+//          prompt chunk, two whole-layer slots (every cold expert of layer l streams into slot l % 2 while layer l - 1
+//          computes) plus the chunk's own large buffers (spare(): scratch, MoE workspace, residual);
+//   host   every cold expert in pinned host memory, per layer [expert: gate | up | down] in expert order.
 //
-// The MoE kernels address an expert as ProjView.trellis + meta word offset (int32, so +-4 GiB of the base). Each
-// projection (gate, up, down) gets one arena laid out as
-//     [hot experts of the first half of the layers][slot 0][slot 1][hot experts of the second half]
-// with the base at slot 0: every hot expert is at a fixed (possibly negative) offset, and layer l's cold experts
-// always land at the same place in slot l % 2, so the meta tables are built once and never rewritten. The load
-// throws if an offset does not fit int32.
+// Device layout: one arena [hot experts, first half of the layers][ring][hot experts, second half], each expert's
+// three projections contiguous. Every ProjView has the ring start as its base and shift 4: meta offsets count 32-byte
+// units, so int32 reaches +-64 GiB. Two meta tables per (layer, projection): the stream table (cold experts at their
+// fixed place in slot l % 2, built once) and the ring table (cold experts where the FIFO put them, rewritten by
+// fetch()). weights(l) returns the table of the current mode.
 //
-// Per use of layer l (all on the caller's compute stream, except the copy):
-//     acquire(l)   compute waits for layer l's copy
-//     ...          moe ops on weights(l)
-//     release(l)   the slot may be overwritten once compute gets here
-//     prefetch(l + 2), which reuses the slot after release(l)
-// A decode step, whose routing is known only at its layer, calls fetch(l, ids) (the few cold experts it uses) right
-// before acquire(l) instead of prefetching whole layers.
+// Protocol (compute = the caller's stream; copies run on the store's own stream):
+//   prompt chunk:  begin_stream(compute); prefetch(0), prefetch(1); per layer acquire(l) -> kernel -> release(l) ->
+//                  prefetch(l + 2). spare() is valid until the next fetch().
+//   decode step / verify window: per layer, routing to the host -> fetch(l, ids, n, compute) -> acquire(l) -> kernel.
+// Switching mode waits for all compute queued so far (the ring and the slots share memory), and a switch to stream
+// mode drops the ring's contents. Why a ring: on held-out routing a FIFO of recently fetched experts halves the misses
+// of a static set of the same size (10,000 slots: 74 -> 38 per token; FIFO = LRU within 3%, TRACKER #57).
 #pragma once
 #include "formats/trellis_table.h"
 #include "kernels/moe/moe_weights.cuh"
@@ -23,6 +26,7 @@
 
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <string>
 #include <vector>
 
@@ -34,47 +38,83 @@ class ExpertStore {
 public:
     using HotSet = std::vector<std::vector<uint8_t>>;                 // [layer][expert] = 1: resident
 
-    // The hot set whose device bytes (hot, two slots, scales, meta) fit `budget`. With `usage` (routed counts,
-    // [layer][expert] flattened): greedy by count per byte over all layers, so layers get different hot counts
-    // (decode fetches only misses, TRACKER #56). Without: the same count in every layer, index order.
-    static HotSet plan(const std::vector<ExpertLayer> & layers, size_t budget, const std::vector<float> & usage = {});
+    struct Sizes {
+        size_t ring_bytes = 4ull << 30;   // decode FIFO (grown to fit the prompt path)
+        size_t stream_extra = 0;          // bytes a prompt chunk borrows after the two slots (spare())
+    };
+    // ring = max(ring_bytes, 2 x the largest cold layer + stream_extra), 256-aligned
+    static size_t ring_size(const std::vector<ExpertLayer> & layers, const HotSet & hot, const Sizes & z);
+    static size_t device_bytes(const std::vector<ExpertLayer> & layers, const HotSet & hot, const Sizes & z);
+
+    // The hot set whose device_bytes fit `budget`. With `usage` (routed counts, [layer][expert] flattened): every
+    // layer first gets its top `floor` experts by count per byte, then greedy by count per byte over all layers; the
+    // floor (steps of 8) with the most hot usage wins, since a layer with few hot experts makes the stream slots
+    // large. Without usage: the same count per layer, index order.
+    static HotSet plan(const std::vector<ExpertLayer> & layers, size_t budget, const Sizes & z,
+                       const std::vector<float> & usage = {});
     // usage file: n_layer * n_expert little-endian float32, layer-major (flashnext_truss_usage.py writes it)
     static std::vector<float> load_usage(const std::string & path, int n_layer, int n_expert);
 
-    ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet & hot);
+    ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet & hot, const Sizes & z);
     ~ExpertStore();
     ExpertStore(const ExpertStore &) = delete;
     ExpertStore & operator=(const ExpertStore &) = delete;
 
-    moe::Weights weights(int layer) const;
-    void prefetch(int layer);                                      // all cold experts, on the store's copy stream
-    // decode: only the cold experts among ids[0 .. n) (host), same slot places; used instead of prefetch
-    void fetch(int layer, const int * ids, int n);
-    void acquire(int layer, cudaStream_t compute);
-    void release(int layer, cudaStream_t compute);
+    moe::Weights weights(int layer) const;                        // meta table of the current mode
+    void begin_stream(cudaStream_t compute);                       // prompt chunk starts: stream mode
+    void * spare() const { return spare_; }                        // stream mode: stream_extra bytes after the slots
+    void prefetch(int layer);                                      // all cold experts of the layer into slot l % 2
+    void fetch(int layer, const int * ids, int n, cudaStream_t compute);   // ring mode: make ids[0 .. n) (host)
+                                                                           // resident, copying the missing ones
+    void acquire(int layer, cudaStream_t compute);                 // compute waits for layer l's copies
+    void release(int layer, cudaStream_t compute);                 // compute is done with slot l % 2 (stream mode)
 
     size_t device_bytes() const { return device_bytes_; }
     size_t cold_bytes() const { return cold_total_; }                // pinned host bytes, streamed once per chunk
+    size_t ring_bytes() const { return ring_; }
     int layers() const { return (int) layers_.size(); }
+
+    struct Stats {                                                  // ring mode, since construction
+        long fetch_calls = 0, experts_asked = 0, misses = 0;
+        size_t bytes = 0;
+    };
+    const Stats & stats() const { return stats_; }
 
 private:
     struct Layer {
-        size_t cold[3] = {};                                        // cold bytes per projection
-        const void * host[3] = {};                                  // pinned source of the cold experts
-        std::vector<int64_t> cold_off[3];                           // [expert] byte offset in host / slot, -1: hot
-        std::vector<size_t> bytes[3];                               // [expert]
-        int32_t * meta[3] = {};                                     // device (K, word offset from the slot-0 base)
+        size_t cold = 0;                                            // cold bytes, all projections
+        const uint8_t * host = nullptr;                             // pinned [cold expert: gate | up | down]
+        std::vector<int64_t> cold_off;                              // [expert] byte offset in host / slot, -1: hot
+        std::vector<size_t> bytes;                                  // [expert] gate + up + down
+        std::array<std::vector<size_t>, 3> part;                    // [p][expert] offset of projection p in the expert
+        int32_t * stream_meta[3] = {}, * ring_meta[3] = {};         // device (K, offset in 32-byte units)
+        int32_t * ring_meta_host = nullptr;                         // pinned mirror of ring_meta, [3][n_expert][2]
+        std::vector<int64_t> ring_at;                               // [expert] byte offset in the ring, -1: absent
         const half * suh[3] = {}, * svh[3] = {};
         int n_expert = 0;
     };
+    struct RingEntry {
+        int layer, expert;
+        int64_t off;
+    };
+    enum class Mode { STREAM, RING };
+
+    void wait_compute(cudaStream_t compute);                        // copy stream waits for all compute queued so far
+    void ring_put(int layer, int expert);
+
     std::vector<Layer> layers_;
-    uint16_t * base_[3] = {};                                      // slot 0 of each projection's arena
-    size_t slot_words_[3] = {};
+    uint8_t * base_ = nullptr;                                     // ring start
+    size_t ring_ = 0, slot_ = 0;
+    void * spare_ = nullptr;
+    int64_t head_ = 0;                                             // next free ring byte (FIFO)
+    std::deque<RingEntry> fifo_;
+    Mode mode_ = Mode::RING;
     std::vector<void *> device_, pinned_;
     cudaStream_t copy_ = nullptr;
-    cudaEvent_t copied_[2] = {}, released_[2] = {};
+    cudaEvent_t copied_[2] = {}, released_[2] = {}, compute_mark_ = nullptr;
     bool released_recorded_[2] = {};
     size_t device_bytes_ = 0, cold_total_ = 0;
+    Stats stats_;
 };
 
 }  // namespace truss::runtime

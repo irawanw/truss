@@ -39,10 +39,16 @@ template <class Shape>
 void select(const half * idx_q, const half * idx_k, int pos0, int T, int * blocks, int * n_blocks, void * ws,
             size_t ws_bytes, cudaStream_t stream);
 
+// Chunks of up to SPLIT_ROWS queries split each query's cells over up to 32 CTAs (flash-decoding) and need a
+// workspace of attention_workspace_bytes(T) (0 for longer chunks). Split and unsplit results differ by fp32
+// reassociation only.
+constexpr int SPLIT_ROWS = 32;
+template <class Shape> size_t attention_workspace_bytes(int max_queries);
+
 // q [T][H][D] (normed, roped), gate [T][H][D] fp32, k, v [n_ctx][HKV][D] -> out [T][H * D] fp16 = softmax(q k / sqrt(D))
 // v over the selected cells, times sigmoid(gate). q head h reads KV head h / (H / HKV).
 template <class Shape>
 void attention(const half * q, const float * gate, const half * k, const half * v, const int * blocks,
-               const int * n_blocks, int pos0, int T, half * out, cudaStream_t stream);
+               const int * n_blocks, int pos0, int T, half * out, void * ws, size_t ws_bytes, cudaStream_t stream);
 
 }  // namespace truss::dsa

@@ -80,10 +80,11 @@ predecessor-relevant low bits: 2^(16−S) floats per step (shared memory for S �
 ## `src/kernels/moe/moe_weights.cuh` — shapes and weight views
 
 `moe::FlashNext { D_MODEL = 2560, D_FF = 640, TOPK = 10 }` (a new model = a new struct + explicit instantiations in
-the op .cu files). `ProjView { trellis (uint16 base), meta ((K, int32 word offset from base) per expert), suh
-[n_expert][in], svh [n_expert][out] }`; `Weights { ProjView proj[3] (gate, up, down); n_expert }`.
-**The kernels address expert e as `trellis + meta[2e+1]` (signed int32 words, ±4 GiB)** — the `ExpertStore` relies on
-this to place experts anywhere in its arena without touching the kernels.
+the op .cu files). `ProjView { trellis (uint16 base), meta ((K, int32 offset from base) per expert), suh
+[n_expert][in], svh [n_expert][out], shift }`; `Weights { ProjView proj[3] (gate, up, down); n_expert }`.
+**The kernels address expert e as `trellis + (meta[2e+1] << shift)` words** (int64 math). `shift` = 0 for GGUF
+tables (word offsets, what the tests pass); `ExpertStore` uses 4 (32-byte units, ±64 GiB) so one arena holds every
+tier and all three projections share a base.
 
 ## `src/kernels/moe/moe_window.cuh`, `moe_window.cu` — routed experts for ≤ 8 rows (decode / verify window)
 

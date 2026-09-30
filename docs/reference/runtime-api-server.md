@@ -4,46 +4,57 @@
 
 ## `src/runtime/expert_store.h`, `expert_store.cu` — which experts live where
 
-**Problem.** Flash-Next's routed experts are 37 GiB; after dense weights, caches and scratch a 3090 has ~14–16 GiB
+**Problem.** Flash-Next's routed experts are 37 GiB; after dense weights, caches and scratch a 3090 has ~13–16 GiB
 for them. The rest (cold, ~24 GB) must come over PCIe (13.5 GB/s pinned, x8) when used.
 
-**Layout.** One device arena per projection (gate, up, down):
+**Tiers.** *hot*: a static usage-ranked set, resident for the run. *ring*: one device region that is either decode's
+FIFO cache of recently fetched cold experts, or, during a prompt chunk, two whole-layer stream slots plus the chunk's
+own large buffers (`spare()`: Forward's prefill scratch, `moe::prefill` workspace, residual). *host*: every cold
+expert in pinned memory, per layer `[expert: gate | up | down]` in expert order.
+
+**Layout.** One device arena:
 
 ```
-[hot experts of layers 0..23][slot 0][slot 1][hot experts of layers 24..47]
-                              ^ base (ProjView.trellis for every layer)
+[hot experts, layers 0..23][ring: slot 0 | slot 1 | spare ... ][hot experts, layers 24..47]
+                            ^ base = ProjView.trellis of every projection, ProjView.shift = 4
 ```
 
-Hot experts sit at fixed offsets (negative for the first half). Layer l's cold experts always land at the same place
-inside slot l % 2 (packed in expert order), so **the per-layer meta tables (K, word offset from base) are built once
-and never rewritten**, and the MoE kernels need no change. Offsets are int32 words (±4 GiB of base); the loader
-throws if one overflows. Cold experts are copied once at load into pinned host memory, per (layer, projection),
-contiguous in slot order.
+Each expert's three projections are contiguous (one copy per fetched expert). Meta offsets count 32-byte units
+(`shift` 4), so int32 reaches ±64 GiB of base. Two meta tables per (layer, projection): the **stream** table (cold
+experts at their fixed place in slot l % 2, built once) and the **ring** table (rewritten by `fetch()` from a pinned
+host mirror, one 4 KB copy per projection per layer that changed). `weights(l)` returns the current mode's table.
 
 **API.**
 
 | call | does |
 |---|---|
-| `ExpertStore::plan(layers, budget, usage = {})` | hot set whose bytes (hot + 2 slots + scales + meta) fit `budget`. Without usage: the first N experts of every layer (index order). With usage (routed counts [layer][expert]): every layer first gets its top `floor` experts by count per byte, then greedy by count per byte over all layers; the floor (swept in steps of 8) with the most hot usage wins — a layer with few hot experts would make both slots large |
-| `ExpertStore::load_usage(path, n_layer, n_expert)` | reads a usage file: n_layer · n_expert float32, layer-major (`flashnext_truss_usage.py` writes it from a routing capture) |
-| `ExpertStore(layers, hot)` | builds arenas, pinned cold copies, meta tables; uploads suh/svh (all resident) |
-| `weights(l)` | `moe::Weights` for layer l |
-| `prefetch(l)` | copy all of layer l's cold experts into slot l%2 on the store's copy stream, after the slot's last user released it |
-| `fetch(l, ids, n)` | copy only the cold experts among `ids` (host ints; deduplicated) into their slot places |
-| `acquire(l, compute)` | compute stream waits for layer l's copy |
-| `release(l, compute)` | records that compute is done with slot l%2 |
-| `device_bytes()`, `cold_bytes()` | memory used; bytes streamed per full pass |
+| `ExpertStore::plan(layers, budget, Sizes{ring_bytes, stream_extra}, usage = {})` | hot set whose `device_bytes` fit `budget`; ring = max(ring_bytes, 2 × largest cold layer + stream_extra). Without usage: the first N experts of every layer. With usage (routed counts [layer][expert]): every layer first gets its top `floor` experts by count per byte, then greedy by count per byte over all layers; the floor (steps of 8) with the most hot usage wins |
+| `ExpertStore::load_usage(path, n_layer, n_expert)` | usage file: n_layer · n_expert float32, layer-major (`tk-profile` or `flashnext_truss_usage.py` writes it) |
+| `ExpertStore(layers, hot, sizes)` | arena, pinned cold copies, both meta tables, suh/svh |
+| `weights(l)` | `moe::Weights` for layer l in the current mode |
+| `begin_stream(compute)` | a prompt chunk starts: waits for queued compute, drops the ring's contents, stream mode |
+| `spare()` | stream mode: `stream_extra` bytes after the slots, valid until the next `fetch()` |
+| `prefetch(l)` | stream mode: all of layer l's cold experts into slot l % 2 (one copy), after the slot's release |
+| `fetch(l, ids, n, compute)` | ring mode: makes the cold experts among `ids` (host) resident: FIFO allocation (256-B aligned, wrap at the end, evicting the oldest), one copy each, ring meta updated; waits for queued compute first (the ring may overwrite what earlier kernels read). Refetches if a copy evicted an expert this call needs |
+| `acquire(l, compute)` / `release(l, compute)` | compute waits for layer l's copies / records it is done with slot l % 2 |
+| `stats()` | ring mode: fetch calls, experts asked, fetched (misses), bytes |
+| `device_bytes()`, `cold_bytes()`, `ring_bytes()` | memory used; bytes streamed per prompt chunk; ring size |
 
-**Protocol (Forward).** Long chunk: `prefetch(0)`, `prefetch(1)` at chunk start; for each layer `acquire(l)` → MoE
-kernel → `release(l)` → `prefetch(l + 2)`. Short chunk (≤ 32 rows): routing to host → `fetch(l, ids)` → `acquire` →
-kernel → `release`. Events per slot keep copies and compute ordered across chunks and modes.
+**Protocol (Forward).** Prompt chunk (> 32 rows): `begin_stream`, `prefetch(0)`, `prefetch(1)`; per layer
+`acquire(l)` → `moe::prefill` → `release(l)` → `prefetch(l + 2)`. Decode step / window (≤ 32 rows): per layer
+routing to host → `fetch(l, ids, n, s)` → `acquire` → `moe::window` (≤ 8 rows) or `moe::prefill`.
 
-**Measured.** Full model, 4K chunk: 204/512 experts hot, 23.6 GB streamed per chunk, PCIe 1.75 s vs compute ~1.8 s,
-overlapped → 2,263 tok/s (TRACKER #52). Streamed == resident bit-exact (`qwen4exp_forward stream`).
+**Why a ring (TRACKER #57).** On held-out chatcode routing a FIFO of recently fetched experts halves the misses of a
+static set of equal size (10,000 slots: 74 → 38 per token; FIFO within 3% of LRU;
+`flashnext_truss_cache_sim.py`). Letting prompt chunks borrow the ring for their buffers moved ~3 GB of
+prefill-only memory into the cache.
 
-**Limits / next.** The two slots are sized for whole-layer prefill streaming (~1.2 GB at 150 hot/layer) and are
-dead weight in decode, so a usage-ranked set fits fewer experts than it could (TRACKER #56). The fetch path is
-synchronous per layer (routing must be read back first).
+**Measured.** Full model, 4K chunk prefill: 2,263 tok/s (TRACKER #52, before the ring). Decode (real code prompt,
+64K context, chunk 8192, profile `usage_code_truss8.f32`): 5,743 hot + 4.6 GB ring, 94 fetches (165 MB) per token,
+33 tok/s (#57). Bit-exact vs all resident incl. ring wraps (`qwen4exp_forward stream`).
+
+**Limits / next.** Fetch is synchronous per layer (routing read back to the host); misses cost PCIe time on the
+critical path (~9.5 ms per token at 94 misses). Next: MTP windows, a CPU tier for misses.
 
 ---
 
@@ -100,4 +111,4 @@ runs unchanged against it.
 the GGUF; checked token-for-token against llama-tokenize on 7.5K tokens of code with special tokens).
 
 **Known limits.** Single sequence; no rewind (multi-turn chats whose history re-renders differently start over);
-decode 13.6–15.5 tok/s (bring-up; the speed work is CP4/CP5).
+decode 33 tok/s at #57 (TRACKER #56+ for the speed work).

@@ -65,12 +65,14 @@ llama-paw function it follows. Checked by `qwen4exp_parity` (160/160, block by b
 
 ```
 Forward(config, weights, n_ctx, max_chunk, Options{ expert_budget = 0 (= all free memory − 768 MiB),
-                                             act = Q8_1, expert_usage = {} (ExpertStore::plan) })
+                                             act = Q8_1, expert_usage = {} (ExpertStore::plan),
+                                             ring_bytes = 4 GiB (decode FIFO; prompt chunks borrow it) })
 run(tokens, T, hook = nullptr)   // append T tokens (a prompt chunk or a decode step); hook(layer, res, T) per layer
 head(first, n, logits)           // logits [n][vocab] (device fp32) for rows of the last chunk; Q8_1: one
                                  // q8_gemv/q8_gemm over the vocab; FP16: q8_gemm_a16 in vocab tiles
 reset()                          // new sequence
-position(), hot_experts() (all layers), cold_bytes(), stream()
+position(), hot_experts() (all layers), cold_bytes(), stream(), experts() (the ExpertStore: stats)
+profile_routes(on), route_counts()   // routing profile [layer][expert] (the usage file; tk-profile)
 ```
 
 `config` and `weights` must outlive it (weights point into the file mapping). Single stream; not thread-safe.
@@ -83,10 +85,9 @@ position(), hot_experts() (all layers), cold_bytes(), stream()
 | `q8` | map tensor → `dense::Q8Matrix`, all Q8_0 matrices repacked at load (one staging buffer) |
 | `experts` | `runtime::ExpertStore` (hot/cold routed experts; runtime-api-server.md) |
 | `st[l]` | per-layer state: DSA `k`, `v` fp16 [n_ctx][2][256], `idx_k` [n_ctx/4][128], `idx_partial` [3][128]; GDN `state` [48][128][128] fp32, `conv` [3][10240]; PLE `ple_hist` [9][10240] |
-| `res` | residual [max_chunk][4][2560] fp32 (persists after `run` for `head`) |
-| `scratch` | per-layer temporaries, size from `scratch_bytes` (per-token peak of the widest block + select workspace) |
+| `small`, `big` (`Buffers`) | per-chunk scratch (`scratch_bytes`: per-token peak of the widest block + DSA select and split-attention workspaces), `moe::prefill` workspace, residual [rows][4][2560]. `small` is resident, sized for 32 rows (decode, verify windows); `big` (max_chunk rows) lives in the ExpertStore ring's spare region and exists only during prompt chunks. `use()` selects one per `run`; the residual persists after `run` for `head` |
 | `w16` | `q8_gemm_a16`'s dequantized-weight scratch (largest non-head matrix) |
-| `moe_ws`, `window_ws`, `ids_host` | MoE workspaces; pinned routing buffer for the expert fetch |
+| `window_ws`, `ids_host`, `route_counts` | `moe::window` workspace; pinned routing buffer for the expert fetch; routing profile while on |
 
 **Per chunk.** See the table in [README.md](README.md). Mode choices inside:
 - `lin`: Q8_1 → `q8_gemv` (≤ 8 rows) / `q8_gemm`; FP16 → `q8_gemm_a16`. `lin32`: cuBLAS SGEMM for F32 weights.

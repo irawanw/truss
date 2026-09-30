@@ -4,6 +4,7 @@
 //               to >= 2^-14), ids in descending probability as the reference's partial_sort
 //   swiglu      silu(g) * u -> fp16 (the down projection's input)
 //   shared_add  out = routed + y * sigmoid(gate)
+//   count       counts[ids[i]] += 1 (routing profile for the expert hot set)
 #pragma once
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -19,5 +20,8 @@ void swiglu(const float * g, const float * u, int n, half * mid16, cudaStream_t 
 // out [T][d] = routed + y * sigmoid(gate [T])
 void shared_add(const float * routed, const float * y, const float * gate, int T, int d, float * out,
                 cudaStream_t stream);
+
+// counts [E] += how often each id appears in ids [n] (float: a profile of many tokens stays exact up to 2^24 per id)
+void count(const int * ids, int n, float * counts, cudaStream_t stream);
 
 }  // namespace truss::ffn

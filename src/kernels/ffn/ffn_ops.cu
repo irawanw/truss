@@ -74,7 +74,19 @@ __global__ void shared_add_kernel(const float * routed, const float * y, const f
     if (i < (int64_t) T * d) out[i] = routed[i] + y[i] * sigmoid(gate[i / d]);
 }
 
+__global__ void count_kernel(const int * ids, int n, float * counts)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) atomicAdd(counts + ids[i], 1.f);
+}
+
 }  // namespace
+
+void count(const int * ids, int n, float * counts, cudaStream_t stream)
+{
+    count_kernel<<<grid(n), THREADS, 0, stream>>>(ids, n, counts);
+    TRUSS_CUDA(cudaGetLastError());
+}
 
 void route(const float * logits, int T, int E, int k, int * ids, float * wts, cudaStream_t stream)
 {

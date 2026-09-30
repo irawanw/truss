@@ -219,7 +219,7 @@ int main(int argc, char ** argv)
                 const size_t ws_bytes = dsa::select_workspace_bytes<S>(T, T);
                 void * ws = scratch.alloc<unsigned char>(ws_bytes);
                 dsa::select<S>(iq16, ik16, 0, T, blocks, n_blocks, ws, ws_bytes, nullptr);
-                dsa::attention<S>(q16, tr.gate, k16, v16, blocks, n_blocks, 0, T, fast, nullptr);
+                dsa::attention<S>(q16, tr.gate, k16, v16, blocks, n_blocks, 0, T, fast, nullptr, 0, nullptr);
                 std::vector<int> hb((size_t) T * S::TOP_BLOCKS), hn(T);
                 TRUSS_CUDA(cudaMemcpy(hb.data(), blocks, hb.size() * 4, cudaMemcpyDeviceToHost));
                 TRUSS_CUDA(cudaMemcpy(hn.data(), n_blocks, hn.size() * 4, cudaMemcpyDeviceToHost));

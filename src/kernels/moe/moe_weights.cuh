@@ -12,10 +12,12 @@ struct FlashNext {                         // Qwen3.8 Flash-Next: 512 experts, t
 };
 
 struct ProjView {                          // one projection (gate, up or down) of all experts of a layer
-    const uint16_t * trellis;              // concatenated tiles
-    const int32_t * meta;                  // [n_expert][2] = (K, uint16 word offset)
+    const uint16_t * trellis;              // base of the tiles
+    const int32_t * meta;                  // [n_expert][2] = (K, offset): expert e at trellis + (offset << shift) words
     const half * suh;                      // [n_expert][in]
     const half * svh;                      // [n_expert][out]
+    int shift = 0;                         // 0: GGUF word offsets; runtime::ExpertStore uses 4 (32-byte units, so an
+                                           // int32 offset reaches +-64 GiB of the base)
 };
 
 struct Weights {

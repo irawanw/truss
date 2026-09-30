@@ -10,8 +10,13 @@ namespace truss {
 
 class Scratch {
 public:
-    explicit Scratch(size_t bytes) : cap_(bytes) { TRUSS_CUDA(cudaMalloc(&base_, bytes)); }
-    ~Scratch() { cudaFree(base_); }
+    explicit Scratch(size_t bytes) : cap_(bytes), owned_(true) { TRUSS_CUDA(cudaMalloc(&base_, bytes)); }
+    // over memory owned elsewhere (e.g. a prompt chunk's share of runtime::ExpertStore's ring)
+    Scratch(void * base, size_t bytes) : base_(base), cap_(bytes) {}
+    ~Scratch()
+    {
+        if (owned_) cudaFree(base_);
+    }
     Scratch(const Scratch &) = delete;
     Scratch & operator=(const Scratch &) = delete;
 
@@ -32,6 +37,7 @@ public:
 private:
     void * base_ = nullptr;
     size_t cap_, used_ = 0;
+    bool owned_ = false;
 };
 
 }  // namespace truss

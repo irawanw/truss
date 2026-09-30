@@ -3,7 +3,7 @@
 // token per run(), device argmax, token copied back like the server does). One warm-up series, then a timed one.
 // Prints ms per step and the split into steps; run under nsys for the per-kernel split.
 // usage: tk-bench-decode <model.gguf> [prompt=512|@ids.i32] [steps=64] [n_ctx=65536] [chunk=8192] [usage file|-]
-//                        [expert budget MiB, 0 = auto]
+//                        [expert budget MiB, 0 = auto] [ring MiB]
 #include "core/cuda_check.h"
 #include "kernels/sampling/argmax.cuh"
 #include "model/qwen4exp/config.h"
@@ -51,14 +51,15 @@ int main(int argc, char ** argv)
         if (argc > 6 && std::string(argv[6]) != "-")
             o.expert_usage = runtime::ExpertStore::load_usage(argv[6], c.n_layer, c.n_expert);
         o.expert_budget = argc > 7 ? (size_t) std::atoll(argv[7]) << 20 : 0;
+        if (argc > 8) o.ring_bytes = (size_t) std::atoll(argv[8]) << 20;
         float * logits;
         int * next_d, * next_h;
         TRUSS_CUDA(cudaMalloc(&logits, sizeof(float) * c.n_vocab));
         TRUSS_CUDA(cudaMalloc(&next_d, sizeof(int)));
         TRUSS_CUDA(cudaMallocHost(&next_h, sizeof(int)));
         q::Forward f(c, w, n_ctx, chunk, o);
-        std::printf("experts: %d of %d resident (%s)\n", f.hot_experts(), c.n_expert * c.n_layer,
-                    o.expert_usage.empty() ? "index order" : "usage-ranked");
+        std::printf("experts: %d of %d resident (%s), ring %.2f GB\n", f.hot_experts(), c.n_expert * c.n_layer,
+                    o.expert_usage.empty() ? "index order" : "usage-ranked", f.experts().ring_bytes() / 1e9);
         for (int pass = 0; pass < 2; ++pass) {
             f.reset();
             for (int s = 0; s < n; s += chunk) f.run(tok.data() + s, std::min(chunk, n - s));
@@ -66,6 +67,7 @@ int main(int argc, char ** argv)
             sampling::argmax(logits, c.n_vocab, next_d, f.stream());
             TRUSS_CUDA(cudaMemcpyAsync(next_h, next_d, 4, cudaMemcpyDeviceToHost, f.stream()));
             TRUSS_CUDA(cudaStreamSynchronize(f.stream()));
+            const runtime::ExpertStore::Stats st0 = f.experts().stats();
             std::vector<double> ms;
             for (int i = 0; i < steps; ++i) {
                 const auto t0 = std::chrono::steady_clock::now();
@@ -84,6 +86,10 @@ int main(int argc, char ** argv)
             std::printf("%s: prompt %d, %d steps: mean %.2f ms (%.1f tok/s), median %.2f, min %.2f, max %.2f\n",
                         pass ? "timed" : "warm-up", n, steps, sum / steps, 1e3 * steps / sum, sorted[steps / 2], sorted[0],
                         sorted[steps - 1]);
+            const runtime::ExpertStore::Stats & st = f.experts().stats();
+            std::printf("  per step: %.1f cold experts routed, %.1f fetched (%.1f MB)\n",
+                        (double) (st.experts_asked - st0.experts_asked) / steps, (double) (st.misses - st0.misses) / steps,
+                        (st.bytes - st0.bytes) / 1e6 / steps);
         }
         return 0;
     } catch (const std::exception & e) {

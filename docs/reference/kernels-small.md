@@ -33,6 +33,7 @@ hc combine: res[c] += out ⊙ 2 sigmoid(inject[c] / 4)
 | `route(logits [T][E], T, E, k, ids [T][k], wts [T][k])` | softmax, top-k (ties: lower id), weights renormalized over the k with sum clamped ≥ 2^-14; ids in descending probability (the reference's `partial_sort`); one warp per token, E ≤ 1024 (16 or 32 per lane) |
 | `swiglu(g, u, n, mid16)` | silu(g)·u → fp16 (down projection input) |
 | `shared_add(routed, y, gate [T], T, d, out)` | out = routed + y·sigmoid(gate) |
+| `count(ids, n, counts)` | counts[ids[i]] += 1 (float atomics; `Forward::profile_routes`) |
 
 The router logits are fp32 (cuBLAS SGEMM, `Forward::lin32`): top-10 of 512 has near-ties, and rounding the router
 would flip them.

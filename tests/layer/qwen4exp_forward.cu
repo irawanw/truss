@@ -30,6 +30,7 @@
 #include <cmath>
 #include <cstdio>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -153,6 +154,13 @@ double run_timed(q::Forward & p, const std::vector<int32_t> & tok, int chunk)
 
 }  // namespace
 
+void require_tokens(int have, int need)
+{
+    if (have < need)
+        throw std::runtime_error("this mode needs a dump of at least " + std::to_string(need) + " tokens (have " +
+                                 std::to_string(have) + ")");
+}
+
 int main(int argc, char ** argv)
 {
     if (argc < 4) {
@@ -198,32 +206,51 @@ int main(int argc, char ** argv)
                             ok ? "PASS" : "FAIL");
             }
         } else if (mode == "stream") {
-            // all resident vs a 2 GiB budget, first with the index-order hot set, then with a scattered one (random
-            // usage counts: different hot counts per layer, holes in the expert order)
+            // All resident vs a 3 GiB budget: prompt chunks stream the cold experts through the ring's two slots, then
+            // single-token steps fetch them into the ring. Passes: index-order hot set with a 1 GiB ring; scattered
+            // hot set (random usage counts: different hot counts per layer, holes in the expert order) with the
+            // smallest ring (the slots), so decode steps wrap and evict. Residuals and step logits must be
+            // bit-identical to all resident. Needs > 32 tokens (llama_dump_chunk8).
+            const int n_dec = 48, P = T - n_dec, V = c.n_vocab, chunk = 64;   // 48 steps wrap the smallest ring
+            require_tokens(T, n_dec + chunk + 1);
             std::mt19937 urng(7);
             std::vector<float> usage((size_t) c.n_layer * c.n_expert);
             for (float & u : usage) u = (float) (urng() % 1000);
+            float * d_logits;
+            TRUSS_CUDA(cudaMalloc(&d_logits, (size_t) V * 4));
             std::vector<std::vector<float>> all;
+            std::vector<float> all_logits;
             for (int pass = 0; pass < 3; ++pass) {
                 q::Forward::Options o;
-                if (pass) o.expert_budget = 2ull << 30;
-                if (pass == 2) o.expert_usage = usage;
-                q::Forward p(c, w, T, (T + 3) / 4 * 4, o);
+                if (pass) o.expert_budget = 3ull << 30, o.ring_bytes = 1ull << 30;
+                if (pass == 2) o.expert_usage = usage, o.ring_bytes = 0;
+                q::Forward p(c, w, T, chunk, o);
                 double t;
-                std::vector<std::vector<float>> got = run_engine(p, tok, (T + 3) / 4 * 4, c.n_layer, row, &t);
+                const std::vector<int32_t> prompt(tok.begin(), tok.begin() + P);
+                std::vector<std::vector<float>> got = run_engine(p, prompt, chunk, c.n_layer, row, &t);
+                std::vector<float> logits((size_t) n_dec * V);
+                for (int i = 0; i < n_dec; ++i) {
+                    p.run(tok.data() + P + i, 1);
+                    p.head(0, 1, d_logits);
+                    TRUSS_CUDA(cudaMemcpy(logits.data() + (size_t) i * V, d_logits, (size_t) V * 4, cudaMemcpyDeviceToHost));
+                }
                 if (!pass) {
-                    all = got;
+                    all = got, all_logits = logits;
                     std::printf("all resident: %d experts\n", p.hot_experts());
                     continue;
                 }
-                long diff = 0;
+                long diff = 0, ldiff = 0;
                 for (int l = 0; l < c.n_layer; ++l)
                     for (size_t i = 0; i < all[l].size(); ++i) diff += all[l][i] != got[l][i];
-                fails += diff != 0;
-                std::printf("2 GiB budget, %s hot set: %d experts resident, %.2f GB streamed per chunk: %ld residual "
-                            "values differ  %s\n", pass == 1 ? "index-order" : "usage-ranked", p.hot_experts(),
-                            p.cold_bytes() / 1e9, diff, diff ? "FAIL" : "PASS");
+                for (size_t i = 0; i < logits.size(); ++i) ldiff += logits[i] != all_logits[i];
+                const runtime::ExpertStore::Stats & st = p.experts().stats();
+                fails += diff != 0 || ldiff != 0;
+                std::printf("3 GiB budget, %s hot set, ring %.2f GB: %d experts resident, %.2f GB streamed per chunk, "
+                            "decode fetched %ld experts: %ld residual and %ld logit values differ  %s\n",
+                            pass == 1 ? "index-order" : "usage-ranked", p.experts().ring_bytes() / 1e9, p.hot_experts(),
+                            p.cold_bytes() / 1e9, st.misses, diff, ldiff, diff || ldiff ? "FAIL" : "PASS");
             }
+            cudaFree(d_logits);
         } else if (mode == "decode") {
             const int n_dec = 32, P = T - n_dec, V = c.n_vocab;
             float * d_logits;

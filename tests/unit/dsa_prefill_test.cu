@@ -72,17 +72,19 @@ int run(int n_ctx, int pos0, int T, bool check, std::mt19937 & rng)
     half * out = dalloc<half>((size_t) T * H * D);
     const size_t ws_bytes = dsa::select_workspace_bytes<Shape>(T, n_ctx);
     void * ws = dalloc<unsigned char>(ws_bytes);
+    const size_t aws_bytes = dsa::attention_workspace_bytes<Shape>(T);   // split path (T <= SPLIT_ROWS)
+    void * aws = aws_bytes ? dalloc<unsigned char>(aws_bytes) : nullptr;
     const half * cq = q.x + (size_t) pos0 * H * D, * ciq = iq.x + (size_t) pos0 * IH * ID;
     const float * cg = gate.f + (size_t) pos0 * H * D;
 
     cudaEvent_t e[3];
     for (auto & x : e) cudaEventCreate(&x);
     dsa::select<Shape>(ciq, ik.x, pos0, T, blocks, n_blocks, ws, ws_bytes, nullptr);   // warm-up
-    dsa::attention<Shape>(cq, cg, k.x, v.x, blocks, n_blocks, pos0, T, out, nullptr);
+    dsa::attention<Shape>(cq, cg, k.x, v.x, blocks, n_blocks, pos0, T, out, aws, aws_bytes, nullptr);
     cudaEventRecord(e[0]);
     dsa::select<Shape>(ciq, ik.x, pos0, T, blocks, n_blocks, ws, ws_bytes, nullptr);
     cudaEventRecord(e[1]);
-    dsa::attention<Shape>(cq, cg, k.x, v.x, blocks, n_blocks, pos0, T, out, nullptr);
+    dsa::attention<Shape>(cq, cg, k.x, v.x, blocks, n_blocks, pos0, T, out, aws, aws_bytes, nullptr);
     cudaEventRecord(e[2]);
     TRUSS_CUDA(cudaEventSynchronize(e[2]));
     float ms_sel, ms_att;
@@ -157,7 +159,7 @@ int run(int n_ctx, int pos0, int T, bool check, std::mt19937 & rng)
     }
     std::printf("  %s\n", check ? (ok ? "PASS" : "FAIL") : "(timed)");
     for (auto & x : e) cudaEventDestroy(x);
-    cudaFree(blocks), cudaFree(n_blocks), cudaFree(out), cudaFree(ws);
+    cudaFree(blocks), cudaFree(n_blocks), cudaFree(out), cudaFree(ws), cudaFree(aws);
     return ok ? 0 : 1;
 }
 
@@ -171,9 +173,14 @@ int main()
         fails += run(12, 0, 12, true, rng);
         fails += run(3001, 0, 3001, true, rng);      // dense and sparse queries, a tail on most
         fails += run(4096, 3072, 1024, true, rng);   // a later chunk
+        fails += run(3001, 2999, 1, true, rng);      // split path: a decode step past the top-k (sparse)
+        fails += run(600, 587, 13, true, rng);       // split path: a window, dense (every block kept)
+        fails += run(4100, 4068, 32, true, rng);     // split path: the largest split chunk
         fails += run(4096, 0, 4096, false, rng);
         fails += run(8192, 0, 8192, false, rng);
         fails += run(32768, 24576, 8192, false, rng);
+        fails += run(32768, 32767, 1, false, rng);    // decode step at 32K
+        fails += run(32768, 32764, 4, false, rng);    // 4-token verify window at 32K
         std::printf("%s\n", fails ? "FAIL" : "PASS");
         return fails ? 1 : 0;
     } catch (const std::exception & e) {

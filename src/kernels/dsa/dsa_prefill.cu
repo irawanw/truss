@@ -10,6 +10,10 @@
 //                     selection and fill one m16 tile. Cells are gathered TILE at a time into shared memory (K and V
 //                     rows are 512 B contiguous); each warp owns half of a tile's cells and its own softmax state,
 //                     and the two states merge at the end.
+//                     Split form (T <= SPLIT_ROWS: decode steps, verify windows): a third grid dimension cuts each
+//                     query's cells into contiguous ranges; each CTA writes its unnormalized state (o, m, l) and
+//                     combine_kernel merges the ranges in order and applies the gate. One query has only HKV = 2
+//                     CTAs otherwise: 227 us per decode layer at 3.4K context (TRACKER #57).
 #include "dsa_prefill.cuh"
 
 #include "core/cuda_check.h"
@@ -170,10 +174,18 @@ __device__ __forceinline__ void cp16(void * dst, const void * src)
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(d), "l"(src));
 }
 
-template <class Shape>
+template <class Shape> struct Partial {             // one split's state per (query, KV head, split)
+    static constexpr int G = Shape::H / Shape::HKV;
+    static constexpr size_t FLOATS = (size_t) G * Shape::D + 2 * G;   // o [G][D], m [G], l [G]
+};
+
+// SPLIT: cells [blockIdx.z * cells_per_split, ...) of each query, unnormalized state to `part`; else all cells, final
+// gated output to `out`.
+template <class Shape, bool SPLIT>
 __global__ void __launch_bounds__(32 * ATTN_WARPS) attn_kernel(const half * q, const float * gate, const half * k,
                                                                const half * v, const int * blocks,
-                                                               const int * n_blocks, int pos0, half * out)
+                                                               const int * n_blocks, int pos0, half * out,
+                                                               int cells_per_split, float * part)
 {
     constexpr int H = Shape::H, HKV = Shape::HKV, D = Shape::D, R = Shape::RATIO, G = H / HKV;
     constexpr int NT = D / 8;   // output n8 tiles
@@ -184,7 +196,9 @@ __global__ void __launch_bounds__(32 * ATTN_WARPS) attn_kernel(const half * q, c
     const int t = blockIdx.x, kv = blockIdx.y, tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
     const int g = lane / 4, qd = lane % 4;
     const int pos = pos0 + t, seen = (pos + 1) / R, nsel = n_blocks[t];
-    const int n_cells = R * nsel + (pos + 1 - R * seen);
+    const int all_cells = R * nsel + (pos + 1 - R * seen);
+    const int begin = SPLIT ? blockIdx.z * cells_per_split : 0;
+    const int n_cells = SPLIT ? min(all_cells, begin + cells_per_split) : all_cells;   // end of this CTA's range
     const int * sel = blocks + (size_t) t * Shape::TOP_BLOCKS;
     const float scale_log2 = 1.44269504f / sqrtf((float) D);
 
@@ -198,7 +212,7 @@ __global__ void __launch_bounds__(32 * ATTN_WARPS) attn_kernel(const half * q, c
 
     float o[NT][4] = {};
     float m[2] = { -INFINITY, -INFINITY }, l[2] = { 0.f, 0.f };   // rows g, g + 8
-    for (int c0 = 0; c0 < n_cells; c0 += TILE) {
+    for (int c0 = begin; c0 < n_cells; c0 += TILE) {
         __syncthreads();   // previous tile consumed (and q stored, first time)
         for (int i = tid; i < TILE * D / 8; i += 32 * ATTN_WARPS) {
             const int r = i / (D / 8), c = 8 * (i % (D / 8)), cell = c0 + r;
@@ -290,6 +304,24 @@ __global__ void __launch_bounds__(32 * ATTN_WARPS) attn_kernel(const half * q, c
     }
     __syncthreads();
     if (warp == 1) return;
+    if constexpr (SPLIT) {
+        float * P = part + (((size_t) t * HKV + kv) * gridDim.z + blockIdx.z) * Partial<Shape>::FLOATS;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int r = g + 8 * i;
+            if (r >= G) continue;
+            const float m1 = ml[r], l1 = ml[16 + r], mm = fmaxf(m[i], m1);
+            const float a = m[i] == -INFINITY ? 0.f : exp2f(m[i] - mm), b = m1 == -INFINITY ? 0.f : exp2f(m1 - mm);
+#pragma unroll
+            for (int n = 0; n < NT; ++n) {
+                const int d = 8 * n + 2 * qd;
+                *reinterpret_cast<float2 *>(P + r * D + d) =
+                    make_float2(o[n][2 * i] * a + mo[r * D + d] * b, o[n][2 * i + 1] * a + mo[r * D + d + 1] * b);
+            }
+            if (qd == 0) P[G * D + r] = mm, P[G * D + G + r] = l[i] * a + l1 * b;
+        }
+        return;
+    }
     float f0[2], f1[2], inv[2];
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
@@ -315,7 +347,49 @@ __global__ void __launch_bounds__(32 * ATTN_WARPS) attn_kernel(const half * q, c
     }
 }
 
+// out [t][kv G + r][d] = gated merge of the splits' states, in split order
+template <class Shape>
+__global__ void __launch_bounds__(256) combine_kernel(const float * part, int splits, const float * gate, half * out)
+{
+    constexpr int H = Shape::H, HKV = Shape::HKV, D = Shape::D, G = H / HKV;
+    const int t = blockIdx.x, kv = blockIdx.y;
+    const float * P0 = part + ((size_t) t * HKV + kv) * splits * Partial<Shape>::FLOATS;
+    for (int i = threadIdx.x; i < G * D; i += blockDim.x) {
+        const int r = i / D, d = i % D;
+        float mm = -INFINITY;
+        for (int z = 0; z < splits; ++z) mm = fmaxf(mm, P0[z * Partial<Shape>::FLOATS + G * D + r]);
+        float num = 0.f, den = 0.f;
+        for (int z = 0; z < splits; ++z) {
+            const float * P = P0 + z * Partial<Shape>::FLOATS;
+            const float m = P[G * D + r];
+            if (m == -INFINITY) continue;
+            const float w = exp2f(m - mm);
+            num += P[r * D + d] * w;
+            den += P[G * D + G + r] * w;
+        }
+        const size_t row = (size_t) t * H + kv * G + r;
+        const float gt = gate[row * D + d];
+        out[row * D + d] = __float2half(num / den / (1.f + __expf(-gt)));
+    }
+}
+
+// splits per query: ranges of >= 2 tiles, at most MAX_SPLITS
+constexpr int MAX_SPLITS = 32;
+
+template <class Shape> int max_query_cells(int pos0, int T)   // the most cells any query of the chunk attends to
+{
+    return std::min(pos0 + T, Shape::RATIO * Shape::TOP_BLOCKS + Shape::RATIO - 1);
+}
+
+int split_count(int max_cells) { return std::max(1, std::min(MAX_SPLITS, (max_cells + 2 * TILE - 1) / (2 * TILE))); }
+
 }  // namespace
+
+template <class Shape> size_t attention_workspace_bytes(int max_queries)
+{
+    if (max_queries > SPLIT_ROWS) return 0;
+    return (size_t) max_queries * Shape::HKV * MAX_SPLITS * Partial<Shape>::FLOATS * sizeof(float);
+}
 
 template <class Shape> size_t select_workspace_bytes(int max_queries, int n_ctx)
 {
@@ -347,23 +421,36 @@ void select(const half * idx_q, const half * idx_k, int pos0, int T, int * block
 
 template <class Shape>
 void attention(const half * q, const float * gate, const half * k, const half * v, const int * blocks,
-               const int * n_blocks, int pos0, int T, half * out, cudaStream_t stream)
+               const int * n_blocks, int pos0, int T, half * out, void * ws, size_t ws_bytes, cudaStream_t stream)
 {
     if (T <= 0 || pos0 < 0) throw std::invalid_argument("dsa::attention: bad chunk");
     const size_t smem = sizeof(AttnSmem<Shape>);
     static bool attr = [&] {
-        TRUSS_CUDA(cudaFuncSetAttribute(attn_kernel<Shape>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
+        TRUSS_CUDA(cudaFuncSetAttribute(attn_kernel<Shape, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
+        TRUSS_CUDA(cudaFuncSetAttribute(attn_kernel<Shape, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
         return true;
     }();
     (void) attr;
-    attn_kernel<Shape><<<dim3(T, Shape::HKV), 32 * ATTN_WARPS, smem, stream>>>(q, gate, k, v, blocks, n_blocks, pos0,
-                                                                              out);
+    if (T <= SPLIT_ROWS) {
+        if (ws_bytes < attention_workspace_bytes<Shape>(T))
+            throw std::invalid_argument("dsa::attention: split workspace too small");
+        const int max_cells = max_query_cells<Shape>(pos0, T), S = split_count(max_cells);
+        const int per = ((max_cells + S - 1) / S + TILE - 1) / TILE * TILE;   // whole tiles per split
+        auto * part = static_cast<float *>(ws);
+        attn_kernel<Shape, true><<<dim3(T, Shape::HKV, S), 32 * ATTN_WARPS, smem, stream>>>(
+            q, gate, k, v, blocks, n_blocks, pos0, out, per, part);
+        combine_kernel<Shape><<<dim3(T, Shape::HKV), 256, 0, stream>>>(part, S, gate, out);
+    } else {
+        attn_kernel<Shape, false><<<dim3(T, Shape::HKV), 32 * ATTN_WARPS, smem, stream>>>(
+            q, gate, k, v, blocks, n_blocks, pos0, out, 0, nullptr);
+    }
     TRUSS_CUDA(cudaGetLastError());
 }
 
 template size_t select_workspace_bytes<FlashNext>(int, int);
 template void select<FlashNext>(const half *, const half *, int, int, int *, int *, void *, size_t, cudaStream_t);
+template size_t attention_workspace_bytes<FlashNext>(int);
 template void attention<FlashNext>(const half *, const float *, const half *, const half *, const int *, const int *,
-                                   int, int, half *, cudaStream_t);
+                                   int, int, half *, void *, size_t, cudaStream_t);
 
 }  // namespace truss::dsa
