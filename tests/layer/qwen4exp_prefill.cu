@@ -2,10 +2,12 @@
 //   short <dump>  12-token llama dump: after every layer, the residual vs llama's l_last and vs the fp32 reference
 //                 chain (qwen4exp::reference blocks, FP32 numerics, from llama's hc_init). Gate vs reference 5e-3:
 //                 the engine rounds activations to fp16 before each GEMM and fp16 P in attention.
+//   stream <dump> all experts resident vs a 2 GiB expert budget (most experts streamed per layer through the
+//                 ExpertStore slots): bit-identical residuals.
 //   long <dump>   the 3,659-token dump: the next layer's attention-side mix of the engine's residual (reference
 //                 hc_mix) vs llama's hc_mixed; chunked (2,048 + rest) vs one chunk, which must agree to 1e-4
 //                 (caches and carried state); timing.
-// usage: qwen4exp_prefill <slice.gguf> short|long <dump dir>
+// usage: qwen4exp_prefill <slice.gguf> short|stream|long <dump dir>
 #include "core/cuda_check.h"
 #include "core/device_tensors.h"
 #include "core/scratch.h"
@@ -189,6 +191,23 @@ int main(int argc, char ** argv)
                             l, e_ref, e_llama, rel(r.data(), ll.data(), r.size()), rel(rl.data(), ll.data(), r.size()),
                             ok ? "PASS" : "FAIL");
             }
+        } else if (mode == "stream") {
+            std::vector<std::vector<float>> all, streamed;
+            double t_all, t_str;
+            int hot_all, hot_str;
+            size_t cold;
+            for (int pass = 0; pass < 2; ++pass) {
+                q::Prefill p(c, w, T, (T + 3) / 4 * 4, pass ? 2ull << 30 : 0);
+                (pass ? streamed : all) = run_engine(p, tok, (T + 3) / 4 * 4, c.n_layer, row, pass ? &t_str : &t_all);
+                (pass ? hot_str : hot_all) = p.hot_experts();
+                if (pass) cold = p.cold_bytes();
+            }
+            long diff = 0;
+            for (int l = 0; l < c.n_layer; ++l)
+                for (size_t i = 0; i < all[l].size(); ++i) diff += all[l][i] != streamed[l][i];
+            fails += diff != 0;
+            std::printf("hot experts per layer: %d (all resident) vs %d (2 GiB budget, %.2f GB streamed per chunk): %ld "
+                        "residual values differ  %s\n", hot_all, hot_str, cold / 1e9, diff, diff ? "FAIL" : "PASS");
         } else if (mode == "long") {
             const int chunk = 2048;
             std::vector<std::vector<float>> one, two;
@@ -244,7 +263,7 @@ int main(int argc, char ** argv)
                             T, mc, sec * 1e3, T / sec, c.n_layer, sec * 1e6 / T / c.n_layer);
             }
         } else {
-            throw std::runtime_error("mode must be short or long");
+            throw std::runtime_error("mode must be short, stream or long");
         }
         std::printf("%s\n", fails ? "FAIL" : "PASS");
         return fails ? 1 : 0;

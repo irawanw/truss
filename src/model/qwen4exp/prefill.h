@@ -6,8 +6,9 @@
 // (cuBLAS SGEMM, so routing keeps full precision). State carried across chunks: DSA K/V and indexer-block caches,
 // GDN recurrent state and conv rows, PLE conv history, the PLE n-gram window.
 //
-// v1 keeps every weight on the device (the 8-layer parity slice fits; the full model needs the cold-expert
-// stream, next). The math is qwen4exp::reference's; tests/layer/qwen4exp_prefill checks it layer by layer.
+// Routed experts live in a runtime::ExpertStore: as many as fit stay resident, the rest stream over PCIe per layer,
+// overlapped with the previous layer's compute. The math is qwen4exp::reference's; tests/layer/qwen4exp_prefill
+// checks it layer by layer.
 #pragma once
 #include "model/qwen4exp/config.h"
 #include "model/qwen4exp/weights.h"
@@ -25,7 +26,8 @@ class Prefill {
 public:
     // n_ctx: the longest sequence; max_chunk: the most tokens per run() call (a multiple of the DSA block ratio)
     // c and w must outlive the Prefill (w references the file mapping the weights are uploaded from)
-    Prefill(const Config & c, const Weights & w, int n_ctx, int max_chunk);
+    // expert_budget: device bytes for routed experts (0: all memory left after everything else, minus a margin)
+    Prefill(const Config & c, const Weights & w, int n_ctx, int max_chunk, size_t expert_budget = 0);
     ~Prefill();
     Prefill(const Prefill &) = delete;
     Prefill & operator=(const Prefill &) = delete;
@@ -36,7 +38,16 @@ public:
     // The next T tokens of the sequence. T <= max_chunk; T % DSA ratio == 0 except on the last chunk.
     void run(const int32_t * tokens, int T, const LayerHook & hook = nullptr);
 
+    // logits [n][n_vocab] (device, fp32) of rows first .. first + n - 1 of the last chunk: the head hc mix, then
+    // the output projection
+    void head(int first, int n, float * logits);
+
+    // start a new sequence (zero recurrent state, conv histories, the PLE window; caches are overwritten by position)
+    void reset();
+
     int position() const { return pos_; }   // tokens consumed so far
+    int hot_experts() const;                // resident experts per layer
+    size_t cold_bytes() const;              // streamed per chunk
     cudaStream_t stream() const;
 
 private:

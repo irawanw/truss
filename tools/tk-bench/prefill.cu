@@ -1,6 +1,6 @@
 // Prefill throughput of qwen4exp::Prefill on a model file (all weights resident): a prompt of random tokens in
 // chunks, one warm-up pass, then one timed pass. Run under nsys for the per-kernel split.
-// usage: tk-bench-prefill <model.gguf> [tokens=4096] [chunk=2048]
+// usage: tk-bench-prefill <model.gguf> [tokens=4096] [chunk=2048] [expert budget MiB, 0 = all free memory]
 #include "core/cuda_check.h"
 #include "model/qwen4exp/config.h"
 #include "model/qwen4exp/prefill.h"
@@ -27,11 +27,14 @@ int main(int argc, char ** argv)
         const q::Config c = q::Config::from_gguf(*file);
         const q::Weights w = q::bind(*file, c);
         const int n = argc > 2 ? std::atoi(argv[2]) : 4096, chunk = argc > 3 ? std::atoi(argv[3]) : 2048;
+        const size_t budget = argc > 4 ? (size_t) std::atoll(argv[4]) << 20 : 0;
         std::mt19937 rng(1);
         std::vector<int32_t> tok(n);
         for (auto & t : tok) t = (int32_t) (rng() % 150000);
         for (int pass = 0; pass < 2; ++pass) {
-            q::Prefill p(c, w, n, chunk);
+            q::Prefill p(c, w, n, chunk, budget);
+            if (!pass) std::printf("experts: %d of %d per layer resident, %.2f GB streamed per chunk\n", p.hot_experts(),
+                                   c.n_expert, p.cold_bytes() / 1e9);
             const auto t0 = std::chrono::steady_clock::now();
             for (int s = 0; s < n; s += chunk) p.run(tok.data() + s, std::min(chunk, n - s));
             TRUSS_CUDA(cudaStreamSynchronize(p.stream()));

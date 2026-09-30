@@ -49,6 +49,7 @@ target_compile_options(truss_models PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wex
 
 # ---- engine: model steps on the fast kernels
 add_library(truss_engine STATIC
+  src/runtime/expert_store.cu
   src/model/qwen4exp/prefill.cu)
 target_link_libraries(truss_engine PUBLIC truss_models truss_kernels)
 
@@ -125,3 +126,5 @@ target_include_directories(qwen4exp_prefill PRIVATE .)
 target_link_libraries(qwen4exp_prefill PRIVATE truss_engine)
 add_executable(tk-bench-prefill tools/tk-bench/prefill.cu)
 target_link_libraries(tk-bench-prefill PRIVATE truss_engine)
+add_executable(tk-parity-kl tools/tk-parity/kl_vs_base.cu)
+target_link_libraries(tk-parity-kl PRIVATE truss_engine)
