@@ -55,6 +55,7 @@ add_library(truss_kernels STATIC
   src/kernels/moe/moe_prefill.cu
   src/kernels/dense/q8_gemm.cu)
 target_include_directories(truss_kernels PUBLIC src)
+target_link_libraries(truss_kernels PUBLIC CUDA::cublas)
 
 # ---- tests (tests/unit: one binary per op, exit code = pass/fail)
 add_executable(moe_window_test tests/unit/moe_window_test.cu)

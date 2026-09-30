@@ -8,11 +8,19 @@
 
 #include "core/cuda_check.h"
 
+#include <cublas_v2.h>
+
 #include <stdexcept>
 #include <string>
 
 namespace truss::dense {
 namespace {
+
+#define TRUSS_CUBLAS(x)                                                                                              \
+    do {                                                                                                             \
+        const cublasStatus_t st_ = (x);                                                                              \
+        if (st_ != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cuBLAS error " + std::to_string((int) st_) + ": " #x); \
+    } while (0)
 
 constexpr int THREADS = 256;
 constexpr int BM = 128, BN = 128, KC = 64;     // outputs, tokens, k per stage
@@ -163,7 +171,37 @@ __global__ __launch_bounds__(THREADS) void gemm_kernel(Q8Matrix W, const int8_t 
             }
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// W8A16: dequantize to fp16 scratch, then cuBLAS (fp16 in, fp32 accumulate). An own fused kernel (int8 staged,
+// converted in shared memory, per-block fp32 fold) reached 38-42 TFLOPS vs cuBLAS 57-66 (TRACKER #44); the dequant
+// pass is ~1.5% of a layer's dense time at 8K tokens.
+
+__global__ void dequant_kernel(const int8_t * __restrict__ q, const half * __restrict__ d, size_t n, half * __restrict__ w)
+{
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;   // 4 weights per thread
+    if (i * 4 >= n) return;
+    const char4 v = *(const char4 *) (q + i * 4);
+    const float s = __half2float(d[i * 4 / 32]);
+    half2 * o = (half2 *) (w + i * 4);
+    o[0] = __floats2half2_rn(v.x * s, v.y * s);
+    o[1] = __floats2half2_rn(v.z * s, v.w * s);
+}
+
 }  // namespace
+
+void q8_gemm_a16(const Q8Matrix & W, const half * x, int rows, float * y, half * w16, cublasHandle_t cublas,
+                 cudaStream_t stream)
+{
+    if (W.in % 64) throw std::runtime_error("q8_gemm_a16: in must be a multiple of 64, got " + std::to_string(W.in));
+    const size_t n = (size_t) W.in * W.out;
+    dequant_kernel<<<(unsigned) ((n / 4 + 255) / 256), 256, 0, stream>>>(W.q, W.d, n, w16);
+    TRUSS_CUDA(cudaGetLastError());
+    // column-major view: W^T is (in x out, ld in), x^T (in x rows, ld in), y^T (out x rows, ld out)
+    const float one = 1.f, zero = 0.f;
+    TRUSS_CUBLAS(cublasSetStream(cublas, stream));
+    TRUSS_CUBLAS(cublasGemmEx(cublas, CUBLAS_OP_T, CUBLAS_OP_N, W.out, rows, W.in, &one, w16, CUDA_R_16F, W.in, x,
+                              CUDA_R_16F, W.in, &zero, y, CUDA_R_32F, W.out, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+}
 
 void q8_repack(const void * blocks, int in, int out, int8_t * q, half * d, cudaStream_t stream)
 {
