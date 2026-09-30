@@ -1,6 +1,8 @@
 #include "core/cuda_check.h"
 #include "kernels/reference/ref.cuh"
 
+#include <cuda_fp16.h>
+
 #include <cmath>
 
 namespace truss::ref {
@@ -80,6 +82,53 @@ __global__ void attn_kernel(const float * q, const float * k, const float * v, c
     }
 }
 
+__device__ __forceinline__ float r16(float x) { return __half2float(__float2half(x)); }
+
+// same layout as attn_kernel, llama-paw's flash-attention numerics (see ref.cuh)
+__global__ void attn_llama_kernel(const float * q, const float * k, const float * v, const uint8_t * sel, float * out,
+                                  int T, int Hq, int Hkv, int d, float scale)
+{
+    constexpr int TILE = 64, MMA_K = 16;
+    constexpr float MAX_OFFSET = 3.0f * 0.6931f;   // FATTN_KQ_MAX_OFFSET
+    extern __shared__ float sm[];                    // [T] scores
+    const int t = blockIdx.x, h = blockIdx.y, hk = h / (Hq / Hkv);
+    const float * qv = q + ((size_t) t * Hq + h) * d;
+    const uint8_t * row = sel + (size_t) t * T;
+    for (int j = threadIdx.x; j < T; j += blockDim.x) {
+        float dot = -INFINITY;
+        if (row[j]) {
+            dot = 0.f;
+            for (int i = 0; i < d; ++i) dot += r16(qv[i] * scale) * r16(k[((size_t) j * Hkv + hk) * d + i]);
+        }
+        sm[j] = dot;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+        float mx = -INFINITY, rowsum = 0.f, acc = 0.f;   // acc holds an fp16 value
+        for (int j0 = 0; j0 < T; j0 += TILE) {
+            const int j1 = min(T, j0 + TILE);
+            float mx_new = mx;
+            for (int j = j0; j < j1; ++j) mx_new = fmaxf(mx_new, sm[j] + MAX_OFFSET);
+            if (mx_new == -INFINITY) continue;
+            const float resc = mx == -INFINITY ? 0.f : expf(mx - mx_new);
+            rowsum *= resc;
+            acc = r16(acc * r16(resc));
+            mx = mx_new;
+            for (int g = j0; g < j1; g += MMA_K) {
+                float part = 0.f;
+                for (int j = g; j < min(j1, g + MMA_K); ++j) {
+                    if (!row[j]) continue;
+                    const float p = expf(sm[j] - mx);
+                    rowsum += p;
+                    part += r16(p) * r16(v[((size_t) j * Hkv + hk) * d + i]);
+                }
+                acc = r16(acc + part);
+            }
+        }
+        out[((size_t) t * Hq + h) * d + i] = acc / rowsum;
+    }
+}
+
 }  // namespace
 
 void rope_neox(float * x, int rows, int heads, int hd, int n_rot, const int * pos, float base, cudaStream_t s)
@@ -97,9 +146,12 @@ void qsa_select(const float * idx_q, const float * idx_k, int T, int heads, int 
 }
 
 void masked_attention(const float * q, const float * k, const float * v, const uint8_t * sel, float * out, int T,
-                      int Hq, int Hkv, int d, float scale, cudaStream_t s)
+                      int Hq, int Hkv, int d, float scale, cudaStream_t s, Numerics num)
 {
-    attn_kernel<<<dim3(T, Hq), 256, T * sizeof(float), s>>>(q, k, v, sel, out, T, Hq, Hkv, d, scale);
+    if (num == Numerics::LLAMA)
+        attn_llama_kernel<<<dim3(T, Hq), 256, T * sizeof(float), s>>>(q, k, v, sel, out, T, Hq, Hkv, d, scale);
+    else
+        attn_kernel<<<dim3(T, Hq), 256, T * sizeof(float), s>>>(q, k, v, sel, out, T, Hq, Hkv, d, scale);
     TRUSS_CUDA(cudaGetLastError());
 }
 

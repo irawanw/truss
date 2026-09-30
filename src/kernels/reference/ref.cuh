@@ -67,7 +67,11 @@ void qsa_select(const float * idx_q, const float * idx_k, int T, int heads, int 
 
 // out[t][h] = sum_j softmax_j(scale q[t][h] . k[j][h / (Hq / Hkv)]) v[j][same kv head] over cells j with
 // sel[t][j] (causal is up to sel). q [T][Hq][d], k, v [T][Hkv][d], out [T][Hq][d].
+// FP32: fp32 scores, fp64 softmax accumulation. LLAMA: ggml-cuda's flash-attention mma kernel on NVIDIA (fp16 K/V
+// cache): q * scale, k and v rounded to fp16, fp32 scores, online softmax over 64-cell tiles with the running max
+// raised by FATTN_KQ_MAX_OFFSET, P rounded to fp16 and P.V accumulated in fp16 (one rounding per 16-cell mma step).
+// Its fp16 accumulator puts it ~2e-3 from FP32 at ~2K cells (TRACKER #48); warp and stream-k splits are not modeled.
 void masked_attention(const float * q, const float * k, const float * v, const uint8_t * sel, float * out, int T,
-                      int Hq, int Hkv, int d, float scale, cudaStream_t s);
+                      int Hq, int Hkv, int d, float scale, cudaStream_t s, Numerics num = Numerics::FP32);
 
 }  // namespace truss::ref
