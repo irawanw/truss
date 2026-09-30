@@ -12,6 +12,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -lineinfo")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)   # the static libraries also go into libtruss.so
 
 # llama-paw's ggml, used by tests only, as the reference implementation
 set(LLAMA_PAW_DIR $ENV{HOME}/llama-paw CACHE PATH "llama-paw checkout (reference for tests)")
@@ -53,6 +54,12 @@ add_library(truss_engine STATIC
   src/model/qwen4exp/forward.cu)
 target_link_libraries(truss_engine PUBLIC truss_models truss_kernels)
 
+# ---- public C API: libtruss.so (include/truss/truss.h), what server/ binds to
+add_library(truss SHARED src/api/truss_c.cu)
+target_include_directories(truss PUBLIC include)
+target_link_libraries(truss PRIVATE truss_engine)
+set_target_properties(truss PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
+
 # ---- pack-time encoders (Viterbi), used by the pack converter
 add_library(truss_encode STATIC
   src/encode/v2one_encode.cu)
@@ -69,7 +76,8 @@ add_library(truss_kernels STATIC
   src/kernels/gdn/gdn_prepare.cu
   src/kernels/hc/hc_prefill.cu
   src/kernels/ffn/ffn_ops.cu
-  src/kernels/ple/ple_prefill.cu)
+  src/kernels/ple/ple_prefill.cu
+  src/kernels/sampling/argmax.cu)
 target_include_directories(truss_kernels PUBLIC src)
 target_link_libraries(truss_kernels PUBLIC CUDA::cublas)
 

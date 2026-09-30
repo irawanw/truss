@@ -88,7 +88,7 @@ struct Forward::Impl {
         moe_ws = alloc<unsigned char>(moe::prefill_workspace_bytes<MoeShape>(max_chunk));
         window_ws = alloc<unsigned char>(moe::workspace_bytes<MoeShape>());
         moe::workspace_init<MoeShape>(window_ws, s);
-        TRUSS_CUDA(cudaMallocHost(&ids_host, sizeof(int) * moe::MAX_ROWS * MoeShape::TOPK));
+        TRUSS_CUDA(cudaMallocHost(&ids_host, sizeof(int) * FETCH_ROWS * MoeShape::TOPK));
         st.resize(c.n_layer);
         const int R = DsaShape::RATIO;
         for (int l = 0; l < c.n_layer; ++l) {
@@ -346,8 +346,11 @@ struct Forward::Impl {
         scratch.release(m);
     }
 
-    // a few rows (a decode step or a small verify window): experts are fetched per routing, not streamed per layer
-    static bool decode_step(int T) { return T <= moe::MAX_ROWS; }
+    // Chunks of up to FETCH_ROWS rows (decode steps, verify windows, short prompts) fetch only the cold experts
+    // their routing uses; longer chunks use most experts, so whole layers stream ahead of the compute instead.
+    // A 67-token prompt took 2.1 s streaming ~24 GB (TRACKER #55). The window kernel serves up to moe::MAX_ROWS rows.
+    static constexpr int FETCH_ROWS = 32;
+    static bool fetch_mode(int T) { return T <= FETCH_ROWS; }
 
     void ffn(int l, const Moe & mo, const float * in, const half * in16, int T, float * out)
     {
@@ -360,12 +363,13 @@ struct Forward::Impl {
         half * mid16 = scratch.alloc<half>((size_t) T * F);
         lin32(mo.router, in, T, logits);
         ffn::route(logits, T, E, K, ids, wts, s);
-        if (decode_step(T)) {   // fetch the few cold experts this step routes to, then the window kernel
+        if (fetch_mode(T)) {   // fetch the few cold experts this chunk routes to
             TRUSS_CUDA(cudaMemcpyAsync(ids_host, ids, sizeof(int) * T * K, cudaMemcpyDeviceToHost, s));
             TRUSS_CUDA(cudaStreamSynchronize(s));
             experts->fetch(l, ids_host, T * K);
             experts->acquire(l, s);
-            moe::window<MoeShape>(experts->weights(l), in, ids, wts, T, routed, window_ws, s);
+            if (T <= moe::MAX_ROWS) moe::window<MoeShape>(experts->weights(l), in, ids, wts, T, routed, window_ws, s);
+            else moe::prefill<MoeShape>(experts->weights(l), in, ids, wts, T, routed, moe_ws, max_chunk, s);
             experts->release(l, s);
         } else {                // whole layers stream ahead (prefetch(l + 2) while this layer computes)
             experts->acquire(l, s);
@@ -427,7 +431,7 @@ struct Forward::Impl {
         TRUSS_CUDA(cudaMemcpyAsync(ids, tokens, (size_t) T * 4, cudaMemcpyHostToDevice, s));
         dense::q8_rows(q8.at(w.token_embd), ids, T, emb, s);
         hc::expand(emb, T, c.hc, c.d_model, res, s);
-        if (!decode_step(T))
+        if (!fetch_mode(T))
             for (int l = 0; l < std::min(2, c.n_layer); ++l) experts->prefetch(l);
         const size_t base = scratch.mark();
         for (int l = 0; l < c.n_layer; ++l) {
