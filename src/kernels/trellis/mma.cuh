@@ -40,4 +40,29 @@ __device__ __forceinline__ void mma_w_f32(const FragB & f0, const FragB & f1, ha
         : "r"(p0[0]), "r"(p1[0]), "r"(p0[1]), "r"(p1[1]), "r"(b0), "r"(b1));
 }
 
+// Generic m16n8k16 fp16 x fp16 -> fp32 with fragments as ldmatrix produces them: a = {(rows 0-7, k 0-7),
+// (rows 8-15, k 0-7), (rows 0-7, k 8-15), (rows 8-15, k 8-15)}, b = {k 0-7, k 8-15} of column lane/4.
+__device__ __forceinline__ void mma_f32(const uint32_t (&a)[4], uint32_t b0, uint32_t b1, float (&c)[4])
+{
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// four 8x8 fp16 matrices from shared memory; lane l gives the address of row l % 8 of matrix l / 8
+__device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void * row)
+{
+    const unsigned a = (unsigned) __cvta_generic_to_shared(row);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+
+// same, each matrix transposed
+__device__ __forceinline__ void ldsm_x4_t(uint32_t (&r)[4], const void * row)
+{
+    const unsigned a = (unsigned) __cvta_generic_to_shared(row);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+
 }  // namespace truss

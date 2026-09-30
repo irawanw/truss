@@ -12,11 +12,15 @@
 //      inputs. Gate: median and max per-query error <= 2x that noise.
 //   C. end to end (reported): the reference's own indexer; its scores differ from llama's by ~1e-4 (Q8_1
 //      projections), which can swap more near-tied blocks.
+//   D. the fast op (dsa::select + dsa::attention, fp16 inputs) on the reference's own tensors: selection vs the
+//      reference's, swaps only within a 2e-3 relative score gap (fp16 indexer inputs); gated attention vs
+//      ref::masked_attention on the fast op's own selection, rel <= 1e-3, worst query <= 3e-3.
 // usage: qwen4exp_dsa_long <slice.gguf> <dump dir>
 #include "core/cuda_check.h"
 
 #include <cuda_fp16.h>
 #include "core/device_tensors.h"
+#include "kernels/dsa/dsa_prefill.cuh"
 #include "core/scratch.h"
 #include "model/qwen4exp/config.h"
 #include "model/qwen4exp/reference.h"
@@ -39,6 +43,12 @@ std::vector<float> host(const float * d, size_t n)
     std::vector<float> h(n);
     TRUSS_CUDA(cudaMemcpy(h.data(), d, n * 4, cudaMemcpyDeviceToHost));
     return h;
+}
+
+__global__ void to_half_kernel(const float * f, half * h, size_t n)
+{
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) h[i] = __float2half(f[i]);
 }
 
 double rel(const float * a, const float * b, size_t n)
@@ -92,6 +102,10 @@ int main(int argc, char ** argv)
             tr.k = scratch.alloc((size_t) T * Hkv * D);
             tr.v = scratch.alloc((size_t) T * Hkv * D);
             tr.sel = scratch.alloc<uint8_t>((size_t) T * T);
+            tr.gate = scratch.alloc((size_t) T * H * D);
+            tr.gated = scratch.alloc((size_t) T * H * D);
+            tr.idx_q = scratch.alloc((size_t) T * Hi * Di);
+            tr.idx_k = scratch.alloc((size_t) nb * Di);
             q::reference::dsa(x, w.layers[l].dsa, r, d_in, T, out, &tr);
 
             // llama's cell sets (future picks are masked cells and do not count) as a mask
@@ -188,6 +202,77 @@ int main(int argc, char ** argv)
                         "  C end to end: cells outside llama's set %ld, worst query rel %.2e\n",
                         l, T, rule_bad_extra, rule_outside, swaps, worst_gap, ok_a ? "PASS" : "FAIL", rq, rk, rv,
                         eb[T / 2], eb.back(), en[T / 2], en.back(), ok_b ? "PASS" : "FAIL", own_outside, worst_c);
+
+            // D: the fast op (dsa::select + dsa::attention) on the reference's own tensors, in fp16
+            {
+                using S = dsa::FlashNext;
+                auto to16 = [&](const float * f, size_t n) {
+                    half * h = scratch.alloc<half>(n);
+                    to_half_kernel<<<(unsigned) ((n + 255) / 256), 256>>>(f, h, n);
+                    return h;
+                };
+                half * q16 = to16(tr.q, (size_t) T * H * D), * k16 = to16(tr.k, (size_t) T * Hkv * D),
+                     * v16 = to16(tr.v, (size_t) T * Hkv * D), * iq16 = to16(tr.idx_q, (size_t) T * Hi * Di),
+                     * ik16 = to16(tr.idx_k, (size_t) nb * Di);
+                int * blocks = scratch.alloc<int>((size_t) T * S::TOP_BLOCKS), * n_blocks = scratch.alloc<int>(T);
+                half * fast = scratch.alloc<half>((size_t) T * H * D);
+                const size_t ws_bytes = dsa::select_workspace_bytes<S>(T, T);
+                void * ws = scratch.alloc<unsigned char>(ws_bytes);
+                dsa::select<S>(iq16, ik16, 0, T, blocks, n_blocks, ws, ws_bytes, nullptr);
+                dsa::attention<S>(q16, tr.gate, k16, v16, blocks, n_blocks, 0, T, fast, nullptr);
+                std::vector<int> hb((size_t) T * S::TOP_BLOCKS), hn(T);
+                TRUSS_CUDA(cudaMemcpy(hb.data(), blocks, hb.size() * 4, cudaMemcpyDeviceToHost));
+                TRUSS_CUDA(cudaMemcpy(hn.data(), n_blocks, hn.size() * 4, cudaMemcpyDeviceToHost));
+                const std::vector<float> hiq = host(tr.idx_q, (size_t) T * Hi * Di), hik = host(tr.idx_k, (size_t) nb * Di);
+                auto score = [&](int t, int b) {
+                    double s = 0;
+                    for (int h = 0; h < Hi; ++h) {
+                        double dot = 0;
+                        for (int i = 0; i < Di; ++i) dot += (double) hiq[((size_t) t * Hi + h) * Di + i] * hik[(size_t) b * Di + i];
+                        s += std::max(dot, 0.0);
+                    }
+                    return s;
+                };
+                std::vector<uint8_t> mine((size_t) T * T, 0);
+                long d_swaps = 0;
+                double d_gap = 0;
+                for (int t = 0; t < T; ++t) {
+                    const int seen = (t + 1) / r;
+                    uint8_t * row = &mine[(size_t) t * T];
+                    for (int i = 0; i < hn[t]; ++i)
+                        for (int e = 0; e < r; ++e) row[r * hb[(size_t) t * S::TOP_BLOCKS + i] + e] = 1;
+                    for (int j = r * seen; j <= t; ++j) row[j] = 1;
+                    double ours_min = INFINITY, ref_max = -INFINITY;
+                    for (int b = 0; b < seen; ++b) {
+                        const bool o = row[r * b], w2 = own[(size_t) t * T + r * b];
+                        if (o && !w2) ours_min = std::min(ours_min, score(t, b));
+                        if (!o && w2) ref_max = std::max(ref_max, score(t, b));
+                    }
+                    if (ours_min == INFINITY && ref_max == -INFINITY) continue;
+                    ++d_swaps;
+                    d_gap = std::max(d_gap, ours_min == INFINITY || ref_max == -INFINITY
+                                                ? INFINITY
+                                                : std::abs(ref_max - ours_min) / std::max(ours_min, ref_max));
+                }
+                // reference attention (fp32 inputs) on the fast op's selection, gated
+                uint8_t * d_mine = scratch.alloc<uint8_t>(mine.size());
+                TRUSS_CUDA(cudaMemcpy(d_mine, mine.data(), mine.size(), cudaMemcpyHostToDevice));
+                ref::masked_attention(tr.q, tr.k, tr.v, d_mine, pre_b, T, H, Hkv, D, scale, nullptr);
+                const std::vector<float> ra = host(pre_b, (size_t) T * H * D), gt = host(tr.gate, (size_t) T * H * D);
+                std::vector<half> fh((size_t) T * H * D);
+                TRUSS_CUDA(cudaMemcpy(fh.data(), fast, fh.size() * 2, cudaMemcpyDeviceToHost));
+                std::vector<float> fw(fh.size()), rw(fh.size());
+                for (size_t i = 0; i < fh.size(); ++i)
+                    fw[i] = __half2float(fh[i]), rw[i] = ra[i] / (1.f + std::exp(-gt[i]));
+                double d_worst = 0;
+                for (int t = 0; t < T; ++t)
+                    d_worst = std::max(d_worst, rel(&fw[(size_t) t * H * D], &rw[(size_t) t * H * D], (size_t) H * D));
+                const double d_all = rel(fw.data(), rw.data(), fw.size());
+                const bool ok_d = d_gap <= 2e-3 && d_all <= 1e-3 && d_worst <= 3e-3;
+                fails += !ok_d;
+                std::printf("  D fast op vs reference: select swaps %ld (worst gap %.1e, gate 2e-3); gated attention "
+                            "rel %.1e, worst query %.1e  %s\n", d_swaps, d_gap, d_all, d_worst, ok_d ? "PASS" : "FAIL");
+            }
         }
         return fails ? 1 : 0;
     } catch (const std::exception & e) {

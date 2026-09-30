@@ -375,7 +375,7 @@ void dsa(const Ctx & x, const Dsa & a, int ratio, const float * in, int T, float
     auto buf = [&](float * t, size_t n) { return t ? t : x.scratch.alloc(n); };
     float * qfull = x.scratch.alloc((size_t) T * H * 2 * D);
     float * q = buf(trace ? trace->q : nullptr, (size_t) T * H * D);
-    float * gate = x.scratch.alloc((size_t) T * H * D);
+    float * gate = buf(trace ? trace->gate : nullptr, (size_t) T * H * D);
     float * k = buf(trace ? trace->k : nullptr, (size_t) T * Hkv * D);
     float * v = buf(trace ? trace->v : nullptr, (size_t) T * Hkv * D);
     float * iq = buf(trace ? trace->idx_q : nullptr, (size_t) T * Hi * Di);

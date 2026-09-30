@@ -56,7 +56,8 @@ add_library(truss_kernels STATIC
   src/kernels/moe/moe_window.cu
   src/kernels/moe/moe_prefill.cu
   src/kernels/dense/q8_gemm.cu
-  src/kernels/gdn/gdn_prefill.cu)
+  src/kernels/gdn/gdn_prefill.cu
+  src/kernels/dsa/dsa_prefill.cu)
 target_include_directories(truss_kernels PUBLIC src)
 target_link_libraries(truss_kernels PUBLIC CUDA::cublas)
 
@@ -75,6 +76,8 @@ target_link_libraries(q8_gemm_test PRIVATE truss_kernels truss_reference)
 
 add_executable(gdn_prefill_test tests/unit/gdn_prefill_test.cu)
 target_link_libraries(gdn_prefill_test PRIVATE truss_kernels truss_reference)
+add_executable(dsa_prefill_test tests/unit/dsa_prefill_test.cu)
+target_link_libraries(dsa_prefill_test PRIVATE truss_kernels truss_reference)
 
 add_executable(codec_v2one_test tests/unit/codec_v2one_test.cu)
 target_link_libraries(codec_v2one_test PRIVATE truss_encode)
@@ -85,7 +88,7 @@ target_include_directories(qwen4exp_parity PRIVATE .)
 target_link_libraries(qwen4exp_parity PRIVATE truss_models truss_kernels)
 add_executable(qwen4exp_dsa_long tests/layer/qwen4exp_dsa_long.cu)
 target_include_directories(qwen4exp_dsa_long PRIVATE .)
-target_link_libraries(qwen4exp_dsa_long PRIVATE truss_models)
+target_link_libraries(qwen4exp_dsa_long PRIVATE truss_models truss_kernels)
 
 # ---- tools/tk-bench: microbenchmarks
 add_executable(tk-bench-ceiling tools/tk-bench/ceiling.cu)

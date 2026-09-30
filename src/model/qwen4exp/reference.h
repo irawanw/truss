@@ -60,6 +60,7 @@ struct DsaTrace {                          // optional intermediates for parity 
     float * q = nullptr, * k = nullptr, * v = nullptr;   // after rope (q, k)
     float * idx_q = nullptr;               // [T][idx_heads][idx_head_dim], normed + roped
     float * idx_k = nullptr;               // [T / ratio][idx_head_dim], pooled complete blocks, normed + roped
+    float * gate = nullptr;                // [T][n_head][head_dim], the gate half of the q projection
     float * pregate = nullptr;             // [T][n_head][head_dim], attention output
     float * gated = nullptr;               // pregate * sigmoid(gate)
     uint8_t * sel = nullptr;               // [T][T], 1 = cell attended by the query (ref::qsa_select)
