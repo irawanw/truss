@@ -83,6 +83,9 @@ target_link_libraries(codec_v2one_test PRIVATE truss_encode)
 add_executable(qwen4exp_parity tests/layer/qwen4exp_parity.cu)
 target_include_directories(qwen4exp_parity PRIVATE .)
 target_link_libraries(qwen4exp_parity PRIVATE truss_models truss_kernels)
+add_executable(qwen4exp_dsa_long tests/layer/qwen4exp_dsa_long.cu)
+target_include_directories(qwen4exp_dsa_long PRIVATE .)
+target_link_libraries(qwen4exp_dsa_long PRIVATE truss_models)
 
 # ---- tools/tk-bench: microbenchmarks
 add_executable(tk-bench-ceiling tools/tk-bench/ceiling.cu)

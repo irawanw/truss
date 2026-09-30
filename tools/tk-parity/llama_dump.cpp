@@ -11,6 +11,7 @@
 #include "ggml-cpu.h"   // ggml_fp16_to_fp32_row
 #include "llama.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -108,8 +109,10 @@ int main(int argc, char ** argv)
     toks.resize(n);
 
     llama_context_params cp = llama_context_default_params();
-    cp.n_ctx = 512;
-    cp.n_batch = cp.n_ubatch = 512;
+    // the whole prompt is one ubatch (the dump is per ubatch): context and batch sized to it, at least 512
+    const uint32_t n_ctx = (uint32_t) std::max(512, (n + 255) / 256 * 256);
+    cp.n_ctx = n_ctx;
+    cp.n_batch = cp.n_ubatch = n_ctx;
     cp.cb_eval = on_tensor;
     cp.cb_eval_user_data = &d;
     llama_context * ctx = llama_init_from_model(model, cp);

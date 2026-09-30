@@ -384,7 +384,7 @@ void dsa(const Ctx & x, const Dsa & a, int ratio, const float * in, int T, float
     float * att = buf(trace ? trace->pregate : nullptr, (size_t) T * H * D);
     float * gated = buf(trace ? trace->gated : nullptr, (size_t) T * H * D);
     int * pos = x.scratch.alloc<int>(T), * bpos = x.scratch.alloc<int>(nb > 0 ? nb : 1);
-    uint8_t * sel = x.scratch.alloc<uint8_t>((size_t) T * T);
+    uint8_t * sel = trace && trace->sel ? trace->sel : x.scratch.alloc<uint8_t>((size_t) T * T);
     positions_kernel<<<blocks(T), 256, 0, x.stream>>>(pos, T, 1);
     positions_kernel<<<blocks(nb), 256, 0, x.stream>>>(bpos, nb, ratio);
 
