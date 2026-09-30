@@ -8,6 +8,7 @@ are added. A change that breaks one of them needs a line in `TRACKER.md` saying 
 | what | where | example |
 |---|---|---|
 | a trellis codec (tile format + codebook) | `src/kernels/trellis/codec_<name>.cuh` | `codec_mul1.cuh` |
+| pack-time encoder (Viterbi) for a codec | `src/encode/<codec>_encode.{h,cu}` | `v2one_encode.cu` |
 | shared device helpers | `src/kernels/trellis/` | `mma.cuh`, `hadamard.cuh` |
 | one fused op | `src/kernels/<op>/<op>.{cuh,cu}` | `moe/moe_window.cu` |
 | model file reader (host C++, zero-copy mmap) | `src/formats/<format>.{h,cc}` | `gguf.h` |
