@@ -5,7 +5,7 @@
 //
 // File: "_logits_", int32 n_ctx, n_vocab, n_chunk, int32 tokens [n_chunk * n_ctx], then per chunk and scored
 // position nv = 2 ((n_vocab + 1) / 2) + 4 uint16: float scale, float min_log_prob, n_vocab quantized log probs.
-// usage: tk-parity-kl <model.gguf> <base.logits> [chunks=8]
+// usage: tk-parity-kl <model.gguf> <base.logits> [chunks=8] [first chunk=0] [q8|fp16]   (dense activations, default q8)
 #include "core/cuda_check.h"
 #include "model/qwen4exp/config.h"
 #include "model/qwen4exp/prefill.h"
@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <string>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -83,7 +84,9 @@ int main(int argc, char ** argv)
         if (!in || std::memcmp(magic, "_logits_", 8)) throw std::runtime_error("not a llama-perplexity logits file");
         std::vector<int32_t> tokens((size_t) n_chunk * n_ctx);
         in.read((char *) tokens.data(), tokens.size() * 4);
-        const int chunks = std::min(n_chunk, argc > 3 ? std::atoi(argv[3]) : 8);
+        const int first_chunk = argc > 4 ? std::atoi(argv[4]) : 0;
+        const int chunks = std::min(n_chunk - first_chunk, argc > 3 ? std::atoi(argv[3]) : 8);
+        const q::Activations act = argc > 5 && std::string(argv[5]) == "fp16" ? q::Activations::FP16 : q::Activations::Q8_1;
         const int first = n_ctx / 2, n_scored = n_ctx - 1 - first;
         const size_t nv = 2 * ((n_vocab + 1) / 2) + 4;
         std::printf("base: n_ctx %d, n_vocab %d, %d chunks in file, scoring %d\n", n_ctx, n_vocab, n_chunk, chunks);
@@ -94,14 +97,15 @@ int main(int argc, char ** argv)
         if (c.n_vocab != n_vocab) throw std::runtime_error("vocabulary size differs from the base file");
         float * d_logits;   // before the engine, whose expert budget takes the memory left
         TRUSS_CUDA(cudaMalloc(&d_logits, (size_t) n_scored * n_vocab * 4));
-        q::Prefill p(c, w, n_ctx, (n_ctx + 3) / 4 * 4);
+        q::Prefill p(c, w, n_ctx, (n_ctx + 3) / 4 * 4, 0, act);
         std::printf("experts: %d of %d per layer resident, %.2f GB streamed per chunk\n", p.hot_experts(), c.n_expert,
                     p.cold_bytes() / 1e9);
         std::vector<float> logits((size_t) n_scored * n_vocab);
         std::vector<uint16_t> base((size_t) n_scored * nv);
         Stats total;
         const int n_threads = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
-        for (int ch = 0; ch < chunks; ++ch) {
+        in.seekg((std::streamoff) first_chunk * n_scored * nv * 2, std::ios::cur);
+        for (int ch = first_chunk; ch < first_chunk + chunks; ++ch) {
             const auto t0 = std::chrono::steady_clock::now();
             const int32_t * tok = tokens.data() + (size_t) ch * n_ctx;
             p.reset();

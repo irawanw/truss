@@ -4,7 +4,7 @@
 // hyper-connection mixes are both "hc_mixed-<il>": they are saved as "#1" and "#2" in call order; any other
 // repeated name gets "#2", "#3", ... from its second occurrence.
 //
-// usage: tk-parity-llama-dump <model.gguf> <out_dir> "<prompt>" [base names, comma separated]
+// usage: tk-parity-llama-dump <model.gguf> <out_dir> "<prompt>" | @<ids.i32> [base names, comma separated]
 //   The whole model runs on the GPU (llama-paw's X3 MoE op is CUDA-only), so the full Flash-Next does not fit one
 //   3090: dump a layer slice (tools/tk-parity/slice_gguf.py).
 #include "ggml-backend.h"
@@ -102,11 +102,21 @@ int main(int argc, char ** argv)
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     const std::string prompt = argv[3];
-    std::vector<llama_token> toks(prompt.size() + 8);
-    const int n = llama_tokenize(vocab, prompt.c_str(), (int32_t) prompt.size(), toks.data(), (int32_t) toks.size(),
-                                 false, true);
+    std::vector<llama_token> toks;
+    if (prompt.size() > 1 && prompt[0] == '@') {   // raw int32 token ids from a file
+        std::FILE * f = std::fopen(prompt.c_str() + 1, "rb");
+        if (!f) return 1;
+        for (int32_t t; std::fread(&t, 4, 1, f) == 1;) toks.push_back(t);
+        std::fclose(f);
+    } else {
+        toks.resize(prompt.size() + 8);
+        const int m = llama_tokenize(vocab, prompt.c_str(), (int32_t) prompt.size(), toks.data(), (int32_t) toks.size(),
+                                     false, true);
+        if (m <= 0) return 1;
+        toks.resize(m);
+    }
+    const int n = (int) toks.size();
     if (n <= 0) return 1;
-    toks.resize(n);
 
     llama_context_params cp = llama_context_default_params();
     // the whole prompt is one ubatch (the dump is per ubatch): context and batch sized to it, at least 512

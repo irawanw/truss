@@ -71,8 +71,10 @@ struct Prefill::Impl {
     int n_hot = 0;
     std::vector<int32_t> tail;                           // the last ple_ngram - 1 tokens seen (PLE window)
 
-    Impl(const Config & cc, const Weights & ww, int nc, int mc, size_t expert_budget)
-        : c(cc), w(ww), n_ctx(nc), max_chunk(mc), scratch(scratch_bytes(cc, mc, nc))
+    const Activations act;
+
+    Impl(const Config & cc, const Weights & ww, int nc, int mc, size_t expert_budget, Activations a)
+        : c(cc), w(ww), n_ctx(nc), max_chunk(mc), scratch(scratch_bytes(cc, mc, nc)), act(a)
     {
         check_shapes();
         TRUSS_CUDA(cudaStreamCreate(&s));
@@ -135,7 +137,8 @@ struct Prefill::Impl {
                            (size_t) c.idx_heads * c.idx_head_dim * 6 + c.idx_head_dim * 4 + DsaShape::ROPE_DIMS * 4 +
                            DsaShape::TOP_BLOCKS * 4 + 4;
         const size_t ffn = (size_t) c.n_expert * 4 + c.n_expert_used * 8 + dm * 8 + (size_t) c.d_ff_shexp * 10 + 4;
-        const size_t per_token = base + std::max({ mix, ple, gdn, dsa, ffn });
+        const size_t q8_act = hcd + hcd / 16;   // Activations::Q8_1: the widest GEMM input, quantized
+        const size_t per_token = base + std::max({ mix, ple, gdn, dsa, ffn }) + q8_act;
         const size_t fixed = dsa::select_workspace_bytes<DsaShape>(T, n_ctx) + (64ull << 20);   // + alignment slack
         return (size_t) T * per_token + fixed;
     }
@@ -209,7 +212,20 @@ struct Prefill::Impl {
     const float * f32(T t) const { return d(t).as<float>(); }
 
     // y [rows][out] = W x, fp16 activations
-    void lin(T t, const half * x, int rows, float * y) { dense::q8_gemm_a16(q8.at(t), x, rows, y, w16, blas, s); }
+    void lin(T t, const half * x, int rows, float * y)
+    {
+        const dense::Q8Matrix & W = q8.at(t);
+        if (act == Activations::FP16) {
+            dense::q8_gemm_a16(W, x, rows, y, w16, blas, s);
+            return;
+        }
+        const size_t m = scratch.mark();
+        int8_t * xq = scratch.alloc<int8_t>((size_t) rows * W.in);
+        half * xd = scratch.alloc<half>((size_t) rows * W.in / 32);
+        dense::q8_quantize_act(x, rows, W.in, xq, xd, s);
+        dense::q8_gemm(W, xq, xd, rows, y, s);
+        scratch.release(m);
+    }
 
     // y [rows][out] = W x, fp32 weights and activations (router, shared-expert gate)
     void lin32(T t, const float * x, int rows, float * y)
@@ -421,8 +437,8 @@ struct Prefill::Impl {
     }
 };
 
-Prefill::Prefill(const Config & c, const Weights & w, int n_ctx, int max_chunk, size_t expert_budget)
-    : m_(std::make_unique<Impl>(c, w, n_ctx, max_chunk, expert_budget))
+Prefill::Prefill(const Config & c, const Weights & w, int n_ctx, int max_chunk, size_t expert_budget, Activations act)
+    : m_(std::make_unique<Impl>(c, w, n_ctx, max_chunk, expert_budget, act))
 {
 }
 

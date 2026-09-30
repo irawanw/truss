@@ -22,12 +22,19 @@
 
 namespace truss::qwen4exp {
 
+// Activations into the dense Q8_0 GEMMs. Q8_1 (default): llama-paw's rounding on the int8 GEMM; full-model KL to
+// llama-paw's Q8 logits 0.0131 = its own run-to-run floor, and the lower perplexity of the two on chat text (TRACKER
+// #53). FP16: closer to exact math per matmul (TRACKER #33) but +3% perplexity on chat-format text vs Q8_1; kept until
+// an unquantized anchor decides which is closer to the real model.
+enum class Activations { FP16, Q8_1 };
+
 class Prefill {
 public:
     // n_ctx: the longest sequence; max_chunk: the most tokens per run() call (a multiple of the DSA block ratio)
     // c and w must outlive the Prefill (w references the file mapping the weights are uploaded from)
     // expert_budget: device bytes for routed experts (0: all memory left after everything else, minus a margin)
-    Prefill(const Config & c, const Weights & w, int n_ctx, int max_chunk, size_t expert_budget = 0);
+    Prefill(const Config & c, const Weights & w, int n_ctx, int max_chunk, size_t expert_budget = 0,
+            Activations act = Activations::Q8_1);
     ~Prefill();
     Prefill(const Prefill &) = delete;
     Prefill & operator=(const Prefill &) = delete;

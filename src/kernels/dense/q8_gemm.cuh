@@ -30,6 +30,7 @@ void q8_repack(const void * blocks, int in, int out, int8_t * q, half * d, cudaS
 
 // x fp32 [rows][in] -> xq int8 [rows][in], xd fp16 [rows][in / 32]
 void q8_quantize_act(const float * x, int rows, int in, int8_t * xq, half * xd, cudaStream_t stream);
+void q8_quantize_act(const half * x, int rows, int in, int8_t * xq, half * xd, cudaStream_t stream);
 
 // y fp32 [rows][W.out] = W . x, from the quantized activations. W.in % 64 == 0; any rows, any W.out.
 void q8_gemm(const Q8Matrix & W, const int8_t * xq, const half * xd, int rows, float * y, cudaStream_t stream);

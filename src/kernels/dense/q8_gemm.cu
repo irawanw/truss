@@ -38,13 +38,16 @@ __global__ void repack_kernel(const BlockQ8_0 * __restrict__ b, int nb, int8_t *
     for (int j = 0; j < 32; ++j) q[(size_t) i * 32 + j] = b[i].qs[j];
 }
 
+__device__ __forceinline__ float to_f32(float v) { return v; }
+__device__ __forceinline__ float to_f32(half v) { return __half2float(v); }
+
 // one warp per 32-block of a row
-__global__ void quantize_kernel(const float * __restrict__ x, int n_blocks, int8_t * __restrict__ q,
-                                half * __restrict__ d)
+template <class X>
+__global__ void quantize_kernel(const X * __restrict__ x, int n_blocks, int8_t * __restrict__ q, half * __restrict__ d)
 {
     const int blk = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x % 32;
     if (blk >= n_blocks) return;
-    const float v = x[(size_t) blk * 32 + lane];
+    const float v = to_f32(x[(size_t) blk * 32 + lane]);
     float amax = fabsf(v);
     for (int m = 16; m; m >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, m));
     const float s = amax / 127.f;
@@ -221,12 +224,22 @@ void q8_repack(const void * blocks, int in, int out, int8_t * q, half * d, cudaS
     TRUSS_CUDA(cudaGetLastError());
 }
 
-void q8_quantize_act(const float * x, int rows, int in, int8_t * xq, half * xd, cudaStream_t stream)
+template <class X> static void quantize_act(const X * x, int rows, int in, int8_t * xq, half * xd, cudaStream_t stream)
 {
     if (in % 32) throw std::runtime_error("q8_quantize_act: in must be a multiple of 32");
     const int nb = rows * (in / 32);
-    quantize_kernel<<<(nb * 32 + 255) / 256, 256, 0, stream>>>(x, nb, xq, xd);
+    quantize_kernel<X><<<(nb * 32 + 255) / 256, 256, 0, stream>>>(x, nb, xq, xd);
     TRUSS_CUDA(cudaGetLastError());
+}
+
+void q8_quantize_act(const float * x, int rows, int in, int8_t * xq, half * xd, cudaStream_t stream)
+{
+    quantize_act(x, rows, in, xq, xd, stream);
+}
+
+void q8_quantize_act(const half * x, int rows, int in, int8_t * xq, half * xd, cudaStream_t stream)
+{
+    quantize_act(x, rows, in, xq, xd, stream);
 }
 
 void q8_gemm(const Q8Matrix & W, const int8_t * xq, const half * xd, int rows, float * y, cudaStream_t stream)
