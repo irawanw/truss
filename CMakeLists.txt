@@ -54,7 +54,8 @@ target_link_libraries(truss_encode PUBLIC truss_core)
 add_library(truss_kernels STATIC
   src/kernels/moe/moe_window.cu
   src/kernels/moe/moe_prefill.cu
-  src/kernels/dense/q8_gemm.cu)
+  src/kernels/dense/q8_gemm.cu
+  src/kernels/gdn/gdn_prefill.cu)
 target_include_directories(truss_kernels PUBLIC src)
 target_link_libraries(truss_kernels PUBLIC CUDA::cublas)
 
@@ -70,6 +71,9 @@ target_link_libraries(moe_prefill_test PRIVATE truss_kernels)
 
 add_executable(q8_gemm_test tests/unit/q8_gemm_test.cu)
 target_link_libraries(q8_gemm_test PRIVATE truss_kernels truss_reference)
+
+add_executable(gdn_prefill_test tests/unit/gdn_prefill_test.cu)
+target_link_libraries(gdn_prefill_test PRIVATE truss_kernels truss_reference)
 
 add_executable(codec_v2one_test tests/unit/codec_v2one_test.cu)
 target_link_libraries(codec_v2one_test PRIVATE truss_encode)
