@@ -38,6 +38,8 @@ struct ForwardOptions {
                                               // prefill's two stream slots (grown to fit them if smaller)
     const Mtp * mtp = nullptr;                // MTP draft block (bind_mtp; must outlive the Forward): draft() works
     int spec_rows = 0;                        // > 0: verify() / accept() for windows of up to spec_rows (<= 8) rows
+    int hint_k = 4;                           // pre-gated prefetch: per row, the next layer's top hint_k predicted
+                                              // experts start copying early (0: off; 3-6 measured equal, TRACKER #59)
 };
 
 class Forward {

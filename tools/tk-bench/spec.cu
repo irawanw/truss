@@ -132,9 +132,10 @@ int main(int argc, char ** argv)
         std::printf("spec : %d tokens in %.2f s = %.1f tok/s, %d passes (%.2f tokens/pass), drafts accepted %ld of %ld\n",
                     (int) got.size(), spec, N / spec, passes, (double) N / passes, accepted, drafted);
         const runtime::ExpertStore::Stats & st = f.experts().stats();
-        std::printf("       per pass: %.1f cold experts routed, %.1f fetched (%.1f MB)\n",
+        std::printf("       per pass: %.1f cold experts routed, %.1f fetched on demand (%.1f MB), %.1f prefetched (%.1f MB)\n",
                     (double) (st.experts_asked - st0.experts_asked) / passes, (double) (st.misses - st0.misses) / passes,
-                    (st.bytes - st0.bytes) / 1e6 / passes);
+                    (st.bytes - st0.bytes) / 1e6 / passes, (double) (st.hinted - st0.hinted) / passes,
+                    (st.hint_bytes - st0.hint_bytes) / 1e6 / passes);
         std::printf("tokens identical to plain greedy: %d of %d  %s\n", same, N, same == N ? "PASS" : "FAIL");
         return same == N ? 0 : 1;
     } catch (const std::exception & e) {

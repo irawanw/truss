@@ -36,8 +36,9 @@ host mirror, one 4 KB copy per projection per layer that changed). `weights(l)` 
 | `spare()` | stream mode: `stream_extra` bytes after the slots, valid until the next `fetch()` |
 | `prefetch(l)` | stream mode: all of layer l's cold experts into slot l % 2 (one copy), after the slot's release |
 | `fetch(l, ids, n, compute)` | ring mode: makes the cold experts among `ids` (host) resident: FIFO allocation (256-B aligned, wrap at the end, evicting the oldest), one copy each, ring meta updated; waits for queued compute first (the ring may overwrite what earlier kernels read). Refetches if a copy evicted an expert this call needs |
+| `prefetch_hint(l, ids, n)` | ring mode, right after `fetch(l)`: starts copying layer l+1's predicted cold experts behind layer l's copies (updates l+1's ring meta). Refuses to evict an expert layer l's fetch needs (stops the hint instead) |
 | `acquire(l, compute)` / `release(l, compute)` | compute waits for layer l's copies / records it is done with slot l % 2 |
-| `stats()` | ring mode: fetch calls, experts asked, fetched (misses), bytes |
+| `stats()` | ring mode: fetch calls, experts asked, fetched on demand (misses, bytes), prefetched by hints (count, bytes) |
 | `device_bytes()`, `cold_bytes()`, `ring_bytes()` | memory used; bytes streamed per prompt chunk; ring size |
 
 **Protocol (Forward).** Prompt chunk (> 32 rows): `begin_stream`, `prefetch(0)`, `prefetch(1)`; per layer

@@ -66,6 +66,10 @@ public:
     void prefetch(int layer);                                      // all cold experts of the layer into slot l % 2
     void fetch(int layer, const int * ids, int n, cudaStream_t compute);   // ring mode: make ids[0 .. n) (host)
                                                                            // resident, copying the missing ones
+    // Pre-gated prefetch (after fetch(layer, ...), before acquire): start copying the experts `ids` predicts for
+    // layer + 1, behind this layer's copies, so PCIe works while this layer and the next one's attention compute.
+    // Never evicts an expert the last fetch() needs (stops instead); wrong guesses only cost bandwidth and ring room.
+    void prefetch_hint(int layer, const int * ids, int n);
     void acquire(int layer, cudaStream_t compute);                 // compute waits for layer l's copies
     void release(int layer, cudaStream_t compute);                 // compute is done with slot l % 2 (stream mode)
 
@@ -75,8 +79,10 @@ public:
     int layers() const { return (int) layers_.size(); }
 
     struct Stats {                                                  // ring mode, since construction
-        long fetch_calls = 0, experts_asked = 0, misses = 0;
-        size_t bytes = 0;
+        long fetch_calls = 0, experts_asked = 0, misses = 0;   // misses: fetched on demand
+        size_t bytes = 0;                                      // demand bytes
+        long hinted = 0;                                       // copied by prefetch_hint
+        size_t hint_bytes = 0;
     };
     const Stats & stats() const { return stats_; }
 
@@ -100,7 +106,9 @@ private:
     enum class Mode { STREAM, RING };
 
     void wait_compute(cudaStream_t compute);                        // copy stream waits for all compute queued so far
-    void ring_put(int layer, int expert);
+    bool ring_put(int layer, int expert, bool hint = false);   // hint: refuse (false) to evict a protected expert
+    std::vector<int> protect_;                                  // layer, experts the last fetch() needs
+    int protect_layer_ = -1;
 
     std::vector<Layer> layers_;
     uint8_t * base_ = nullptr;                                     // ring start

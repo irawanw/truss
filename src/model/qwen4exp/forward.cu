@@ -112,11 +112,12 @@ struct Forward::Impl {
     std::vector<int32_t> tail;                           // the last ple_ngram - 1 tokens seen (PLE window)
 
     const Activations act;
+    const int hint_k;                                    // Options::hint_k
     int n_store = 0;                                     // ExpertStore layers: n_layer (+ 1 with the MTP block)
 
     Impl(const Config & cc, const Weights & ww, int nc, int mc, const Options & o)
         : c(cc), w(ww), n_ctx(nc), max_chunk(mc), small_scratch(scratch_bytes(cc, std::min(mc, FETCH_ROWS), nc)),
-          act(o.act), spec_rows(o.spec_rows)
+          spec_rows(o.spec_rows), act(o.act), hint_k(o.hint_k)
     {
         check_shapes();
         mtp = o.mtp;
@@ -140,7 +141,7 @@ struct Forward::Impl {
         use(small);
         window_ws = alloc<unsigned char>(moe::workspace_bytes<MoeShape>());
         moe::workspace_init<MoeShape>(window_ws, s);
-        TRUSS_CUDA(cudaMallocHost(&ids_host, sizeof(int) * FETCH_ROWS * MoeShape::TOPK));
+        TRUSS_CUDA(cudaMallocHost(&ids_host, sizeof(int) * 2 * FETCH_ROWS * MoeShape::TOPK));   // routing + prediction
         st.resize(c.n_layer);
         const int R = DsaShape::RATIO;
         const int W = spec_rows;
@@ -509,9 +510,26 @@ struct Forward::Impl {
         ffn::route(logits, T, E, K, ids, wts, s);
         if (route_counts) ffn::count(ids, T * K, route_counts + (size_t) l * E, s);
         if (!stream) {   // fetch the few cold experts this chunk routes to
+            // pre-gating: the next layer's router on this layer's input predicts 72% of its experts (TRACKER #58);
+            // their copies start behind this layer's, one sync for both id sets
+            const bool hint = hint_k > 0 && l + 1 < c.n_layer;
+            int * pred = nullptr;
+            if (hint) {
+                float * pl = sc->alloc((size_t) T * E), * pw = sc->alloc((size_t) T * K);
+                pred = sc->alloc<int>((size_t) T * K);
+                lin32(w.layers[l + 1].moe.router, in, T, pl);
+                ffn::route(pl, T, E, K, pred, pw, s);
+                TRUSS_CUDA(cudaMemcpyAsync(ids_host + T * K, pred, sizeof(int) * T * K, cudaMemcpyDeviceToHost, s));
+            }
             TRUSS_CUDA(cudaMemcpyAsync(ids_host, ids, sizeof(int) * T * K, cudaMemcpyDeviceToHost, s));
             TRUSS_CUDA(cudaStreamSynchronize(s));
             experts->fetch(l, ids_host, T * K, s);
+            if (hint) {   // each row's first hint_k guesses (ids are in descending probability)
+                std::vector<int> h;
+                for (int t = 0; t < T; ++t)
+                    for (int i = 0; i < std::min(K, hint_k); ++i) h.push_back(ids_host[T * K + t * K + i]);
+                experts->prefetch_hint(l, h.data(), (int) h.size());
+            }
             experts->acquire(l, s);
             if (T <= moe::MAX_ROWS) moe::window<MoeShape>(experts->weights(l), in, ids, wts, T, routed, window_ws, s);
             else moe::prefill<MoeShape>(experts->weights(l), in, ids, wts, T, routed, cur.moe_ws, cur.moe_rows, s);

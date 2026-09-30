@@ -99,8 +99,9 @@ profile_routes(on), route_counts()   // routing profile [layer][expert] (the usa
 
 **Per chunk.** See the table in [README.md](README.md). Mode choices inside:
 - `lin`: Q8_1 → `q8_gemv` (≤ 8 rows) / `q8_gemm`; FP16 → `q8_gemm_a16`. `lin32`: cuBLAS SGEMM for F32 weights.
-- FFN residency: `fetch_mode(T)` = T ≤ `FETCH_ROWS` (32): read routing back, `ExpertStore::fetch` the routed cold
-  experts, then `moe::window` (T ≤ 8) or `moe::prefill`; otherwise whole layers stream (`prefetch(0), prefetch(1)`
+- FFN residency: `fetch_mode(T)` = T ≤ `FETCH_ROWS` (32): read routing back (with layer l+1's router applied to this
+  layer's input: pre-gating predicts 72% of its experts; each row's top `hint_k` go to `ExpertStore::prefetch_hint`),
+  `ExpertStore::fetch` the routed cold experts, then `moe::window` (T ≤ 8) or `moe::prefill`; otherwise whole layers stream (`prefetch(0), prefetch(1)`
   at chunk start, `prefetch(l + 2)` after layer l's experts).
 - Chunks may start at any position (DSA partial blocks, GDN conv rows, PLE history and window are carried).
 

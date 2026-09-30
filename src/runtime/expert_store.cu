@@ -319,10 +319,22 @@ void ExpertStore::prefetch(int l)
 
 // FIFO allocation: evict the oldest entries overlapping [head, head + bytes) (wrapping to 0 when the tail is too
 // short), copy the expert, point the ring meta at it.
-void ExpertStore::ring_put(int l, int e)
+bool ExpertStore::ring_put(int l, int e, bool hint)
 {
     Layer & Y = layers_[l];
     const int64_t need = (int64_t) align_up(Y.bytes[e]);
+    if (hint) {   // would this allocation evict an expert the current layer's kernel reads?
+        const int64_t start = head_ + need > (int64_t) ring_ ? 0 : head_;
+        for (const RingEntry & r : fifo_) {
+            const bool gone = (start == 0 && r.off >= head_) || (r.off >= start && r.off < start + need);
+            if (!gone) {
+                if (r.off >= start + need) break;   // FIFO order: later entries lie further on
+                continue;
+            }
+            if (r.layer == protect_layer_ && std::find(protect_.begin(), protect_.end(), r.expert) != protect_.end())
+                return false;
+        }
+    }
     if (head_ + need > (int64_t) ring_) {   // wrap: the tail [head, end) goes with its entries
         while (!fifo_.empty() && fifo_.front().off >= head_) {
             layers_[fifo_.front().layer].ring_at[fifo_.front().expert] = -1;
@@ -341,8 +353,9 @@ void ExpertStore::ring_put(int l, int e)
     uint8_t * at = base_ + off;
     TRUSS_CUDA(cudaMemcpyAsync(at, Y.host + Y.cold_off[e], Y.bytes[e], cudaMemcpyHostToDevice, copy_));
     for (int p = 0; p < 3; ++p) Y.ring_meta_host[(size_t) p * 2 * Y.n_expert + 2 * e + 1] = unit_offset(at + Y.part[p][e], base_, l);
-    stats_.bytes += Y.bytes[e];
-    ++stats_.misses;
+    if (hint) stats_.hint_bytes += Y.bytes[e], ++stats_.hinted;
+    else stats_.bytes += Y.bytes[e], ++stats_.misses;
+    return true;
 }
 
 void ExpertStore::fetch(int l, const int * ids, int n, cudaStream_t compute)
@@ -363,6 +376,9 @@ void ExpertStore::fetch(int l, const int * ids, int n, cudaStream_t compute)
         need.push_back(e);
     }
     stats_.experts_asked += (long) need.size();
+    protect_layer_ = l;
+    protect_.clear();
+    for (int i = 0; i < n; ++i) protect_.push_back(ids[i]);
     // A copy may evict another expert this call needs: repeat until all are resident. The ring holds thousands of
     // experts and a call needs at most rows x top-k, so this ends after one extra round.
     bool changed = false;
@@ -381,6 +397,27 @@ void ExpertStore::fetch(int l, const int * ids, int n, cudaStream_t compute)
             TRUSS_CUDA(cudaMemcpyAsync(Y.ring_meta[p], Y.ring_meta_host + (size_t) p * 2 * Y.n_expert,
                                        sizeof(int32_t) * 2 * Y.n_expert, cudaMemcpyHostToDevice, copy_));
     TRUSS_CUDA(cudaEventRecord(copied_[l % 2], copy_));
+}
+
+void ExpertStore::prefetch_hint(int l, const int * ids, int n)
+{
+    const int next = l + 1;
+    if (mode_ != Mode::RING || next >= (int) layers_.size()) return;
+    Layer & Y = layers_[next];
+    bool changed = false;
+    std::vector<int> seen;
+    for (int i = 0; i < n; ++i) {
+        const int e = ids[i];
+        if (e < 0 || e >= Y.n_expert || Y.cold_off[e] < 0 || Y.ring_at[e] >= 0) continue;
+        if (std::find(seen.begin(), seen.end(), e) != seen.end()) continue;
+        seen.push_back(e);
+        if (!ring_put(next, e, true)) break;   // the next slot holds an expert this layer still reads
+        changed = true;
+    }
+    if (changed)
+        for (int p = 0; p < 3; ++p)
+            TRUSS_CUDA(cudaMemcpyAsync(Y.ring_meta[p], Y.ring_meta_host + (size_t) p * 2 * Y.n_expert,
+                                       sizeof(int32_t) * 2 * Y.n_expert, cudaMemcpyHostToDevice, copy_));
 }
 
 void ExpertStore::acquire(int l, cudaStream_t compute)
