@@ -20,7 +20,10 @@ namespace {
 // in-situ tier reached 23.7 GB/s against the 50.9 GB/s of a probe that gives each thread a whole expert (TRACKER
 // #66). Overridable for the sweep; the defaults are what was measured best.
 constexpr int GU_CHUNK_DEF = 64, DN_CHUNK_DEF = 256;
-constexpr int SPIN_DEF = 40000;   // pause iterations before a worker blocks (~0.5 ms: covers the gap between two decode layers, TRACKER #75)
+// microseconds an idle worker spins before it blocks: Strata's kSpinBeforeSleep (20 ms). Decode calls the pool every
+// ~0.5-1 ms; the old 40,000 pauses (~0.65 ms on Zen 2) let the workers fall asleep between layers, and start() then
+// spent 0.27 ms per layer on the mutex and the futex wakes (13.9 ms per pass, TRACKER #77)
+constexpr int SPIN_US_DEF = 20000;
 // trellis items: gate/up and down columns per item (multiples of 128: the output Hadamard blocks)
 constexpr int TR_GU_COLS = 128, TR_DN_COLS = 128;
 int gu_chunk()
@@ -168,7 +171,7 @@ ExpertPool::ExpertPool(int threads)
     // Pinning (TRUSS_CPU_PIN=1): worker i on its own physical core, skipping core 0 (the driver thread's), as Strata
     // does. Off by default: the renters' threads float over every core, and pinning measured ~40% slower at loadavg
     // 28 with the q4s kernel (TRACKER #27); TRACKER #76 re-measures it with the int16 trellis kernel.
-    spin_ = getenv("TRUSS_CPU_SPIN") ? atoi(getenv("TRUSS_CPU_SPIN")) : SPIN_DEF;
+    spin_ = getenv("TRUSS_CPU_SPIN_US") ? atoi(getenv("TRUSS_CPU_SPIN_US")) : SPIN_US_DEF;
     const bool pin = getenv("TRUSS_CPU_PIN") && atoi(getenv("TRUSS_CPU_PIN"));
     const std::vector<int> cores = pin ? physical_cores() : std::vector<int>{};
     for (int i = 0; i < threads; ++i) {
@@ -198,7 +201,8 @@ ExpertPool::~ExpertPool()
 void ExpertPool::start(const float * x, int T, const std::vector<Slot> & slots, float * y)
 {
     if (T < 1 || T > MAX_ROWS) throw std::invalid_argument("cpu::ExpertPool: 1 .. 8 rows");
-    std::unique_lock<std::mutex> g(mu_);
+    // no lock: no worker reads the call's fields while busy_ is false (a late grab() takes an index of this call only
+    // after ticket_ is reset below, i.e. after the fields are written); wake() handles sleepers
     if (busy_) throw std::logic_error("cpu::ExpertPool::start while busy");
     x_ = x, y_ = y, T_ = T, slots_ = slots;
     groups_.clear();
@@ -250,9 +254,15 @@ void ExpertPool::start(const float * x, int T, const std::vector<Slot> & slots, 
     for (const Group & gr : groups_) rows_sum_ += (long long) gr.rows.size();
     t_start_ = std::chrono::steady_clock::now();
     last_ms_ = 0;
-    busy_ = G > 0;   // release: the item fields above are visible to any worker that sees busy_
-    g.unlock();
-    if (G) cv_.notify_all();
+    busy_ = G > 0;   // seq_cst: the item fields above are visible to any worker that sees busy_
+    if (G) wake();
+}
+
+void ExpertPool::wake()
+{
+    if (sleepers_.load() == 0) return;
+    { std::lock_guard<std::mutex> g(mu_); }   // a sleeper between its predicate check and its wait holds mu_
+    cv_.notify_all();
 }
 
 // trellis items. phase 0: one group's gate and up activations prepared (Hadamard, permutation); phase 1: gate and up
@@ -390,19 +400,14 @@ void ExpertPool::retire(int ph)
     if (ph + 1 < n_phases_) {
         if (!trellis_) quantize_h();
         else if (ph == 1) prep_down();
-        // State changes that sleepers wait on are made under the mutex: a sleeper checks its predicate under it, so
-        // a change and notify between its check and its wait cannot be lost (both were lost before: a hung call)
-        {
-            std::lock_guard<std::mutex> g(mu_);
-            ticket_.store((ph + 1) << TICKET_SHIFT, std::memory_order_release);   // after the flip's preparation
-        }
-        cv_.notify_all();   // workers blocked on the flip
+        // seq_cst store, then wake(): a sleeper registered in sleepers_ before checking open() under mu_, so either
+        // it sees the flip or wake() sees it (a lost wakeup hung calls before, TRACKER #73)
+        ticket_.store((ph + 1) << TICKET_SHIFT);   // after the flip's preparation
+        wake();   // workers blocked on the flip
     } else {
         last_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start_).count();
-        std::lock_guard<std::mutex> g(mu_);
-        busy_.store(false, std::memory_order_release);
+        busy_.store(false);   // the caller spins on it (wait())
     }
-    done_cv_.notify_all();   // the caller helps with the next phase or collects the result
 }
 
 void ExpertPool::run_items()
@@ -416,19 +421,27 @@ void ExpertPool::run_items()
 void ExpertPool::worker()
 {
     for (;;) {
-        for (int s = spin_; s > 0; --s) {   // a layer's call is a ~1 ms burst: blocking costs more than spinning
-            if (stop_.load(std::memory_order_relaxed) ||
-                open())
-                break;
+        // spin up to spin_ us (checked every 256 pauses): decode calls come every ~0.5-1 ms, a wake costs more.
+        // Sleep only when the spin timed out. Before (TRACKER #77), a worker that left the spin because items opened
+        // re-checked open() and slept when the other workers had already taken them all: every phase put most of
+        // the pool to sleep (the first sleep came after ~0.2 ms, not the spin limit), and each start() paid futex
+        // wakes, 0.2 ms per call in the engine.
+        const auto t0 = std::chrono::steady_clock::now();
+        bool timed_out = false;
+        for (int n = 0; !stop_.load(std::memory_order_relaxed) && !open(); ++n) {
             _mm_pause();
+            if ((n & 255) == 255 && std::chrono::steady_clock::now() - t0 > std::chrono::microseconds(spin_)) {
+                timed_out = true;
+                break;
+            }
         }
-        if (!open()) {
+        if (timed_out) {
             std::unique_lock<std::mutex> g(mu_);
-            cv_.wait(g, [&] {
-                return stop_.load(std::memory_order_relaxed) || open();
-            });
-            if (stop_.load(std::memory_order_relaxed)) return;
+            sleepers_.fetch_add(1);   // before the predicate check (see sleepers_)
+            cv_.wait(g, [&] { return stop_.load() || open(); });
+            sleepers_.fetch_sub(1);
         }
+        if (stop_.load()) return;
         run_items();
     }
 }
@@ -436,15 +449,14 @@ void ExpertPool::worker()
 void ExpertPool::wait()
 {
     const auto t0 = std::chrono::steady_clock::now();
-    for (;;) {   // the caller is a worker too, in every phase, until the call is done
+    for (;;) {   // the caller is a worker too, in every phase, and spins (as Strata's host) until the call is done
         int i, ph;
         while (grab(i, ph)) {
             item(i, ph);
             retire(ph);
         }
-        std::unique_lock<std::mutex> g(mu_);
-        done_cv_.wait(g, [&] { return !busy_.load(std::memory_order_acquire) || open(); });
-        if (!busy_.load(std::memory_order_acquire)) break;
+        if (!busy_.load()) break;
+        _mm_pause();
     }
     wait_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
     ++waits_;

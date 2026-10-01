@@ -110,6 +110,7 @@ profile_routes(on), route_counts()   // routing profile [layer][expert] (the usa
   no extra RAM), `cpu_share` (static set: rarest experts holding that share of cold routing mass), `cpu_dynamic`
   (Strata's per-layer CPU / PCIe split over all eligible misses), `pcie_gbps`, `pcie_frac` (≥ 0: a fixed share of each layer's eligible misses over PCIe, Strata's `--pcie-frac`, instead of the fitted cost model; TRACKER #76), `cpu_threads`; `dyn_stats()` (misses each way and the CPU cost line, call + per-expert ms).
 - `Options::doorbell` (default on): decode FFNs without a host sync per layer (runtime-api-server.md, doorbell).
+- `section_moe_ms(out[4])`, `driver_ms(out[3], n)`: with `TRUSS_PROFILE_SECTIONS`, the doorbell decode's routed MoE split (router + publish, wait for the host plan, wait for copies, expert kernel; events 7/9/8 inside section 3) and the driver thread's split / CPU start / copies + plan time (TRACKER #77).
   `ring_bytes_override` sets the ring size for sweeps.
 - Instrumentation: `TRUSS_PROFILE_SECTIONS=1` → `section_ms()` (device time per section of the layer chain, events on
   the engine stream: PLE+hc mix, mixer, combine+ffn mix, router+routed MoE, shared, CPU join, combine);

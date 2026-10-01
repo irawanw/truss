@@ -139,6 +139,13 @@ public:
     // [5] CPU-tier join (its spin) + routed/shared combine. Device events on the engine stream, so host stalls
     // inside a section are included; the gaps between sections are not. TRUSS_PROFILE_SECTIONS=1 turns it on.
     void section_ms(double out[6], bool reset = false) const;
+    // TRUSS_PROFILE_SECTIONS, doorbell decode: routed MoE split into router + publish, the wait for the driver's plan
+    // (host split, CPU start, copies issued), the wait for the layer's copies, and the GPU expert kernel (ms summed
+    // since the last reset)
+    void section_moe_ms(double out[4], bool reset = false) const;
+    // doorbell driver thread, ms summed over n served layers: the split (from seeing the doorbell), starting the CPU
+    // pool, issuing the copies and writing the plan (read between passes only)
+    void driver_ms(double out[3], long & n, bool reset = false) const;
     const runtime::ExpertStore & experts() const;   // residency and fetch statistics (the MTP block, when present,
                                                     // is store layer n_layer)
 

@@ -320,6 +320,7 @@ void ExpertStore::begin_stream(cudaStream_t compute)
     wait_compute(compute);   // decode kernels may still read the ring the slots overwrite
     for (const RingEntry & r : fifo_) layers_[r.layer].ring_at[r.expert] = -1;
     fifo_.clear();
+    hinted_.clear();
     head_ = 0;
     released_recorded_[0] = released_recorded_[1] = false;
     mode_ = Mode::STREAM;
@@ -384,7 +385,7 @@ void ExpertStore::begin_ring()
     }
 }
 
-void ExpertStore::fetch(int l, const int * ids, int n, cudaStream_t compute)
+bool ExpertStore::fetch(int l, const int * ids, int n, cudaStream_t compute)
 {
     if (mode_ != Mode::RING) throw std::logic_error("ExpertStore::fetch outside ring mode (begin_ring)");
     if (compute) wait_compute(compute);   // earlier kernels may read what the ring overwrites
@@ -399,6 +400,11 @@ void ExpertStore::fetch(int l, const int * ids, int n, cudaStream_t compute)
         need.push_back(e);
     }
     stats_.experts_asked += (long) need.size();
+    bool hinted_needed = false;   // a hinted expert's copy may not have landed yet
+    if ((size_t) l < hinted_.size()) {
+        for (int e : need) hinted_needed |= std::find(hinted_[l].begin(), hinted_[l].end(), e) != hinted_[l].end();
+        hinted_[l].clear();
+    }
     protect_layer_ = l;
     protect_.clear();
     for (int i = 0; i < n; ++i) protect_.push_back(ids[i]);
@@ -421,6 +427,7 @@ void ExpertStore::fetch(int l, const int * ids, int n, cudaStream_t compute)
             TRUSS_CUDA(cudaMemcpyAsync(Y.ring_meta[p], Y.ring_meta_host + (size_t) p * 2 * Y.n_expert,
                                        sizeof(int32_t) * 2 * Y.n_expert, cudaMemcpyHostToDevice, copy_));
     TRUSS_CUDA(cudaEventRecord(copied_[l % 2], copy_));
+    return changed || hinted_needed;
 }
 
 void ExpertStore::prefetch_hint(int l, const int * ids, int n)
@@ -436,6 +443,8 @@ void ExpertStore::prefetch_hint(int l, const int * ids, int n)
         if (std::find(seen.begin(), seen.end(), e) != seen.end()) continue;
         seen.push_back(e);
         if (!ring_put(next, e, true)) break;   // the next slot holds an expert this layer still reads
+        if (hinted_.size() < layers_.size()) hinted_.resize(layers_.size());
+        hinted_[next].push_back(e);
         changed = true;
     }
     if (changed)

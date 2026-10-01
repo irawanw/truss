@@ -140,6 +140,7 @@ int main(int argc, char ** argv)
         prompt(f, tok, step);
         g.rows(f, (int) (tok.size() - 1) % step, 1, &t);
         f.section_ms(sect, true);
+        { double m4[4], d3[3]; long dn; f.section_moe_ms(m4, true); f.driver_ms(d3, dn, true); }
         std::vector<int32_t> got;
         const runtime::ExpertStore::Stats st0 = f.experts().stats();
         int passes = 0;
@@ -219,6 +220,17 @@ int main(int argc, char ** argv)
                         "+ shared %.2f + cpu join/combine %.2f = %.2f\n",
                         sect[0] / passes, sect[1] / passes, sect[2] / passes, sect[3] / passes, sect[4] / passes,
                         sect[5] / passes, (sect[0] + sect[1] + sect[2] + sect[3] + sect[4] + sect[5]) / passes);
+        double m4[4];
+        f.section_moe_ms(m4);
+        if (m4[0] + m4[1] + m4[2] + m4[3] > 0)
+            std::printf("       routed MoE ms/pass: router+publish %.2f + wait for the host plan %.2f + wait for copies %.2f "
+                        "+ expert kernel %.2f\n", m4[0] / passes, m4[1] / passes, m4[2] / passes, m4[3] / passes);
+        double d3[3];
+        long dn = 0;
+        f.driver_ms(d3, dn);
+        if (dn)
+            std::printf("       driver ms/pass: split %.2f + CPU start %.2f + copies and plan %.2f (%.1f layers/pass)\n",
+                        d3[0] / passes, d3[1] / passes, d3[2] / passes, (double) dn / passes);
         TRUSS_CUDA(cudaEventDestroy(e0));
         TRUSS_CUDA(cudaEventDestroy(e1));
         std::printf("tokens identical to plain greedy: %d of %d  %s\n", same, N, same == N ? "PASS" : "FAIL");

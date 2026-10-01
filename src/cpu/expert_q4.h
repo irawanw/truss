@@ -110,12 +110,18 @@ private:
     void finish();
 
     std::vector<std::thread> workers_;
-    // The workers take items without the mutex and spin briefly before blocking: a layer's call is a burst of
-    // ~1 ms, and condvar wake latency was 43% of it (cpu_expert_test: 903 us wall, 515 us of parallel compute).
-    // Only the final "busy_ == false" and the idle wait use the mutex.
+    // The workers take items without the mutex and spin (TRUSS_CPU_SPIN_US, default 20 ms as Strata's) before
+    // blocking: a layer's call is a burst of ~1 ms, and condvar wake latency was 43% of it (cpu_expert_test: 903 us
+    // wall, 515 us of parallel compute). The caller spins in wait(). The mutex only guards blocking (see sleepers_).
     std::mutex mu_;
-    std::condition_variable cv_, done_cv_;
+    std::condition_variable cv_;
     std::atomic<bool> stop_{ false }, busy_{ false };
+    // workers blocked (or about to block) on cv_. A state change takes the mutex and notifies only when this is > 0
+    // (Strata's pool: sleepers_): during decode the workers spin through, so start() and the phase flips take no
+    // lock. The counter is incremented before the predicate check under mu_ and read after the state store (both
+    // seq_cst), so either the notifier sees the sleeper or the sleeper sees the new state.
+    std::atomic<int> sleepers_{ 0 };
+    void wake();                             // after a state change: lock + notify if anyone may sleep
     // q4s: phase 0 gate/up, 1 down. trellis: 0 prep gate/up activations, 1 gate/up, 2 down.
     // ticket_ = phase << TICKET_SHIFT | next item, one atomic: a worker that read the phase and then took an index
     // separately could take index 0 of the next phase after a flip, run the wrong item and retire it against the old
@@ -126,7 +132,7 @@ private:
     int phase_items_[3] = {};
     int n_phases_ = 2;
     bool trellis_ = false;
-    int spin_ = 0;                           // pause iterations before blocking (TRUSS_CPU_SPIN)
+    int spin_ = 0;                           // microseconds a worker spins before blocking (TRUSS_CPU_SPIN_US)
 
     // the current call
     const float * x_ = nullptr;

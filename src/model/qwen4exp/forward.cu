@@ -125,6 +125,7 @@ struct Forward::Impl {
         int * ids = nullptr, * pred = nullptr, * mids = nullptr;     // mapped [8][k]; mids: pinned source
         float * w = nullptr, * x = nullptr, * y = nullptr;           // mapped [8][k], [8][d], [8][d]
         int * doorbell = nullptr, * cpu_done = nullptr;             // mapped words
+        int * plan = nullptr, * need_copy = nullptr;                // mapped words the driver writes (wait_plan)
         int * go = nullptr, * d_mids = nullptr;                       // device
         int seq = 0;                                                  // host: the last seq enqueued
     };
@@ -137,6 +138,10 @@ struct Forward::Impl {
     std::mutex dq_mu;
     std::condition_variable dq_cv;
     std::deque<Job> jobs;
+    std::chrono::steady_clock::time_point drv_t[3];   // driver thread only: doorbell seen, split done, CPU started
+    double drv_ms[3] = { 0, 0, 0 };                    // summed: split, CPU start, copies + plan (driver_ms)
+    long drv_n = 0;
+    std::atomic<long> jobs_pushed{ 0 };   // the driver spins on this before it sleeps on dq_cv (Strata's host spins)
     bool driver_stop = false;
     std::exception_ptr driver_error;
     bool use_doorbell = true;
@@ -334,6 +339,7 @@ struct Forward::Impl {
             sect_on = true;
             sect_ev.resize(n_store);
             sect_rec.assign(n_store, 0);
+            sect_bell.assign(n_store, 0);
             for (auto & a : sect_ev)
                 for (cudaEvent_t & e : a) TRUSS_CUDA(cudaEventCreate(&e));
         }
@@ -351,7 +357,7 @@ struct Forward::Impl {
         }
         for (Bell & b : bells)
             for (void * p : { (void *) b.ids, (void *) b.pred, (void *) b.mids, (void *) b.w, (void *) b.x, (void *) b.y,
-                              (void *) b.doorbell, (void *) b.cpu_done })
+                              (void *) b.doorbell, (void *) b.cpu_done, (void *) b.plan, (void *) b.need_copy })
                 if (p) cudaFreeHost(p);
         for (void * p : owned) cudaFree(p);
         if (ids_host) cudaFreeHost(ids_host);
@@ -390,6 +396,8 @@ struct Forward::Impl {
             mapped((void **) &b.y, sizeof(float) * R * c.d_model);
             mapped((void **) &b.doorbell, sizeof(int));
             mapped((void **) &b.cpu_done, sizeof(int));
+            mapped((void **) &b.plan, sizeof(int));
+            mapped((void **) &b.need_copy, sizeof(int));
             b.go = alloc<int>(1);
             b.d_mids = alloc<int>((size_t) R * K);
         }
@@ -400,11 +408,15 @@ struct Forward::Impl {
     // start the CPU work, issue the expert copies and the go word, then publish the CPU result.
     void drive()
     {
+        long taken = 0;
         for (;;) {
             Job j;
+            // spin first: the next layer's job arrives within ~0.5 ms during a pass, and a condvar wake costs more
+            for (int i = 0; i < 200000 && jobs_pushed.load(std::memory_order_acquire) <= taken; ++i) _mm_pause();
             {
                 std::unique_lock<std::mutex> g(dq_mu);
                 dq_cv.wait(g, [&] { return driver_stop || !jobs.empty(); });
+                ++taken;
                 if (driver_stop && jobs.empty()) return;
                 j = jobs.front();
                 jobs.pop_front();
@@ -412,11 +424,15 @@ struct Forward::Impl {
             Bell & b = bells[j.layer];
             while (*(volatile int *) b.doorbell < j.seq) _mm_pause();
             std::atomic_thread_fence(std::memory_order_acquire);
+            drv_t[0] = std::chrono::steady_clock::now();
             try {
                 serve(j, b);
             } catch (...) {   // keep the GPU moving (its output is garbage now); the caller rethrows at its next sync
                 if (!driver_error) driver_error = std::current_exception();
                 experts->signal(j.layer, b.go, j.seq);
+                *(volatile int *) b.need_copy = j.seq;
+                std::atomic_thread_fence(std::memory_order_release);
+                *(volatile int *) b.plan = j.seq;
                 std::atomic_thread_fence(std::memory_order_release);
                 *(volatile int *) b.cpu_done = j.seq;
             }
@@ -477,10 +493,23 @@ struct Forward::Impl {
             if (to_cpu[i]) slots.push_back(ct->slot(i / K, l, e, b.w[i]));
             else gpu_ids.push_back(e);
         }
+        drv_t[1] = std::chrono::steady_clock::now();
         if (ct) ct->pool->start(b.x, j.T, slots, b.y);   // CPU first: it runs while the copies are issued
-        experts->fetch(l, gpu_ids.data(), (int) gpu_ids.size(), nullptr);
-        if (ct) experts->upload(b.d_mids, b.mids, sizeof(int) * n);
-        experts->signal(l, b.go, j.seq);   // go before the hints: this layer must not wait for the next one's copies
+        drv_t[2] = std::chrono::steady_clock::now();
+        // the plan (masked ids in mapped b.mids) goes to the GPU through mapped words, as Strata's: a layer that needs
+        // no copies is not ordered behind the copy stream (earlier layers' hints and meta uploads); one that copies
+        // also waits for go, which the copy stream writes behind its copies
+        const bool copied = experts->fetch(l, gpu_ids.data(), (int) gpu_ids.size(), nullptr);
+        if (copied) experts->signal(l, b.go, j.seq);   // go before the hints: this layer must not wait for the next one's copies
+        *(volatile int *) b.need_copy = copied ? j.seq : 0;
+        std::atomic_thread_fence(std::memory_order_release);
+        *(volatile int *) b.plan = j.seq;
+        {   // driver timing (Forward::driver_ms): split, CPU start, copies + plan
+            const auto t3 = std::chrono::steady_clock::now();
+            auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+            drv_ms[0] += ms(drv_t[0], drv_t[1]), drv_ms[1] += ms(drv_t[1], drv_t[2]), drv_ms[2] += ms(drv_t[2], t3);
+            ++drv_n;
+        }
         if (j.hint) {
             std::vector<int> h;
             // static: the next layer's CPU set never goes to the GPU, so it is not hinted; dynamic: a hinted expert
@@ -1067,12 +1096,20 @@ struct Forward::Impl {
             Bell & b = bells[l];
             const int seq = ++b.seq;
             runtime::publish(ids, pred, wts, T * K, in, T * dm, b.ids, b.pred, b.w, b.x, b.doorbell, seq, s);
+            if (sect) sect_record(l, 7), sect_bell[l] = 1;
             {
                 std::lock_guard<std::mutex> g(dq_mu);
                 jobs.push_back({ l, T, seq, hint, cpu_on });
+                jobs_pushed.fetch_add(1, std::memory_order_release);
             }
             dq_cv.notify_one();
-            runtime::spin_until(b.go, seq, s);   // the layer's copies (and masked ids) are in
+            // the driver's plan (mapped), the layer's copies when it queued any, the masked ids into d_mids
+            if (sect) {   // profiling: the plan and the copies waited for apart (two launches instead of one)
+                runtime::spin_until(b.plan, seq, s);
+                sect_record(l, 9);
+            }
+            runtime::wait_plan(b.plan, b.need_copy, b.go, seq, b.mids, b.d_mids, cpu_on ? T * K : 0, s);
+            if (sect) sect_record(l, 8);
             moe::window<MoeShape>(experts->weights(l), in, cpu_on ? b.d_mids : ids, wts, T, routed, window_ws, s);
             if (cpu_on) cpu_rows = -T;            // the CPU rows join after the shared expert (mapped)
         } else if (!stream) {   // fetch the few cold experts this chunk routes to
@@ -1340,9 +1377,13 @@ struct Forward::Impl {
     // stream order, so elapsed(e[i-1], e[i]) is one section's device time including any host stall inside it.
     // Sums accumulate per run()/verify(); section_ms() reads them back.
     bool sect_on = false;
-    std::vector<std::array<cudaEvent_t, 7>> sect_ev;   // [layer][0..6]; one pair per section, all on stream s
+    std::vector<std::array<cudaEvent_t, 10>> sect_ev;   // [layer][0..6] section bounds; 7, 9, 8: inside routed MoE (doorbell)
     mutable std::vector<uint8_t> sect_rec;             // layers recorded since the last flush
     mutable double sect_ms[6] = { 0, 0, 0, 0, 0, 0 };
+    // routed MoE on the doorbell path split at events 7 (doorbell raised), 9 (plan received) and 8 (copies landed,
+    // TRACKER #77): router + publish, wait for the host's plan, wait for the layer's copies, expert kernel
+    mutable std::vector<uint8_t> sect_bell;
+    mutable double sect_moe[4] = { 0, 0, 0, 0 };
     void sect_record(int layer, int i)
     {
         if (!sect_on) return;
@@ -1362,7 +1403,15 @@ struct Forward::Impl {
                 TRUSS_CUDA(cudaEventElapsedTime(&ms, sect_ev[l][i - 1], sect_ev[l][i]));
                 sect_ms[i - 1] += ms;
             }
-            sect_rec[l] = 0;
+            if (sect_bell[l]) {
+                const int at[5] = { 3, 7, 9, 8, 4 };
+                for (int i = 0; i < 4; ++i) {
+                    float ms = 0.f;
+                    TRUSS_CUDA(cudaEventElapsedTime(&ms, sect_ev[l][at[i]], sect_ev[l][at[i + 1]]));
+                    sect_moe[i] += ms;
+                }
+            }
+            sect_rec[l] = 0, sect_bell[l] = 0;
         }
     }
     void mtp_calib_open(int max_rows)
@@ -1500,6 +1549,22 @@ void Forward::section_ms(double out[6], bool reset) const
 {
     for (int i = 0; i < 6; ++i) out[i] = m_->sect_ms[i];
     if (reset) for (int i = 0; i < 6; ++i) m_->sect_ms[i] = 0;
+}
+
+void Forward::driver_ms(double out[3], long & n, bool reset) const
+{
+    for (int i = 0; i < 3; ++i) out[i] = m_->drv_ms[i];
+    n = m_->drv_n;
+    if (reset) {
+        for (int i = 0; i < 3; ++i) m_->drv_ms[i] = 0;
+        m_->drv_n = 0;
+    }
+}
+
+void Forward::section_moe_ms(double out[4], bool reset) const
+{
+    for (int i = 0; i < 4; ++i) out[i] = m_->sect_moe[i];
+    if (reset) for (int i = 0; i < 4; ++i) m_->sect_moe[i] = 0;
 }
 
 void Forward::cpu_shape(long long out[4]) const

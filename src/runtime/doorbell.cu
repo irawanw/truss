@@ -27,6 +27,22 @@ __global__ void spin_kernel(const volatile int * flag, int seq)
     __threadfence();
 }
 
+__global__ void wait_plan_kernel(const volatile int * plan, const volatile int * need_copy, const volatile int * go,
+                                 int seq, const volatile int * mapped_ids, int * dst, int n)
+{
+    __shared__ int need;
+    if (threadIdx.x == 0) {
+        while (*plan < seq) __nanosleep(128);
+        __threadfence_system();
+        need = *need_copy == seq;
+        if (need)
+            while (*go < seq) __nanosleep(128);
+        __threadfence();
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = mapped_ids[i];
+}
+
 __global__ void add_mapped_kernel(float * y, const float * x, int n)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -46,6 +62,13 @@ void publish(const int * ids, const int * pred, const float * wts, int n_ids, co
 void spin_until(const volatile int * flag, int seq, cudaStream_t stream)
 {
     spin_kernel<<<1, 1, 0, stream>>>(flag, seq);
+    TRUSS_CUDA(cudaGetLastError());
+}
+
+void wait_plan(const volatile int * plan, const volatile int * need_copy, const volatile int * go, int seq,
+               const int * mapped_ids, int * dst, int n, cudaStream_t stream)
+{
+    wait_plan_kernel<<<1, 128, 0, stream>>>(plan, need_copy, go, seq, mapped_ids, dst, n);
     TRUSS_CUDA(cudaGetLastError());
 }
 

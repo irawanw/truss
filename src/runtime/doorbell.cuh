@@ -21,6 +21,14 @@ void publish(const int * ids, const int * pred, const float * wts, int n_ids, co
 // waits until *flag >= seq (flag: device memory or a mapped host word)
 void spin_until(const volatile int * flag, int seq, cudaStream_t stream);
 
+// Strata's per-layer plan handoff (TRACKER #77): wait until the mapped word plan >= seq (the host writes it straight
+// into pinned memory, no CUDA call); then, only when the mapped word need_copy == seq (the layer queued expert
+// copies), also until the device word go >= seq (the copy stream writes it behind the copies); then copy n masked
+// ids from mapped host memory to dst (n = 0: none). Before, every layer waited for go, which the copy stream wrote
+// behind the previous layers' hint copies and meta uploads (TRUSS routed MoE 14.5 ms/pass vs Strata's 4.7).
+void wait_plan(const volatile int * plan, const volatile int * need_copy, const volatile int * go, int seq,
+               const int * mapped_ids, int * dst, int n, cudaStream_t stream);
+
 // y [n] += x [n], x in mapped host memory
 void add_mapped(float * y, const float * x, int n, cudaStream_t stream);
 

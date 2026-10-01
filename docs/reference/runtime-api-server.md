@@ -37,6 +37,7 @@ host mirror, one 4 KB copy per projection per layer that changed). `weights(l)` 
 | `prefetch(l)` | stream mode: all of layer l's cold experts into slot l % 2 (one copy), after the slot's release |
 | `fetch(l, ids, n, compute)` | ring mode: makes the cold experts among `ids` (host) resident: FIFO allocation (256-B aligned, wrap at the end, evicting the oldest), one copy each, ring meta updated; waits for queued compute first (the ring may overwrite what earlier kernels read). Refetches if a copy evicted an expert this call needs (up to `need + 1` rounds: each re-copied expert lands at the head; a fixed 3-round bound failed on a 4-row verify window, 10-01). Throws outside ring mode. `compute` = nullptr skips the wait (doorbell: the doorbell already orders it) |
 | `begin_ring()` | switch to ring mode (ring starts empty); called on the thread that enqueues kernels, before `weights()`, because with a doorbell driver `fetch` runs later on another thread (a mode switch there raced with kernel enqueue, TRACKER #61) |
+| `fetch` return value | true when it queued a copy (ring entries or meta tables) or needs an expert that `prefetch_hint` queued for this layer since its last fetch (`hinted_`, the copy may still be in flight); false = every id already on the device, nothing to wait for (the doorbell's `wait_plan` then skips `go`) |
 | `signal(l, flag, seq)` / `upload(dst, src, bytes)` | queue, behind every copy issued so far, a write of `seq` to device word `flag` (the doorbell's "go"; sources come from a 1,024-entry pinned word ring since a queued copy reads its source when it runs) / a small pinned copy on the copy stream |
 | `prefetch_hint(l, ids, n)` | ring mode, right after `fetch(l)`: starts copying layer l+1's predicted cold experts behind layer l's copies (updates l+1's ring meta). Refuses to evict an expert layer l's fetch needs (stops the hint instead) |
 | `acquire(l, compute)` / `release(l, compute)` | compute waits for layer l's copies / records it is done with slot l % 2 |
@@ -51,11 +52,25 @@ routing to host → `fetch(l, ids, n, s)` → `acquire` → `moe::window` (≤ 8
 design: the host enqueues a whole pass ahead and never synchronizes per layer. Per decode layer the GPU runs
 `publish` (copies routing ids, the next layer's predicted ids, weights and the FFN input rows into mapped pinned host
 memory, then raises the layer's doorbell word = the pass's seq), then `spin_until(go, seq)` (a one-thread kernel
-holding the stream). A driver thread in `Forward` spins on the doorbell and serves the layer in this order: start the
-CPU pool → `fetch(l, ids, n, nullptr)` → upload masked routing → `signal(go)` → `prefetch_hint` → pool wait →
-raise `cpu_done`; the GPU then `spin_until(cpu_done)` and `add_mapped` adds the CPU rows. The go word must precede
-the hint copies (queued after them it cost 49 → 41 tok/s). Flags only increase, so nothing is reset between passes.
-Same output as the synchronous path (`tk-bench-spec ... sync`).
+holding the stream). A driver thread in `Forward` serves the layers in enqueue order. It spins on its job counter
+(`jobs_pushed`, up to 200,000 pauses before the condvar) and on the doorbell, then:
+1. starts the CPU pool;
+2. calls `fetch(l, ids, n, nullptr)`, which returns whether it queued a copy;
+3. only if it did, `signal(go)`;
+4. writes the mapped words `need_copy` (= seq when copies were queued) and `plan` (= seq);
+5. calls `prefetch_hint`, waits for the pool, and raises `cpu_done`.
+
+The GPU runs `wait_plan`: it spins on the mapped `plan`, also on `go` when `need_copy == seq`, and copies the masked
+ids from mapped memory to the device. Then come the expert kernel, `spin_until(cpu_done)` and `add_mapped` of the CPU
+rows. Flags only increase, so nothing is reset between passes. Output is the same as the synchronous path
+(`tk-bench-spec ... sync`).
+
+This handoff is Strata's: mapped flags and plan, no CUDA call between a layer's routing and its expert kernel when no
+copy is needed (TRACKER #77). Before, every layer waited for a `go` written by the copy stream behind its masked-id
+upload, ring-meta uploads and the previous layer's hint copies.
+
+`fetch` counts an expert hinted for the layer since its last fetch as a copy (`hinted_`): that copy may still be in
+flight. The go word must precede the hint copies (queued after them it cost 49 → 41 tok/s).
 
 **Why a ring (TRACKER #57).** On held-out chatcode routing a FIFO of recently fetched experts halves the misses of a
 static set of equal size (10,000 slots: 74 → 38 per token; FIFO within 3% of LRU;
@@ -152,7 +167,7 @@ q, down d (2560 × 640).
 w}, y [T][2560])` returns at once, `wait()` blocks (the caller works on items meanwhile); `run` = both.
 
 **Work split.** Slots are grouped by expert. Phase 0 items: an expert's gate and up rows in chunks of 64 (10 per
-expert) → h = silu(gate)·up. Phase 1 items: down rows in chunks of 256 (10 per expert); h is quantized once per group at the phase 0 → 1 flip (AVX2 `quantize`, bit-identical to the scalar loop). fp16 block scales are preconverted to fp32 at load (`Q4Matrix::df`, `preconvert_scales`). Idle workers spin `TRUSS_CPU_SPIN` pause iterations before blocking. Then y[row] =
+expert) → h = silu(gate)·up. Phase 1 items: down rows in chunks of 256 (10 per expert); h is quantized once per group at the phase 0 → 1 flip (AVX2 `quantize`, bit-identical to the scalar loop). fp16 block scales are preconverted to fp32 at load (`Q4Matrix::df`, `preconvert_scales`). Idle workers spin `TRUSS_CPU_SPIN_US` µs before blocking (see the trellis section). Then y[row] =
 Σ over the row's slots in slot order of w·out.
 
 **Numerics.** x and h quantized per 32-block to int8 (d = amax/127, as the GPU's Q8_1), int32 dots (AVX2 maddubs),
@@ -255,9 +270,17 @@ down activations are prepared; 2 down in 128-column items (20 per expert). `last
 (start to its last item), which the dynamic split now averages instead of the driver thread's start-to-wait time
 (that included issuing the PCIe copies and overstated the CPU's cost, so it got only 7% of the misses).
 Small-call latency (`cpu_trellis_test`, 12 threads, loaded box): 1 expert 0.20 ms, 2 experts 0.27, 4 experts 0.46.
-Idle workers spin `TRUSS_CPU_SPIN` pauses (default 40,000, ~0.5 ms) before blocking: decode layers call the pool
-~1 ms apart, and with the old 4,000 the workers slept between layers and the in-engine fit read 0.32 + 0.36 ms per
-call/expert at 8 threads against 0.16 + 0.16 spinning (TRACKER #75).
+Idle workers spin `TRUSS_CPU_SPIN_US` µs (default 20,000, Strata's `kSpinBeforeSleep`) and block only when the
+spin times out. `start()`, the phase flips and the end of a call take no lock: they store the state (seq_cst) and
+call `wake()`, which locks and notifies only when `sleepers_ > 0`. The caller spins in `wait()`.
+
+Until TRACKER #77, a worker that left its spin because items opened re-checked `open()` and slept when the others
+had already taken every item. Most of the pool fell asleep each phase, and each `start()` paid futex wakes:
+- 0.2 ms per call in the engine, 13.9 ms per pass;
+- after the fix, 0.2 ms per pass.
+
+Decode at share 0.2 went from 42-46 to 57-61 tok/s. Pool probe (`pw`, 1-expert calls 0.2-5 ms apart): 0.30-0.82 →
+0.12 ms per call, zero wakes.
 `TRUSS_CPU_PIN=1` pins worker i to physical core i + 1 (one logical CPU per core from sysfs, as Strata's pool);
 off by default, neutral in `cpu_trellis_test` at 6-23 threads under renter load (TRACKER #76).
 Row stride of the prepared activations is `trellis_prep_floats(in, 1)` for every kernel (the K 5-6 kernel read rows

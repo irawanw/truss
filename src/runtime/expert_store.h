@@ -67,8 +67,9 @@ public:
     void begin_ring();
     void * spare() const { return spare_; }                        // stream mode: stream_extra bytes after the slots
     void prefetch(int layer);                                      // all cold experts of the layer into slot l % 2
-    void fetch(int layer, const int * ids, int n, cudaStream_t compute);   // ring mode: make ids[0 .. n) (host)
-                                                                           // resident, copying the missing ones
+    // ring mode: make ids[0 .. n) (host) resident, copying the missing ones; true when it queued any copy (ring
+    // entries or meta tables), false when every id was already on the device (nothing for the GPU to wait for)
+    bool fetch(int layer, const int * ids, int n, cudaStream_t compute);
     // Pre-gated prefetch (after fetch(layer, ...), before acquire): start copying the experts `ids` predicts for
     // layer + 1, behind this layer's copies, so PCIe works while this layer and the next one's attention compute.
     // Never evicts an expert the last fetch() needs (stops instead); wrong guesses only cost bandwidth and ring room.
@@ -127,6 +128,9 @@ private:
     void wait_compute(cudaStream_t compute);                        // copy stream waits for all compute queued so far
     bool ring_put(int layer, int expert, bool hint = false);   // hint: refuse (false) to evict a protected expert
     std::vector<int> protect_;                                  // layer, experts the last fetch() needs
+    // [layer] experts prefetch_hint() queued since that layer's last fetch(): their copies may still be in flight, so
+    // a fetch() that needs one reports a copy (the GPU must wait for the copy stream)
+    std::vector<std::vector<int>> hinted_;
     int protect_layer_ = -1;
 
     std::vector<Layer> layers_;
