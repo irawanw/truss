@@ -82,9 +82,13 @@ int main(int argc, char ** argv)
         const std::string draft_vocab = argc > 9 && std::string(argv[9]) != "-" ? argv[9] : "";
         const float min_p = argc > 11 ? std::atof(argv[11]) : 0.f;
         const std::string cpu_dir = argc > 10 && std::string(argv[10]) != "-" ? argv[10] : "";
-        q::Forward::Options o;
-        o.mtp = &mtp;
-        o.spec_rows = nd + 1;
+q::Forward::Options o;
+o.mtp = &mtp;
+o.spec_rows = nd + 1;
+        // the prompt path's VRAM is sized by the prompt, not by max_chunk: a chunk cap above the prompt's real
+        // length holds cached experts out of the ring's spare region for the whole run (TRACKER #70)
+        const int step = (int) std::min<size_t>(chunk, tok.size());
+        o.prefill_rows = step;
         if (!draft_vocab.empty()) {
             FILE * fv = std::fopen(draft_vocab.c_str(), "rb");
             if (!fv) throw std::runtime_error("cannot open " + draft_vocab);
@@ -97,19 +101,27 @@ int main(int argc, char ** argv)
         o.cpu_dir = cpu_dir;
         if (const char * e = std::getenv("TRUSS_CPU_SHARE")) o.cpu_share = (float) std::atof(e);   // sweeps
         if (const char * e = std::getenv("TRUSS_CPU_THREADS")) o.cpu_threads = std::atoi(e);
+        if (const char * e = std::getenv("TRUSS_CPU_DYNAMIC")) o.cpu_dynamic = std::atoi(e) != 0;   // Strata split
+        if (const char * e = std::getenv("TRUSS_CPU_TRELLIS")) o.cpu_trellis = std::atoi(e) != 0;   // CPU from the pack
+        if (const char * e = std::getenv("TRUSS_PCIE_GBPS")) o.pcie_gbps = (float) std::atof(e);
         if (const char * e = std::getenv("TRUSS_RING_GB")) o.ring_bytes_override = (size_t) std::atof(e) * (1ull << 30);
         if (argc > 6 && std::string(argv[6]) != "-")
             o.expert_usage = runtime::ExpertStore::load_usage(argv[6], c.n_layer, c.n_expert);   // MTP: Forward adds
                                                                                                // the mean layer
+        // Drop the shards the moment upload() is done: they peak near 47 GB resident, and load_cpu_tier()'s vector
+        // would otherwise allocate on top of that and the kernel would OOM us (TRACKER #72).
+        o.after_upload = [&] { file->release_pages(); mfile->release_pages(); };
         Greedy g(c.n_vocab);   // before the Forward: its expert budget takes the memory left
         q::Forward f(c, w, n_ctx, chunk, o);
+        file->release_pages();
+        mfile->release_pages();
         std::printf("experts: %d resident, ring %.2f GB; drafts %d\n", f.hot_experts(), f.experts().ring_bytes() / 1e9, nd);
 
         // plain greedy
         std::vector<int32_t> ref;
-        prompt(f, tok, chunk);
+        prompt(f, tok, step);
         int32_t t;
-        g.rows(f, (int) (tok.size() - 1) % chunk, 1, &t);
+        g.rows(f, (int) (tok.size() - 1) % step, 1, &t);
         auto t0 = std::chrono::steady_clock::now();
         for (int i = 0; i < N; ++i) {
             ref.push_back(t);
@@ -123,8 +135,8 @@ int main(int argc, char ** argv)
         f.cpu_stats(true);   // CPU tier time below covers the spec phase only
         f.cpu_shape_reset();   // CPU shape below covers the spec phase only
         double sect[6];      // layer sections, reset after the prompt below so they cover the spec phase only
-        prompt(f, tok, chunk);
-        g.rows(f, (int) (tok.size() - 1) % chunk, 1, &t);
+        prompt(f, tok, step);
+        g.rows(f, (int) (tok.size() - 1) % step, 1, &t);
         f.section_ms(sect, true);
         std::vector<int32_t> got;
         const runtime::ExpertStore::Stats st0 = f.experts().stats();
@@ -188,16 +200,23 @@ int main(int argc, char ** argv)
                         sh[0] / (double) passes, sh[1] / (double) passes, sh[2] / (double) passes,
                         sh[2] / (double) std::max(1LL, sh[1]));
         }
+        {
+            long dc = 0, dp = 0;
+            double ce = 0;
+            f.dyn_stats(dc, dp, ce);
+            if (dc + dp)
+                std::printf("       dynamic split (whole run): %ld misses to the CPU, %ld over PCIe; CPU %.3f ms/expert\n",
+                            dc, dp, ce);
+        }
         std::printf("       device ms/pass: draft %.2f + verify %.2f + head %.2f = %.2f (rest: host stalls/gaps)\n",
                     ms_draft / passes, ms_verify / passes, ms_head / passes,
                     (ms_draft + ms_verify + ms_head) / passes);
         f.section_ms(sect);
         if (sect[0] > 0)
             std::printf("       layer device ms/pass: ple+hc_mix %.2f + mixer %.2f + hc_mix %.2f + routed MoE %.2f "
-                        "+ shared %.2f + cpu join %.2f + combine %.2f = %.2f\n",
+                        "+ shared %.2f + cpu join/combine %.2f = %.2f\n",
                         sect[0] / passes, sect[1] / passes, sect[2] / passes, sect[3] / passes, sect[4] / passes,
-                        sect[5] / passes, sect[6] / passes,
-                        (sect[0] + sect[1] + sect[2] + sect[3] + sect[4] + sect[5] + sect[6]) / passes);
+                        sect[5] / passes, (sect[0] + sect[1] + sect[2] + sect[3] + sect[4] + sect[5]) / passes);
         TRUSS_CUDA(cudaEventDestroy(e0));
         TRUSS_CUDA(cudaEventDestroy(e1));
         std::printf("tokens identical to plain greedy: %d of %d  %s\n", same, N, same == N ? "PASS" : "FAIL");

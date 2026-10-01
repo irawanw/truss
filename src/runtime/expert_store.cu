@@ -6,11 +6,23 @@
 #include <climits>
 #include <cstdio>
 #include <cstring>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <stdexcept>
 #include <string>
 
 namespace truss::runtime {
 namespace {
+
+// MADV_DONTNEED over the whole pages of a mapped tensor (file pages only: the tensor is read-only and shared)
+void release_pages(const gguf::Tensor * t)
+{
+    const long ps = sysconf(_SC_PAGESIZE);
+    if (!t || !t->data || !t->bytes || ps <= 0) return;
+    const uintptr_t a = (uintptr_t) t->data, m = (uintptr_t) ps - 1;
+    const uintptr_t lo = (a + m) & ~m, hi = (a + (uintptr_t) t->bytes) & ~m;   // pages wholly inside the tensor
+    if (hi > lo) madvise((void *) lo, (size_t) (hi - lo), MADV_DONTNEED);
+}
 
 constexpr int SHIFT = 4;                 // meta offsets in 16-word (32-byte) units
 constexpr size_t UNIT = 2u << SHIFT;     // bytes per offset unit
@@ -249,6 +261,10 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
                 rm[2 * e + 1] = hot[l][e] ? sm[2 * e + 1] : 0;   // cold: set when fetched
             }
         }
+        // The layer's tiles now live in the pinned copy or on the device: drop the file pages they were read from.
+        // The mapping stays valid (read-only, shared; a later read re-faults), but without this the load's resident
+        // peak counts the pack twice (pinned + page cache, ~69 GB measured) beside renters holding 58-77 GB.
+        for (int p = 0; p < 3; ++p) release_pages(layers[l][p]->trellis);
         for (int p = 0; p < 3; ++p) {
             const formats::ExpertTable & t = *layers[l][p];
             Y.stream_meta[p] = static_cast<int32_t *>(device_alloc(sizeof(int32_t) * 2 * E, device_));

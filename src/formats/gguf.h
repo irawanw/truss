@@ -73,6 +73,12 @@ public:
 
     const std::vector<std::string> & shard_paths() const { return paths_; }
 
+    // Drop the file-backed pages of every shard from the process. The mapping stays valid (PROT_READ | MAP_SHARED):
+    // a later touch just re-faults from disk, so this is safe once the tensors have been uploaded. Worth doing after
+    // Forward's upload() — the shards are tens of GB of RSS that would otherwise sit resident beside every run
+    // (TRACKER #72).
+    void release_pages() const;
+
 private:
     struct Mapping { void * addr; size_t size; };
     File() = default;

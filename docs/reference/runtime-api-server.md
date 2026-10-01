@@ -159,7 +159,7 @@ expert) → h = silu(gate)·up. Phase 1 items: down rows in chunks of 256 (10 pe
 fp32 scaling. Rows are independent and summed in slot order, so a verify window equals single steps
 (`cpu_expert_test`: rel 2e-7 vs a double reference; each row bit-identical to its 1-row call).
 
-**In Forward (Options::cpu_dir, cpu_share, cpu_threads).** At load, per layer, the non-resident experts in ascending
+**In Forward (Options::cpu_dir or cpu_trellis, cpu_share, cpu_threads, cpu_dynamic).** At load, per layer, the non-resident experts in ascending
 usage until they hold `cpu_share` of the layer's non-resident routing mass are the CPU set (static: results never
 depend on cache state); their q4s bytes are read into RAM. Decode layers (fetch mode): the FFN input rows and routing
 weights come to the host in the routing sync; CPU slots go to the pool; the GPU kernel gets the same routing with
@@ -167,5 +167,49 @@ those slots masked (weight 0, id of an expert already in the row, so no extra wo
 routed output before the shared-expert combine. Prompt chunks (stream mode) compute every expert on the GPU from the
 trellis pack. The MTP block has no CPU tier.
 
+`Options::cpu_dynamic` (Strata's split, `serve()`): every expert with a CPU copy is eligible; per layer, routed experts
+already on the GPU (hot, or in the ring incl. queued copies: `ExpertStore::on_device`) run there, and of the missed
+eligible ones the last m in routing order go over PCIe, the rest to the CPU, m minimizing max(CPU time, copy time)
+with the CPU's per-expert time a running mean measured on the driver thread and copies at `pcie_gbps`. Doorbell path
+only. Results then depend on the cache state; with `cpu_trellis` the CPU's weights equal the GPU's, so only fp32
+summation order differs.
+
 **Speed.** The tier is DRAM-bound: 16 threads read q4s at 46.6 GB/s, 84% of this box's roofline; instruction cuts were neutral and more threads slower (TRACKER #62, #64). Its per-layer join is the cost: a verify pass at share 0.7 spent 32 of 75 ms in it (#63). `cpu_expert_test` timing: 4 rows × 8 experts in ~0.93 ms with 8 threads + caller (converter running
 beside it). Probe (`tools/tk-bench/cpu_q4.cc`): 8 threads 10.3 experts/ms at 4 rows, 16 threads 16.8.
+
+**Pool scheduling.** Items are taken lock-free from one atomic ticket = phase << 20 | item index; a phase's last item
+prepares what the next phase reads (q4s: quantize h; trellis: prepare h for down) and then publishes the next phase's
+ticket. Before 10-01 the phase and the index were two atomics: a worker could read the old phase, take index 0 of the
+new one after a flip, run the wrong item and retire it against the old phase, so a pending count never reached zero
+and the call hung (seen with the trellis tier's 3 phases; `cpu_trellis_test` now runs 3,000 small calls).
+
+## `src/cpu/expert_trellis.h`, `expert_trellis.cc` — CPU GEMV from the pack's own trellis bytes
+
+**Why (TRACKER #73).** Strata's CPU computes missed experts from the very bytes the GPU would copy, so its CPU tier
+costs no RAM. The q4s tier above needs a second copy (2.76 MB per CPU expert beside the pinned 1.77 MB): 28 GB at
+share 0.15, which swapped once the renters grew (they hold 58-77 GB of the 125 GB). `Options::cpu_trellis` points the
+CPU at the ExpertStore's pinned pack copies instead (`ExpertStore::host_part`): no file, no extra RAM, and the CPU
+computes the GPU's own weights.
+
+**Math.** Per projection a = fp16(H128(suh·x)), c = W·a with W decoded from 16×16 tiles, y = svh·H128(c) — the
+reference `qwen4exp::project` and `moe::window`. Weight j of a tile is the 16-bit state ending at bit (j+1)·K of the
+tile's cyclic 256·K-bit stream (MSB first), value bytesum(state · 0x83DCD12D) + 1024 as fp16 times 1/147.7 − 10.39.
+
+**Kernel (K ≤ 4, `gemv_tiles4`).** Each nt column's tiles are byte-swapped once into a small buffer (the stream then
+reads as big-endian bytes; the tile's last word in front for lane 0). For weight index m the 8 lanes of an octet sit at
+byte offsets K·l + const with one shared bit shift, so a pair of 16-byte loads, one `vpshufb` and two immediate shifts
+give 8 states; then `vpmulld`, byte sum (`maddubs` + `madd`), convert, FMA to the codebook value, one FMA per row
+into the octet's accumulators (activations pre-permuted by `trellis_prep`). K is a template parameter (shifts become
+immediates). K 5-6 use the scalar-window kernel `gemv_tiles`. The weights are not rounded to fp16 by default (the
+GPU's hfma2 does): rounding cost ~40% of the loop on Zen 2 and moves a weight by at most half an fp16 ulp
+(`TRUSS_TRELLIS_ROUND=1` restores it).
+
+**Measured** (`cpu_trellis_test`, K = 2, renters at loadavg ~27): 4.8 cycles per 8 weights at 1 row (first version
+8.6: scalar windows, F16C rounding); 0.80 ms per expert on one thread from cache; 12 threads over experts from DRAM
+8.5-9.6 experts/ms; the pool on a 4-row call with 37 distinct experts 9.6 experts/ms (PCIe moves ~7.6/ms). Rel. error
+vs a dense double reference from the bit-by-bit decode 1-9e-6 (K 1-4, 1-8 rows); the pool equals per-slot experts
+exactly and each row equals its 1-row call.
+
+**In the pool.** Slots carry `t` (a `TrellisExpert`) instead of `e`; one call is all one kind. Phases: 0 prepare each
+group's gate/up activations, 1 gate/up in 128-column items then silu·up, 2 down in 256-column items (h prepared at the
+flip).

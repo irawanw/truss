@@ -106,6 +106,9 @@ profile_routes(on), route_counts()   // routing profile [layer][expert] (the usa
   (`dense::q8_gather` at load) and `sampling::argmax_prob` maps back to the real id. Acceptance is unchanged on the
   code prompt (2.98 tok/pass vs 2.98 full; a first-N-ids subset lost it). `Options::draft_min_p` stops a chain once
   the draft's probability drops below it; `draft()` returns how many it made. Verify keeps the output exact either way.
+- CPU tier options (runtime-api-server.md, src/cpu): `cpu_dir` (q4s files) or `cpu_trellis` (the pinned pack bytes,
+  no extra RAM), `cpu_share` (static set: rarest experts holding that share of cold routing mass), `cpu_dynamic`
+  (Strata's per-layer CPU / PCIe split over all eligible misses), `pcie_gbps`, `cpu_threads`; `dyn_stats()`.
 - `Options::doorbell` (default on): decode FFNs without a host sync per layer (runtime-api-server.md, doorbell).
   `ring_bytes_override` sets the ring size for sweeps.
 - Instrumentation: `TRUSS_PROFILE_SECTIONS=1` → `section_ms()` (device time per section of the layer chain, events on

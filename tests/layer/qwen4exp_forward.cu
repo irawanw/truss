@@ -264,7 +264,7 @@ int main(int argc, char ** argv)
             }
             cudaFree(d_logits);
         } else if (mode == "cpu") {
-            // CPU tier (needs argv[4] = the q4s dir, llama_dump_chunk8; TRUSS_TEST_NO_CPU=1 runs the same without it):
+            // CPU tier (needs argv[4] = the q4s dir or "trellis", llama_dump_chunk8; TRUSS_TEST_NO_CPU=1 runs the same without it):
             // with a 3 GiB budget and the rarest half of the non-resident routing mass on the CPU, 16 single-token
             // steps, 4 runs of 4 tokens and 4 verify windows of 4 (accepting every row) must give identical logits,
             // close to all-resident ones.
@@ -288,7 +288,12 @@ int main(int argc, char ** argv)
             for (int pass = 0; pass < 3; ++pass) {   // 1-token steps, verify windows of 4, plain 4-token runs
                 q::Forward::Options o;
                 o.expert_budget = 3ull << 30, o.ring_bytes = 0, o.expert_usage = usage;
-                if (!getenv("TRUSS_TEST_NO_CPU")) o.cpu_dir = argv[4];
+                // argv[4] = "trellis": the CPU computes from the pinned pack bytes (Options::cpu_trellis): same weights
+                // as the GPU, so the KL vs all-resident must be at the level of summation order, far below q4s's
+                if (!getenv("TRUSS_TEST_NO_CPU")) {
+                    if (std::string(argv[4]) == "trellis") o.cpu_trellis = true;
+                    else o.cpu_dir = argv[4];
+                }
                 o.spec_rows = 4, o.cpu_threads = 8;
                 q::Forward p(c, w, T, 64, o);
                 for (int s0 = 0; s0 < P; s0 += 64) p.run(tok.data() + s0, std::min(64, P - s0));

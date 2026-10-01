@@ -85,6 +85,17 @@ public:
     size_t cold_bytes() const { return cold_total_; }                // pinned host bytes, streamed once per chunk
     size_t ring_bytes() const { return ring_; }
     int layers() const { return (int) layers_.size(); }
+    // expert e of layer l is readable by the GPU now: hot, or in the ring (ring mode; a queued copy counts, since the
+    // compute that reads it waits for the copy stream)
+    bool on_device(int l, int e) const { return layers_[l].cold_off[e] < 0 || layers_[l].ring_at[e] >= 0; }
+    size_t bytes_of(int l, int e) const { return layers_[l].bytes[e]; }
+    // pinned host copy of projection p (gate, up, down) of a cold expert; nullptr for a hot one (it has none). The CPU
+    // tier reads the pack's trellis bytes from here (cpu::TrellisExpert): the same bytes PCIe copies.
+    const uint8_t * host_part(int l, int e, int p) const
+    {
+        const Layer & Y = layers_[l];
+        return Y.cold_off[e] < 0 ? nullptr : Y.host + Y.cold_off[e] + Y.part[p][e];
+    }
 
     struct Stats {                                                  // ring mode, since construction
         long fetch_calls = 0, experts_asked = 0, misses = 0;   // misses: fetched on demand

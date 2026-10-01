@@ -18,6 +18,8 @@ namespace {
 // #66). Overridable for the sweep; the defaults are what was measured best.
 constexpr int GU_CHUNK_DEF = 64, DN_CHUNK_DEF = 256;
 constexpr int SPIN_DEF = 4000;   // pause iterations before a worker blocks
+// trellis items: gate/up and down columns per item (multiples of 128: the output Hadamard blocks)
+constexpr int TR_GU_COLS = 128, TR_DN_COLS = 256;
 int gu_chunk()
 {
     static const int v = getenv("TRUSS_CPU_GU_CHUNK") ? atoi(getenv("TRUSS_CPU_GU_CHUNK")) : GU_CHUNK_DEF;
@@ -139,7 +141,10 @@ ExpertPool::ExpertPool(int threads)
 
 ExpertPool::~ExpertPool()
 {
-    stop_ = true;
+    {
+        std::lock_guard<std::mutex> g(mu_);
+        stop_ = true;
+    }
     cv_.notify_all();
     for (auto & t : workers_) t.join();
 }
@@ -151,15 +156,20 @@ void ExpertPool::start(const float * x, int T, const std::vector<Slot> & slots, 
     if (busy_) throw std::logic_error("cpu::ExpertPool::start while busy");
     x_ = x, y_ = y, T_ = T, slots_ = slots;
     groups_.clear();
+    trellis_ = !slots_.empty() && slots_[0].t != nullptr;
     for (const Slot & s : slots_) {
         if (s.row < 0 || s.row >= T) throw std::out_of_range("cpu::ExpertPool: slot row");
-        auto it = std::find_if(groups_.begin(), groups_.end(), [&](const Group & gr) { return gr.e == s.e; });
-        if (it == groups_.end()) groups_.push_back({ s.e, {} }), it = groups_.end() - 1;
+        if ((s.t != nullptr) != trellis_) throw std::invalid_argument("cpu::ExpertPool: q4s and trellis slots mixed");
+        auto it = std::find_if(groups_.begin(), groups_.end(), [&](const Group & gr) { return gr.e == s.e && gr.t == s.t; });
+        if (it == groups_.end()) groups_.push_back({ s.e, s.t, {} }), it = groups_.end() - 1;
         if (std::find(it->rows.begin(), it->rows.end(), s.row) == it->rows.end()) it->rows.push_back(s.row);
     }
-    xq_.resize((size_t) T * D_MODEL);
-    xd_.resize((size_t) T * D_MODEL / BLOCK);
-    for (int t = 0; t < T; ++t) quantize(x + (size_t) t * D_MODEL, D_MODEL, &xq_[(size_t) t * D_MODEL], &xd_[(size_t) t * D_MODEL / BLOCK]);
+    if (!trellis_) {
+        xq_.resize((size_t) T * D_MODEL);
+        xd_.resize((size_t) T * D_MODEL / BLOCK);
+        for (int t = 0; t < T; ++t)
+            quantize(x + (size_t) t * D_MODEL, D_MODEL, &xq_[(size_t) t * D_MODEL], &xd_[(size_t) t * D_MODEL / BLOCK]);
+    }
     const size_t G = groups_.size();
     // grow-only scratch: every cell read below is written first (h/out rows only for rows in each group's list),
     // so the zeroing of assign() is pure overhead, ~100 KB per layer per pass.
@@ -167,10 +177,26 @@ void ExpertPool::start(const float * x, int T, const std::vector<Slot> & slots, 
     if (hq_.size() < G * MAX_ROWS * D_FF) hq_.resize(G * MAX_ROWS * D_FF);
     if (hd_.size() < G * MAX_ROWS * D_FF / BLOCK) hd_.resize(G * MAX_ROWS * D_FF / BLOCK);
     if (out_.size() < G * MAX_ROWS * D_MODEL) out_.resize(G * MAX_ROWS * D_MODEL);
-    phase_items_[0] = (int) G * (D_FF / gu_chunk());
-    phase_items_[1] = (int) G * (D_MODEL / dn_chunk());
-    pending_[0] = phase_items_[0], pending_[1] = phase_items_[1];
-    phase_ = 0, next_item_ = 0;
+    if (trellis_) {   // 0: prep gate/up per group, 1: gate/up in 128-column items, 2: down in 256-column items
+        size_t off = 0;
+        for (Group & gr : groups_) {
+            const int R = (int) gr.rows.size();
+            gr.p_gu = off, off += 2 * (size_t) trellis_prep_floats(D_MODEL, R);
+            gr.p_d = off, off += (size_t) trellis_prep_floats(D_FF, R);
+        }
+        if (tp_.size() < off) tp_.resize(off);
+        n_phases_ = 3;
+        phase_items_[0] = (int) G;
+        phase_items_[1] = (int) G * (D_FF / TR_GU_COLS);
+        phase_items_[2] = (int) G * (D_MODEL / TR_DN_COLS);
+    } else {
+        n_phases_ = 2;
+        phase_items_[0] = (int) G * (D_FF / gu_chunk());
+        phase_items_[1] = (int) G * (D_MODEL / dn_chunk());
+        phase_items_[2] = 0;
+    }
+    for (int p = 0; p < 3; ++p) pending_[p] = phase_items_[p];
+    ticket_ = 0;
     ++calls_;
     groups_sum_ += (long long) G;
     slots_sum_ += (long long) slots_.size();
@@ -180,11 +206,69 @@ void ExpertPool::start(const float * x, int T, const std::vector<Slot> & slots, 
     if (G) cv_.notify_all();
 }
 
-// phase 0: gate and up rows of one chunk, then h = silu(gate) * up; phase 1: h quantized, down rows of one chunk
-void ExpertPool::item(int i)
+// trellis items. phase 0: one group's gate and up activations prepared (Hadamard, permutation); phase 1: gate and up
+// for TR_GU_COLS columns, then h = silu(gate) * up; phase 2: down for TR_DN_COLS columns (its activations were
+// prepared at the flip, prep_down)
+void ExpertPool::item_trellis(int i, int phase)
 {
     const auto t0 = std::chrono::steady_clock::now();
-    if (phase_ == 0) {
+    if (phase == 0) {
+        const Group & gr = groups_[i];
+        float * P = &tp_[gr.p_gu];
+        const size_t step = (size_t) trellis_prep_floats(D_MODEL, 1);
+        const size_t up_off = (size_t) trellis_prep_floats(D_MODEL, (int) gr.rows.size());
+        for (size_t k = 0; k < gr.rows.size(); ++k) {
+            const float * x = x_ + (size_t) gr.rows[k] * D_MODEL;
+            trellis_prep(gr.t->gate, x, D_MODEL, 1, P + k * step);
+            trellis_prep(gr.t->up, x, D_MODEL, 1, P + up_off + k * step);
+        }
+        hq_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    } else if (phase == 1) {
+        const int per = D_FF / TR_GU_COLS, gi = i / per, c0 = (i % per) * TR_GU_COLS;
+        const Group & gr = groups_[gi];
+        const int R = (int) gr.rows.size();
+        const float * P = &tp_[gr.p_gu];
+        float g[MAX_ROWS * TR_GU_COLS], u[MAX_ROWS * TR_GU_COLS];
+        trellis_gemv(gr.t->gate, P, R, c0, c0 + TR_GU_COLS, g, TR_GU_COLS);
+        trellis_gemv(gr.t->up, P + trellis_prep_floats(D_MODEL, R), R, c0, c0 + TR_GU_COLS, u, TR_GU_COLS);
+        const auto t2 = std::chrono::steady_clock::now();
+        float * h = &h_[(size_t) gi * MAX_ROWS * D_FF];
+        for (int k = 0; k < R; ++k)
+            for (int j = 0; j < TR_GU_COLS; ++j) {
+                const float a = g[k * TR_GU_COLS + j];
+                h[k * D_FF + c0 + j] = a / (1.f + std::exp(-a)) * u[k * TR_GU_COLS + j];
+            }
+        gate_us_ += std::chrono::duration_cast<std::chrono::microseconds>(t2 - t0).count();
+        silu_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t2).count();
+    } else {
+        const int per = D_MODEL / TR_DN_COLS, gi = i / per, c0 = (i % per) * TR_DN_COLS;
+        const Group & gr = groups_[gi];
+        trellis_gemv(gr.t->down, &tp_[gr.p_d], (int) gr.rows.size(), c0, c0 + TR_DN_COLS,
+                     &out_[(size_t) gi * MAX_ROWS * D_MODEL + c0], D_MODEL);
+        down_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    }
+    item_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// every group's h rows prepared for the down projection, once, at the gate/up -> down flip
+void ExpertPool::prep_down()
+{
+    const auto t0 = std::chrono::steady_clock::now();
+    const size_t step = (size_t) trellis_prep_floats(D_FF, 1);
+    for (size_t gi = 0; gi < groups_.size(); ++gi) {
+        const Group & gr = groups_[gi];
+        for (size_t k = 0; k < gr.rows.size(); ++k)
+            trellis_prep(gr.t->down, &h_[((size_t) gi * MAX_ROWS + k) * D_FF], D_FF, 1, &tp_[gr.p_d + k * step]);
+    }
+    hq_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// phase 0: gate and up rows of one chunk, then h = silu(gate) * up; phase 1: h quantized, down rows of one chunk
+void ExpertPool::item(int i, int ph)
+{
+    if (trellis_) return item_trellis(i, ph);
+    const auto t0 = std::chrono::steady_clock::now();
+    if (ph == 0) {
         const int gc = gu_chunk(), per = D_FF / gc, gi = i / per, r0 = (i % per) * gc, r1 = r0 + gc;
         const Group & gr = groups_[gi];
         const int R = (int) gr.rows.size();
@@ -236,35 +320,48 @@ void ExpertPool::quantize_h()
     hq_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
 }
 
+bool ExpertPool::open() const
+{
+    if (!busy_.load(std::memory_order_acquire)) return false;
+    const int t = ticket_.load(std::memory_order_acquire);
+    return (t & ((1 << TICKET_SHIFT) - 1)) < phase_items_[t >> TICKET_SHIFT];
+}
+
 bool ExpertPool::grab(int & i, int & phase)
 {
     if (!busy_.load(std::memory_order_acquire)) return false;
-    const int ph = phase_.load(std::memory_order_relaxed);
-    if (next_item_.load(std::memory_order_relaxed) >= phase_items_[ph]) return false;
-    i = next_item_.fetch_add(1, std::memory_order_relaxed);
-    phase = ph;
-    return i < phase_items_[ph];
+    if (!open()) return false;
+    const int t = ticket_.fetch_add(1, std::memory_order_acq_rel);   // phase and index from the same value
+    phase = t >> TICKET_SHIFT, i = t & ((1 << TICKET_SHIFT) - 1);
+    return i < phase_items_[phase];
 }
 
-// the last item of a phase: flip to phase 1 (quantizing h first, so no phase-1 item sees stale hq_) or end the call
+// the last item of a phase: flip to the next (first preparing what it reads: q4s quantizes h before down, trellis
+// prepares h for down) or end the call
 void ExpertPool::retire(int ph)
 {
     if (pending_[ph].fetch_sub(1, std::memory_order_acq_rel) != 1) return;
-    if (ph == 0) {
-        quantize_h();
-        next_item_.store(0, std::memory_order_relaxed);
-        phase_.store(1, std::memory_order_relaxed);
-        cv_.notify_all();   // a worker blocked on the flip must see it
+    if (ph + 1 < n_phases_) {
+        if (!trellis_) quantize_h();
+        else if (ph == 1) prep_down();
+        // State changes that sleepers wait on are made under the mutex: a sleeper checks its predicate under it, so
+        // a change and notify between its check and its wait cannot be lost (both were lost before: a hung call)
+        {
+            std::lock_guard<std::mutex> g(mu_);
+            ticket_.store((ph + 1) << TICKET_SHIFT, std::memory_order_release);   // after the flip's preparation
+        }
+        cv_.notify_all();   // workers blocked on the flip
     } else {
+        std::lock_guard<std::mutex> g(mu_);
         busy_.store(false, std::memory_order_release);
     }
-    done_cv_.notify_all();   // the caller helps with phase 1 or collects the result
+    done_cv_.notify_all();   // the caller helps with the next phase or collects the result
 }
 
 void ExpertPool::run_items()
 {
     for (int i, ph; grab(i, ph);) {
-        item(i);
+        item(i, ph);
         retire(ph);
     }
 }
@@ -274,18 +371,14 @@ void ExpertPool::worker()
     for (;;) {
         for (int s = spin_; s > 0; --s) {   // a layer's call is a ~1 ms burst: blocking costs more than spinning
             if (stop_.load(std::memory_order_relaxed) ||
-                (busy_.load(std::memory_order_acquire) &&
-                 next_item_.load(std::memory_order_relaxed) < phase_items_[phase_.load(std::memory_order_relaxed)]))
+                open())
                 break;
             _mm_pause();
         }
-        if (!busy_.load(std::memory_order_acquire) ||
-            next_item_.load(std::memory_order_relaxed) >= phase_items_[phase_.load(std::memory_order_relaxed)]) {
+        if (!open()) {
             std::unique_lock<std::mutex> g(mu_);
             cv_.wait(g, [&] {
-                return stop_.load(std::memory_order_relaxed) ||
-                       (busy_.load(std::memory_order_acquire) &&
-                        next_item_.load(std::memory_order_relaxed) < phase_items_[phase_.load(std::memory_order_relaxed)]);
+                return stop_.load(std::memory_order_relaxed) || open();
             });
             if (stop_.load(std::memory_order_relaxed)) return;
         }
@@ -296,14 +389,15 @@ void ExpertPool::worker()
 void ExpertPool::wait()
 {
     const auto t0 = std::chrono::steady_clock::now();
-    {
+    for (;;) {   // the caller is a worker too, in every phase, until the call is done
         int i, ph;
-        while (grab(i, ph)) {   // the caller is a worker too
-            item(i);
+        while (grab(i, ph)) {
+            item(i, ph);
             retire(ph);
         }
         std::unique_lock<std::mutex> g(mu_);
-        while (busy_.load(std::memory_order_acquire)) done_cv_.wait(g);
+        done_cv_.wait(g, [&] { return !busy_.load(std::memory_order_acquire) || open(); });
+        if (!busy_.load(std::memory_order_acquire)) break;
     }
     wait_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
     ++waits_;
@@ -330,7 +424,7 @@ void ExpertPool::finish()
 {
     std::fill(y_, y_ + (size_t) T_ * D_MODEL, 0.f);
     for (const Slot & s : slots_) {
-        const int gi = (int) (std::find_if(groups_.begin(), groups_.end(), [&](const Group & gr) { return gr.e == s.e; }) -
+        const int gi = (int) (std::find_if(groups_.begin(), groups_.end(), [&](const Group & gr) { return gr.e == s.e && gr.t == s.t; }) -
                               groups_.begin());
         const std::vector<int> & rows = groups_[gi].rows;
         const int k = (int) (std::find(rows.begin(), rows.end(), s.row) - rows.begin());

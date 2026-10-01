@@ -268,6 +268,13 @@ File::~File()
     for (auto & m : maps_) munmap(m.addr, m.size);
 }
 
+void File::release_pages() const
+{
+    long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0) return;
+    for (auto & m : maps_) madvise(m.addr, m.size / (size_t) ps * (size_t) ps, MADV_DONTNEED);
+}
+
 const Tensor * File::find(std::string_view name) const
 {
     const auto it = index_.find(std::string(name));

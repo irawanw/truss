@@ -46,6 +46,20 @@ struct ForwardOptions {
     std::string cpu_dir;
     float cpu_share = 0.5f;
     int cpu_threads = 12;
+    // Strata's split (TRACKER #73): the CPU tier set (cpu_share of the loaded copies) becomes the experts the CPU MAY
+    // compute. Per decode layer, the routed experts already on the GPU (hot or in the ring) run there; of the
+    // missed ones with a host copy, the last m in routing order go over PCIe and the rest to the CPU, m chosen so
+    // the CPU's time (measured per expert, running mean) and the copies' time (bytes / pcie_gbps) are balanced.
+    // Faster, but the result then depends on the cache state (the CPU's q4s copy and the pack differ): verify
+    // windows no longer reproduce plain steps bit for bit. Doorbell path only (the sync path keeps the static set).
+    bool cpu_dynamic = false;
+    // CPU tier from the pack itself (TRACKER #73): the CPU decodes the cold experts' trellis tiles straight from the
+    // ExpertStore's pinned copies (cpu/expert_trellis.h) instead of q4s files: no extra RAM (the q4s tier needed
+    // 2.76 MB per CPU expert beside the pinned 1.77, 28 GB at share 0.15, which swapped beside the renters), and the
+    // CPU computes the GPU's own weights. Every cold expert is eligible; cpu_share picks the static set as with
+    // cpu_dir (ignored when cpu_dir is set).
+    bool cpu_trellis = false;
+    float pcie_gbps = 13.5f;                  // host -> device copy rate the dynamic split assumes (PCIe 4.0 x8)
     std::vector<int32_t> draft_vocab;         // MTP drafts score only these token ids (empty: all), e.g.
                                               // data/draft_vocab_en.bin: the draft head reads 16% of the output
                                               // matrix; verify keeps the output exact
@@ -53,8 +67,17 @@ struct ForwardOptions {
     bool doorbell = true;                     // decode FFNs without a host sync (driver thread; TRACKER #61)
     size_t ring_bytes_override = 0;         // ring size (0: Options::ring_bytes) — the ring competes with the
                                               // static hot set for VRAM; a sweep knob for the decode trade-off
+    int prefill_rows = 0;                  // rows the prompt path's buffers are sized for (0: max_chunk). They are
+                                              // carved from the ring's spare region, so rows past the prompt's real
+                                              // length evict cached experts for the whole run; pass the prompt's
+                                              // length and step run() by it (TRACKER #70)
     int hint_k = 4;                           // pre-gated prefetch: per row, the next layer's top hint_k predicted
                                               // experts start copying early (0: off; 3-6 measured equal, TRACKER #59)
+    // Called once upload() has the weights on the device but before the constructor does anything else expensive
+    // (the expert plan, the CPU tier). The owner releases the model's file-backed pages there — the shards fault to a
+    // ~47 GB resident peak during upload, and the CPU tier's anonymous vector then allocates on top of it and the
+    // kernel OOM-kills the run. The mapping stays valid, so anything still read just re-faults (TRACKER #72).
+    std::function<void()> after_upload;
 };
 
 class Forward {
@@ -103,11 +126,14 @@ public:
     void cpu_phase_us(long long out[4]) const;   // gate/up gemv, silu, h-quantize, down gemv sums
     void cpu_shape(long long out[4]) const;    // calls, distinct experts, slots, rows-served sum (the gemv's R)
     void cpu_shape_reset();
+    // Options::cpu_dynamic: eligible misses sent to the CPU / over PCIe since construction, and the CPU's current
+    // per-expert time estimate (ms)
+    void dyn_stats(long & cpu, long & pcie, double & cpu_ms_expert) const;
     // Per-section device time of the layer chain, in ms, accumulated over every run()/verify() since the last
     // reset: [0] PLE + attn hyper-connection mix, [1] GDN/DSA mixer, [2] hc combine + ffn-side mix,
     // [3] router + routed MoE (PCIe copies and the CPU tier's start inside), [4] shared expert,
-    // [5] CPU-tier join (its host spin), [6] hc combine. Device events on the engine stream, so host stalls inside
-    // a section are included; the gaps between sections are not. TRUSS_PROFILE_SECTIONS=1 turns it on.
+    // [5] CPU-tier join (its spin) + routed/shared combine. Device events on the engine stream, so host stalls
+    // inside a section are included; the gaps between sections are not. TRUSS_PROFILE_SECTIONS=1 turns it on.
     void section_ms(double out[6], bool reset = false) const;
     const runtime::ExpertStore & experts() const;   // residency and fetch statistics (the MTP block, when present,
                                                     // is store layer n_layer)

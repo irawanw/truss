@@ -14,6 +14,8 @@
 // computed independently and a row's experts are summed in slot order, so results do not depend on how many rows a
 // call has (a verify window equals single steps).
 #pragma once
+#include "cpu/expert_trellis.h"
+
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -46,11 +48,13 @@ constexpr size_t SCALES_PER_EXPERT =
 // gate, up, down scales as fp32 into out [SCALES_PER_EXPERT] (one _cvtsh_ss per block, once at load)
 void preconvert_scales(const Q4Expert & e, float * out);
 
-// One layer's CPU work: rows x [T][D_MODEL] (fp32) and the slots routed to CPU experts.
+// One layer's CPU work: rows x [T][D_MODEL] (fp32) and the slots routed to CPU experts. An expert is either a q4s
+// copy (e) or the pack's own trellis bytes (t, expert_trellis.h); one call uses one kind.
 struct Slot {
     int row;                // 0 .. T - 1
     const Q4Expert * e;
     float w;                // routing weight
+    const TrellisExpert * t = nullptr;
 };
 
 class ExpertPool {
@@ -87,14 +91,18 @@ public:
 private:
     struct Group {                          // one expert and the rows routed to it
         const Q4Expert * e;
+        const TrellisExpert * t;
         std::vector<int> rows;
+        size_t p_gu = 0, p_d = 0;           // trellis: offsets of its prepared gate/up and down activations in tp_
     };
     void worker();
-    void item(int i);
+    void item(int i, int phase);
     bool grab(int & i, int & phase);         // lock-free: take the next item of the current phase
     void retire(int phase);                  // one item finished: phase flip or call done
     void run_items();                        // grab + run until the current phase has no items left
     void quantize_h();   // quantize every group's h rows into hq_/hd_ (once, by the last phase-0 worker)
+    void prep_down();    // trellis: every group's h rows prepared for down (once, at the gate/up -> down flip)
+    void item_trellis(int i, int phase);
     void finish();
 
     std::vector<std::thread> workers_;
@@ -104,8 +112,16 @@ private:
     std::mutex mu_;
     std::condition_variable cv_, done_cv_;
     std::atomic<bool> stop_{ false }, busy_{ false };
-    std::atomic<int> phase_{ 0 }, next_item_{ 0 }, pending_[2] = { 0, 0 };
-    int phase_items_[2] = {};
+    // q4s: phase 0 gate/up, 1 down. trellis: 0 prep gate/up activations, 1 gate/up, 2 down.
+    // ticket_ = phase << TICKET_SHIFT | next item, one atomic: a worker that read the phase and then took an index
+    // separately could take index 0 of the next phase after a flip, run the wrong item and retire it against the old
+    // phase, leaving a pending count that never reaches 0 (the call hung; TRACKER #73).
+    static constexpr int TICKET_SHIFT = 20;
+    std::atomic<int> ticket_{ 0 }, pending_[3] = { 0, 0, 0 };
+    bool open() const;                       // a call is running and its current phase has items left
+    int phase_items_[3] = {};
+    int n_phases_ = 2;
+    bool trellis_ = false;
     int spin_ = 0;                           // pause iterations before blocking (TRUSS_CPU_SPIN)
 
     // the current call
@@ -120,6 +136,7 @@ private:
     std::vector<int8_t> hq_;                // [group][row][D_FF], quantized once at the phase 0->1 flip
     std::vector<float> hd_;                 // [group][row][D_FF / 32] its scales
     std::vector<float> out_;                // [group][row][D_MODEL]
+    std::vector<float> tp_;                 // trellis: per group [gate P][up P][down P] (trellis_prep layouts)
     std::atomic<long long> wait_us_{ 0 };   // benchmark stats (see wait_us())
     std::atomic<long> waits_{ 0 };
     std::atomic<long long> item_us_{ 0 };

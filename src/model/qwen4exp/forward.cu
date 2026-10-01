@@ -28,16 +28,21 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <exception>
 #include <immintrin.h>
 #include <mutex>
+#include <numeric>
 #include <thread>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <unordered_map>
 
 namespace truss::qwen4exp {
@@ -65,7 +70,7 @@ template <class X> X * dmalloc(size_t n, bool zero = true)
 struct Forward::Impl {
     const Config & c;
     const Weights & w;
-    const int n_ctx, max_chunk;
+    const int n_ctx, max_chunk, prefill_rows;
     cudaStream_t s = nullptr;
     cublasHandle_t blas = nullptr;
     std::unique_ptr<DeviceTensors> dev;                  // every tensor except Q8_0 matrices and the PLE table
@@ -99,6 +104,12 @@ struct Forward::Impl {
                                                           // q4s block, gate+up+down order per expert; the per-block
                                                           // _cvtsh_ss in the hot loop cost ~0.9 ms/expert)
         std::vector<std::vector<cpu::Q4Expert>> view;     // [layer][expert]
+        bool trellis = false;                             // Options::cpu_trellis: tview, not view
+        std::vector<std::vector<cpu::TrellisExpert>> tview;   // [layer][expert] views of the pinned pack bytes
+        cpu::Slot slot(int row, int l, int e, float w)
+        {
+            return trellis ? cpu::Slot{ row, nullptr, w, &tview[l][e] } : cpu::Slot{ row, &view[l][e], w };
+        }
         std::unique_ptr<cpu::ExpertPool> pool;
         float * x = nullptr, * w = nullptr, * y = nullptr;   // pinned [8][d], [8][k], [8][d]
         int * ids = nullptr;                                 // pinned [8][k] routing with CPU slots as -1
@@ -129,6 +140,12 @@ struct Forward::Impl {
     bool driver_stop = false;
     std::exception_ptr driver_error;
     bool use_doorbell = true;
+    // Options::cpu_dynamic (Strata's split, TRACKER #73): per layer, missed experts with a host copy go to the CPU or
+    // over PCIe so that both finish together. cpu_ms_expert: the pool's wall time per distinct expert (running mean,
+    // measured on the driver thread); pcie_ms_byte: 1 / Options::pcie_gbps.
+    bool cpu_dynamic = false;
+    double cpu_ms_expert = 0.08, pcie_ms_byte = 1.0 / 13.5e6;
+    long dyn_cpu = 0, dyn_pcie = 0;                      // eligible misses sent each way (stats)
     int8_t * embd_q = nullptr;                           // token embedding in pinned host memory (upload())
     half * embd_d = nullptr;
 
@@ -173,8 +190,20 @@ struct Forward::Impl {
     float * draft_prob_host = nullptr;
     int n_store = 0;                                     // ExpertStore layers: n_layer (+ 1 with the MTP block)
 
+    // The prompt path's buffers are sized by prefill_rows, not max_chunk: they are carved from the ring's spare
+    // region, so every row above the prompt's real length holds cached experts out of VRAM for the whole run
+    // (TRACKER #70). 0 (or >= max_chunk) keeps the old behaviour.
+    static int prefill_rows_of(int mc, int rows)
+    {
+        if (rows <= 0 || rows >= mc) return mc;
+        const int r = (rows + DsaShape::RATIO - 1) / DsaShape::RATIO * DsaShape::RATIO;   // whole DSA blocks
+        return std::min(std::max(r, FETCH_ROWS + 1), mc);
+    }
+
     Impl(const Config & cc, const Weights & ww, int nc, int mc, const Options & o)
-        : c(cc), w(ww), n_ctx(nc), max_chunk(mc), small_scratch(scratch_bytes(cc, std::min(mc, FETCH_ROWS), nc)),
+        : c(cc), w(ww), n_ctx(nc), max_chunk(mc),
+          prefill_rows(prefill_rows_of(mc, o.prefill_rows)),
+          small_scratch(scratch_bytes(cc, std::min(mc, FETCH_ROWS), nc, o.mtp)),
           spec_rows(o.spec_rows), act(o.act), hint_k(o.hint_k)
     {
         check_shapes();
@@ -183,6 +212,7 @@ struct Forward::Impl {
         TRUSS_CUDA(cudaStreamCreate(&s));
         TRUSS_CUBLAS(cublasCreate(&blas));
         upload();
+        if (o.after_upload) o.after_upload();
         const int small_rows = std::min(max_chunk, FETCH_ROWS);
         mtp = o.mtp;
         require(spec_rows >= 0 && spec_rows <= moe::MAX_ROWS, "spec_rows must be 0.." + std::to_string(moe::MAX_ROWS));
@@ -268,26 +298,33 @@ struct Forward::Impl {
         }
         runtime::ExpertStore::Sizes z;
         z.ring_bytes = o.ring_bytes_override ? o.ring_bytes_override : o.ring_bytes;
-        if (max_chunk > FETCH_ROWS) z.stream_extra = big_bytes();
+        if (prefill_rows > FETCH_ROWS) z.stream_extra = big_bytes();
         const runtime::ExpertStore::HotSet hot = runtime::ExpertStore::plan(tables, expert_budget, z, usage);
         for (const auto & h : hot) n_hot += (int) std::count(h.begin(), h.end(), 1);
         experts = std::make_unique<runtime::ExpertStore>(tables, hot, z);
+        // The store's constructor is the last reader of the shards: it memcpy'd every cold expert into pinned host
+        // memory and uploaded the hot set, so from here the mapping is dead weight. Releasing before load_cpu_tier
+        // keeps a ~24 GB resident peak off the books while that vector allocates (TRACKER #72).
+        if (o.after_upload) o.after_upload();
         if (!o.cpu_dir.empty()) load_cpu_tier(o, hot);
+        else if (o.cpu_trellis) load_cpu_tier_trellis(o, hot);
         use_doorbell = o.doorbell;
+        cpu_dynamic = o.cpu_dynamic && cpu_tier && use_doorbell;
+        pcie_ms_byte = 1.0 / (o.pcie_gbps * 1e6);
         setup_doorbells();
-        if (max_chunk > FETCH_ROWS) {   // the prompt path's buffers, carved from the ring's spare region
+        if (prefill_rows > FETCH_ROWS) {   // the prompt path's buffers, carved from the ring's spare region
             auto * p = static_cast<unsigned char *>(experts->spare());
-            const size_t sb = scratch_bytes(c, max_chunk, n_ctx), wb = align(moe::prefill_workspace_bytes<MoeShape>(max_chunk));
+            const size_t sb = scratch_bytes(c, prefill_rows, n_ctx, mtp), wb = align(moe::prefill_workspace_bytes<MoeShape>(prefill_rows));
             big_scratch = std::make_unique<Scratch>(p, sb);
-            const size_t rb = align(sizeof(float) * max_chunk * c.hc_dim());
-            big = { big_scratch.get(), p + align(sb), max_chunk, reinterpret_cast<float *>(p + align(sb) + wb), nullptr,
+            const size_t rb = align(sizeof(float) * prefill_rows * c.hc_dim());
+            big = { big_scratch.get(), p + align(sb), prefill_rows, reinterpret_cast<float *>(p + align(sb) + wb), nullptr,
                     nullptr };
             if (mtp) {
                 big.mh = reinterpret_cast<float *>(p + align(sb) + wb + rb);
                 big.mres = reinterpret_cast<float *>(p + align(sb) + wb + 2 * rb);
             }
         }
-        if (mtp) mtp_calib_open(max_chunk);
+        if (mtp) mtp_calib_open(prefill_rows);
         if (getenv("TRUSS_PROFILE_SECTIONS")) {
             sect_on = true;
             sect_ev.resize(n_store);
@@ -388,20 +425,61 @@ struct Forward::Impl {
         std::vector<cpu::Slot> slots;
         std::vector<int> gpu_ids;
         gpu_ids.reserve(n);
+        // which routed experts the CPU computes: static (the CPU set always), or dynamic (Strata's split)
+        uint8_t to_cpu[8 * 16] = {};   // per entry
+        int n_cpu = 0;
+        if (ct && cpu_dynamic) {
+            // distinct experts in routing order; the GPU takes the resident ones and the non-eligible misses
+            int dist[8 * 16], nd = 0;
+            std::vector<int> elig;          // eligible misses (positions in dist), routing order
+            double pcie_bytes = 0;          // copies the layer needs anyway
+            for (int i = 0; i < n; ++i) {
+                const int e = b.ids[i];
+                bool seen = false;
+                for (int q = 0; q < nd; ++q) seen |= b.ids[dist[q]] == e;
+                if (seen) continue;
+                dist[nd] = i;
+                if (!experts->on_device(l, e)) {
+                    if (ct->is_cpu[l][e]) elig.push_back(nd);
+                    else pcie_bytes += (double) experts->bytes_of(l, e);
+                }
+                ++nd;
+            }
+            // m = how many eligible misses (the last ones) go over PCIe: minimize max(CPU time, copy time)
+            const int ne = (int) elig.size();
+            int best_m = 0;
+            double best = 1e30, tail = 0;
+            for (int m = 0; m <= ne; ++m) {
+                if (m > 0) tail += (double) experts->bytes_of(l, b.ids[dist[elig[ne - m]]]);
+                const double t = std::max(cpu_ms_expert * (ne - m), pcie_ms_byte * (pcie_bytes + tail));
+                if (t < best - 1e-9) best = t, best_m = m;
+            }
+            for (int q = 0; q < ne - best_m; ++q) {
+                const int e = b.ids[dist[elig[q]]];
+                for (int i = 0; i < n; ++i) to_cpu[i] |= b.ids[i] == e;
+            }
+            n_cpu = ne - best_m;
+            dyn_cpu += n_cpu;
+            dyn_pcie += best_m;
+        } else if (ct) {
+            for (int i = 0; i < n; ++i) to_cpu[i] = ct->is_cpu[l][b.ids[i]];
+        }
         for (int i = 0; i < n; ++i) {
             const int e = b.ids[i];
-            const bool on_cpu = ct && ct->is_cpu[l][e];
-            b.mids[i] = on_cpu ? -1 : e;
-            if (on_cpu) slots.push_back({ i / K, &ct->view[l][e], b.w[i] });
+            b.mids[i] = to_cpu[i] ? -1 : e;
+            if (to_cpu[i]) slots.push_back(ct->slot(i / K, l, e, b.w[i]));
             else gpu_ids.push_back(e);
         }
+        const auto t0 = std::chrono::steady_clock::now();
         if (ct) ct->pool->start(b.x, j.T, slots, b.y);   // CPU first: it runs while the copies are issued
         experts->fetch(l, gpu_ids.data(), (int) gpu_ids.size(), nullptr);
         if (ct) experts->upload(b.d_mids, b.mids, sizeof(int) * n);
         experts->signal(l, b.go, j.seq);   // go before the hints: this layer must not wait for the next one's copies
         if (j.hint) {
             std::vector<int> h;
-            const CpuTier * nt = l + 1 < c.n_layer ? cpu_tier.get() : nullptr;
+            // static: the next layer's CPU set never goes to the GPU, so it is not hinted; dynamic: a hinted expert
+            // that arrives in time is simply a GPU hit
+            const CpuTier * nt = l + 1 < c.n_layer && !cpu_dynamic ? cpu_tier.get() : nullptr;
             for (int t = 0; t < j.T; ++t)
                 for (int i = 0; i < std::min(K, hint_k); ++i) {
                     const int e = b.pred[t * K + i];
@@ -411,6 +489,10 @@ struct Forward::Impl {
         }
         if (ct) {
             ct->pool->wait();
+            if (cpu_dynamic && n_cpu > 0) {
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                cpu_ms_expert = 0.9 * cpu_ms_expert + 0.1 * (ms / n_cpu);
+            }
             std::atomic_thread_fence(std::memory_order_release);
             *(volatile int *) b.cpu_done = j.seq;
         }
@@ -423,6 +505,67 @@ struct Forward::Impl {
             driver_error = nullptr;
             std::rethrow_exception(e);
         }
+    }
+
+    // Options::cpu_trellis: per layer, the cold experts in ascending usage until they hold cpu_share of the layer's
+    // cold routing mass form the static CPU set (cpu_dynamic: all cold experts are eligible); views point into the
+    // ExpertStore's pinned copies and the pack's suh/svh rows. Nothing is read or allocated per expert.
+    void load_cpu_tier_trellis(const Options & o, const runtime::ExpertStore::HotSet & hot)
+    {
+        require(!o.expert_usage.empty() || o.cpu_dynamic, "the static CPU tier needs expert_usage (it picks the rarest)");
+        auto t = std::make_unique<CpuTier>();
+        t->trellis = true;
+        const int E = c.n_expert;
+        require(c.d_model == cpu::D_MODEL && c.d_ff_exp == cpu::D_FF, "CPU tier shape");
+        t->is_cpu.assign(c.n_layer, std::vector<uint8_t>(E, 0));
+        t->tview.resize(c.n_layer);
+        size_t n_cpu = 0;
+        for (int l = 0; l < c.n_layer; ++l) {
+            const Moe & mo = w.layers[l].moe;
+            const formats::ExpertTable * tab[3] = { &mo.gate, &mo.up, &mo.down };
+            t->tview[l].resize(E);
+            std::vector<int> cold;
+            double mass = 0;
+            for (int e = 0; e < E; ++e)
+                if (!hot[l][e]) {
+                    cold.push_back(e);
+                    if (!o.expert_usage.empty()) mass += o.expert_usage[(size_t) l * E + e];
+                    cpu::TrellisMat m[3];
+                    for (int p = 0; p < 3; ++p) {
+                        const formats::ExpertTable & T = *tab[p];
+                        require(T.k[e] >= 1 && T.k[e] <= 6, "CPU tier: trellis K out of 1..6");
+                        m[p] = { reinterpret_cast<const uint32_t *>(experts->host_part(l, e, p)), T.k[e], (int) T.in,
+                                 (int) T.out,
+                                 reinterpret_cast<const uint16_t *>(T.suh->data) + (size_t) e * T.in,
+                                 reinterpret_cast<const uint16_t *>(T.svh->data) + (size_t) e * T.out };
+                    }
+                    t->tview[l][e] = { m[0], m[1], m[2] };
+                }
+            if (o.cpu_dynamic) {
+                for (int e : cold) t->is_cpu[l][e] = 1;
+                n_cpu += cold.size();
+                continue;
+            }
+            std::stable_sort(cold.begin(), cold.end(), [&](int a, int b) {
+                return o.expert_usage[(size_t) l * E + a] < o.expert_usage[(size_t) l * E + b];
+            });
+            double acc = 0;
+            for (int e : cold) {
+                const double u = o.expert_usage[(size_t) l * E + e];
+                if (acc + u > o.cpu_share * mass) break;
+                acc += u;
+                t->is_cpu[l][e] = 1;
+                ++n_cpu;
+            }
+        }
+        std::fprintf(stderr, "CPU tier (trellis, pinned pack bytes): %zu experts eligible (%.1f per layer), %s\n", n_cpu,
+                     (double) n_cpu / c.n_layer, o.cpu_dynamic ? "dynamic split" : "static set");
+        t->pool = std::make_unique<cpu::ExpertPool>(o.cpu_threads);
+        TRUSS_CUDA(cudaMallocHost(&t->x, sizeof(float) * FETCH_ROWS * c.d_model));
+        TRUSS_CUDA(cudaMallocHost(&t->w, sizeof(float) * FETCH_ROWS * c.n_expert_used));
+        TRUSS_CUDA(cudaMallocHost(&t->y, sizeof(float) * cpu::MAX_ROWS * c.d_model));
+        TRUSS_CUDA(cudaMallocHost(&t->ids, sizeof(int) * cpu::MAX_ROWS * c.n_expert_used));
+        cpu_tier = std::move(t);
     }
 
     // Per layer, the non-resident experts in ascending usage until they hold cpu_share of the layer's non-resident
@@ -439,25 +582,28 @@ struct Forward::Impl {
         t->data.resize(c.n_layer);
         t->fscales.resize(c.n_layer);
         t->view.resize(c.n_layer);
+        std::vector<std::vector<int>> pick_of(c.n_layer);
+        std::vector<std::vector<int64_t>> slot_of(c.n_layer);
         for (int l = 0; l < c.n_layer; ++l) {
             const std::string base = o.cpu_dir + "/L" + (l < 10 ? "0" : "") + std::to_string(l);
-            std::vector<int64_t> slot_of(E, -1);   // expert -> position in the q4s file
+            std::vector<int64_t> & slot_of_l = slot_of[l];
+            slot_of_l.assign(E, -1);   // expert -> position in the q4s file
             if (FILE * fi = std::fopen((base + ".ids").c_str(), "rb")) {
                 int32_t e;
                 for (int64_t k = 0; std::fread(&e, 4, 1, fi) == 1; ++k) {
                     require(e >= 0 && e < E, base + ".ids: expert id out of range");
-                    slot_of[e] = k;
+                    slot_of_l[e] = k;
                 }
                 std::fclose(fi);
             } else {
-                for (int e = 0; e < E; ++e) slot_of[e] = e;
+                for (int e = 0; e < E; ++e) slot_of_l[e] = e;
             }
             std::vector<int> cold;
             double mass = 0;
             for (int e = 0; e < E; ++e)
                 if (!hot[l][e]) {
                     mass += o.expert_usage[(size_t) l * E + e];
-                    if (slot_of[e] >= 0) cold.push_back(e);
+                    if (slot_of_l[e] >= 0) cold.push_back(e);
                 }
             std::stable_sort(cold.begin(), cold.end(), [&](int a, int b) {
                 return o.expert_usage[(size_t) l * E + a] < o.expert_usage[(size_t) l * E + b];
@@ -471,23 +617,65 @@ struct Forward::Impl {
                 pick.push_back(e);
             }
             std::sort(pick.begin(), pick.end());
-            const std::string path = base + ".q4s";
-            FILE * f = std::fopen(path.c_str(), "rb");
-            require(f != nullptr, "cannot open " + path);
+            pick_of[l] = pick;
             t->data[l].resize(pick.size() * cpu::EXPERT_BYTES);
             t->fscales[l].resize(pick.size() * cpu::SCALES_PER_EXPERT);
             t->view[l].resize(E);
-            for (size_t i = 0; i < pick.size(); ++i) {
-                uint8_t * dst = t->data[l].data() + i * cpu::EXPERT_BYTES;
-                const bool ok = std::fseek(f, (long) ((size_t) slot_of[pick[i]] * cpu::EXPERT_BYTES), SEEK_SET) == 0 &&
+        }
+        // Read the experts in .q4s slot order, not pick order. pick is sorted by expert id while the file is
+        // ordered rarest-first, so the slots scatter and each fseek+fread is an independent random 2.7 MB read:
+        // one at a time that is latency-bound, ~15000 of them cost ~18 min on a 2.8 GB/s NVMe. In slot order the
+        // reads run forward, and the layers are independent, so they go in parallel too (TRACKER #71).
+        {
+            const int nth = std::max(1, std::min((int) c.n_layer, (int) std::thread::hardware_concurrency()));
+            std::vector<std::thread> workers;
+            std::mutex mu;
+            std::string err;
+            std::atomic<size_t> bytes{0};
+            for (int w = 0; w < nth; ++w)
+                workers.emplace_back([&, w] {
+                    for (int l = w; l < c.n_layer; l += nth) {
+                        const std::vector<int> & pick = pick_of[l];
+                        const std::vector<int64_t> & slot_of_l = slot_of[l];
+                        const std::string path =
+                            o.cpu_dir + "/L" + (l < 10 ? "0" : "") + std::to_string(l) + ".q4s";
+                        FILE * f = std::fopen(path.c_str(), "rb");
+                        if (!f) {
+                            std::lock_guard<std::mutex> g(mu);
+                            err = "cannot open " + path;
+                            return;
+                        }
+                        std::vector<int> order(pick.size());
+                        std::iota(order.begin(), order.end(), 0);
+                        std::sort(order.begin(), order.end(),
+                                  [&](int a, int b) { return slot_of_l[pick[a]] < slot_of_l[pick[b]]; });
+                        for (int i : order) {
+                            uint8_t * dst = t->data[l].data() + (size_t) i * cpu::EXPERT_BYTES;
+                            const bool ok =
+                                std::fseek(f, (long) ((size_t) slot_of_l[pick[i]] * cpu::EXPERT_BYTES), SEEK_SET) == 0 &&
                                 std::fread(dst, 1, cpu::EXPERT_BYTES, f) == cpu::EXPERT_BYTES;
-                require(ok, "short read of expert " + std::to_string(pick[i]) + " from " + path);
-                t->view[l][pick[i]] = cpu::expert_view(dst);
-                cpu::preconvert_scales(t->view[l][pick[i]], t->fscales[l].data() + i * cpu::SCALES_PER_EXPERT);
-                t->is_cpu[l][pick[i]] = 1;
-            }
-            std::fclose(f);
-            t->bytes += t->data[l].size();
+                            if (!ok) {
+                                std::lock_guard<std::mutex> g(mu);
+                                err = "short read of expert " + std::to_string(pick[i]) + " from " + path;
+                                std::fclose(f);
+                                return;
+                            }
+                            t->view[l][pick[i]] = cpu::expert_view(dst);
+                            cpu::preconvert_scales(t->view[l][pick[i]],
+                                                    t->fscales[l].data() + (size_t) i * cpu::SCALES_PER_EXPERT);
+                            t->is_cpu[l][pick[i]] = 1;
+                        }
+                        std::fclose(f);
+                        bytes += t->data[l].size();
+                    }
+                });
+            for (auto & th : workers) th.join();
+            require(err.empty(), err);
+            t->bytes = bytes;
+            size_t n_cpu = 0;
+            for (const auto & pk : pick_of) n_cpu += pk.size();
+            std::fprintf(stderr, "CPU tier: %zu experts (%.1f per layer), %.2f GB of q4s in RAM\n", n_cpu,
+                         (double) n_cpu / c.n_layer, t->bytes / 1e9);
         }
         t->pool = std::make_unique<cpu::ExpertPool>(o.cpu_threads);
         TRUSS_CUDA(cudaMallocHost(&t->x, sizeof(float) * FETCH_ROWS * c.d_model));
@@ -497,11 +685,11 @@ struct Forward::Impl {
         cpu_tier = std::move(t);
     }
 
-    // bytes of the prompt path's buffers (scratch, moe::prefill workspace, residual) at max_chunk rows
+    // bytes of the prompt path's buffers (scratch, moe::prefill workspace, residual) at prefill_rows rows
     size_t big_bytes() const
     {
-        return align(scratch_bytes(c, max_chunk, n_ctx)) + align(moe::prefill_workspace_bytes<MoeShape>(max_chunk)) +
-               (mtp ? 3 : 1) * align(sizeof(float) * max_chunk * c.hc_dim());
+        return align(scratch_bytes(c, prefill_rows, n_ctx)) + align(moe::prefill_workspace_bytes<MoeShape>(prefill_rows)) +
+               (mtp ? 3 : 1) * align(sizeof(float) * prefill_rows * c.hc_dim());
     }
 
     void copy(float * dst, const float * src, size_t n)
@@ -524,7 +712,7 @@ struct Forward::Impl {
     }
 
     // peak per-layer temporaries: the layer's own buffers plus the largest of hc mix / PLE / GDN / DSA / FFN
-    static size_t scratch_bytes(const Config & c, int T, int n_ctx)
+    static size_t scratch_bytes(const Config & c, int T, int n_ctx, bool mtp_run = false)
     {
         const size_t hcd = c.hc_dim(), dm = c.d_model, qd = (size_t) c.n_head * c.head_dim;
         const size_t base = dm * 4 + 4 + dm * (4 + 4 + 2) + c.hc * 4;   // embedding + ids, then the layer's own
@@ -539,7 +727,10 @@ struct Forward::Impl {
         // MTP join: hn16, rstd, [e | hn] fp16 and its Q8_1 form (the widest GEMM input when present)
         const size_t mtp = hcd * 2 + c.hc * 4 + (size_t) c.hc * 2 * dm * (2 + 1) + (size_t) c.hc * 2 * dm / 16;
         const size_t q8_act = 2 * (hcd + hcd / 16);   // Q8_1: a shared quantized input (Act) + one per-call input
-        const size_t per_token = base + std::max({ mix, ple, gdn, dsa, ffn, mtp }) + q8_act;
+        // mtp_rows holds its join buffers while it runs the layer's mixer and FFN, so with the MTP block the join
+        // and the layer's own peak are live together: add them. Taking the max of the two only fit because the
+        // prompt path's cap used to be max_chunk rows, well above the chunk actually run (TRACKER #70).
+        const size_t per_token = base + q8_act + std::max({ mix, ple, gdn, dsa, ffn }) + (mtp_run ? mtp : 0);
         const size_t fixed = dsa::select_workspace_bytes<DsaShape>(T, n_ctx) + dsa::attention_workspace_bytes<DsaShape>(T) +
                              (64ull << 20);   // + alignment slack
         return (size_t) T * per_token + fixed;
@@ -559,6 +750,19 @@ struct Forward::Impl {
     }
 
     // Q8_0 matrices are repacked (one staging buffer); everything else is uploaded as stored
+    // A tensor's file pages are dead weight once it has been copied to the device. MADV_DONTNEED only drops them:
+    // the mapping stays PROT_READ|MAP_SHARED, so a later touch re-faults from disk and nothing can break. Doing this
+    // per tensor instead of once after upload() keeps the peak RSS down (upload used to fault ~48 GB at once, which
+    // is more than this box has free beside the renter) (TRACKER #72).
+    static void release_tensor(const gguf::Tensor * t)
+    {
+        long ps = sysconf(_SC_PAGESIZE);
+        if (!t || !t->data || !t->bytes || ps <= 0) return;
+        const uintptr_t a = (uintptr_t) t->data, m = (uintptr_t) ps - 1;
+        const uintptr_t lo = a & ~m, hi = (a + (uintptr_t) t->bytes + m) & ~m;
+        madvise((void *) lo, (size_t) (hi - lo), MADV_DONTNEED);
+    }
+
     void upload()
     {
         std::vector<const gguf::Tensor *> plain, q8_list;
@@ -590,6 +794,7 @@ struct Forward::Impl {
                 add(L.moe.shexp_down);
         }
         dev = std::make_unique<DeviceTensors>(plain);
+        for (T t : plain) release_tensor(t);
 
         // The token embedding is read one row per token: it lives in pinned host memory and the gather reads it over
         // PCIe (2.5 KB per token), leaving its 0.68 GB of VRAM to the expert cache (TRACKER #60). Tied: stays.
@@ -609,6 +814,7 @@ struct Forward::Impl {
             if (q8.count(t) || (host_embd && t == w.token_embd)) continue;
             const int in = (int) t->shape[0], out = (int) t->elements() / in;
             TRUSS_CUDA(cudaMemcpy(stage, t->data, t->bytes, cudaMemcpyHostToDevice));
+            release_tensor(t);
             dense::q8_repack(stage, in, out, qs, ds, s);
             q8[t] = { qs, ds, in, out };
             qs += (size_t) in * out;
@@ -622,6 +828,7 @@ struct Forward::Impl {
             int8_t * tq = dmalloc<int8_t>(nq, false);
             half * td = dmalloc<half>(nd, false);
             TRUSS_CUDA(cudaMemcpy(stage, t->data, t->bytes, cudaMemcpyHostToDevice));
+            release_tensor(t);
             dense::q8_repack(stage, in, out, tq, td, s);
             TRUSS_CUDA(cudaStreamSynchronize(s));
             TRUSS_CUDA(cudaHostAlloc(reinterpret_cast<void **>(&embd_q), nq, cudaHostAllocMapped));
@@ -881,7 +1088,7 @@ struct Forward::Impl {
                     const int e = ids_host[j];
                     const bool on_cpu = ct->is_cpu[l][e];
                     ct->ids[j] = on_cpu ? -1 : e;
-                    if (on_cpu) slots.push_back({ j / K, &ct->view[l][e], ct->w[j] });
+                    if (on_cpu) slots.push_back(ct->slot(j / K, l, e, ct->w[j]));
                     else gpu_ids.push_back(e);
                 }
                 if (!slots.empty()) {
@@ -1008,6 +1215,9 @@ struct Forward::Impl {
         require(!vw.open, "run()/verify() before accept() of the previous verify()");
         check_driver();
         const bool stream = !fetch_mode(T);
+        if (stream)
+            require(T <= prefill_rows, "prompt chunk of " + std::to_string(T) + " tokens over prefill_rows (" +
+                                            std::to_string(prefill_rows) + "); raise Options::prefill_rows");
         if (!stream) {
             use(small);
             experts->begin_ring();
@@ -1282,6 +1492,13 @@ void Forward::cpu_shape(long long out[4]) const
         return;
     }
     m_->cpu_tier->pool.get()->shape(out);
+}
+
+void Forward::dyn_stats(long & cpu, long & pcie, double & cpu_ms_expert) const
+{
+    cpu = m_->dyn_cpu;
+    pcie = m_->dyn_pcie;
+    cpu_ms_expert = m_->cpu_ms_expert;
 }
 
 void Forward::cpu_shape_reset()
