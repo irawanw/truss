@@ -105,6 +105,8 @@ int main(int argc, char ** argv)
         if (const char * e = std::getenv("TRUSS_CPU_TRELLIS")) o.cpu_trellis = std::atoi(e) != 0;   // CPU from the pack
         if (const char * e = std::getenv("TRUSS_PCIE_GBPS")) o.pcie_gbps = (float) std::atof(e);
         if (const char * e = std::getenv("TRUSS_PCIE_FRAC")) o.pcie_frac = (float) std::atof(e);   // fixed share
+        if (const char * e = std::getenv("TRUSS_ADAPT_EVERY")) o.adapt_every = std::atoi(e);   // adaptive tier
+        if (const char * e = std::getenv("TRUSS_ADAPT_SWAPS")) o.adapt_swaps = std::atoi(e);
         if (const char * e = std::getenv("TRUSS_RING_GB")) o.ring_bytes_override = (size_t) std::atof(e) * (1ull << 30);
         if (const char * e = std::getenv("TRUSS_HINT_K")) o.hint_k = std::atoi(e);   // pre-gated prefetch width
         if (argc > 6 && std::string(argv[6]) != "-")
@@ -225,6 +227,7 @@ int main(int argc, char ** argv)
         if (m4[0] + m4[1] + m4[2] + m4[3] > 0)
             std::printf("       routed MoE ms/pass: router+publish %.2f + wait for the host plan %.2f + wait for copies %.2f "
                         "+ expert kernel %.2f\n", m4[0] / passes, m4[1] / passes, m4[2] / passes, m4[3] / passes);
+        if (f.adapt_admitted()) std::printf("       adaptive tier: %ld experts admitted\n", f.adapt_admitted());
         double d3[3];
         long dn = 0;
         f.driver_ms(d3, dn);

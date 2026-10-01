@@ -236,6 +236,7 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
         std::vector<int32_t> smeta(3 * 2 * E);
         Y.cold_off.assign(E, -1);
         Y.ring_at.assign(E, -1);
+        Y.pend.assign(E, 0);
         uint8_t * slot_dst = base_ + (l % 2) * slot_;
         size_t cold_pos = 0;
         for (int e = 0; e < E; ++e) {
@@ -293,6 +294,7 @@ ExpertStore::~ExpertStore()
         if (released_[s]) cudaEventDestroy(released_[s]);
     }
     if (compute_mark_) cudaEventDestroy(compute_mark_);
+    if (adm_ev_) cudaEventDestroy(adm_ev_);
     if (copy_) cudaStreamDestroy(copy_);
 }
 
@@ -318,9 +320,10 @@ void ExpertStore::wait_compute(cudaStream_t compute)
 void ExpertStore::begin_stream(cudaStream_t compute)
 {
     wait_compute(compute);   // decode kernels may still read the ring the slots overwrite
-    for (const RingEntry & r : fifo_) layers_[r.layer].ring_at[r.expert] = -1;
+    for (const RingEntry & r : fifo_) layers_[r.layer].ring_at[r.expert] = -1, layers_[r.layer].pend[r.expert] = 0;
     fifo_.clear();
     hinted_.clear();
+    adm_.clear();
     head_ = 0;
     released_recorded_[0] = released_recorded_[1] = false;
     mode_ = Mode::STREAM;
@@ -357,12 +360,14 @@ bool ExpertStore::ring_put(int l, int e, bool hint)
     if (head_ + need > (int64_t) ring_) {   // wrap: the tail [head, end) goes with its entries
         while (!fifo_.empty() && fifo_.front().off >= head_) {
             layers_[fifo_.front().layer].ring_at[fifo_.front().expert] = -1;
+            layers_[fifo_.front().layer].pend[fifo_.front().expert] = 0;
             fifo_.pop_front();
         }
         head_ = 0;
     }
     while (!fifo_.empty() && fifo_.front().off >= head_ && fifo_.front().off < head_ + need) {
         layers_[fifo_.front().layer].ring_at[fifo_.front().expert] = -1;
+        layers_[fifo_.front().layer].pend[fifo_.front().expert] = 0;
         fifo_.pop_front();
     }
     const int64_t off = head_;
@@ -375,6 +380,41 @@ bool ExpertStore::ring_put(int l, int e, bool hint)
     if (hint) stats_.hint_bytes += Y.bytes[e], ++stats_.hinted;
     else stats_.bytes += Y.bytes[e], ++stats_.misses;
     return true;
+}
+
+void ExpertStore::poll_admitted()
+{
+    if (adm_.empty() || cudaEventQuery(adm_ev_) != cudaSuccess) return;
+    for (const auto & [l, e] : adm_) layers_[l].pend[e] = 0;
+    adm_.clear();
+}
+
+void ExpertStore::admit(const std::vector<std::pair<int, int>> & le, cudaStream_t compute)
+{
+    if (mode_ != Mode::RING) return;
+    poll_admitted();
+    if (!adm_.empty() || le.empty()) return;
+    wait_compute(compute);   // the copies overwrite ring slots that queued kernels may still read
+    std::vector<uint8_t> touched(layers_.size(), 0);
+    for (const auto & [l, e] : le) {
+        Layer & Y = layers_.at(l);
+        if (Y.cold_off[e] < 0 || Y.ring_at[e] >= 0) continue;
+        ring_put(l, e);
+        Y.pend[e] = 1;
+        adm_.push_back({ l, e });
+        touched[l] = 1;
+    }
+    for (size_t l = 0; l < layers_.size(); ++l)
+        if (touched[l])
+            for (int p = 0; p < 3; ++p)
+                TRUSS_CUDA(cudaMemcpyAsync(layers_[l].ring_meta[p], layers_[l].ring_meta_host + (size_t) p * 2 * layers_[l].n_expert,
+                                           sizeof(int32_t) * 2 * layers_[l].n_expert, cudaMemcpyHostToDevice, copy_));
+    // a ring_put of a later admission may have evicted an earlier one of this batch: keep only the resident
+    adm_.erase(std::remove_if(adm_.begin(), adm_.end(), [&](const auto & x) { return layers_[x.first].ring_at[x.second] < 0; }),
+               adm_.end());
+    if (!adm_ev_) TRUSS_CUDA(cudaEventCreateWithFlags(&adm_ev_, cudaEventDisableTiming));
+    TRUSS_CUDA(cudaEventRecord(adm_ev_, copy_));
+    adm_total_ += (long) adm_.size();
 }
 
 void ExpertStore::begin_ring()
@@ -405,6 +445,8 @@ bool ExpertStore::fetch(int l, const int * ids, int n, cudaStream_t compute)
         for (int e : need) hinted_needed |= std::find(hinted_[l].begin(), hinted_[l].end(), e) != hinted_[l].end();
         hinted_[l].clear();
     }
+    poll_admitted();
+    for (int e : need) hinted_needed |= Y.pend[e] != 0;   // admitted, copy maybe in flight: wait for go
     protect_layer_ = l;
     protect_.clear();
     for (int i = 0; i < n; ++i) protect_.push_back(ids[i]);

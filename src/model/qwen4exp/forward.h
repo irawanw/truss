@@ -64,6 +64,12 @@ struct ForwardOptions {
     // misses) go over PCIe (the last ones in routing order), the rest to the CPU. < 0: the fitted cost model instead,
     // which can starve the CPU when its fitted per-call cost drifts up (few experts per call make calls look fixed-cost)
     float pcie_frac = -1.f;
+    // Strata's adaptive tier (TRACKER #78): every adapt_every decode passes (0: off), before the pass, the cold
+    // experts not on the device whose decayed routing count is >= 2 (most-routed first, at most adapt_swaps) are
+    // copied into the ring off the critical path (ExpertStore::admit); counts decay x0.7 after each admission round.
+    // Meant with pcie_frac 0 and hint_k 0: no copies inside a pass at all.
+    int adapt_every = 0;
+    int adapt_swaps = 96;
     std::vector<int32_t> draft_vocab;         // MTP drafts score only these token ids (empty: all), e.g.
                                               // data/draft_vocab_en.bin: the draft head reads 16% of the output
                                               // matrix; verify keeps the output exact
@@ -146,6 +152,7 @@ public:
     // doorbell driver thread, ms summed over n served layers: the split (from seeing the doorbell), starting the CPU
     // pool, issuing the copies and writing the plan (read between passes only)
     void driver_ms(double out[3], long & n, bool reset = false) const;
+    long adapt_admitted() const;              // experts admitted by the adaptive tier since construction
     const runtime::ExpertStore & experts() const;   // residency and fetch statistics (the MTP block, when present,
                                                     // is store layer n_layer)
 

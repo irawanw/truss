@@ -88,7 +88,20 @@ public:
     int layers() const { return (int) layers_.size(); }
     // expert e of layer l is readable by the GPU now: hot, or in the ring (ring mode; a queued copy counts, since the
     // compute that reads it waits for the copy stream)
-    bool on_device(int l, int e) const { return layers_[l].cold_off[e] < 0 || layers_[l].ring_at[e] >= 0; }
+    bool on_device(int l, int e) const
+    {
+        const Layer & Y = layers_[l];
+        return Y.cold_off[e] < 0 || (Y.ring_at[e] >= 0 && !Y.pend[e]);
+    }
+
+    // Strata's adaptive tier (TRACKER #78), between decode passes: copy the cold experts `le` (layer, expert) into the
+    // ring (FIFO eviction) on the copy stream, after the compute queued on `compute` so far (no kernel can read a
+    // slot being overwritten). Evicted experts stop being on the device at once; admitted ones count only once
+    // their copies have landed (poll_admitted). A no-op while the previous batch is in flight.
+    void admit(const std::vector<std::pair<int, int>> & le, cudaStream_t compute);
+    void poll_admitted();                                          // promote the batch whose copies have landed
+    bool admitting() const { return !adm_.empty(); }
+    long admitted() const { return adm_total_; }
     size_t bytes_of(int l, int e) const { return layers_[l].bytes[e]; }
     // pinned host copy of projection p (gate, up, down) of a cold expert; nullptr for a hot one (it has none). The CPU
     // tier reads the pack's trellis bytes from here (cpu::TrellisExpert): the same bytes PCIe copies.
@@ -116,6 +129,7 @@ private:
         int32_t * stream_meta[3] = {}, * ring_meta[3] = {};         // device (K, offset in 32-byte units)
         int32_t * ring_meta_host = nullptr;                         // pinned mirror of ring_meta, [3][n_expert][2]
         std::vector<int64_t> ring_at;                               // [expert] byte offset in the ring, -1: absent
+        std::vector<uint8_t> pend;                                  // [expert] admitted, copy not known to have landed
         const half * suh[3] = {}, * svh[3] = {};
         int n_expert = 0;
     };
@@ -131,6 +145,9 @@ private:
     // [layer] experts prefetch_hint() queued since that layer's last fetch(): their copies may still be in flight, so
     // a fetch() that needs one reports a copy (the GPU must wait for the copy stream)
     std::vector<std::vector<int>> hinted_;
+    std::vector<std::pair<int, int>> adm_;                      // the admit() batch in flight
+    cudaEvent_t adm_ev_ = nullptr;
+    long adm_total_ = 0;
     int protect_layer_ = -1;
 
     std::vector<Layer> layers_;

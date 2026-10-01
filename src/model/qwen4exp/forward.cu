@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <tuple>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -153,6 +154,11 @@ struct Forward::Impl {
     bool cpu_dynamic = false;
     double cpu_ms_call = 0.12, cpu_ms_expert = 0.085, pcie_ms_byte = 1.0 / 13.5e6;
     double pcie_frac = -1;   // Options::pcie_frac
+    // adaptive tier (Options::adapt_every): decayed routing counts per (store layer, expert), written by the driver
+    // thread in serve(), read between passes by adapt()
+    int adapt_every = 0, adapt_swaps = 96;
+    long decode_passes = 0;
+    std::vector<float> route_usage;
     double dyn_s1 = 0, dyn_sn = 0, dyn_st = 0, dyn_snn = 0, dyn_snt = 0;
     long dyn_cpu = 0, dyn_pcie = 0;                      // eligible misses sent each way (stats)
     int8_t * embd_q = nullptr;                           // token embedding in pinned host memory (upload())
@@ -321,6 +327,8 @@ struct Forward::Impl {
         cpu_dynamic = o.cpu_dynamic && cpu_tier && use_doorbell;
         pcie_ms_byte = 1.0 / (o.pcie_gbps * 1e6);
         pcie_frac = o.pcie_frac;
+        adapt_every = o.adapt_every, adapt_swaps = o.adapt_swaps;
+        if (adapt_every > 0) route_usage.assign((size_t) n_store * c.n_expert, 0.f);
         setup_doorbells();
         if (prefill_rows > FETCH_ROWS) {   // the prompt path's buffers, carved from the ring's spare region
             auto * p = static_cast<unsigned char *>(experts->spare());
@@ -443,6 +451,8 @@ struct Forward::Impl {
     {
         const int K = c.n_expert_used, l = j.layer, n = j.T * K;
         CpuTier * ct = j.cpu ? cpu_tier.get() : nullptr;
+        if (!route_usage.empty())
+            for (int i = 0; i < n; ++i) route_usage[(size_t) l * c.n_expert + b.ids[i]] += 1.f;
         std::vector<cpu::Slot> slots;
         std::vector<int> gpu_ids;
         gpu_ids.reserve(n);
@@ -1275,6 +1285,7 @@ struct Forward::Impl {
         if (!stream) {
             use(small);
             experts->begin_ring();
+            if (adapt_every > 0 && ++decode_passes % adapt_every == 0) adapt();
         } else {   // the ring becomes the stream slots and this chunk's buffers
             experts->begin_stream(s);
             use(big);
@@ -1319,6 +1330,28 @@ struct Forward::Impl {
         }
         commit_tail(tokens, T);
         if (mtp) mtp_commit(tokens, pos0, T, stream);
+    }
+
+    // Strata's adapt() (generate.cpp): the most-routed missing experts (decayed count >= 2) of every store layer,
+    // at most adapt_swaps, into the ring; then counts x0.7. Between passes: the driver thread is idle (the caller
+    // synced the last pass for its logits), so route_usage is not being written.
+    void adapt()
+    {
+        experts->poll_admitted();
+        if (experts->admitting()) return;   // the previous batch is still being copied
+        std::vector<std::tuple<float, int, int>> cand;
+        for (int l = 0; l < n_store; ++l)
+            for (int e = 0; e < c.n_expert; ++e) {
+                const float u = route_usage[(size_t) l * c.n_expert + e];
+                if (u >= 2.f && !experts->on_device(l, e)) cand.emplace_back(u, l, e);
+            }
+        const size_t n = std::min(cand.size(), (size_t) adapt_swaps);
+        std::partial_sort(cand.begin(), cand.begin() + (ptrdiff_t) n, cand.end(),
+                          [](const auto & a, const auto & b) { return std::get<0>(a) > std::get<0>(b); });
+        std::vector<std::pair<int, int>> le;
+        for (size_t i = 0; i < n; ++i) le.push_back({ std::get<1>(cand[i]), std::get<2>(cand[i]) });
+        experts->admit(le, s);
+        for (float & u : route_usage) u *= 0.7f;
     }
 
     void commit_tail(const int32_t * tokens, int T)   // the PLE window's predecessors for the next chunk
@@ -1560,6 +1593,8 @@ void Forward::driver_ms(double out[3], long & n, bool reset) const
         m_->drv_n = 0;
     }
 }
+
+long Forward::adapt_admitted() const { return m_->experts->admitted(); }
 
 void Forward::section_moe_ms(double out[4], bool reset) const
 {
