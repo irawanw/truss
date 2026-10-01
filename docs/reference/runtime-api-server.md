@@ -170,7 +170,10 @@ trellis pack. The MTP block has no CPU tier.
 `Options::cpu_dynamic` (Strata's split, `serve()`): every expert with a CPU copy is eligible; per layer, routed experts
 already on the GPU (hot, or in the ring incl. queued copies: `ExpertStore::on_device`) run there, and of the missed
 eligible ones the last m in routing order go over PCIe, the rest to the CPU, m minimizing max(CPU time, copy time)
-with the CPU's per-expert time a running mean of the pool's own call time (`ExpertPool::last_call_ms`) and copies at `pcie_gbps`. Doorbell path
+with the CPU's time for n experts = `cpu_ms_call + cpu_ms_expert·n` (a least-squares line through the pool's own call
+times, `ExpertPool::last_call_ms`, exponentially weighted with decay 0.98; the slope keeps its last value while the
+calls are too alike in n to fit) and copies at `pcie_gbps`. A flat per-expert mean charged each call's ~0.1 ms of
+wake/join to its ~1 expert and starved the CPU (TRACKER #75). Doorbell path
 only. Results then depend on the cache state; with `cpu_trellis` the CPU's weights equal the GPU's, so only fp32
 summation order differs.
 
@@ -217,3 +220,8 @@ down activations are prepared; 2 down in 128-column items (20 per expert). `last
 (start to its last item), which the dynamic split now averages instead of the driver thread's start-to-wait time
 (that included issuing the PCIe copies and overstated the CPU's cost, so it got only 7% of the misses).
 Small-call latency (`cpu_trellis_test`, 12 threads, loaded box): 1 expert 0.20 ms, 2 experts 0.27, 4 experts 0.46.
+Idle workers spin `TRUSS_CPU_SPIN` pauses (default 40,000, ~0.5 ms) before blocking: decode layers call the pool
+~1 ms apart, and with the old 4,000 the workers slept between layers and the in-engine fit read 0.32 + 0.36 ms per
+call/expert at 8 threads against 0.16 + 0.16 spinning (TRACKER #75).
+Row stride of the prepared activations is `trellis_prep_floats(in, 1)` for every kernel (the K 5-6 kernel read rows
+at 2·in, wrong for multi-row calls through the pool, which preps rows one at a time).

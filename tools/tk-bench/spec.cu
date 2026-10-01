@@ -105,6 +105,7 @@ int main(int argc, char ** argv)
         if (const char * e = std::getenv("TRUSS_CPU_TRELLIS")) o.cpu_trellis = std::atoi(e) != 0;   // CPU from the pack
         if (const char * e = std::getenv("TRUSS_PCIE_GBPS")) o.pcie_gbps = (float) std::atof(e);
         if (const char * e = std::getenv("TRUSS_RING_GB")) o.ring_bytes_override = (size_t) std::atof(e) * (1ull << 30);
+        if (const char * e = std::getenv("TRUSS_HINT_K")) o.hint_k = std::atoi(e);   // pre-gated prefetch width
         if (argc > 6 && std::string(argv[6]) != "-")
             o.expert_usage = runtime::ExpertStore::load_usage(argv[6], c.n_layer, c.n_expert);   // MTP: Forward adds
                                                                                                // the mean layer
@@ -202,11 +203,11 @@ int main(int argc, char ** argv)
         }
         {
             long dc = 0, dp = 0;
-            double ce = 0;
-            f.dyn_stats(dc, dp, ce);
+            double ce = 0, cc = 0;
+            f.dyn_stats(dc, dp, ce, cc);
             if (dc + dp)
-                std::printf("       dynamic split (whole run): %ld misses to the CPU, %ld over PCIe; CPU %.3f ms/expert\n",
-                            dc, dp, ce);
+                std::printf("       dynamic split (whole run): %ld misses to the CPU, %ld over PCIe; CPU call %.3f + %.3f ms/expert\n",
+                            dc, dp, cc, ce);
         }
         std::printf("       device ms/pass: draft %.2f + verify %.2f + head %.2f = %.2f (rest: host stalls/gaps)\n",
                     ms_draft / passes, ms_verify / passes, ms_head / passes,

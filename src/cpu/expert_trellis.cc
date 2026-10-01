@@ -65,7 +65,9 @@ inline uint64_t window_wrap(const uint32_t * t, int words, int p)
 template <int R, bool ROUND>
 void gemv_tiles(const TrellisMat & W, const float * P, int nt0, int nt1, float * c, int ldc)
 {
-    const int K = W.K, words = 8 * K, KT = W.in / 16, NT = W.out / 16, in = W.in;
+    // rs: row stride of P, trellis_prep_floats(in, 1) like gemv_tiles4 (the pool preps rows one at a time at that step;
+    // this kernel used 2 * in, wrong for R > 1 through the pool)
+    const int K = W.K, words = 8 * K, KT = W.in / 16, NT = W.out / 16, rs = trellis_prep_floats(W.in, 1);
     // per lane: where its 64-bit window starts. Lanes >= 1 never wrap and never read past the tile when they need
     // bits from a third word, except the last lanes; those (and lane 0, which starts before bit 0) take the slow path.
     int wi[32], wo[32];
@@ -105,7 +107,7 @@ void gemv_tiles(const TrellisMat & W, const float * P, int nt0, int nt1, float *
                     __m256 v = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_add_epi32(sum, h0)), kinv, kbias);
                     if (ROUND) v = _mm256_cvtph_ps(_mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT));
                     for (int r = 0; r < R; ++r)
-                        acc[q & 1][r] = _mm256_fmadd_ps(v, _mm256_loadu_ps(pk + (size_t) r * in * 2 + q * 8), acc[q & 1][r]);
+                        acc[q & 1][r] = _mm256_fmadd_ps(v, _mm256_loadu_ps(pk + (size_t) r * rs + q * 8), acc[q & 1][r]);
                 }
             }
             for (int r = 0; r < R; ++r) {
@@ -291,8 +293,8 @@ void trellis_prep(const TrellisMat & W, const float * x, int ldx, int R, float *
                 for (int m = 0; m < 8; ++m)
                     for (int l = 0; l < 8; ++l)
                         pr[(kt * 8 + m) * 8 + l] = a[kt * 16 + 2 * (l % 4) + (m & 1) + 8 * ((m >> 1) & 1)];
-        } else {          // gemv_tiles: [kt][lane quad][element]
-            float * pr = P + (size_t) r * in * 2;
+        } else {          // gemv_tiles: [kt][lane quad][element] (2 * in of the row's 4 * in)
+            float * pr = P + (size_t) r * in * 4;
             for (int kt = 0; kt < KT; ++kt)
                 for (int q = 0; q < 4; ++q)
                     for (int e = 0; e < 8; ++e) {

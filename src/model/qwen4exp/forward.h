@@ -127,8 +127,8 @@ public:
     void cpu_shape(long long out[4]) const;    // calls, distinct experts, slots, rows-served sum (the gemv's R)
     void cpu_shape_reset();
     // Options::cpu_dynamic: eligible misses sent to the CPU / over PCIe since construction, and the CPU's current
-    // per-expert time estimate (ms)
-    void dyn_stats(long & cpu, long & pcie, double & cpu_ms_expert) const;
+    // cost model of one CPU call, cpu_ms_call + cpu_ms_expert * n (ms, fitted to the pool's call times)
+    void dyn_stats(long & cpu, long & pcie, double & cpu_ms_expert, double & cpu_ms_call) const;
     // Per-section device time of the layer chain, in ms, accumulated over every run()/verify() since the last
     // reset: [0] PLE + attn hyper-connection mix, [1] GDN/DSA mixer, [2] hc combine + ffn-side mix,
     // [3] router + routed MoE (PCIe copies and the CPU tier's start inside), [4] shared expert,

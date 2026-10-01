@@ -17,7 +17,7 @@ namespace {
 // in-situ tier reached 23.7 GB/s against the 50.9 GB/s of a probe that gives each thread a whole expert (TRACKER
 // #66). Overridable for the sweep; the defaults are what was measured best.
 constexpr int GU_CHUNK_DEF = 64, DN_CHUNK_DEF = 256;
-constexpr int SPIN_DEF = 4000;   // pause iterations before a worker blocks
+constexpr int SPIN_DEF = 40000;   // pause iterations before a worker blocks (~0.5 ms: covers the gap between two decode layers, TRACKER #75)
 // trellis items: gate/up and down columns per item (multiples of 128: the output Hadamard blocks)
 constexpr int TR_GU_COLS = 128, TR_DN_COLS = 128;
 int gu_chunk()

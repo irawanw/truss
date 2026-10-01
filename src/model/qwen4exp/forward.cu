@@ -141,10 +141,13 @@ struct Forward::Impl {
     std::exception_ptr driver_error;
     bool use_doorbell = true;
     // Options::cpu_dynamic (Strata's split, TRACKER #73): per layer, missed experts with a host copy go to the CPU or
-    // over PCIe so that both finish together. cpu_ms_expert: the pool's wall time per distinct expert (running mean,
-    // measured on the driver thread); pcie_ms_byte: 1 / Options::pcie_gbps.
+    // over PCIe so that both finish together. CPU time of a call with n experts = cpu_ms_call + cpu_ms_expert * n
+    // (n > 0), a least-squares line through the pool's own call times (exponentially weighted sums dyn_s*; a flat
+    // per-expert mean charged the ~0.1 ms wake/join of every call to its ~1 expert, TRACKER #75); pcie_ms_byte:
+    // 1 / Options::pcie_gbps.
     bool cpu_dynamic = false;
-    double cpu_ms_expert = 0.08, pcie_ms_byte = 1.0 / 13.5e6;
+    double cpu_ms_call = 0.12, cpu_ms_expert = 0.085, pcie_ms_byte = 1.0 / 13.5e6;
+    double dyn_s1 = 0, dyn_sn = 0, dyn_st = 0, dyn_snn = 0, dyn_snt = 0;
     long dyn_cpu = 0, dyn_pcie = 0;                      // eligible misses sent each way (stats)
     int8_t * embd_q = nullptr;                           // token embedding in pinned host memory (upload())
     half * embd_d = nullptr;
@@ -451,7 +454,8 @@ struct Forward::Impl {
             double best = 1e30, tail = 0;
             for (int m = 0; m <= ne; ++m) {
                 if (m > 0) tail += (double) experts->bytes_of(l, b.ids[dist[elig[ne - m]]]);
-                const double t = std::max(cpu_ms_expert * (ne - m), pcie_ms_byte * (pcie_bytes + tail));
+                const double tc = ne - m > 0 ? cpu_ms_call + cpu_ms_expert * (ne - m) : 0;
+                const double t = std::max(tc, pcie_ms_byte * (pcie_bytes + tail));
                 if (t < best - 1e-9) best = t, best_m = m;
             }
             for (int q = 0; q < ne - best_m; ++q) {
@@ -489,10 +493,23 @@ struct Forward::Impl {
         if (ct) {
             ct->pool->wait();
             if (cpu_dynamic && n_cpu > 0)   // the pool's own time (start to last item), not this thread's
-                cpu_ms_expert = 0.9 * cpu_ms_expert + 0.1 * (ct->pool->last_call_ms() / n_cpu);
+                fit_cpu_cost(n_cpu, ct->pool->last_call_ms());
             std::atomic_thread_fence(std::memory_order_release);
             *(volatile int *) b.cpu_done = j.seq;
         }
+    }
+
+    // add one call (n experts, t ms) to the weighted sums and refit cpu_ms_call + cpu_ms_expert * n; the slope
+    // keeps its last value while the calls are too alike in n to fit one (and stays within sane bounds)
+    void fit_cpu_cost(int n, double t)
+    {
+        const double d = 0.98;
+        dyn_s1 = d * dyn_s1 + 1, dyn_sn = d * dyn_sn + n, dyn_st = d * dyn_st + t;
+        dyn_snn = d * dyn_snn + (double) n * n, dyn_snt = d * dyn_snt + n * t;
+        const double var = dyn_snn * dyn_s1 - dyn_sn * dyn_sn;
+        if (dyn_s1 > 8 && var > 0.25 * dyn_s1 * dyn_s1)
+            cpu_ms_expert = std::min(2.0, std::max(0.02, (dyn_snt * dyn_s1 - dyn_sn * dyn_st) / var));
+        cpu_ms_call = std::max(0.0, (dyn_st - cpu_ms_expert * dyn_sn) / dyn_s1);
     }
 
     void check_driver()
@@ -1491,11 +1508,12 @@ void Forward::cpu_shape(long long out[4]) const
     m_->cpu_tier->pool.get()->shape(out);
 }
 
-void Forward::dyn_stats(long & cpu, long & pcie, double & cpu_ms_expert) const
+void Forward::dyn_stats(long & cpu, long & pcie, double & cpu_ms_expert, double & cpu_ms_call) const
 {
     cpu = m_->dyn_cpu;
     pcie = m_->dyn_pcie;
     cpu_ms_expert = m_->cpu_ms_expert;
+    cpu_ms_call = m_->cpu_ms_call;
 }
 
 void Forward::cpu_shape_reset()

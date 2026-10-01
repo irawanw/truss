@@ -37,7 +37,8 @@ struct TrellisExpert {
 };
 
 // floats of a prepared activation block for R rows of a projection with `in` inputs (the most any K needs): K <= 4
-// lays out each 16-input slice as [8 weight indices][8 lanes] (4 * in per row), K 5-6 as [4 lane quads][8] (2 * in)
+// lays out each 16-input slice as [8 weight indices][8 lanes] (4 * in per row), K 5-6 as [4 lane quads][8] (2 * in
+// used of the same 4 * in row stride, so a row prepared alone at r * trellis_prep_floats(in, 1) is row r)
 constexpr int trellis_prep_floats(int in, int R) { return 4 * R * in; }
 
 // P [R][in/16][4][8] = a = fp16(H128(suh * x[r])), permuted to the kernel's lane order. x rows have stride ldx.
