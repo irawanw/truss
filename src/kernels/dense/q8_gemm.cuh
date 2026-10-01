@@ -50,6 +50,9 @@ void q8_gemv(const Q8Matrix & W, const int8_t * xq, const half * xd, int rows, f
 // cuBLAS picks its SGEMM by row count and 1e-6 flips near-tied experts, TRACKER #60). For decode-sized rows.
 void f32_gemv(const float * W, int in, int out, const float * x, int rows, float * y, cudaStream_t stream);
 
+// out = rows ids[0 .. n) of W as a new matrix (q [n][in], d [n][in / 32]), e.g. the MTP draft head's vocabulary subset
+void q8_gather(const Q8Matrix & W, const int * ids, int n, int8_t * q, half * d, cudaStream_t stream);
+
 // out fp32 [n][W.in] = rows ids[0 .. n) of W (q * d), e.g. the token embedding
 void q8_rows(const Q8Matrix & W, const int * ids, int n, float * out, cudaStream_t stream);
 

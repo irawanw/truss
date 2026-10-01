@@ -62,6 +62,10 @@ The hashing of token n-grams to table rows and the gather from the 48 GiB table 
 `sampling::argmax(x, n, out, stream)`: one 1024-thread block, ties → lowest index. Used by `truss_eval_argmax` so
 greedy decoding copies 4 bytes instead of 1 MB of logits per token.
 
+`sampling::argmax_prob(x, n, map, out, prob, stream)`: the same over a subset of logits, plus the maximum's softmax
+probability: `out = map ? map[argmax] : argmax`, `prob = exp(x_max - logsumexp(x))`. The MTP draft head scores the
+`draft_vocab` rows and stops drafting once `prob < Options::draft_min_p`.
+
 ## Tested by
 
 No unit test per small op: each is checked inside the layer chain. `qwen4exp_parity` checks the reference blocks

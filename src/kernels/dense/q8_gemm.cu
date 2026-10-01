@@ -260,7 +260,21 @@ __global__ void __launch_bounds__(128) f32_gemv_kernel(const float * __restrict_
     }
 }
 
+__global__ void gather_kernel(const int8_t * __restrict__ q, const half * __restrict__ d, const int * ids, int in,
+                              int8_t * __restrict__ oq, half * __restrict__ od)
+{
+    const size_t r = (size_t) ids[blockIdx.x], o = blockIdx.x;
+    for (int i = threadIdx.x; i < in; i += blockDim.x) oq[o * in + i] = q[r * in + i];
+    for (int i = threadIdx.x; i < in / 32; i += blockDim.x) od[o * (in / 32) + i] = d[r * (in / 32) + i];
+}
+
 }  // namespace
+
+void q8_gather(const Q8Matrix & W, const int * ids, int n, int8_t * q, half * d, cudaStream_t stream)
+{
+    gather_kernel<<<n, 256, 0, stream>>>(W.q, W.d, ids, W.in, q, d);
+    TRUSS_CUDA(cudaGetLastError());
+}
 
 void f32_gemv(const float * W, int in, int out, const float * x, int rows, float * y, cudaStream_t stream)
 {

@@ -101,7 +101,17 @@ profile_routes(on), route_counts()   // routing profile [layer][expert] (the usa
 - `lin`: Q8_1 → `q8_gemv` (≤ 8 rows) / `q8_gemm`; FP16 → `q8_gemm_a16`. `lin32`: cuBLAS SGEMM for F32 weights.
   An input read by several projections is quantized once (`quant()` → `Act`, in the caller's scratch scope): GDN
   qkv/gate/alpha/beta, DSA q/k/v/indexer, hc down + inject, shared gate + up, PLE key + value.
-- MTP drafts may score only token ids < `Options::draft_vocab` (the head reads that share of the output matrix).
+- MTP drafts may score only the token ids in `Options::draft_vocab` (e.g. `data/draft_vocab_en.bin`, Strata's
+  40,525-id English/code subset, MIT, `data/README.md`): the draft head is that subset of the output matrix
+  (`dense::q8_gather` at load) and `sampling::argmax_prob` maps back to the real id. Acceptance is unchanged on the
+  code prompt (2.98 tok/pass vs 2.98 full; a first-N-ids subset lost it). `Options::draft_min_p` stops a chain once
+  the draft's probability drops below it; `draft()` returns how many it made. Verify keeps the output exact either way.
+- `Options::doorbell` (default on): decode FFNs without a host sync per layer (runtime-api-server.md, doorbell).
+  `ring_bytes_override` sets the ring size for sweeps.
+- Instrumentation: `TRUSS_PROFILE_SECTIONS=1` → `section_ms()` (device time per section of the layer chain, events on
+  the engine stream: PLE+hc mix, mixer, combine+ffn mix, router+routed MoE, shared, CPU join, combine);
+  `cpu_stats`, `cpu_item_us`, `cpu_phase_us`, `cpu_shape` (CPU tier). `TRUSS_MTP_CALIB=file.f32` appends the MTP
+  block's FFN input rows of true-path commits (fp32 [d_model] each) for an offline Hessian (TRACKER #65).
 - FFN residency: `fetch_mode(T)` = T ≤ `FETCH_ROWS` (32): read routing back (with layer l+1's router applied to this
   layer's input: pre-gating predicts 72% of its experts; each row's top `hint_k` go to `ExpertStore::prefetch_hint`),
   `ExpertStore::fetch` the routed cold experts, then `moe::window` (T ≤ 8) or `moe::prefill`; otherwise whole layers stream (`prefetch(0), prefetch(1)`

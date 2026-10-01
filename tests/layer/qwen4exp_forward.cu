@@ -46,6 +46,18 @@ std::vector<float> host(const float * d, size_t n)
     return h;
 }
 
+// Device-to-host inside a decode run (TRACKER #61): the doorbell driver thread issues its expert copies and go
+// words on the copy stream while this thread syncs. A legacy blocking cudaMemcpy here holds libcuda's internal
+// write rwlock across its wait (observed: main spinning on clock_gettime inside cuMemcpyDtoH_v2) while the
+// driver's cuEventRecord blocks on a read of the same lock (host futex) and the GPU spins on its go word:
+// a three-way deadlock. Like the production C API (src/api/truss_c.cu), move with an async copy on the
+// engine's stream plus a stream-scoped sync, never a legacy blocking call.
+void dtoh_sync(q::Forward & p, void * h, const void * d, size_t bytes)
+{
+    TRUSS_CUDA(cudaMemcpyAsync(h, d, bytes, cudaMemcpyDeviceToHost, p.stream()));
+    TRUSS_CUDA(cudaStreamSynchronize(p.stream()));
+}
+
 double rel(const float * a, const float * b, size_t n)
 {
     double num = 0, den = 0;
@@ -232,7 +244,7 @@ int main(int argc, char ** argv)
                 for (int i = 0; i < n_dec; ++i) {
                     p.run(tok.data() + P + i, 1);
                     p.head(0, 1, d_logits);
-                    TRUSS_CUDA(cudaMemcpy(logits.data() + (size_t) i * V, d_logits, (size_t) V * 4, cudaMemcpyDeviceToHost));
+                    dtoh_sync(p, logits.data() + (size_t) i * V, d_logits, (size_t) V * 4);
                 }
                 if (!pass) {
                     all = got, all_logits = logits;
@@ -285,18 +297,18 @@ int main(int argc, char ** argv)
                     if (pass == 2) {
                         p.run(tok.data() + P + i, 4);
                         p.head(0, 4, d_logits);
-                        TRUSS_CUDA(cudaMemcpy(out.data() + (size_t) i * V, d_logits, (size_t) 4 * V * 4, cudaMemcpyDeviceToHost));
+                        dtoh_sync(p, out.data() + (size_t) i * V, d_logits, (size_t) 4 * V * 4);
                         i += 4;
                     } else if (!pass) {
                         p.run(tok.data() + P + i, 1);
                         p.head(0, 1, d_logits);
-                        TRUSS_CUDA(cudaMemcpy(out.data() + (size_t) i * V, d_logits, (size_t) V * 4, cudaMemcpyDeviceToHost));
+                        dtoh_sync(p, out.data() + (size_t) i * V, d_logits, (size_t) V * 4);
                         ++i;
                     } else {
                         p.verify(tok.data() + P + i, 4);
                         p.head(0, 4, d_logits);
                         p.accept(4);
-                        TRUSS_CUDA(cudaMemcpy(out.data() + (size_t) i * V, d_logits, (size_t) 4 * V * 4, cudaMemcpyDeviceToHost));
+                        dtoh_sync(p, out.data() + (size_t) i * V, d_logits, (size_t) 4 * V * 4);
                         i += 4;
                     }
                 }
@@ -352,8 +364,7 @@ int main(int argc, char ** argv)
                     const auto t0 = std::chrono::steady_clock::now();
                     p.run(tok.data() + i, n);
                     p.head(0, n, d_logits);
-                    TRUSS_CUDA(cudaMemcpy(dec.data() + (size_t) (i - P) * V, d_logits, (size_t) n * V * 4,
-                                          cudaMemcpyDeviceToHost));
+                    dtoh_sync(p, dec.data() + (size_t) (i - P) * V, d_logits, (size_t) n * V * 4);
                     if (n == 1) step_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), ++steps;
                     i += n;
                 }

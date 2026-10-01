@@ -182,6 +182,8 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
         TRUSS_CUDA(cudaEventCreateWithFlags(&released_[s], cudaEventDisableTiming));
     }
     TRUSS_CUDA(cudaEventCreateWithFlags(&compute_mark_, cudaEventDisableTiming));
+    TRUSS_CUDA(cudaHostAlloc(reinterpret_cast<void **>(&signal_src_), sizeof(int) * SIGNAL_RING, cudaHostAllocDefault));
+    pinned_.push_back(signal_src_);
 
     size_t hot_lo = 0, hot_hi = 0;
     for (int l = 0; l < L; ++l) {
@@ -358,13 +360,18 @@ bool ExpertStore::ring_put(int l, int e, bool hint)
     return true;
 }
 
-void ExpertStore::fetch(int l, const int * ids, int n, cudaStream_t compute)
+void ExpertStore::begin_ring()
 {
     if (mode_ != Mode::RING) {   // first decode step after a prompt: the ring starts empty over the slots and spare
         mode_ = Mode::RING;
         head_ = 0;
     }
-    wait_compute(compute);   // earlier kernels may read what the ring overwrites
+}
+
+void ExpertStore::fetch(int l, const int * ids, int n, cudaStream_t compute)
+{
+    if (mode_ != Mode::RING) throw std::logic_error("ExpertStore::fetch outside ring mode (begin_ring)");
+    if (compute) wait_compute(compute);   // earlier kernels may read what the ring overwrites
     Layer & Y = layers_.at(l);
     ++stats_.fetch_calls;
     std::vector<int> need;
@@ -379,14 +386,15 @@ void ExpertStore::fetch(int l, const int * ids, int n, cudaStream_t compute)
     protect_layer_ = l;
     protect_.clear();
     for (int i = 0; i < n; ++i) protect_.push_back(ids[i]);
-    // A copy may evict another expert this call needs: repeat until all are resident. The ring holds thousands of
-    // experts and a call needs at most rows x top-k, so this ends after one extra round.
+    // A copy may evict another expert this call needs (one lying just ahead of the head): repeat until all are
+    // resident. A re-copied expert lands at the head and is not evicted again by this call, so each round settles at
+    // least one needed expert and the loop ends within need.size() + 1 rounds unless the ring is smaller than them.
     bool changed = false;
     for (int round = 0;; ++round) {
         bool missing = false;
         for (int e : need)
             if (Y.ring_at[e] < 0) {
-                if (round > 2) throw std::runtime_error("ExpertStore::fetch: ring too small for one layer's experts");
+                if (round > (int) need.size()) throw std::runtime_error("ExpertStore::fetch: ring too small for one layer's experts");
                 ring_put(l, e);
                 missing = changed = true;
             }
@@ -418,6 +426,20 @@ void ExpertStore::prefetch_hint(int l, const int * ids, int n)
         for (int p = 0; p < 3; ++p)
             TRUSS_CUDA(cudaMemcpyAsync(Y.ring_meta[p], Y.ring_meta_host + (size_t) p * 2 * Y.n_expert,
                                        sizeof(int32_t) * 2 * Y.n_expert, cudaMemcpyHostToDevice, copy_));
+}
+
+void ExpertStore::signal(int l, int * flag, int seq)
+{
+    (void) l;
+    int * src = signal_src_ + signal_next_;
+    signal_next_ = (signal_next_ + 1) % SIGNAL_RING;
+    *src = seq;
+    TRUSS_CUDA(cudaMemcpyAsync(flag, src, sizeof(int), cudaMemcpyHostToDevice, copy_));
+}
+
+void ExpertStore::upload(void * dst, const void * src, size_t bytes)
+{
+    TRUSS_CUDA(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, copy_));
 }
 
 void ExpertStore::acquire(int l, cudaStream_t compute)

@@ -14,6 +14,7 @@
 // computed independently and a row's experts are summed in slot order, so results do not depend on how many rows a
 // call has (a verify window equals single steps).
 #pragma once
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -26,6 +27,7 @@ namespace truss::cpu {
 struct Q4Matrix {
     const uint8_t * q;      // [rows][cols / 2]
     const uint16_t * d;     // [rows][cols / 32] fp16 bits
+    const float * df = nullptr;   // optional preconverted fp32 scales (same count; gemv uses these when set)
     int rows, cols;
 };
 
@@ -38,6 +40,11 @@ constexpr size_t EXPERT_BYTES = 3 * ((size_t) D_MODEL * D_FF / 2 + (size_t) D_MO
 
 // the matrices of one expert stored contiguously in q4s order at p
 Q4Expert expert_view(const uint8_t * p);
+
+constexpr size_t SCALES_PER_EXPERT =
+    (D_FF * (D_MODEL / BLOCK) + D_FF * (D_MODEL / BLOCK) + D_MODEL * (D_FF / BLOCK));
+// gate, up, down scales as fp32 into out [SCALES_PER_EXPERT] (one _cvtsh_ss per block, once at load)
+void preconvert_scales(const Q4Expert & e, float * out);
 
 // One layer's CPU work: rows x [T][D_MODEL] (fp32) and the slots routed to CPU experts.
 struct Slot {
@@ -59,6 +66,23 @@ public:
     void wait();
     void run(const float * x, int T, const std::vector<Slot> & slots, float * y) { start(x, T, slots, y), wait(); }
     int threads() const { return (int) workers_.size(); }
+    // benchmark stats: total microseconds inside wait() and its calls (wait = pool latency + work the caller
+    // did not itself compute; TRACKER #61 measures the CPU tier against DRAM peak through these).
+    void reset_stats();
+    long long wait_us() const { return wait_us_; }
+    long waits() const { return waits_; }
+    long long item_us() const { return item_us_; }   // sum of item() compute time (all threads, caller included)
+    // phase breakdown of item_us_ (same clock): gate/up gemv, silu, h-quantize, down gemv
+    long long gate_us() const { return gate_us_; }
+    long long silu_us() const { return silu_us_; }
+    long long hq_us() const { return hq_us_; }
+    long long down_us() const { return down_us_; }
+    // call shape since the last reset: calls, distinct experts (groups), slots (expert x row pairs), and the sum of
+    // rows each expert served (the gemv's R: weights are loaded once, so R costs ALU, not bytes)
+    void shape(long long out[4]) const
+    {
+        out[0] = calls_, out[1] = groups_sum_, out[2] = slots_sum_, out[3] = rows_sum_;
+    }
 
 private:
     struct Group {                          // one expert and the rows routed to it
@@ -67,17 +91,22 @@ private:
     };
     void worker();
     void item(int i);
+    bool grab(int & i, int & phase);         // lock-free: take the next item of the current phase
+    void retire(int phase);                  // one item finished: phase flip or call done
+    void run_items();                        // grab + run until the current phase has no items left
+    void quantize_h();   // quantize every group's h rows into hq_/hd_ (once, by the last phase-0 worker)
     void finish();
 
     std::vector<std::thread> workers_;
+    // The workers take items without the mutex and spin briefly before blocking: a layer's call is a burst of
+    // ~1 ms, and condvar wake latency was 43% of it (cpu_expert_test: 903 us wall, 515 us of parallel compute).
+    // Only the final "busy_ == false" and the idle wait use the mutex.
     std::mutex mu_;
     std::condition_variable cv_, done_cv_;
-    long generation_ = 0;
-    bool stop_ = false;
+    std::atomic<bool> stop_{ false }, busy_{ false };
+    std::atomic<int> phase_{ 0 }, next_item_{ 0 }, pending_[2] = { 0, 0 };
     int phase_items_[2] = {};
-    std::vector<int> pending_;              // [phase] items not finished
-    int phase_ = 0, next_item_ = 0, running_ = 0;
-    bool busy_ = false;
+    int spin_ = 0;                           // pause iterations before blocking (TRUSS_CPU_SPIN)
 
     // the current call
     const float * x_ = nullptr;
@@ -88,7 +117,14 @@ private:
     std::vector<int8_t> xq_;                // [T][D_MODEL]
     std::vector<float> xd_;                 // [T][D_MODEL / 32]
     std::vector<float> h_;                  // [group][row][D_FF]
+    std::vector<int8_t> hq_;                // [group][row][D_FF], quantized once at the phase 0->1 flip
+    std::vector<float> hd_;                 // [group][row][D_FF / 32] its scales
     std::vector<float> out_;                // [group][row][D_MODEL]
+    std::atomic<long long> wait_us_{ 0 };   // benchmark stats (see wait_us())
+    std::atomic<long> waits_{ 0 };
+    std::atomic<long long> item_us_{ 0 };
+    std::atomic<long long> gate_us_{ 0 }, silu_us_{ 0 }, hq_us_{ 0 }, down_us_{ 0 };
+    std::atomic<long long> calls_{ 0 }, groups_sum_{ 0 }, slots_sum_{ 0 }, rows_sum_{ 0 };
 };
 
 }  // namespace truss::cpu

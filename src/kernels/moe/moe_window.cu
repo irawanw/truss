@@ -509,8 +509,10 @@ __global__ __launch_bounds__(THREADS, Tune<Shape>::BLOCKS_PER_SM) void window_ke
     if (threadIdx.x == 0) first_item = atomicAdd(&ctr.next_item, 1);
     build_route<Shape>(ids, wts, n_rows, W, R);
     const int n = R.n;
+    if (n == 0)   // every pair skipped (all on the CPU tier): no combine will run, so the output is zero here
+        for (int i = blockIdx.x * THREADS + threadIdx.x; i < n_rows * D; i += gridDim.x * THREADS) out[i] = 0.f;
 
-    for (bool first = true;; first = false) {
+    for (bool first = true; n > 0; first = false) {
         if (threadIdx.x == 0) {
             s_item = first ? first_item : atomicAdd(&ctr.next_item, 1);
             s_it = decode_item<Shape>(s_item, n);

@@ -58,6 +58,7 @@ target_link_libraries(truss_cpu PUBLIC Threads::Threads)
 
 add_library(truss_engine STATIC
   src/runtime/expert_store.cu
+  src/runtime/doorbell.cu
   src/model/qwen4exp/forward.cu)
 target_link_libraries(truss_engine PUBLIC truss_models truss_kernels truss_cpu)
 

@@ -62,6 +62,9 @@ public:
 
     moe::Weights weights(int layer) const;                        // meta table of the current mode
     void begin_stream(cudaStream_t compute);                       // prompt chunk starts: stream mode
+    // decode starts: ring mode (the ring starts empty over the slots). Called by the thread that enqueues kernels
+    // before weights(): with a doorbell driver, fetch() runs on another thread later (TRACKER #61)
+    void begin_ring();
     void * spare() const { return spare_; }                        // stream mode: stream_extra bytes after the slots
     void prefetch(int layer);                                      // all cold experts of the layer into slot l % 2
     void fetch(int layer, const int * ids, int n, cudaStream_t compute);   // ring mode: make ids[0 .. n) (host)
@@ -70,6 +73,11 @@ public:
     // layer + 1, behind this layer's copies, so PCIe works while this layer and the next one's attention compute.
     // Never evicts an expert the last fetch() needs (stops instead); wrong guesses only cost bandwidth and ring room.
     void prefetch_hint(int layer, const int * ids, int n);
+    // Doorbell decode (qwen4exp::Forward): fetch(l, ids, n, nullptr) skips the wait on compute (the doorbell that
+    // gave the ids already orders it), and signal(l, flag, seq) queues, behind every copy issued so far, a write of
+    // seq to the device word flag, which a spin kernel on the compute stream waits for instead of acquire().
+    void signal(int layer, int * flag, int seq);
+    void upload(void * dst, const void * src, size_t bytes);         // a small copy (pinned src) on the copy stream
     void acquire(int layer, cudaStream_t compute);                 // compute waits for layer l's copies
     void release(int layer, cudaStream_t compute);                 // compute is done with slot l % 2 (stream mode)
 
@@ -123,6 +131,11 @@ private:
     bool released_recorded_[2] = {};
     size_t device_bytes_ = 0, cold_total_ = 0;
     Stats stats_;
+    // pinned ring of the words signal() copies: a queued copy reads its source when it runs, so each call gets its
+    // own word (the copy stream never lags SIGNAL_RING calls behind)
+    static constexpr int SIGNAL_RING = 1024;
+    int * signal_src_ = nullptr;
+    int signal_next_ = 0;
 };
 
 }  // namespace truss::runtime

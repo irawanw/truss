@@ -20,6 +20,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace truss::qwen4exp {
@@ -45,8 +46,13 @@ struct ForwardOptions {
     std::string cpu_dir;
     float cpu_share = 0.5f;
     int cpu_threads = 12;
-    int draft_vocab = 0;                      // MTP drafts score only token ids < draft_vocab (0: all): the draft head
-                                              // reads that share of the output matrix; verify keeps the output exact
+    std::vector<int32_t> draft_vocab;         // MTP drafts score only these token ids (empty: all), e.g.
+                                              // data/draft_vocab_en.bin: the draft head reads 16% of the output
+                                              // matrix; verify keeps the output exact
+    float draft_min_p = 0.f;                  // a draft chain stops once the MTP head's top probability drops below
+    bool doorbell = true;                     // decode FFNs without a host sync (driver thread; TRACKER #61)
+    size_t ring_bytes_override = 0;         // ring size (0: Options::ring_bytes) — the ring competes with the
+                                              // static hot set for VRAM; a sweep knob for the decode trade-off
     int hint_k = 4;                           // pre-gated prefetch: per row, the next layer's top hint_k predicted
                                               // experts start copying early (0: off; 3-6 measured equal, TRACKER #59)
 };
@@ -75,9 +81,10 @@ public:
     void verify(const int32_t * tokens, int T);
     void accept(int n);
 
-    // MTP drafts (Options::mtp): n greedy guesses for the tokens after `next`, the token at position(). The MTP block
-    // reads the last committed row's hidden state; every run() / accept() keeps the MTP layer's own cache in step.
-    void draft(int32_t next, int n, int32_t * out);
+    // MTP drafts (Options::mtp): up to n greedy guesses for the tokens after `next`, the token at position(); returns
+    // how many (0 .. n: the chain stops before a guess whose probability < Options::draft_min_p). The MTP block reads the last
+    // committed row's hidden state; every run() / accept() keeps the MTP layer's own cache in step.
+    int draft(int32_t next, int n, int32_t * out);
 
     // logits [n][n_vocab] (device, fp32) of rows first .. first + n - 1 of the last chunk: the head hc mix, then
     // the output projection
@@ -89,6 +96,19 @@ public:
     int position() const { return pos_; }   // tokens consumed so far
     int hot_experts() const;                // resident experts, all layers
     size_t cold_bytes() const;              // streamed per chunk
+    // CPU tier benchmark stats (0, 0 without Options::cpu_dir): total microseconds in ExpertPool::wait() and its
+    // calls since the last reset (reset with cpu_stats(true)).
+    std::pair<long long, long> cpu_stats(bool reset = false);
+    long long cpu_item_us() const;   // sum of ExpertPool::item() compute time, all threads
+    void cpu_phase_us(long long out[4]) const;   // gate/up gemv, silu, h-quantize, down gemv sums
+    void cpu_shape(long long out[4]) const;    // calls, distinct experts, slots, rows-served sum (the gemv's R)
+    void cpu_shape_reset();
+    // Per-section device time of the layer chain, in ms, accumulated over every run()/verify() since the last
+    // reset: [0] PLE + attn hyper-connection mix, [1] GDN/DSA mixer, [2] hc combine + ffn-side mix,
+    // [3] router + routed MoE (PCIe copies and the CPU tier's start inside), [4] shared expert,
+    // [5] CPU-tier join (its host spin), [6] hc combine. Device events on the engine stream, so host stalls inside
+    // a section are included; the gaps between sections are not. TRUSS_PROFILE_SECTIONS=1 turns it on.
+    void section_ms(double out[6], bool reset = false) const;
     const runtime::ExpertStore & experts() const;   // residency and fetch statistics (the MTP block, when present,
                                                     // is store layer n_layer)
 

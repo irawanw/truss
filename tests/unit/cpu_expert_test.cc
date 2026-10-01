@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -77,7 +78,7 @@ int main()
         }
         ex.push_back(e);
     }
-    ExpertPool pool(8);
+    ExpertPool pool(getenv("POOL_THREADS") ? atoi(getenv("POOL_THREADS")) : 8);
     int fails = 0;
     auto check = [&](int T, const std::vector<Slot> & slots, const char * name) {
         std::vector<float> x((size_t) T * D_MODEL), y((size_t) T * D_MODEL);
@@ -130,8 +131,22 @@ int main()
         pool.run(x.data(), 4, s, y.data());
     }
     const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / iters;
+    pool.reset_stats();
     std::printf("timing: 4 rows, 8 experts per call, %d threads + caller: %.0f us per call (%.1f experts/ms)\n",
                 pool.threads(), us, 8e3 / us);
+    {   // the same call again, to split compute from wake/barrier overhead
+        const auto t1 = std::chrono::steady_clock::now();
+        for (int it = 0; it < iters; ++it) {
+            std::vector<Slot> s;
+            for (int k = 0; k < 8; ++k) s.push_back({ k % 4, &mex[(it * 8 + k) % POOL], 0.1f });
+            pool.run(x.data(), 4, s, y.data());
+        }
+        const double wall =
+            std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t1).count() / iters;
+        const double items = (double) pool.item_us() / iters;
+        std::printf("         compute %.0f us/call over %d items, wall %.0f us -> overhead %.0f us (%.0f%%)\n", items,
+                    pool.threads() + 1, wall, wall - items / (pool.threads() + 1), 100 * (1 - items / (pool.threads() + 1) / wall));
+    }
     std::printf("%s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
 }

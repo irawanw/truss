@@ -27,6 +27,7 @@ GGUF stores Q8_0 as interleaved 34-byte blocks (fp16 d + 32 int8), which cannot 
 | `q8_gemv(W, xq, xd, rows ≤ GEMV_ROWS = 8, y, stream)` | same as q8_gemm for decode rows | same, only fp32 summation order differs (= q8_gemm to 1.8e-7) | 740–790 GB/s on the big shapes (~85% of peak) (TRACKER #54) |
 | `f32_gemv(W, in, out, x, rows, y, stream)` | fp32 W [out][in] · x for decode-sized rows (router, shared-expert gate) | one warp per output, fixed reduction order: row-invariant, unlike cuBLAS SGEMM, whose algorithm depends on the row count (it flipped near-tied experts: 1-token steps vs 4-token windows differed by 3% rel in logits, TRACKER #60) | `Forward::lin32` uses it for ≤ 32 rows, cuBLAS above |
 | `q8_gemm_a16(W, x_half, rows, y, w16, cublas, stream)` | fp16 activations: dequantize W to `w16` (scratch, in·out halfs) then `cublasGemmEx` fp16 in / fp32 accumulate | one fp16 rounding of each weight (≤ 2^-12 rel); no activation quantization | 47–71 TFLOPS (TRACKER #44) |
+| `q8_gather(W, ids, n, q, d, stream)` | rows `ids` of W copied in Q8Matrix layout (q int8 [n][in], d fp16 [n][in/32]) into a new matrix: the MTP draft head over `Options::draft_vocab` (40,525 of 248,320 rows, 16% of the head's bytes) | exact | load time only |
 | `q8_rows(W, ids, n, out, stream)` | out fp32 [n][in] = rows `ids` of W (token embedding) | exact | — |
 
 ## Which one runs (`Forward::lin`)

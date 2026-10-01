@@ -35,7 +35,9 @@ host mirror, one 4 KB copy per projection per layer that changed). `weights(l)` 
 | `begin_stream(compute)` | a prompt chunk starts: waits for queued compute, drops the ring's contents, stream mode |
 | `spare()` | stream mode: `stream_extra` bytes after the slots, valid until the next `fetch()` |
 | `prefetch(l)` | stream mode: all of layer l's cold experts into slot l % 2 (one copy), after the slot's release |
-| `fetch(l, ids, n, compute)` | ring mode: makes the cold experts among `ids` (host) resident: FIFO allocation (256-B aligned, wrap at the end, evicting the oldest), one copy each, ring meta updated; waits for queued compute first (the ring may overwrite what earlier kernels read). Refetches if a copy evicted an expert this call needs |
+| `fetch(l, ids, n, compute)` | ring mode: makes the cold experts among `ids` (host) resident: FIFO allocation (256-B aligned, wrap at the end, evicting the oldest), one copy each, ring meta updated; waits for queued compute first (the ring may overwrite what earlier kernels read). Refetches if a copy evicted an expert this call needs (up to `need + 1` rounds: each re-copied expert lands at the head; a fixed 3-round bound failed on a 4-row verify window, 10-01). Throws outside ring mode. `compute` = nullptr skips the wait (doorbell: the doorbell already orders it) |
+| `begin_ring()` | switch to ring mode (ring starts empty); called on the thread that enqueues kernels, before `weights()`, because with a doorbell driver `fetch` runs later on another thread (a mode switch there raced with kernel enqueue, TRACKER #61) |
+| `signal(l, flag, seq)` / `upload(dst, src, bytes)` | queue, behind every copy issued so far, a write of `seq` to device word `flag` (the doorbell's "go"; sources come from a 1,024-entry pinned word ring since a queued copy reads its source when it runs) / a small pinned copy on the copy stream |
 | `prefetch_hint(l, ids, n)` | ring mode, right after `fetch(l)`: starts copying layer l+1's predicted cold experts behind layer l's copies (updates l+1's ring meta). Refuses to evict an expert layer l's fetch needs (stops the hint instead) |
 | `acquire(l, compute)` / `release(l, compute)` | compute waits for layer l's copies / records it is done with slot l % 2 |
 | `stats()` | ring mode: fetch calls, experts asked, fetched on demand (misses, bytes), prefetched by hints (count, bytes) |
@@ -44,6 +46,16 @@ host mirror, one 4 KB copy per projection per layer that changed). `weights(l)` 
 **Protocol (Forward).** Prompt chunk (> 32 rows): `begin_stream`, `prefetch(0)`, `prefetch(1)`; per layer
 `acquire(l)` → `moe::prefill` → `release(l)` → `prefetch(l + 2)`. Decode step / window (≤ 32 rows): per layer
 routing to host → `fetch(l, ids, n, s)` → `acquire` → `moe::window` (≤ 8 rows) or `moe::prefill`.
+
+**Doorbell decode (`src/runtime/doorbell.{cuh,cu}`, Forward `Options::doorbell` = true, TRACKER #61).** Strata's
+design: the host enqueues a whole pass ahead and never synchronizes per layer. Per decode layer the GPU runs
+`publish` (copies routing ids, the next layer's predicted ids, weights and the FFN input rows into mapped pinned host
+memory, then raises the layer's doorbell word = the pass's seq), then `spin_until(go, seq)` (a one-thread kernel
+holding the stream). A driver thread in `Forward` spins on the doorbell and serves the layer in this order: start the
+CPU pool → `fetch(l, ids, n, nullptr)` → upload masked routing → `signal(go)` → `prefetch_hint` → pool wait →
+raise `cpu_done`; the GPU then `spin_until(cpu_done)` and `add_mapped` adds the CPU rows. The go word must precede
+the hint copies (queued after them it cost 49 → 41 tok/s). Flags only increase, so nothing is reset between passes.
+Same output as the synchronous path (`tk-bench-spec ... sync`).
 
 **Why a ring (TRACKER #57).** On held-out chatcode routing a FIFO of recently fetched experts halves the misses of a
 static set of equal size (10,000 slots: 74 → 38 per token; FIFO within 3% of LRU;
@@ -66,6 +78,9 @@ One `truss_model` = one model file, one sequence, on the current CUDA device (`C
 | function | contract |
 |---|---|
 | `truss_open(gguf, n_ctx, max_chunk, expert_usage)` | load (architecture must be `qwen4exp`); NULL on error. `max_chunk` rounded down to a multiple of 4. `expert_usage`: NULL or a usage file (`ExpertStore::load_usage`) for the hot set |
+| `truss_default_params()`, `truss_open_params(gguf, &params)` | every load option: `n_ctx`, `max_chunk`, `expert_usage`, `mtp` (draft block GGUF → speculative decoding), `drafts` (1..7), `cpu_dir` / `cpu_share` / `cpu_threads` (CPU tier). `truss_open` = defaults + its three arguments |
+| `truss_spec_step(m, next, emitted, &n, &new_next)` | one greedy speculative round after `next`: drafts, one verify pass, accept the matching prefix; appends `emitted[0..n)` (`next` first, then the accepted drafts) and returns the greedy token after them. Output equals plain greedy decoding. Near n_ctx it falls back to one plain step |
+| `truss_drafts(m)` | drafts per round (0: no MTP) |
 | `truss_close(m)` | free everything |
 | `truss_last_error()` | message of the last failure on this thread |
 | `truss_n_vocab`, `truss_n_ctx`, `truss_position` | sizes; tokens in the sequence |
@@ -84,7 +99,7 @@ dispatch on `general.architecture` inside `truss_open`.
 
 | file | role |
 |---|---|
-| `truss_ctypes.py` | `Model(gguf, n_ctx, max_chunk)`: ctypes signatures for every C function, `eval(tokens) → logits` (numpy view reused per call), `eval_argmax`, `reset`, `meta_string/int`, `position`. ctypes releases the GIL during calls |
+| `truss_ctypes.py` | `Model(gguf, n_ctx, max_chunk, expert_usage, mtp, drafts, cpu_dir, cpu_share, cpu_threads)` (the `truss_params` struct), `spec_step(next) → (tokens appended, next token)`, ctypes signatures for every C function, `eval(tokens) → logits` (numpy view reused per call), `eval_argmax`, `reset`, `meta_string/int`, `position`. ctypes releases the GIL during calls |
 | `chat.py` | `Chat(tokenizer_json, template)`: HF `tokenizers` tokenizer (NFC-normalizing like training; llama.cpp skips NFC — the only difference found on real text), chat template from the GGUF rendered by transformers `apply_chat_template`; `Detokenizer` (text deltas, holds back incomplete UTF-8); `sample()` (temperature, top-k, top-p; numpy) |
 | `app.py` | `Engine` (model + the sequence in it + lock) and the FastAPI app |
 
@@ -95,7 +110,9 @@ dispatch on `general.architecture` inside `truss_open`.
 
 **Engine.generate.** One request at a time (lock). Prefix reuse: if the new prompt starts with every token already in
 the engine's sequence, only the new tokens are evaluated; otherwise reset (the GDN state cannot rewind). Greedy
-(`temperature ≤ 0`) uses `eval_argmax`; sampling copies logits. Stops on the GGUF EOS id, `<|im_end|>`,
+(`temperature ≤ 0`) uses `eval_argmax` after the prompt and then, with `--mtp`, speculative rounds (`spec_step`),
+emitting each round's tokens in order (a stop token or string inside a round ends the reply; the engine keeps the
+round's later tokens, and prefix reuse tracks them); sampling copies logits. Stops on the GGUF EOS id, `<|im_end|>`,
 `<|endoftext|>`, a stop string, `max_tokens`, or n_ctx. After each request it logs one line (stdout and `--log`):
 
 ```
@@ -106,7 +123,8 @@ This is the format `flashnext_strata_bench.py` parses; run the server with `--lo
 runs unchanged against it.
 
 **Run.** `CUDA_VISIBLE_DEVICES=2 python3 -m server.app --model <gguf shard 1> --tokenizer <tokenizer.json>
-[--n-ctx 65536] [--chunk 8192] [--expert-usage file] [--port 8080] [--log file] [--log-tag tag]`. Usage file in use:
+[--n-ctx 65536] [--chunk 8192] [--expert-usage file] [--mtp file] [--drafts 3] [--cpu-dir dir] [--cpu-share 0.5]
+[--cpu-threads 12] [--port 8080] [--log file] [--log-tag tag]`. Usage file in use:
 `~/ML_projects/flashnext/20260930_truss_tg/data/usage_chatcode64.f32` (32K chatcode tokens). The Flash-Next tokenizer.json in use:
 `/data/www/Qwen3.8-27B-DFlash2-EXL3-5.0bpw/models/Qwen3.8-27B-EXL3-3.5bpw/tokenizer.json` (same 248,077 tokens as
 the GGUF; checked token-for-token against llama-tokenize on 7.5K tokens of code with special tokens).
@@ -134,7 +152,7 @@ q, down d (2560 × 640).
 w}, y [T][2560])` returns at once, `wait()` blocks (the caller works on items meanwhile); `run` = both.
 
 **Work split.** Slots are grouped by expert. Phase 0 items: an expert's gate and up rows in chunks of 64 (10 per
-expert) → h = silu(gate)·up. Phase 1 items: h quantized, down rows in chunks of 256 (10 per expert). Then y[row] =
+expert) → h = silu(gate)·up. Phase 1 items: down rows in chunks of 256 (10 per expert); h is quantized once per group at the phase 0 → 1 flip (AVX2 `quantize`, bit-identical to the scalar loop). fp16 block scales are preconverted to fp32 at load (`Q4Matrix::df`, `preconvert_scales`). Idle workers spin `TRUSS_CPU_SPIN` pause iterations before blocking. Then y[row] =
 Σ over the row's slots in slot order of w·out.
 
 **Numerics.** x and h quantized per 32-block to int8 (d = amax/127, as the GPU's Q8_1), int32 dots (AVX2 maddubs),
@@ -149,5 +167,5 @@ those slots masked (weight 0, id of an expert already in the row, so no extra wo
 routed output before the shared-expert combine. Prompt chunks (stream mode) compute every expert on the GPU from the
 trellis pack. The MTP block has no CPU tier.
 
-**Speed.** `cpu_expert_test` timing: 4 rows × 8 experts in ~0.93 ms with 8 threads + caller (converter running
+**Speed.** The tier is DRAM-bound: 16 threads read q4s at 46.6 GB/s, 84% of this box's roofline; instruction cuts were neutral and more threads slower (TRACKER #62, #64). Its per-layer join is the cost: a verify pass at share 0.7 spent 32 of 75 ms in it (#63). `cpu_expert_test` timing: 4 rows × 8 experts in ~0.93 ms with 8 threads + caller (converter running
 beside it). Probe (`tools/tk-bench/cpu_q4.cc`): 8 threads 10.3 experts/ms at 4 rows, 16 threads 16.8.

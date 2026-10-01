@@ -19,13 +19,23 @@
 #include "kernels/sampling/argmax.cuh"
 #include "kernels/spec/rollback.cuh"
 #include "model/qwen4exp/ple.h"
+#include "runtime/doorbell.cuh"
 #include "runtime/expert_store.h"
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <exception>
+#include <immintrin.h>
+#include <mutex>
+#include <thread>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -85,6 +95,9 @@ struct Forward::Impl {
     struct CpuTier {
         std::vector<std::vector<uint8_t>> is_cpu;         // [layer][expert]
         std::vector<std::vector<uint8_t>> data;           // [layer] the CPU experts' q4s bytes
+        std::vector<std::vector<float>> fscales;          // [layer] preconverted fp32 weight scales (one per
+                                                          // q4s block, gate+up+down order per expert; the per-block
+                                                          // _cvtsh_ss in the hot loop cost ~0.9 ms/expert)
         std::vector<std::vector<cpu::Q4Expert>> view;     // [layer][expert]
         std::unique_ptr<cpu::ExpertPool> pool;
         float * x = nullptr, * w = nullptr, * y = nullptr;   // pinned [8][d], [8][k], [8][d]
@@ -92,6 +105,30 @@ struct Forward::Impl {
         size_t bytes = 0;
     };
     std::unique_ptr<CpuTier> cpu_tier;
+
+    // Doorbell decode (TRACKER #61): FFNs of windows up to cpu::MAX_ROWS rows run without a host sync. Per store
+    // layer: mapped host buffers the GPU publishes the routing and FFN input into, the doorbell, the CPU tier's
+    // result and done flag (mapped), a device "go" word the copy stream writes after the layer's copies, and the
+    // masked ids (CPU slots = -1) the copy stream uploads. A driver thread services the layers in enqueue order.
+    struct Bell {
+        int * ids = nullptr, * pred = nullptr, * mids = nullptr;     // mapped [8][k]; mids: pinned source
+        float * w = nullptr, * x = nullptr, * y = nullptr;           // mapped [8][k], [8][d], [8][d]
+        int * doorbell = nullptr, * cpu_done = nullptr;             // mapped words
+        int * go = nullptr, * d_mids = nullptr;                       // device
+        int seq = 0;                                                  // host: the last seq enqueued
+    };
+    std::vector<Bell> bells;
+    struct Job {
+        int layer, T, seq;
+        bool hint, cpu;
+    };
+    std::thread driver;
+    std::mutex dq_mu;
+    std::condition_variable dq_cv;
+    std::deque<Job> jobs;
+    bool driver_stop = false;
+    std::exception_ptr driver_error;
+    bool use_doorbell = true;
     int8_t * embd_q = nullptr;                           // token embedding in pinned host memory (upload())
     half * embd_d = nullptr;
 
@@ -129,7 +166,11 @@ struct Forward::Impl {
 
     const Activations act;
     const int hint_k;                                    // Options::hint_k
-    int draft_vocab = 0;                                 // Options::draft_vocab (0: all)
+    dense::Q8Matrix draft_head{};                        // the output matrix's draft_vocab rows (Options::draft_vocab)
+    int * draft_map = nullptr;                           // device [draft_head.out]: row -> token id
+    float draft_min_p = 0.f;
+    float * draft_prob = nullptr;                        // device [spec_rows], pinned mirror below
+    float * draft_prob_host = nullptr;
     int n_store = 0;                                     // ExpertStore layers: n_layer (+ 1 with the MTP block)
 
     Impl(const Config & cc, const Weights & ww, int nc, int mc, const Options & o)
@@ -138,7 +179,7 @@ struct Forward::Impl {
     {
         check_shapes();
         mtp = o.mtp;
-        draft_vocab = o.draft_vocab > 0 && o.draft_vocab < c.n_vocab ? o.draft_vocab / 64 * 64 : 0;
+        draft_min_p = o.draft_min_p;
         TRUSS_CUDA(cudaStreamCreate(&s));
         TRUSS_CUBLAS(cublasCreate(&blas));
         upload();
@@ -155,6 +196,19 @@ struct Forward::Impl {
             mtp_logits = alloc<float>(c.n_vocab);
             draft_ids = alloc<int>(moe::MAX_ROWS + 1);
             TRUSS_CUDA(cudaMallocHost(&draft_host, sizeof(int32_t) * (moe::MAX_ROWS + 1)));
+            draft_prob = alloc<float>(moe::MAX_ROWS + 1);
+            TRUSS_CUDA(cudaMallocHost(&draft_prob_host, sizeof(float) * (moe::MAX_ROWS + 1)));
+            if (!o.draft_vocab.empty()) {   // gather the subset's output rows once
+                const dense::Q8Matrix & O = q8.at(w.output);
+                const int n = (int) o.draft_vocab.size();
+                for (int32_t t : o.draft_vocab) require(t >= 0 && t < O.out, "draft_vocab token id out of range");
+                draft_map = alloc<int>(n);
+                TRUSS_CUDA(cudaMemcpy(draft_map, o.draft_vocab.data(), sizeof(int) * n, cudaMemcpyHostToDevice));
+                int8_t * q = alloc<int8_t>((size_t) n * O.in);
+                half * dd = alloc<half>((size_t) n * O.in / 32);
+                dense::q8_gather(O, draft_map, n, q, dd, s);
+                draft_head = { q, dd, O.in, n };
+            }
         }
         use(small);
         window_ws = alloc<unsigned char>(moe::workspace_bytes<MoeShape>());
@@ -213,12 +267,14 @@ struct Forward::Impl {
             expert_budget = free_b - MARGIN;
         }
         runtime::ExpertStore::Sizes z;
-        z.ring_bytes = o.ring_bytes;
+        z.ring_bytes = o.ring_bytes_override ? o.ring_bytes_override : o.ring_bytes;
         if (max_chunk > FETCH_ROWS) z.stream_extra = big_bytes();
         const runtime::ExpertStore::HotSet hot = runtime::ExpertStore::plan(tables, expert_budget, z, usage);
         for (const auto & h : hot) n_hot += (int) std::count(h.begin(), h.end(), 1);
         experts = std::make_unique<runtime::ExpertStore>(tables, hot, z);
         if (!o.cpu_dir.empty()) load_cpu_tier(o, hot);
+        use_doorbell = o.doorbell;
+        setup_doorbells();
         if (max_chunk > FETCH_ROWS) {   // the prompt path's buffers, carved from the ring's spare region
             auto * p = static_cast<unsigned char *>(experts->spare());
             const size_t sb = scratch_bytes(c, max_chunk, n_ctx), wb = align(moe::prefill_workspace_bytes<MoeShape>(max_chunk));
@@ -231,26 +287,148 @@ struct Forward::Impl {
                 big.mres = reinterpret_cast<float *>(p + align(sb) + wb + 2 * rb);
             }
         }
+        if (mtp) mtp_calib_open(max_chunk);
+        if (getenv("TRUSS_PROFILE_SECTIONS")) {
+            sect_on = true;
+            sect_ev.resize(n_store);
+            sect_rec.assign(n_store, 0);
+            for (auto & a : sect_ev)
+                for (cudaEvent_t & e : a) TRUSS_CUDA(cudaEventCreate(&e));
+        }
     }
 
     ~Impl()
     {
+        if (driver.joinable()) {
+            {
+                std::lock_guard<std::mutex> g(dq_mu);
+                driver_stop = true;
+            }
+            dq_cv.notify_all();
+            driver.join();
+        }
+        for (Bell & b : bells)
+            for (void * p : { (void *) b.ids, (void *) b.pred, (void *) b.mids, (void *) b.w, (void *) b.x, (void *) b.y,
+                              (void *) b.doorbell, (void *) b.cpu_done })
+                if (p) cudaFreeHost(p);
         for (void * p : owned) cudaFree(p);
         if (ids_host) cudaFreeHost(ids_host);
         if (draft_host) cudaFreeHost(draft_host);
+        if (draft_prob_host) cudaFreeHost(draft_prob_host);
         if (embd_q) cudaFreeHost(embd_q);
         if (cpu_tier)
             for (void * p : { (void *) cpu_tier->x, (void *) cpu_tier->w, (void *) cpu_tier->y, (void *) cpu_tier->ids })
                 if (p) cudaFreeHost(p);
         if (embd_d) cudaFreeHost(embd_d);
+        if (calib_host) cudaFreeHost(calib_host);
+        if (mtp_calib_f) std::fclose(mtp_calib_f);
+        for (auto & a : sect_ev)
+            for (cudaEvent_t e : a)
+                if (e) cudaEventDestroy(e);
         if (blas) cublasDestroy(blas);
         if (s) cudaStreamDestroy(s);
     }
 
     static size_t align(size_t x) { return (x + 255) / 256 * 256; }
 
+    void setup_doorbells()
+    {
+        const int K = c.n_expert_used, R = cpu::MAX_ROWS;
+        bells.resize(n_store);
+        auto mapped = [](void ** p, size_t bytes) {
+            TRUSS_CUDA(cudaHostAlloc(p, bytes, cudaHostAllocMapped));
+            std::memset(*p, 0, bytes);
+        };
+        for (Bell & b : bells) {
+            mapped((void **) &b.ids, sizeof(int) * R * K);
+            mapped((void **) &b.pred, sizeof(int) * R * K);
+            mapped((void **) &b.mids, sizeof(int) * R * K);
+            mapped((void **) &b.w, sizeof(float) * R * K);
+            mapped((void **) &b.x, sizeof(float) * R * c.d_model);
+            mapped((void **) &b.y, sizeof(float) * R * c.d_model);
+            mapped((void **) &b.doorbell, sizeof(int));
+            mapped((void **) &b.cpu_done, sizeof(int));
+            b.go = alloc<int>(1);
+            b.d_mids = alloc<int>((size_t) R * K);
+        }
+        driver = std::thread([this] { drive(); });
+    }
+
+    // The driver: for each queued decode FFN, wait for its doorbell, split the routed experts (CPU tier / GPU),
+    // start the CPU work, issue the expert copies and the go word, then publish the CPU result.
+    void drive()
+    {
+        for (;;) {
+            Job j;
+            {
+                std::unique_lock<std::mutex> g(dq_mu);
+                dq_cv.wait(g, [&] { return driver_stop || !jobs.empty(); });
+                if (driver_stop && jobs.empty()) return;
+                j = jobs.front();
+                jobs.pop_front();
+            }
+            Bell & b = bells[j.layer];
+            while (*(volatile int *) b.doorbell < j.seq) _mm_pause();
+            std::atomic_thread_fence(std::memory_order_acquire);
+            try {
+                serve(j, b);
+            } catch (...) {   // keep the GPU moving (its output is garbage now); the caller rethrows at its next sync
+                if (!driver_error) driver_error = std::current_exception();
+                experts->signal(j.layer, b.go, j.seq);
+                std::atomic_thread_fence(std::memory_order_release);
+                *(volatile int *) b.cpu_done = j.seq;
+            }
+        }
+    }
+
+    void serve(const Job & j, Bell & b)
+    {
+        const int K = c.n_expert_used, l = j.layer, n = j.T * K;
+        CpuTier * ct = j.cpu ? cpu_tier.get() : nullptr;
+        std::vector<cpu::Slot> slots;
+        std::vector<int> gpu_ids;
+        gpu_ids.reserve(n);
+        for (int i = 0; i < n; ++i) {
+            const int e = b.ids[i];
+            const bool on_cpu = ct && ct->is_cpu[l][e];
+            b.mids[i] = on_cpu ? -1 : e;
+            if (on_cpu) slots.push_back({ i / K, &ct->view[l][e], b.w[i] });
+            else gpu_ids.push_back(e);
+        }
+        if (ct) ct->pool->start(b.x, j.T, slots, b.y);   // CPU first: it runs while the copies are issued
+        experts->fetch(l, gpu_ids.data(), (int) gpu_ids.size(), nullptr);
+        if (ct) experts->upload(b.d_mids, b.mids, sizeof(int) * n);
+        experts->signal(l, b.go, j.seq);   // go before the hints: this layer must not wait for the next one's copies
+        if (j.hint) {
+            std::vector<int> h;
+            const CpuTier * nt = l + 1 < c.n_layer ? cpu_tier.get() : nullptr;
+            for (int t = 0; t < j.T; ++t)
+                for (int i = 0; i < std::min(K, hint_k); ++i) {
+                    const int e = b.pred[t * K + i];
+                    if (!nt || !nt->is_cpu[l + 1][e]) h.push_back(e);
+                }
+            experts->prefetch_hint(l, h.data(), (int) h.size());
+        }
+        if (ct) {
+            ct->pool->wait();
+            std::atomic_thread_fence(std::memory_order_release);
+            *(volatile int *) b.cpu_done = j.seq;
+        }
+    }
+
+    void check_driver()
+    {
+        if (driver_error) {
+            std::exception_ptr e = driver_error;
+            driver_error = nullptr;
+            std::rethrow_exception(e);
+        }
+    }
+
     // Per layer, the non-resident experts in ascending usage until they hold cpu_share of the layer's non-resident
-    // routing mass; their q4s copies are read from cpu_dir/L<nn>.q4s.
+    // routing mass; their q4s copies are read from cpu_dir/L<nn>.q4s. With cpu_dir/L<nn>.ids (int32 expert ids in
+    // file order) the file holds only those experts (an NVMe subset of the full archive, flashnext_truss_cpu_subset.py)
+    // and the CPU set is chosen among them.
     void load_cpu_tier(const Options & o, const runtime::ExpertStore::HotSet & hot)
     {
         require(!o.expert_usage.empty(), "the CPU tier needs expert_usage (it picks the rarest experts)");
@@ -259,12 +437,28 @@ struct Forward::Impl {
         require(c.d_model == cpu::D_MODEL && c.d_ff_exp == cpu::D_FF, "CPU tier shape");
         t->is_cpu.assign(c.n_layer, std::vector<uint8_t>(E, 0));
         t->data.resize(c.n_layer);
+        t->fscales.resize(c.n_layer);
         t->view.resize(c.n_layer);
         for (int l = 0; l < c.n_layer; ++l) {
+            const std::string base = o.cpu_dir + "/L" + (l < 10 ? "0" : "") + std::to_string(l);
+            std::vector<int64_t> slot_of(E, -1);   // expert -> position in the q4s file
+            if (FILE * fi = std::fopen((base + ".ids").c_str(), "rb")) {
+                int32_t e;
+                for (int64_t k = 0; std::fread(&e, 4, 1, fi) == 1; ++k) {
+                    require(e >= 0 && e < E, base + ".ids: expert id out of range");
+                    slot_of[e] = k;
+                }
+                std::fclose(fi);
+            } else {
+                for (int e = 0; e < E; ++e) slot_of[e] = e;
+            }
             std::vector<int> cold;
             double mass = 0;
             for (int e = 0; e < E; ++e)
-                if (!hot[l][e]) cold.push_back(e), mass += o.expert_usage[(size_t) l * E + e];
+                if (!hot[l][e]) {
+                    mass += o.expert_usage[(size_t) l * E + e];
+                    if (slot_of[e] >= 0) cold.push_back(e);
+                }
             std::stable_sort(cold.begin(), cold.end(), [&](int a, int b) {
                 return o.expert_usage[(size_t) l * E + a] < o.expert_usage[(size_t) l * E + b];
             });
@@ -277,17 +471,19 @@ struct Forward::Impl {
                 pick.push_back(e);
             }
             std::sort(pick.begin(), pick.end());
-            const std::string path = o.cpu_dir + "/L" + (l < 10 ? "0" : "") + std::to_string(l) + ".q4s";
+            const std::string path = base + ".q4s";
             FILE * f = std::fopen(path.c_str(), "rb");
             require(f != nullptr, "cannot open " + path);
             t->data[l].resize(pick.size() * cpu::EXPERT_BYTES);
+            t->fscales[l].resize(pick.size() * cpu::SCALES_PER_EXPERT);
             t->view[l].resize(E);
             for (size_t i = 0; i < pick.size(); ++i) {
                 uint8_t * dst = t->data[l].data() + i * cpu::EXPERT_BYTES;
-                const bool ok = std::fseek(f, (long) ((size_t) pick[i] * cpu::EXPERT_BYTES), SEEK_SET) == 0 &&
+                const bool ok = std::fseek(f, (long) ((size_t) slot_of[pick[i]] * cpu::EXPERT_BYTES), SEEK_SET) == 0 &&
                                 std::fread(dst, 1, cpu::EXPERT_BYTES, f) == cpu::EXPERT_BYTES;
                 require(ok, "short read of expert " + std::to_string(pick[i]) + " from " + path);
                 t->view[l][pick[i]] = cpu::expert_view(dst);
+                cpu::preconvert_scales(t->view[l][pick[i]], t->fscales[l].data() + i * cpu::SCALES_PER_EXPERT);
                 t->is_cpu[l][pick[i]] = 1;
             }
             std::fclose(f);
@@ -622,6 +818,9 @@ struct Forward::Impl {
     void ffn(int l, const Moe & mo, const float * in, const half * in16, int T, float * out, bool stream)
     {
         const size_t m = sc->mark();
+        // only a run_chunk() layer brackets all five sections; the MTP block's FFN (draft steps, commits) does not
+        const bool sect = sect_on && l < c.n_layer;
+        if (sect) sect_record(l, 3);   // router + routed MoE (its copies and the CPU tier's start are inside)
         const int E = c.n_expert, K = c.n_expert_used, F = c.d_ff_shexp, dm = c.d_model;
         float * logits = sc->alloc((size_t) T * E), * wts = sc->alloc((size_t) T * K);
         int * ids = sc->alloc<int>((size_t) T * K);
@@ -631,7 +830,28 @@ struct Forward::Impl {
         lin32(mo.router, in, T, logits);
         ffn::route(logits, T, E, K, ids, wts, s);
         if (route_counts) ffn::count(ids, T * K, route_counts + (size_t) l * E, s);
-        if (!stream) {   // fetch the few cold experts this chunk routes to
+        if (!stream && use_doorbell && T <= cpu::MAX_ROWS) {   // no host sync: the driver thread serves this FFN
+            const bool hint = hint_k > 0 && l + 1 < c.n_layer;
+            int * pred = nullptr;
+            if (hint) {
+                float * pl = sc->alloc((size_t) T * E), * pw = sc->alloc((size_t) T * K);
+                pred = sc->alloc<int>((size_t) T * K);
+                lin32(w.layers[l + 1].moe.router, in, T, pl);
+                ffn::route(pl, T, E, K, pred, pw, s);
+            }
+            const bool cpu_on = cpu_tier && l < c.n_layer;
+            Bell & b = bells[l];
+            const int seq = ++b.seq;
+            runtime::publish(ids, pred, wts, T * K, in, T * dm, b.ids, b.pred, b.w, b.x, b.doorbell, seq, s);
+            {
+                std::lock_guard<std::mutex> g(dq_mu);
+                jobs.push_back({ l, T, seq, hint, cpu_on });
+            }
+            dq_cv.notify_one();
+            runtime::spin_until(b.go, seq, s);   // the layer's copies (and masked ids) are in
+            moe::window<MoeShape>(experts->weights(l), in, cpu_on ? b.d_mids : ids, wts, T, routed, window_ws, s);
+            if (cpu_on) cpu_rows = -T;            // the CPU rows join after the shared expert (mapped)
+        } else if (!stream) {   // fetch the few cold experts this chunk routes to
             // pre-gating: the next layer's router on this layer's input predicts 72% of its experts (TRACKER #58);
             // their copies start behind this layer's, one sync for both id sets
             const bool hint = hint_k > 0 && l + 1 < c.n_layer;
@@ -695,12 +915,19 @@ struct Forward::Impl {
             experts->release(l, s);
             if (l + 2 < n_store) experts->prefetch(l + 2);   // the MTP block streams after the last layer
         }
+        if (sect) sect_record(l, 4);   // shared expert + the CPU tier's join (its spin lands in this section)
         const Act ia = quant(in16, T, c.d_model);
         lin(mo.shexp_gate, ia, T, g);
         lin(mo.shexp_up, ia, T, u);
         ffn::swiglu(g, u, T * F, mid16, s);
         lin(mo.shexp_down, mid16, T, y);
         lin32(mo.shexp_gate_inp, in, T, sg);
+        if (sect) sect_record(l, 5);   // section 5: the CPU tier's join (its spin is the section)
+        if (cpu_rows < 0) {   // doorbell path: wait for the CPU tier's rows (mapped) and add them
+            runtime::spin_until(bells[l].cpu_done, bells[l].seq, s);
+            runtime::add_mapped(routed, bells[l].y, -cpu_rows * dm, s);
+            cpu_rows = 0;
+        }
         if (cpu_rows) {   // the CPU experts' sum joins the routed output
             CpuTier & ct = *cpu_tier;
             float * yc = sc->alloc((size_t) cpu_rows * dm);
@@ -720,24 +947,23 @@ struct Forward::Impl {
     void head(int first, int n, float * logits)
     {
         require(first >= 0 && n > 0 && first + n <= last_T, "head rows outside the last chunk");
+        check_driver();
         sc->reset();   // run()'s temporaries are dead; the residual is not in the scratch
         head_rows(res + (size_t) first * c.hc_dim(), n, logits);
     }
 
     // logits [n][vocab] of residual rows [n][hc][d]: the head hc mix, then the output projection
-    void head_rows(const float * rows, int n, float * logits, int vocab = 0)
+    void head_rows(const float * rows, int n, float * logits, bool draft = false)
     {
         const size_t m = sc->mark();
         float * mixed = sc->alloc((size_t) n * c.d_model);
         half * mixed16 = sc->alloc<half>((size_t) n * c.d_model);
         hc_mix(w.hc_head, rows, n, mixed, mixed16, nullptr);
         if (act == Activations::Q8_1) {   // q8_gemv / q8_gemm write the whole vocab (decode: 0.9 ms vs 4 ms, #56)
-            if (vocab > 0) {               // the first `vocab` rows of the output matrix only
-                const dense::Q8Matrix & O = q8.at(w.output);
-                const dense::Q8Matrix sub{ O.q, O.d, O.in, vocab };
-                const Act a = quant(mixed16, n, O.in);
-                if (n <= dense::GEMV_ROWS) dense::q8_gemv(sub, a.q, a.d, n, logits, s);
-                else dense::q8_gemm(sub, a.q, a.d, n, logits, s);
+            if (draft && draft_head.q) {   // the draft vocabulary's rows only
+                const Act a = quant(mixed16, n, draft_head.in);
+                if (n <= dense::GEMV_ROWS) dense::q8_gemv(draft_head, a.q, a.d, n, logits, s);
+                else dense::q8_gemm(draft_head, a.q, a.d, n, logits, s);
                 sc->release(m);
                 return;
             }
@@ -780,9 +1006,11 @@ struct Forward::Impl {
         require(T > 0 && T <= max_chunk, "chunk of " + std::to_string(T) + " tokens (max " + std::to_string(max_chunk) + ")");
         require(pos0 + T <= n_ctx, "sequence longer than n_ctx");
         require(!vw.open, "run()/verify() before accept() of the previous verify()");
+        check_driver();
         const bool stream = !fetch_mode(T);
         if (!stream) {
             use(small);
+            experts->begin_ring();
         } else {   // the ring becomes the stream slots and this chunk's buffers
             experts->begin_stream(s);
             use(big);
@@ -802,19 +1030,24 @@ struct Forward::Impl {
             float * mixed = sc->alloc((size_t) T * c.d_model), * out = sc->alloc((size_t) T * c.d_model);
             float * inject = sc->alloc((size_t) T * c.hc);
             half * mixed16 = sc->alloc<half>((size_t) T * c.d_model);
+            sect_record(l, 0);
             if (c.is_ple(l)) ple(L.ple, st[l], tokens, T, tentative);
             hc_mix(L.hc_attn, res, T, mixed, mixed16, inject);
+            sect_record(l, 1);
             if (L.mixer == Mixer::GDN) gdn(L.gdn, st[l], mixed16, T, out, tentative);
             else dsa(L.dsa, st[l], mixed16, pos0, T, out, tentative);
+            sect_record(l, 2);
             hc::combine(res, out, inject, T, c.hc, c.d_model, s);
             hc_mix(L.hc_ffn, res, T, mixed, mixed16, inject);
-            ffn(l, L.moe, mixed, mixed16, T, out, stream);
+            ffn(l, L.moe, mixed, mixed16, T, out, stream);   // records 3 (routed MoE), 4 (shared), 5 (cpu join)
+            sect_record(l, 6);
             hc::combine(res, out, inject, T, c.hc, c.d_model, s);
             if (hook) {
                 TRUSS_CUDA(cudaStreamSynchronize(s));
                 hook(l, res, T);
             }
         }
+        sect_flush();
         last_T = T;
         if (tentative) {
             vw = { true, pos0, T, std::vector<int32_t>(tokens, tokens + T) };
@@ -870,11 +1103,53 @@ struct Forward::Impl {
         if (mtp) mtp_commit(vw.tokens.data(), vw.pos0, n, false);
     }
 
-    // ---- MTP block (Options::mtp)
+    // MTP calibration capture (TRUSS_MTP_CALIB=/path/file.f32): the MTP block's FFN input rows (fp32 [d_model],
+    // one per true-path row) appended for an offline Hessian (gate/up share this input; the down Hessian is derived
+    // from the BF16 gate/up weights). Only true-path commits (mtp_commit), never draft chains.
+    FILE * mtp_calib_f = nullptr;
+    float * calib_host = nullptr;   // pinned [max_chunk][d_model] staging
 
+    // Layer-chain section profile (TRUSS_PROFILE_SECTIONS=1). Five events reused for every layer: they complete in
+    // stream order, so elapsed(e[i-1], e[i]) is one section's device time including any host stall inside it.
+    // Sums accumulate per run()/verify(); section_ms() reads them back.
+    bool sect_on = false;
+    std::vector<std::array<cudaEvent_t, 7>> sect_ev;   // [layer][0..6]; one pair per section, all on stream s
+    mutable std::vector<uint8_t> sect_rec;             // layers recorded since the last flush
+    mutable double sect_ms[6] = { 0, 0, 0, 0, 0, 0 };
+    void sect_record(int layer, int i)
+    {
+        if (!sect_on) return;
+        TRUSS_CUDA(cudaEventRecord(sect_ev[layer][i], s));
+        sect_rec[layer] = 1;
+    }
+    // Read the events back after the whole chunk (one sync, no per-layer stall) and add the five sections. Only
+    // the layers that ran are read: draft()'s MTP steps record only some.
+    void sect_flush()
+    {
+        if (!sect_on) return;
+        for (int l = 0; l < n_store; ++l) {
+            if (!sect_rec[l]) continue;
+            TRUSS_CUDA(cudaEventSynchronize(sect_ev[l][6]));
+            for (int i = 1; i <= 6; ++i) {
+                float ms = 0.f;
+                TRUSS_CUDA(cudaEventElapsedTime(&ms, sect_ev[l][i - 1], sect_ev[l][i]));
+                sect_ms[i - 1] += ms;
+            }
+            sect_rec[l] = 0;
+        }
+    }
+    void mtp_calib_open(int max_rows)
+    {
+        if (const char * p = getenv("TRUSS_MTP_CALIB")) {
+            mtp_calib_f = std::fopen(p, "ab");
+            require(mtp_calib_f != nullptr, "cannot open TRUSS_MTP_CALIB file");
+            TRUSS_CUDA(cudaMallocHost(&calib_host, sizeof(float) * (size_t) max_rows * c.d_model));
+        }
+    }
     // The MTP block on T rows: hidden states h [T][hc][d] (device), next tokens d_ids [T] (device) at MTP positions
     // pos0 .. pos0 + T - 1; its residual in cur.mres; logits of the last row into mtp_logits when asked.
-    void mtp_rows(const float * h, const int * d_ids, int pos0, int T, bool stream, bool logits)
+    // calib: also append the FFN input rows to the TRUSS_MTP_CALIB capture (true-path commits only).
+    void mtp_rows(const float * h, const int * d_ids, int pos0, int T, bool stream, bool logits, bool calib = false)
     {
         const Layer & L = mtp->layer;
         const int hc = c.hc, dm = c.d_model;
@@ -894,10 +1169,15 @@ struct Forward::Impl {
         dsa(L.dsa, mst, mixed16, pos0, T, out, false);
         hc::combine(mres, out, inject, T, hc, dm, s);
         hc_mix(L.hc_ffn, mres, T, mixed, mixed16, inject);
+        if (calib && mtp_calib_f) {   // the routed experts' input rows, true path only
+            TRUSS_CUDA(cudaMemcpyAsync(calib_host, mixed, sizeof(float) * (size_t) T * dm, cudaMemcpyDeviceToHost, s));
+            TRUSS_CUDA(cudaStreamSynchronize(s));
+            require(std::fwrite(calib_host, sizeof(float) * dm, T, mtp_calib_f) == (size_t) T, "TRUSS_MTP_CALIB write");
+        }
         ffn(c.n_layer, L.moe, mixed, mixed16, T, out, stream);
         hc::combine(mres, out, inject, T, hc, dm, s);
         (void) base;
-        if (logits) head_rows(mres + (size_t) (T - 1) * c.hc_dim(), 1, mtp_logits, draft_vocab);
+        if (logits) head_rows(mres + (size_t) (T - 1) * c.hc_dim(), 1, mtp_logits, true);
         sc->release(m);
     }
 
@@ -916,7 +1196,7 @@ struct Forward::Impl {
             const size_t m = sc->mark();
             int * d_ids = sc->alloc<int>(n);
             TRUSS_CUDA(cudaMemcpyAsync(d_ids, tokens + skip, sizeof(int32_t) * n, cudaMemcpyHostToDevice, s));
-            mtp_rows(mh, d_ids, pos0 + skip, n, stream, false);
+            mtp_rows(mh, d_ids, pos0 + skip, n, stream, false, true);
             TRUSS_CUDA(cudaStreamSynchronize(s));   // tokens may be a host temporary
             sc->release(m);
         }
@@ -927,27 +1207,37 @@ struct Forward::Impl {
     // n greedy drafts after `next` (the token at position pos): a chain of single-row MTP steps, each from the
     // previous step's residual and argmax. The chain's cache rows and indexer block are tentative: the snapshot is
     // restored at the end, and mtp_commit rewrites those positions from the target's states.
-    void draft(int32_t next, int pos, int n, int32_t * out)
+    int draft(int32_t next, int pos, int n, int32_t * out)
     {
         require(mtp && has_pending, "draft() needs an MTP block and a committed position");
         require(n >= 1 && n <= moe::MAX_ROWS, "draft count");
         require(!vw.open, "draft() before accept()");
         use(small);
+        experts->begin_ring();
         sc->reset();
         const size_t row = c.hc_dim();
         copy(mtp_partial_snap, mst.idx_partial, (size_t) (DsaShape::RATIO - 1) * c.idx_head_dim);
         draft_host[0] = next;
         TRUSS_CUDA(cudaMemcpyAsync(draft_ids, draft_host, sizeof(int32_t), cudaMemcpyHostToDevice, s));
         copy(cur.mh, pending_h, row);
+        const int nv = draft_head.q ? draft_head.out : c.n_vocab;
+        int made = 0;
         for (int i = 0; i < n; ++i) {
             mtp_rows(cur.mh, draft_ids + i, pos + i, 1, false, true);
-            sampling::argmax(mtp_logits, draft_vocab ? draft_vocab : c.n_vocab, draft_ids + i + 1, s);
+            sampling::argmax_prob(mtp_logits, nv, draft_map, draft_ids + i + 1, draft_prob + i, s);
+            if (draft_min_p > 0.f) {   // an unsure guess does not enter the window, and ends the chain
+                TRUSS_CUDA(cudaMemcpyAsync(draft_prob_host + i, draft_prob + i, sizeof(float), cudaMemcpyDeviceToHost, s));
+                TRUSS_CUDA(cudaStreamSynchronize(s));
+                if (draft_prob_host[i] < draft_min_p) break;
+            }
+            ++made;
             if (i + 1 < n) copy(cur.mh, cur.mres, row);
         }
         copy(mst.idx_partial, mtp_partial_snap, (size_t) (DsaShape::RATIO - 1) * c.idx_head_dim);
-        TRUSS_CUDA(cudaMemcpyAsync(draft_host, draft_ids + 1, sizeof(int32_t) * n, cudaMemcpyDeviceToHost, s));
+        if (made) TRUSS_CUDA(cudaMemcpyAsync(draft_host, draft_ids + 1, sizeof(int32_t) * made, cudaMemcpyDeviceToHost, s));
         TRUSS_CUDA(cudaStreamSynchronize(s));
-        std::copy(draft_host, draft_host + n, out);
+        std::copy(draft_host, draft_host + made, out);
+        return made;
     }
 };
 
@@ -963,6 +1253,54 @@ cudaStream_t Forward::stream() const { return m_->s; }
 int Forward::hot_experts() const { return m_->n_hot; }
 
 size_t Forward::cold_bytes() const { return m_->experts->cold_bytes(); }
+
+std::pair<long long, long> Forward::cpu_stats(bool reset)
+{
+    if (!m_->cpu_tier || !m_->cpu_tier->pool) return { 0, 0 };
+    auto * p = m_->cpu_tier->pool.get();
+    const auto out = std::make_pair(p->wait_us(), p->waits());
+    if (reset) p->reset_stats();
+    return out;
+}
+
+long long Forward::cpu_item_us() const
+{
+    if (!m_->cpu_tier || !m_->cpu_tier->pool) return 0;
+    return m_->cpu_tier->pool.get()->item_us();
+}
+
+void Forward::section_ms(double out[6], bool reset) const
+{
+    for (int i = 0; i < 6; ++i) out[i] = m_->sect_ms[i];
+    if (reset) for (int i = 0; i < 6; ++i) m_->sect_ms[i] = 0;
+}
+
+void Forward::cpu_shape(long long out[4]) const
+{
+    if (!m_->cpu_tier || !m_->cpu_tier->pool) {
+        out[0] = out[1] = out[2] = out[3] = 0;
+        return;
+    }
+    m_->cpu_tier->pool.get()->shape(out);
+}
+
+void Forward::cpu_shape_reset()
+{
+    if (m_->cpu_tier && m_->cpu_tier->pool) m_->cpu_tier->pool.get()->reset_stats();
+}
+
+void Forward::cpu_phase_us(long long out[4]) const
+{
+    if (!m_->cpu_tier || !m_->cpu_tier->pool) {
+        out[0] = out[1] = out[2] = out[3] = 0;
+        return;
+    }
+    auto * p = m_->cpu_tier->pool.get();
+    out[0] = p->gate_us();
+    out[1] = p->silu_us();
+    out[2] = p->hq_us();
+    out[3] = p->down_us();
+}
 
 const runtime::ExpertStore & Forward::experts() const { return *m_->experts; }
 
@@ -1017,6 +1355,6 @@ void Forward::accept(int n)
     pos_ += n;
 }
 
-void Forward::draft(int32_t next, int n, int32_t * out) { m_->draft(next, pos_, n, out); }
+int Forward::draft(int32_t next, int n, int32_t * out) { return m_->draft(next, pos_, n, out); }
 
 }  // namespace truss::qwen4exp

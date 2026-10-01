@@ -91,22 +91,44 @@ cpu_q4,cpu_subset}.py`. Card: `20260930_truss_tg/README.md` (update it with #60/
 
 ## 6. Next steps (ranked by expected gain)
 
-1. **Grow the CPU tier to cover the mid-usage experts** (target: CPU takes most misses, PCIe the rest, both overlapped).
-   Storage options for the user: (a) allow ~46 GB more on NVMe (below the 50 GB-free rule), (b) load the full q4s
-   archive from HDD into RAM at server start (~5 min once), (c) derive the CPU copies of mid-usage experts from the
-   trellis pack at load on the GPU (no disk, but +~12% error on those experts vs BF16-q4s). **Measured at share 0.7
-   (full archive): PCIe drops to 50 MB/pass but spec falls to 35.6 tok/s — the CPU expert kernel is too slow, so do
-   step 2 first**, then grow the CPU share while tok/s rises.
-2. **Optimize the CPU expert kernel to DRAM bandwidth (now the top priority)**: `cpu_expert_test` timing 4 rows × 8 experts 0.93 ms (8
-   threads); probe 16 threads 52 GB/s. Targets: pin threads, spin briefly before sleeping (wake latency per layer),
-   prefetch rows, larger row chunks for 4-row windows; report % of measured DRAM peak.
-3. **CUDA graph of the decode pass** on top of the doorbell path (positions from device memory), removing ~2,400
-   launches per pass (GPU compute is ~21 ms/pass; launch gaps included).
-4. **Adaptive expert cache** (Strata: swap up to 96 experts every 4 rounds during drafting).
-5. **Prompt-lookup drafts** for code edits (Strata: +6–11%).
-6. Better MTP acceptance: calibrate the MTP experts' Hessian from engine captures (identity Hessian now).
-7. Then prefill (3,000 target): the dense Q8 GEMM runs ~70 TOPS vs cuBLAS int8 ~200; prefill regressed to 1,180
-   tok/s in one measurement taken while the converter held GPU memory — re-measure clean before trusting it.
+> **Updated 10-01 (TRACKER #62-#65): steps 1 and 2 are resolved, and the CPU expert kernel is no longer the lever.**
+> A new per-section profile (`TRUSS_PROFILE_SECTIONS=1`, `Forward::section_ms`) puts a verify pass at 75.5 ms:
+> **cpu join 32.2 + routed MoE 28.3 + mixer 7.4 + hc_mix 5.5 + shared 2.3**. Two hard facts decide the rest:
+> (a) the CPU tier is **DRAM-bound** — it reads q4s at 46.6 GB/s on 16 threads, 84% of this box's roofline, so
+> making its kernel cheaper is measurably neutral and more threads make it worse (#62, #64);
+> (b) the pool is **started when a layer's FFN input is published and joined at the end of that same layer's FFN**,
+> so the GPU idles ~0.4 ms every one of the 48 layers (#63). The join, not the kernel, is the cost.
+> Reachability *(est.)*: the tier can serve ~15 experts/ms and PCIe ~7.7, so the per-pass fetch/compute floor is
+> ~17 ms and with the ~15 ms of non-MoE GPU work the pass cannot go below ~32 ms = **~83 tok/s at 2.67 tok/pass**.
+> **100 tok/s needs both tok/pass >= 3.1 and that floor**, which makes the MTP acceptance work below the only
+> remaining lever on this box.
+
+1. **MTP draft experts with real Hessians** (was step 6; now first): identity-Hessian K3 gives weight NMSE 0.017.
+   Capture now works — `TRUSS_MTP_CALIB=file.f32` appends the MTP block's FFN input rows from true-path commits
+   (326 MB / 127k rows from four prompts), and `flashnext_truss_mtp_encode_calib.py` encodes gate/up off a shared
+   `X^T X` and down off per-expert `A^T A`. **BLOCKED**: `~/src/exllamav3`'s `exllamav3_ext.so` was built against
+   torch 2.2.5 and this box has 2.8.0 (undefined `c10::cuda::CUDAErrorLogCapture`). Rebuild the extension (or find
+   the venv the 09-30 encode used) before anything else here.
+2. **Overlap the CPU tier across layers** (new, replaces the CPU-kernel work): start layer l+1's pool from layer
+   l's *predicted* routing and verify at the join, or move the shared expert ahead of the routed MoE so more GPU
+   work sits between pool start and join. Both must keep verify == run(T) bit-for-bit.
+3. **Cut cold experts with VRAM, not with the CPU**: 384 cold routings per pass and 5,358 resident experts of
+   25,088; the ring (5.4 GB) and prefill stream slots compete with the static hot set for the same 24 GB.
+4. **CUDA graph of the decode pass** on top of the doorbell path, removing ~2,400 launches per pass.
+5. **Adaptive expert cache** (Strata: swap up to 96 experts every 4 rounds during drafting).
+6. **Prompt-lookup drafts** for code edits (Strata: +6-11%).
+7. Then prefill (3,000 target): the dense Q8 GEMM runs ~70 TOPS vs cuBLAS int8 ~200; re-measure clean before
+   trusting the 1,180 tok/s reading.
+
+## 6b. What was tried and did not work (10-01)
+
+- Draft count 2/3/4/5, min-p 0.3/0.5, CPU threads 8/12/16/20/24, CPU share 0.5/0.7/0.8: all flat or worse.
+- CPU-tier worker pinning (~40% loss, traps on busy cores) and spin-then-sleep wake (~2x regression under load).
+- `cpu_sparse_max`, letting the GPU skip layers with few CPU slots: breaks verify == run invariance (spec FAIL
+  49/128) because the CPU/GPU split becomes window-size dependent. The split must stay a static function of
+  (layer, expert).
+- Preconverting fp32 weight scales and quantizing `h` once per group instead of per down-chunk item: strictly less
+  work, bit-identical, and measurably **neutral** — which is what proved the tier is DRAM-bound.
 
 ## 7. How to run
 

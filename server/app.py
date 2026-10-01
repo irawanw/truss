@@ -28,7 +28,9 @@ class Engine:
     """The model plus the sequence in it; generate() is the only way in and holds the lock."""
 
     def __init__(self, a):
-        self.model = Model(a.model, a.n_ctx, a.chunk, a.expert_usage)
+        self.model = Model(a.model, a.n_ctx, a.chunk, a.expert_usage, mtp=a.mtp, drafts=a.drafts, cpu_dir=a.cpu_dir,
+                           cpu_share=a.cpu_share, cpu_threads=a.cpu_threads, draft_vocab=a.draft_vocab,
+                           draft_min_p=a.draft_min_p)
         self.chat = Chat(a.tokenizer, self.model.meta_string("tokenizer.chat_template"))
         self.stop_ids = {i for i in (self.model.meta_int("tokenizer.ggml.eos_token_id"),
                                      self.chat.token_id("<|im_end|>"), self.chat.token_id("<|endoftext|>"))
@@ -71,22 +73,34 @@ class Engine:
                 raise
             t1 = time.time()
             detok, text, n_gen, finish = Detokenizer(self.chat), "", 0, "length"
+            spec = greedy and self.model.drafts > 0
+            drafted = accepted = 0
+            pending = []   # tokens the engine already holds that are still to be emitted (speculative rounds)
             try:
                 while n_gen < max_tokens:
+                    if spec and not pending:   # one round: nxt plus the accepted drafts enter the sequence
+                        if self.model.position + 1 >= self.model.n_ctx:
+                            break
+                        emitted, after = self.model.spec_step(nxt)
+                        self.cached += emitted
+                        drafted += self.model.drafts
+                        accepted += len(emitted) - 1
+                        pending, nxt = emitted, after
+                    tok = pending.pop(0) if spec else nxt
                     n_gen += 1
-                    if nxt in self.stop_ids:
+                    if tok in self.stop_ids:
                         finish = "stop"
                         break
-                    delta = detok.push(nxt)
+                    delta = detok.push(tok)
                     text += delta
                     hit = next((s for s in stop_strings if s and s in text), None)
                     if hit:
                         cut = text.index(hit)
-                        yield nxt, delta[:max(0, len(delta) - (len(text) - cut))], None
+                        yield tok, delta[:max(0, len(delta) - (len(text) - cut))], None
                         finish = "stop"
                         break
-                    yield nxt, delta, None
-                    if n_gen < max_tokens and self.model.position < self.model.n_ctx:
+                    yield tok, delta, None
+                    if not spec and n_gen < max_tokens and self.model.position < self.model.n_ctx:
                         nxt = step([nxt])
             except TrussError:
                 self.cached = []
@@ -96,7 +110,7 @@ class Engine:
                 read, gen_s = t1 - t0, t2 - t1
                 self.log(f"{self.log_tag}: prompt {n_prompt} tokens = {reuse} reused + {n_prompt - reuse} read in "
                          f"{read * 1e3:.0f} ms ({(n_prompt - reuse) / max(read, 1e-9):.1f} tok/s), {n_gen} generated "
-                         f"in {gen_s * 1e3:.0f} ms ({n_gen / max(gen_s, 1e-9):.1f} tok/s), drafts accepted 0 of 0")
+                         f"in {gen_s * 1e3:.0f} ms ({n_gen / max(gen_s, 1e-9):.1f} tok/s), drafts accepted {accepted} of {drafted}")
             yield None, "", finish
 
 
@@ -237,6 +251,13 @@ def main():
     ap.add_argument("--chunk", type=int, default=8192, help="prompt tokens per GPU pass")
     ap.add_argument("--expert-usage", default=None, help="routed counts per expert (float32 [layer][expert]); "
                     "keeps the most-used experts in VRAM (decode speed)")
+    ap.add_argument("--mtp", default=None, help="MTP draft block GGUF: greedy requests decode speculatively")
+    ap.add_argument("--drafts", type=int, default=3, help="MTP drafts per round")
+    ap.add_argument("--draft-vocab", default=None, help="int32 token ids the draft head scores (data/draft_vocab_en.bin)")
+    ap.add_argument("--draft-min-p", type=float, default=0.5, help="drafting stops below this MTP probability")
+    ap.add_argument("--cpu-dir", default=None, help="CPU expert tier (q4s files); needs --expert-usage")
+    ap.add_argument("--cpu-share", type=float, default=0.5)
+    ap.add_argument("--cpu-threads", type=int, default=12)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--name", default="flash-next-truss")
