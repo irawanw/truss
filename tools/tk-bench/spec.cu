@@ -104,6 +104,7 @@ int main(int argc, char ** argv)
         if (const char * e = std::getenv("TRUSS_CPU_DYNAMIC")) o.cpu_dynamic = std::atoi(e) != 0;   // Strata split
         if (const char * e = std::getenv("TRUSS_CPU_TRELLIS")) o.cpu_trellis = std::atoi(e) != 0;   // CPU from the pack
         if (const char * e = std::getenv("TRUSS_PCIE_GBPS")) o.pcie_gbps = (float) std::atof(e);
+        if (const char * e = std::getenv("TRUSS_PCIE_FRAC")) o.pcie_frac = (float) std::atof(e);   // fixed share
         if (const char * e = std::getenv("TRUSS_RING_GB")) o.ring_bytes_override = (size_t) std::atof(e) * (1ull << 30);
         if (const char * e = std::getenv("TRUSS_HINT_K")) o.hint_k = std::atoi(e);   // pre-gated prefetch width
         if (argc > 6 && std::string(argv[6]) != "-")

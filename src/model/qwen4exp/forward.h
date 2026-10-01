@@ -60,6 +60,10 @@ struct ForwardOptions {
     // cpu_dir (ignored when cpu_dir is set).
     bool cpu_trellis = false;
     float pcie_gbps = 13.5f;                  // host -> device copy rate the dynamic split assumes (PCIe 4.0 x8)
+    // cpu_dynamic with a fixed share, as Strata's --pcie-frac (TRACKER #76): per layer round(pcie_frac * eligible
+    // misses) go over PCIe (the last ones in routing order), the rest to the CPU. < 0: the fitted cost model instead,
+    // which can starve the CPU when its fitted per-call cost drifts up (few experts per call make calls look fixed-cost)
+    float pcie_frac = -1.f;
     std::vector<int32_t> draft_vocab;         // MTP drafts score only these token ids (empty: all), e.g.
                                               // data/draft_vocab_en.bin: the draft head reads 16% of the output
                                               // matrix; verify keeps the output exact

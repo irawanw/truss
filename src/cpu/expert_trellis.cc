@@ -20,6 +20,13 @@ constexpr int ORDER[8] = { 0, 1, 4, 5, 2, 3, 6, 7 };
 inline float k_inv() { return _cvtsh_ss(0x1eee); }
 inline float k_bias() { return _cvtsh_ss(0xc931); }
 
+// TRUSS_TRELLIS_ROUND=1: decoded weights rounded to fp16 like the GPU (gemv_tiles4 / gemv_tiles only)
+bool round_weights()
+{
+    static const bool v = getenv("TRUSS_TRELLIS_ROUND") && atoi(getenv("TRUSS_TRELLIS_ROUND"));
+    return v;
+}
+
 inline float round16(float x) { return _cvtsh_ss(_cvtss_sh(x, _MM_FROUND_TO_NEAREST_INT)); }
 
 // fp32 -> nearest-even fp16 precision (10 mantissa bits) on the bits: 3 integer ops instead of cvtps_ph + cvtph_ps
@@ -204,6 +211,168 @@ void gemv_tiles4(const TrellisMat & W, const float * P2, int nt0, int nt1, float
     }
 }
 
+// The int16 kernel (K <= 4, default; TRUSS_TRELLIS_I16=0 selects gemv_tiles4). Zen 2 measured per vector op
+// (TRACKER #76): vpmulld 2.3 cycles, every other integer multiply (vpmullw, vpmulhuw, vpmaddubsw, vpmaddwd) and
+// every shift 1 cycle on a single pipe each, and/or/add/pshufb ~4 per cycle. gemv_tiles4 spends vpmulld +
+// vpmaddubsw + vpmaddwd = ~4.3 multiply-pipe cycles per 8 weights. Here, per 16 weights (two m of one octet):
+//   states: m's 32-bit window of gemv_tiles4 holds m + 1's state too (ms + K + 16 <= 32): shifted down (state m in
+//           the low half of each dword) and up (state m + 1 in the high half), vpblendw: 16 states in 16-bit lanes
+//   hash:   s * 0x83DCD12D mod 2^32 from 16-bit products, low half = mullo(s, 0xD12D), high half =
+//           mulhi(s, 0xD12D) + mullo(s, 0x83DC) (mod 2^16; exact because s < 2^16)
+//   sum:    bytes of lo by vpmaddubsw (x ones), bytes of hi by (hi & 0xff) + (hi >> 8): measured best balance of the
+//           multiply pipe against the ALUs (all-ALU byte sums 3.4, both by vpmaddubsw 3.25 cycles / 8 weights)
+//   dot:    one vpmaddwd of the 16 byte sums (0..1020) against int16 activations, int32 accumulators.
+// = 5 multiply-pipe ops, ~17 vector ops per 16 weights: 2.8 cycles / 8 weights vs gemv_tiles4's 4.8 (Zen 2, one
+// thread from cache, TRACKER #76); now bound by the total op count, not one pipe. The weight is kinv * (1024 + sum) + kbias, so
+// sum_i w_i a_i = kinv * sum_i bytesum_i a_i + (1024 kinv + kbias) * sum_i a_i: the codebook's affine part is one
+// per-row term. Activations: int16 with one scale per row (amax / 32767) from the fp32 Hadamard output, which is
+// finer than the GPU's fp16 activations (error |a|max / 65534 per element vs 2^-12 relative); weights are the exact
+// fp32 codebook values, as in gemv_tiles4. Overflow: per pair 2 * 1020 * 32767 = 6.7e7, 2 pairs per accumulator per
+// 16-input slice, flushed to fp32 every 8 slices (1.1e9 < 2^31).
+// Prepared row (trellis_prep, K <= 4 with i16): int16 [kt][v][16] with v = 0 for m in {0,1,4,5}, 1 for {2,3,6,7},
+// lane 2e + j -> a[16 kt + 2 (e % 4) + j + 8 v] (m and m + 4 read the same inputs), then float scale, float sum(a).
+bool use_i16()
+{
+    static const bool v = !getenv("TRUSS_TRELLIS_I16") || atoi(getenv("TRUSS_TRELLIS_I16"));
+    return v;
+}
+
+template <int K, int R>
+void gemv_i16(const TrellisMat & W, const float * P, int nt0, int nt1, float * c, int ldc, uint8_t * col)
+{
+    const int words = 8 * K, KT = W.in / 16, NT = W.out / 16, in = W.in, rs = trellis_prep_floats(in, 1);
+    const int stride = 32 * K + 32;
+    const __m256i bswap = _mm256_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12,
+                                           3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+    __m256i pick;
+    {
+        alignas(32) int8_t idx[32];
+        for (int h = 0; h < 2; ++h)
+            for (int i = 0; i < 4; ++i)
+                for (int b = 0; b < 4; ++b) idx[16 * h + 4 * i + b] = (int8_t) (K * i + 3 - b);
+        pick = _mm256_load_si256(reinterpret_cast<const __m256i *>(idx));
+    }
+    auto mb = [](int m) { return ((m + 1) * K + 16) >> 3; };
+    auto ms = [](int m) { return ((m + 1) * K + 16) & 7; };
+    const __m256i mlo = _mm256_set1_epi16((short) 0xD12D), mhi = _mm256_set1_epi16((short) 0x83DC);
+    const __m256i lo8 = _mm256_set1_epi16(0x00ff), ones8 = _mm256_set1_epi8(1);
+    const float kinv = k_inv(), cb = std::fma(1024.f, k_inv(), k_bias());
+    float scale[R], suma[R];
+    for (int r = 0; r < R; ++r) {
+        const float * tail = P + (size_t) r * rs + in;   // after the 2 * in int16
+        scale[r] = tail[0], suma[r] = tail[1];
+    }
+    // Loop order: blocks of KB slices outer, columns inner. Tiles are k-slice major, so the tiles of one slice for the
+    // call's columns are contiguous: each block reads KB contiguous runs instead of walking each column at a stride
+    // of NT tiles (3.8 KB for gate/up), which the hardware prefetcher follows poorly (one thread: 1.0 ms / expert
+    // from DRAM vs 0.55 from cache, TRACKER #76). fp32 accumulators per column stay in L1 between blocks.
+    constexpr int KB = 8;   // slices per block: also the int32 flush interval (overflow bound above)
+    const int ncol = nt1 - nt0;
+    alignas(32) float facc[512 / 16][4][2][R][8];   // [column][octet][m >= 4][row][lane]; trellis_gemv passes <= 512 columns
+    std::memset(facc, 0, sizeof(float) * 8 * R * 8 * ncol);
+    auto prefetch_block = [&](int k0) {
+        for (int kt = k0; kt < std::min(KT, k0 + KB); ++kt) {
+            const char * t = reinterpret_cast<const char *>(W.tiles + ((size_t) kt * NT + nt0) * words);
+            const int n = ncol * words * 4;
+            for (int b = 0; b < n; b += 64) _mm_prefetch(t + b, _MM_HINT_T0);
+        }
+    };
+    prefetch_block(0);
+    for (int k0 = 0; k0 < KT; k0 += KB) {
+        const int k1 = std::min(KT, k0 + KB);
+        if (k1 < KT) prefetch_block(k1);
+        for (int nt = nt0; nt < nt1; ++nt) {
+            for (int kt = k0; kt < k1; ++kt) {   // byte-swap the block's tiles of this column (as gemv_tiles4)
+                const uint32_t * t = W.tiles + ((size_t) kt * NT + nt) * words;
+                uint8_t * d = col + (size_t) (kt - k0) * stride;
+                const uint32_t last = __builtin_bswap32(t[words - 1]);
+                std::memcpy(d, &last, 4);
+                int w = 0;
+                for (; w + 8 <= words; w += 8)
+                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(d + 4 + 4 * w),
+                                        _mm256_shuffle_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(t + w)), bswap));
+                for (; w < words; ++w) {
+                    const uint32_t v = __builtin_bswap32(t[w]);
+                    std::memcpy(d + 4 + 4 * w, &v, 4);
+                }
+                // no padding written: bytes past the stream only reach window bits that the shifts discard
+            }
+            for (int o = 0; o < 4; ++o) {
+                __m256i iacc[2][R];
+                for (int r = 0; r < R; ++r) iacc[0][r] = iacc[1][r] = _mm256_setzero_si256();
+                for (int kt = k0; kt < k1; ++kt) {
+                    const uint8_t * d = col + (size_t) (kt - k0) * stride + 8 * K * o;
+                    const int16_t * q = reinterpret_cast<const int16_t *>(P) + (size_t) kt * 32;
+                    auto win = [&](auto mc) {
+                        constexpr int m = decltype(mc)::value;
+                        const uint8_t * b = d + mb(m);
+                        const __m256i raw = _mm256_loadu2_m128i(reinterpret_cast<const __m128i *>(b + 4 * K),
+                                                                reinterpret_cast<const __m128i *>(b));
+                        return _mm256_shuffle_epi8(raw, pick);
+                    };
+                    auto pair = [&](auto mc) {   // m, m + 1 (m even): both states lie in m's 32-bit window
+                        constexpr int m = decltype(mc)::value;
+                        const __m256i w = win(mc);
+                        const __m256i s = _mm256_blend_epi16(_mm256_srli_epi32(w, 16 - ms(m)), _mm256_slli_epi32(w, ms(m) + K), 0xAA);
+                        const __m256i lo = _mm256_mullo_epi16(s, mlo);
+                        const __m256i hi = _mm256_add_epi16(_mm256_mulhi_epu16(s, mlo), _mm256_mullo_epi16(s, mhi));
+                        // bytes of lo by vpmaddubsw, bytes of hi by and/shift: balances the multiply pipe and the ALUs
+                        const __m256i bs = _mm256_add_epi16(_mm256_maddubs_epi16(lo, ones8),
+                                                            _mm256_add_epi16(_mm256_and_si256(hi, lo8), _mm256_srli_epi16(hi, 8)));
+                        constexpr int v = (m >> 1) & 1, g = m >> 2;
+                        for (int r = 0; r < R; ++r) {
+                            const __m256i av = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q + (size_t) r * rs * 2 + v * 16));
+                            iacc[g][r] = _mm256_add_epi32(iacc[g][r], _mm256_madd_epi16(bs, av));
+                        }
+                    };
+                    pair(std::integral_constant<int, 0>{}), pair(std::integral_constant<int, 2>{});
+                    pair(std::integral_constant<int, 4>{}), pair(std::integral_constant<int, 6>{});
+                }
+                for (int r = 0; r < R; ++r)
+                    for (int g = 0; g < 2; ++g) {
+                        float * f = facc[nt - nt0][o][g][r];
+                        _mm256_store_ps(f, _mm256_add_ps(_mm256_load_ps(f), _mm256_cvtepi32_ps(iacc[g][r])));
+                    }
+            }
+        }
+    }
+    for (int nt = nt0; nt < nt1; ++nt)
+        for (int o = 0; o < 4; ++o)
+            for (int r = 0; r < R; ++r)
+                for (int g = 0; g < 2; ++g) {
+                    const float * f = facc[nt - nt0][o][g][r];
+                    float * cr = c + (size_t) r * ldc + (nt - nt0) * 16 + 8 * g;
+                    const float ks = kinv * scale[r], bias = cb * suma[r];
+                    cr[2 * o] = std::fma(ks, f[0] + f[1] + f[2] + f[3], bias);
+                    cr[2 * o + 1] = std::fma(ks, f[4] + f[5] + f[6] + f[7], bias);
+                }
+}
+
+template <int K>
+void dispatch_i16(const TrellisMat & W, const float * P, int R, int nt0, int nt1, float * c, uint8_t * col)
+{
+    const int rs = trellis_prep_floats(W.in, 1);
+    for (int r0 = 0; r0 < R; r0 += 4) {   // at most 4 rows per pass (registers)
+        const float * Pr = P + (size_t) r0 * rs;
+        float * cr = c + (size_t) r0 * 512;
+        switch (std::min(4, R - r0)) {
+        case 1: gemv_i16<K, 1>(W, Pr, nt0, nt1, cr, 512, col); break;
+        case 2: gemv_i16<K, 2>(W, Pr, nt0, nt1, cr, 512, col); break;
+        case 3: gemv_i16<K, 3>(W, Pr, nt0, nt1, cr, 512, col); break;
+        default: gemv_i16<K, 4>(W, Pr, nt0, nt1, cr, 512, col); break;
+        }
+    }
+}
+void dispatch_i16k(const TrellisMat & W, const float * P, int R, int nt0, int nt1, float * c, uint8_t * col)
+{
+    switch (W.K) {
+    case 1: dispatch_i16<1>(W, P, R, nt0, nt1, c, col); break;
+    case 2: dispatch_i16<2>(W, P, R, nt0, nt1, c, col); break;
+    case 3: dispatch_i16<3>(W, P, R, nt0, nt1, c, col); break;
+    default: dispatch_i16<4>(W, P, R, nt0, nt1, c, col); break;
+    }
+}
+
 template <int K, bool ROUND>
 void dispatch4r(const TrellisMat & W, const float * P, int R, int nt0, int nt1, float * c, uint8_t * col)
 {
@@ -286,6 +455,32 @@ void trellis_prep(const TrellisMat & W, const float * x, int ldx, int R, float *
             _mm256_store_ps(a + i, _mm256_mul_ps(_mm256_loadu_ps(xr + i),
                                                  _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(W.suh + i)))));
         for (int b = 0; b < in; b += 128) hadamard128(a + b);
+        if (W.K <= 4 && use_i16() && !round_weights()) {   // gemv_i16: int16 [kt][v][16], then scale, sum
+            // lanes 2e + j of block (kt, v) read a[16 kt + 8 v + (2 (e % 4) + j)]: the 8 inputs a[16 kt + 8 v ..] twice
+            const __m256 sign = _mm256_set1_ps(-0.f);
+            __m256 mx = _mm256_setzero_ps();
+            for (int i = 0; i < in; i += 8) mx = _mm256_max_ps(mx, _mm256_andnot_ps(sign, _mm256_load_ps(a + i)));
+            alignas(32) float m8[8];
+            _mm256_store_ps(m8, mx);
+            const float amax = *std::max_element(m8, m8 + 8);
+            const float s = amax / 32767.f, inv = amax > 0 ? 32767.f / amax : 0.f;
+            float * pr = P + (size_t) r * in * 4;
+            int16_t * q = reinterpret_cast<int16_t *>(pr);
+            const __m256 vi = _mm256_set1_ps(inv);
+            __m256i acc = _mm256_setzero_si256();
+            for (int i = 0; i < in; i += 8) {   // block (kt, v) = i / 8; cvtps rounds to nearest even, as lrint
+                const __m256i x = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_load_ps(a + i), vi));
+                acc = _mm256_add_epi32(acc, x);
+                const __m128i h = _mm_packs_epi32(_mm256_castsi256_si128(x), _mm256_extracti128_si256(x, 1));
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(q + 2 * i), _mm256_set_m128i(h, h));
+            }
+            alignas(32) int32_t s8[8];
+            _mm256_store_si256(reinterpret_cast<__m256i *>(s8), acc);
+            long long sum = 0;
+            for (int k = 0; k < 8; ++k) sum += s8[k];
+            pr[in] = s, pr[in + 1] = (float) ((double) sum * s);
+            continue;
+        }
         for (int i = 0; i < in; ++i) a[i] = round16(a[i]);   // the GPU feeds fp16 activations to its MMA
         if (W.K <= 4) {   // gemv_tiles4: [kt][m][lane of the octet]
             float * pr = P + (size_t) r * in * 4;
@@ -315,11 +510,12 @@ void trellis_gemv(const TrellisMat & W, const float * P, int R, int c0, int c1, 
     // The GPU rounds each decoded weight to fp16 (hfma2). Rounding here costs ~40% of the loop (Zen 2's vector
     // integer pipes are the limit) and changes a weight by at most half an fp16 ulp (~5e-4 relative), far below the
     // codebook's own quantization error, so it is off unless TRUSS_TRELLIS_ROUND=1.
-    static const bool round = getenv("TRUSS_TRELLIS_ROUND") && atoi(getenv("TRUSS_TRELLIS_ROUND"));
+    const bool round = round_weights();
     // at most 512 columns per pass of the buffer
     for (int b0 = c0; b0 < c1; b0 += 512) {
         const int b1 = std::min(c1, b0 + 512), nb = b1 - b0;
-        if (W.K <= 4) dispatch4(W, P, R, round, b0 / 16, b1 / 16, c, col);
+        if (W.K <= 4 && use_i16() && !round) dispatch_i16k(W, P, R, b0 / 16, b1 / 16, c, col);
+        else if (W.K <= 4) dispatch4(W, P, R, round, b0 / 16, b1 / 16, c, col);
         else dispatch6(W, P, R, round, b0 / 16, b1 / 16, c);
         for (int r = 0; r < R; ++r) {
             float * cr = c + (size_t) r * 512;

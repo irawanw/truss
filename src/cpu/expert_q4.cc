@@ -8,6 +8,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <cstdio>
+#include <pthread.h>
+#include <sched.h>
 
 namespace truss::cpu {
 namespace {
@@ -131,12 +134,55 @@ void preconvert_scales(const Q4Expert & e, float * out)
     }
 }
 
+// one logical CPU per physical core this process may run on (the first allowed SMT sibling), from sysfs, as Strata's
+// pool (kernels/cpu/pool.cpp physical_cores): two workers on SMT siblings share one core's pipes
+static std::vector<int> physical_cores()
+{
+    std::vector<int> out;
+    std::vector<std::pair<long, long>> seen;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof set, &set) != 0) return out;
+    for (int c = 0; c < CPU_SETSIZE; ++c) {
+        if (!CPU_ISSET(c, &set)) continue;
+        auto topo = [c](const char * what) {
+            char path[96];
+            std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/%s", c, what);
+            long v = -1;
+            if (FILE * f = std::fopen(path, "r")) {
+                if (std::fscanf(f, "%ld", &v) != 1) v = -1;
+                std::fclose(f);
+            }
+            return v;
+        };
+        const std::pair<long, long> key{ topo("physical_package_id"), topo("core_id") };
+        if (std::find(seen.begin(), seen.end(), key) != seen.end()) continue;
+        seen.push_back(key);
+        out.push_back(c);
+    }
+    return out;
+}
+
 ExpertPool::ExpertPool(int threads)
 {
-    // NOTE: workers are deliberately *not* pinned: this box always hosts renter load (TRACKER #27) and pinning
-    // traps threads on busy cores (measured: pinning cost ~40% at loadavg 28). The scheduler dodges better.
+    // Pinning (TRUSS_CPU_PIN=1): worker i on its own physical core, skipping core 0 (the driver thread's), as Strata
+    // does. Off by default: the renters' threads float over every core, and pinning measured ~40% slower at loadavg
+    // 28 with the q4s kernel (TRACKER #27); TRACKER #76 re-measures it with the int16 trellis kernel.
     spin_ = getenv("TRUSS_CPU_SPIN") ? atoi(getenv("TRUSS_CPU_SPIN")) : SPIN_DEF;
-    for (int i = 0; i < threads; ++i) workers_.emplace_back([this] { worker(); });
+    const bool pin = getenv("TRUSS_CPU_PIN") && atoi(getenv("TRUSS_CPU_PIN"));
+    const std::vector<int> cores = pin ? physical_cores() : std::vector<int>{};
+    for (int i = 0; i < threads; ++i) {
+        const int core = i + 1 < (int) cores.size() ? cores[i + 1] : -1;
+        workers_.emplace_back([this, core] {
+            if (core >= 0) {
+                cpu_set_t set;
+                CPU_ZERO(&set);
+                CPU_SET(core, &set);
+                pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+            }
+            worker();
+        });
+    }
 }
 
 ExpertPool::~ExpertPool()

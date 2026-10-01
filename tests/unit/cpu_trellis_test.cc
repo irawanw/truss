@@ -2,6 +2,8 @@
 // ref_trellis.cu), for K = 1..4 and 1..8 rows; then speed: one expert (gate + up 2560 -> 640, down 640 -> 2560) per
 // call, single thread from cache, and N threads over a set of experts larger than the L3 (DRAM, as in decode).
 // usage: cpu_trellis_test [threads=12] [K for the speed run=2]
+// Pass: within 1e-5 of the fp16-activation reference (gemv_tiles4), or, for the int16 kernel (gemv_i16, int16
+// activations), no further from the exact (unrounded-activation) product than the GPU's fp16 activations are.
 #include "cpu/expert_q4.h"
 #include "cpu/expert_trellis.h"
 
@@ -54,7 +56,9 @@ Mat make(int K, int in, int out, std::mt19937 & g)
     return M;
 }
 
-double check(int K, int in, int out, int R, std::mt19937 & g)
+// relative error of trellis_gemv against the reference with fp16-rounded activations (the GPU's) and, in *exact,
+// against exact (unrounded) activations; *gpu = the GPU-equivalent fp16-activation reference's own error vs exact
+double check(int K, int in, int out, int R, std::mt19937 & g, double * exact = nullptr, double * gpu = nullptr)
 {
     const bool round = getenv("TRUSS_TRELLIS_ROUND") && atoi(getenv("TRUSS_TRELLIS_ROUND"));
     Mat M = make(K, in, out, g);
@@ -67,23 +71,27 @@ double check(int K, int in, int out, int R, std::mt19937 & g)
     std::vector<float> P(trellis_prep_floats(in, R)), y((size_t) R * out);
     trellis_prep(M.m, x.data(), in, R, P.data());
     trellis_gemv(M.m, P.data(), R, 0, out, y.data(), out);
-    double err = 0, ref = 0;
+    double err = 0, ref = 0, errx = 0, refx = 0, errg = 0;
     for (int r = 0; r < R; ++r) {
-        std::vector<double> a(in), c(out);
+        std::vector<double> a(in), ax(in), c(out), cx(out);
         for (int i = 0; i < in; ++i) a[i] = (double) x[(size_t) r * in + i] * _cvtsh_ss(M.suh[i]);
         for (int b = 0; b < in; b += 128) h128(&a[b]);
+        ax = a;
         for (int i = 0; i < in; ++i) a[i] = r16((float) a[i]);
         for (int o = 0; o < out; ++o) {
-            double s = 0;
-            for (int i = 0; i < in; ++i) s += (double) W[(size_t) o * in + i] * a[i];
-            c[o] = s;
+            double s = 0, sx = 0;
+            for (int i = 0; i < in; ++i) s += (double) W[(size_t) o * in + i] * a[i], sx += (double) W[(size_t) o * in + i] * ax[i];
+            c[o] = s, cx[o] = sx;
         }
-        for (int b = 0; b < out; b += 128) h128(&c[b]);
+        for (int b = 0; b < out; b += 128) h128(&c[b]), h128(&cx[b]);
         for (int o = 0; o < out; ++o) {
             const double yr = c[o] * _cvtsh_ss(M.svh[o]), d = y[(size_t) r * out + o] - yr;
-            err += d * d, ref += yr * yr;
+            const double yx = cx[o] * _cvtsh_ss(M.svh[o]), dx = y[(size_t) r * out + o] - yx;
+            err += d * d, ref += yr * yr, errx += dx * dx, refx += yx * yx, errg += (yr - yx) * (yr - yx);
         }
     }
+    if (exact) *exact = std::sqrt(errx / refx);
+    if (gpu) *gpu = std::sqrt(errg / refx);
     return std::sqrt(err / ref);
 }
 
@@ -113,10 +121,14 @@ int main(int argc, char ** argv)
     bool ok = true;
     for (int K = 1; K <= 4; ++K)
         for (int R : { 1, 3, 8 }) {
-            const double e1 = check(K, 256, 128, R, g), e2 = check(K, 128, 384, R, g);
-            const bool pass = e1 < 1e-5 && e2 < 1e-5;
+            // pass: within 1e-5 of the fp16-activation reference (gemv_tiles4), or (int16 activations, gemv_i16) no
+            // further from the exact product than the GPU's own fp16 activations are
+            double x1, g1, x2, g2;
+            const double e1 = check(K, 256, 128, R, g, &x1, &g1), e2 = check(K, 128, 384, R, g, &x2, &g2);
+            const bool pass = (e1 < 1e-5 && e2 < 1e-5) || (x1 <= std::max(1e-5, g1) && x2 <= std::max(1e-5, g2));
             ok &= pass;
-            std::printf("K %d rows %d: rel err %.2e / %.2e  %s\n", K, R, e1, e2, pass ? "ok" : "FAIL");
+            std::printf("K %d rows %d: rel err %.2e / %.2e (vs exact %.2e / %.2e, GPU fp16 act %.2e / %.2e)  %s\n", K, R,
+                        e1, e2, x1, x2, g1, g2, pass ? "ok" : "FAIL");
         }
 
     // speed: N experts of random K-bit tiles (the bytes are what matters; values are random)

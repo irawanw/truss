@@ -108,7 +108,7 @@ profile_routes(on), route_counts()   // routing profile [layer][expert] (the usa
   the draft's probability drops below it; `draft()` returns how many it made. Verify keeps the output exact either way.
 - CPU tier options (runtime-api-server.md, src/cpu): `cpu_dir` (q4s files) or `cpu_trellis` (the pinned pack bytes,
   no extra RAM), `cpu_share` (static set: rarest experts holding that share of cold routing mass), `cpu_dynamic`
-  (Strata's per-layer CPU / PCIe split over all eligible misses), `pcie_gbps`, `cpu_threads`; `dyn_stats()` (misses each way and the CPU cost line, call + per-expert ms).
+  (Strata's per-layer CPU / PCIe split over all eligible misses), `pcie_gbps`, `pcie_frac` (≥ 0: a fixed share of each layer's eligible misses over PCIe, Strata's `--pcie-frac`, instead of the fitted cost model; TRACKER #76), `cpu_threads`; `dyn_stats()` (misses each way and the CPU cost line, call + per-expert ms).
 - `Options::doorbell` (default on): decode FFNs without a host sync per layer (runtime-api-server.md, doorbell).
   `ring_bytes_override` sets the ring size for sweeps.
 - Instrumentation: `TRUSS_PROFILE_SECTIONS=1` → `section_ms()` (device time per section of the layer chain, events on

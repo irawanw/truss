@@ -147,6 +147,7 @@ struct Forward::Impl {
     // 1 / Options::pcie_gbps.
     bool cpu_dynamic = false;
     double cpu_ms_call = 0.12, cpu_ms_expert = 0.085, pcie_ms_byte = 1.0 / 13.5e6;
+    double pcie_frac = -1;   // Options::pcie_frac
     double dyn_s1 = 0, dyn_sn = 0, dyn_st = 0, dyn_snn = 0, dyn_snt = 0;
     long dyn_cpu = 0, dyn_pcie = 0;                      // eligible misses sent each way (stats)
     int8_t * embd_q = nullptr;                           // token embedding in pinned host memory (upload())
@@ -314,6 +315,7 @@ struct Forward::Impl {
         use_doorbell = o.doorbell;
         cpu_dynamic = o.cpu_dynamic && cpu_tier && use_doorbell;
         pcie_ms_byte = 1.0 / (o.pcie_gbps * 1e6);
+        pcie_frac = o.pcie_frac;
         setup_doorbells();
         if (prefill_rows > FETCH_ROWS) {   // the prompt path's buffers, carved from the ring's spare region
             auto * p = static_cast<unsigned char *>(experts->spare());
@@ -452,12 +454,13 @@ struct Forward::Impl {
             const int ne = (int) elig.size();
             int best_m = 0;
             double best = 1e30, tail = 0;
-            for (int m = 0; m <= ne; ++m) {
+            for (int m = 0; m <= ne && pcie_frac < 0; ++m) {
                 if (m > 0) tail += (double) experts->bytes_of(l, b.ids[dist[elig[ne - m]]]);
                 const double tc = ne - m > 0 ? cpu_ms_call + cpu_ms_expert * (ne - m) : 0;
                 const double t = std::max(tc, pcie_ms_byte * (pcie_bytes + tail));
                 if (t < best - 1e-9) best = t, best_m = m;
             }
+            if (pcie_frac >= 0) best_m = std::min(ne, (int) std::lround(pcie_frac * ne));
             for (int q = 0; q < ne - best_m; ++q) {
                 const int e = b.ids[dist[elig[q]]];
                 for (int i = 0; i < n; ++i) to_cpu[i] |= b.ids[i] == e;

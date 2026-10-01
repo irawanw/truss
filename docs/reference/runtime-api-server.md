@@ -213,6 +213,41 @@ GPU's hfma2 does): rounding cost ~40% of the loop on Zen 2 and moves a weight by
 vs a dense double reference from the bit-by-bit decode 1-9e-6 (K 1-4, 1-8 rows); the pool equals per-slot experts
 exactly and each row equals its 1-row call.
 
+**Kernel (K ≤ 4, default since 10-01: `gemv_i16`, TRACKER #76).** Measured on this Zen 2 per vector op
+(`ub` probe, 8 independent chains): `vpmulld` 2.3 cycles; every other integer multiply (`vpmullw`, `vpmulhuw`,
+`vpmaddubsw`, `vpmaddwd`) and every shift 1 cycle on one pipe; and/or/add/`vpshufb` several per cycle. `gemv_tiles4`
+spends ~4.3 multiply-pipe cycles per 8 weights, which is its 4.8. `gemv_i16` does 16 weights (two m of an octet) per
+step:
+- states: m's 32-bit window also holds m+1's state (ms + K + 16 ≤ 32), shifted down and up and `vpblendw`-ed:
+  16 states in 16-bit lanes from one `vpshufb`;
+- hash: s·0x83DCD12D mod 2³² from 16-bit products (low half `mullo(s, 0xD12D)`, high half
+  `mulhi(s, 0xD12D) + mullo(s, 0x83DC)`, exact because s < 2¹⁶);
+- byte sum: low half by `vpmaddubsw`, high half by and/shift. This is the measured balance between the multiply pipe
+  and the ALUs: all-ALU 3.4, both `maddubs` 3.25, mixed 2.8 cycles per 8 weights;
+- dot: one `vpmaddwd` of the byte sums (0..1020) against int16 activations into int32 accumulators, flushed to fp32
+  every 8 slices (overflow bound 1.1e9).
+
+The codebook's affine part is a per-row term: Σ wᵢaᵢ = kinv·Σ bytesumᵢ·aᵢ + (1024·kinv + kbias)·Σ aᵢ.
+
+Activations are int16 with one scale per row (amax/32767) taken from the fp32 Hadamard output. Weight m and m+4 read
+the same inputs, so a prepared slice is the 8 inputs a[16kt+8v ..] written twice for v = 0, 1, then the scale and Σa.
+The row stride is still `trellis_prep_floats(in, 1)`.
+
+Error vs exact activations is 2.3-3.2e-5, against 1.7-2.2e-4 for the GPU's own fp16 activations, so about 8x lower.
+`cpu_trellis_test` passes a kernel that is within 1e-5 of the fp16 reference (`gemv_tiles4`) or no further from exact
+than the GPU is (`gemv_i16`). Slice engine test: CPU-tier KL vs all-resident 2.39e-4 (was 3.35e-4).
+
+Memory order: blocks of 8 slices outer, columns inner, so each block reads contiguous runs of tiles (k-slice major),
+with software prefetch one block ahead. Walking a column at a stride of NT tiles (3.8 KB for gate/up) left one thread
+at 1.0 ms/expert from DRAM against 0.55 from cache.
+
+Measured (`cpu_trellis_test`, K 3, loadavg ~23):
+- 0.55 ms/expert on one thread from cache, 0.68 from DRAM (was 0.83 / 1.0);
+- 12 threads over DRAM experts: 12.5-15.6 experts/ms (was 8.1-9.0);
+- pool latency for 1 row × 4 experts: 0.29 ms at 12 threads, 0.19 at 23 (was 0.43-0.46).
+
+`TRUSS_TRELLIS_I16=0` (or `TRUSS_TRELLIS_ROUND=1`) selects `gemv_tiles4`. K 5-6 keep `gemv_tiles`.
+
 **In the pool.** Slots carry `t` (a `TrellisExpert`) instead of `e`; one call is all one kind. Phases: 0 prepare each
 group's gate/up activations; 1 gate and up as separate 128-column items (10 per expert: a decode layer hands the CPU
 ~0.5-2 experts, and with gate+up per item only 5 of 12 threads had work); at the flip h = silu(gate)·up and its
@@ -223,5 +258,7 @@ Small-call latency (`cpu_trellis_test`, 12 threads, loaded box): 1 expert 0.20 m
 Idle workers spin `TRUSS_CPU_SPIN` pauses (default 40,000, ~0.5 ms) before blocking: decode layers call the pool
 ~1 ms apart, and with the old 4,000 the workers slept between layers and the in-engine fit read 0.32 + 0.36 ms per
 call/expert at 8 threads against 0.16 + 0.16 spinning (TRACKER #75).
+`TRUSS_CPU_PIN=1` pins worker i to physical core i + 1 (one logical CPU per core from sysfs, as Strata's pool);
+off by default, neutral in `cpu_trellis_test` at 6-23 threads under renter load (TRACKER #76).
 Row stride of the prepared activations is `trellis_prep_floats(in, 1)` for every kernel (the K 5-6 kernel read rows
 at 2·in, wrong for multi-row calls through the pool, which preps rows one at a time).
