@@ -17,6 +17,7 @@
 #include "cpu/expert_trellis.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -75,7 +76,10 @@ public:
     void reset_stats();
     long long wait_us() const { return wait_us_; }
     long waits() const { return waits_; }
-    long long item_us() const { return item_us_; }   // sum of item() compute time (all threads, caller included)
+    long long item_us() const { return item_us_; }
+    // the last call's own duration, start() to its last item (not to wait()'s return): what the CPU took, without
+    // whatever the caller did before calling wait(). 0 for an empty call.
+    double last_call_ms() const { return last_ms_; }   // sum of item() compute time (all threads, caller included)
     // phase breakdown of item_us_ (same clock): gate/up gemv, silu, h-quantize, down gemv
     long long gate_us() const { return gate_us_; }
     long long silu_us() const { return silu_us_; }
@@ -137,6 +141,9 @@ private:
     std::vector<float> hd_;                 // [group][row][D_FF / 32] its scales
     std::vector<float> out_;                // [group][row][D_MODEL]
     std::vector<float> tp_;                 // trellis: per group [gate P][up P][down P] (trellis_prep layouts)
+    std::vector<float> g_;                  // trellis: [group][row][D_FF] gate output (up output in h_ until the flip)
+    std::chrono::steady_clock::time_point t_start_;
+    double last_ms_ = 0;
     std::atomic<long long> wait_us_{ 0 };   // benchmark stats (see wait_us())
     std::atomic<long> waits_{ 0 };
     std::atomic<long long> item_us_{ 0 };

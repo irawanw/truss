@@ -470,7 +470,6 @@ struct Forward::Impl {
             if (to_cpu[i]) slots.push_back(ct->slot(i / K, l, e, b.w[i]));
             else gpu_ids.push_back(e);
         }
-        const auto t0 = std::chrono::steady_clock::now();
         if (ct) ct->pool->start(b.x, j.T, slots, b.y);   // CPU first: it runs while the copies are issued
         experts->fetch(l, gpu_ids.data(), (int) gpu_ids.size(), nullptr);
         if (ct) experts->upload(b.d_mids, b.mids, sizeof(int) * n);
@@ -489,10 +488,8 @@ struct Forward::Impl {
         }
         if (ct) {
             ct->pool->wait();
-            if (cpu_dynamic && n_cpu > 0) {
-                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-                cpu_ms_expert = 0.9 * cpu_ms_expert + 0.1 * (ms / n_cpu);
-            }
+            if (cpu_dynamic && n_cpu > 0)   // the pool's own time (start to last item), not this thread's
+                cpu_ms_expert = 0.9 * cpu_ms_expert + 0.1 * (ct->pool->last_call_ms() / n_cpu);
             std::atomic_thread_fence(std::memory_order_release);
             *(volatile int *) b.cpu_done = j.seq;
         }

@@ -170,7 +170,7 @@ trellis pack. The MTP block has no CPU tier.
 `Options::cpu_dynamic` (Strata's split, `serve()`): every expert with a CPU copy is eligible; per layer, routed experts
 already on the GPU (hot, or in the ring incl. queued copies: `ExpertStore::on_device`) run there, and of the missed
 eligible ones the last m in routing order go over PCIe, the rest to the CPU, m minimizing max(CPU time, copy time)
-with the CPU's per-expert time a running mean measured on the driver thread and copies at `pcie_gbps`. Doorbell path
+with the CPU's per-expert time a running mean of the pool's own call time (`ExpertPool::last_call_ms`) and copies at `pcie_gbps`. Doorbell path
 only. Results then depend on the cache state; with `cpu_trellis` the CPU's weights equal the GPU's, so only fp32
 summation order differs.
 
@@ -211,5 +211,9 @@ vs a dense double reference from the bit-by-bit decode 1-9e-6 (K 1-4, 1-8 rows);
 exactly and each row equals its 1-row call.
 
 **In the pool.** Slots carry `t` (a `TrellisExpert`) instead of `e`; one call is all one kind. Phases: 0 prepare each
-group's gate/up activations, 1 gate/up in 128-column items then silu·up, 2 down in 256-column items (h prepared at the
-flip).
+group's gate/up activations; 1 gate and up as separate 128-column items (10 per expert: a decode layer hands the CPU
+~0.5-2 experts, and with gate+up per item only 5 of 12 threads had work); at the flip h = silu(gate)·up and its
+down activations are prepared; 2 down in 128-column items (20 per expert). `last_call_ms()` is the call's own time
+(start to its last item), which the dynamic split now averages instead of the driver thread's start-to-wait time
+(that included issuing the PCIe copies and overstated the CPU's cost, so it got only 7% of the misses).
+Small-call latency (`cpu_trellis_test`, 12 threads, loaded box): 1 expert 0.20 ms, 2 experts 0.27, 4 experts 0.46.

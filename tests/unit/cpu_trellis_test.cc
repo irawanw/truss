@@ -207,6 +207,19 @@ int main(int argc, char ** argv)
             }
             std::printf("stress: 3000 small calls in %.0f ms, no hang\n", ms_since(t0));
         }
+        // small-call latency: what a decode layer usually hands the CPU (~0.5-2 experts)
+        for (int ne : { 1, 2, 4 }) {
+            std::vector<Slot> sl;
+            for (int j = 0; j < ne; ++j) sl.push_back({ 0, nullptr, 0.5f, &ex[(11 * j + 5) % n_exp] });
+            std::vector<float> ys(2560);
+            double best = 1e9;
+            for (int k = 0; k < 30; ++k) {
+                const auto t0 = std::chrono::steady_clock::now();
+                pool.run(xs.data(), 1, sl, ys.data());
+                best = std::min(best, ms_since(t0));
+            }
+            std::printf("pool latency: 1 row x %d expert(s): best %.3f ms\n", ne, best);
+        }
         // pool speed: 4 rows x 10 slots over 30 distinct experts (a verify window's CPU share, from DRAM)
         std::vector<Slot> big;
         for (int t = 0; t < 4; ++t)

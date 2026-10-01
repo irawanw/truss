@@ -82,9 +82,9 @@ int main(int argc, char ** argv)
         const std::string draft_vocab = argc > 9 && std::string(argv[9]) != "-" ? argv[9] : "";
         const float min_p = argc > 11 ? std::atof(argv[11]) : 0.f;
         const std::string cpu_dir = argc > 10 && std::string(argv[10]) != "-" ? argv[10] : "";
-q::Forward::Options o;
-o.mtp = &mtp;
-o.spec_rows = nd + 1;
+        q::Forward::Options o;
+        o.mtp = &mtp;
+        o.spec_rows = nd + 1;
         // the prompt path's VRAM is sized by the prompt, not by max_chunk: a chunk cap above the prompt's real
         // length holds cached experts out of the ring's spare region for the whole run (TRACKER #70)
         const int step = (int) std::min<size_t>(chunk, tok.size());

@@ -19,7 +19,7 @@ namespace {
 constexpr int GU_CHUNK_DEF = 64, DN_CHUNK_DEF = 256;
 constexpr int SPIN_DEF = 4000;   // pause iterations before a worker blocks
 // trellis items: gate/up and down columns per item (multiples of 128: the output Hadamard blocks)
-constexpr int TR_GU_COLS = 128, TR_DN_COLS = 256;
+constexpr int TR_GU_COLS = 128, TR_DN_COLS = 128;
 int gu_chunk()
 {
     static const int v = getenv("TRUSS_CPU_GU_CHUNK") ? atoi(getenv("TRUSS_CPU_GU_CHUNK")) : GU_CHUNK_DEF;
@@ -187,7 +187,8 @@ void ExpertPool::start(const float * x, int T, const std::vector<Slot> & slots, 
         if (tp_.size() < off) tp_.resize(off);
         n_phases_ = 3;
         phase_items_[0] = (int) G;
-        phase_items_[1] = (int) G * (D_FF / TR_GU_COLS);
+        phase_items_[1] = (int) G * 2 * (D_FF / TR_GU_COLS);   // gate and up are separate items (small calls)
+        if (g_.size() < G * MAX_ROWS * D_FF) g_.resize(G * MAX_ROWS * D_FF);
         phase_items_[2] = (int) G * (D_MODEL / TR_DN_COLS);
     } else {
         n_phases_ = 2;
@@ -201,6 +202,8 @@ void ExpertPool::start(const float * x, int T, const std::vector<Slot> & slots, 
     groups_sum_ += (long long) G;
     slots_sum_ += (long long) slots_.size();
     for (const Group & gr : groups_) rows_sum_ += (long long) gr.rows.size();
+    t_start_ = std::chrono::steady_clock::now();
+    last_ms_ = 0;
     busy_ = G > 0;   // release: the item fields above are visible to any worker that sees busy_
     g.unlock();
     if (G) cv_.notify_all();
@@ -223,23 +226,15 @@ void ExpertPool::item_trellis(int i, int phase)
             trellis_prep(gr.t->up, x, D_MODEL, 1, P + up_off + k * step);
         }
         hq_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
-    } else if (phase == 1) {
-        const int per = D_FF / TR_GU_COLS, gi = i / per, c0 = (i % per) * TR_GU_COLS;
+    } else if (phase == 1) {   // gate or up for TR_GU_COLS columns: gate into g_, up into h_ (silu * up at the flip)
+        const int per = 2 * (D_FF / TR_GU_COLS), gi = i / per, r = i % per, up = r >= per / 2;
+        const int c0 = (r % (per / 2)) * TR_GU_COLS;
         const Group & gr = groups_[gi];
         const int R = (int) gr.rows.size();
-        const float * P = &tp_[gr.p_gu];
-        float g[MAX_ROWS * TR_GU_COLS], u[MAX_ROWS * TR_GU_COLS];
-        trellis_gemv(gr.t->gate, P, R, c0, c0 + TR_GU_COLS, g, TR_GU_COLS);
-        trellis_gemv(gr.t->up, P + trellis_prep_floats(D_MODEL, R), R, c0, c0 + TR_GU_COLS, u, TR_GU_COLS);
-        const auto t2 = std::chrono::steady_clock::now();
-        float * h = &h_[(size_t) gi * MAX_ROWS * D_FF];
-        for (int k = 0; k < R; ++k)
-            for (int j = 0; j < TR_GU_COLS; ++j) {
-                const float a = g[k * TR_GU_COLS + j];
-                h[k * D_FF + c0 + j] = a / (1.f + std::exp(-a)) * u[k * TR_GU_COLS + j];
-            }
-        gate_us_ += std::chrono::duration_cast<std::chrono::microseconds>(t2 - t0).count();
-        silu_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t2).count();
+        const float * P = &tp_[gr.p_gu] + (up ? trellis_prep_floats(D_MODEL, R) : 0);
+        float * dst = (up ? &h_[0] : &g_[0]) + (size_t) gi * MAX_ROWS * D_FF + c0;
+        trellis_gemv(up ? gr.t->up : gr.t->gate, P, R, c0, c0 + TR_GU_COLS, dst, D_FF);
+        gate_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
     } else {
         const int per = D_MODEL / TR_DN_COLS, gi = i / per, c0 = (i % per) * TR_DN_COLS;
         const Group & gr = groups_[gi];
@@ -250,13 +245,18 @@ void ExpertPool::item_trellis(int i, int phase)
     item_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
 }
 
-// every group's h rows prepared for the down projection, once, at the gate/up -> down flip
+// every group's h = silu(gate) * up, prepared for the down projection, once, at the gate/up -> down flip
 void ExpertPool::prep_down()
 {
     const auto t0 = std::chrono::steady_clock::now();
     const size_t step = (size_t) trellis_prep_floats(D_FF, 1);
     for (size_t gi = 0; gi < groups_.size(); ++gi) {
         const Group & gr = groups_[gi];
+        for (size_t k = 0; k < gr.rows.size(); ++k) {
+            float * h = &h_[((size_t) gi * MAX_ROWS + k) * D_FF];
+            const float * g = &g_[((size_t) gi * MAX_ROWS + k) * D_FF];
+            for (int j = 0; j < D_FF; ++j) h[j] = g[j] / (1.f + std::exp(-g[j])) * h[j];
+        }
         for (size_t k = 0; k < gr.rows.size(); ++k)
             trellis_prep(gr.t->down, &h_[((size_t) gi * MAX_ROWS + k) * D_FF], D_FF, 1, &tp_[gr.p_d + k * step]);
     }
@@ -352,6 +352,7 @@ void ExpertPool::retire(int ph)
         }
         cv_.notify_all();   // workers blocked on the flip
     } else {
+        last_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start_).count();
         std::lock_guard<std::mutex> g(mu_);
         busy_.store(false, std::memory_order_release);
     }
