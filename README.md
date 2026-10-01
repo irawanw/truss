@@ -20,6 +20,7 @@ Every number has a row in [TRACKER.md](TRACKER.md) with the command that produce
 - **[docs/reference/](docs/reference/README.md)** — every source file: what it computes, API and shapes, layouts,
   numerics, invariants, tests, tunables, how to change it. Start with its README (data flow of one forward pass).
 - [docs/CODE.md](docs/CODE.md) — code rules: where files go, extension points, kernel and test rules.
+- **[docs/PLAN-20261002-tg100-pp3000.md](docs/PLAN-20261002-tg100-pp3000.md)** — current plan: decode 100 tok/s, prefill 3,000 tok/s (measured gaps vs Strata, steps D0-D5 / P0-P3, gates).
 - [TRACKER.md](TRACKER.md) — every experiment and measurement, checkpoints (CP0–CP9), the "Do not repeat" list.
 - [docs/06-truss.md](docs/06-truss.md) — design; `docs/01..05`, `PLAN.md` — the evidence and plans that led here.
 
