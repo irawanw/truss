@@ -153,12 +153,12 @@ the GGUF; checked token-for-token against llama-tokenize on 7.5K tokens of code 
 **Engine knobs from the environment.** `truss_open_params` applies `qwen4exp::apply_env` (`forward.h`) after the
 params, the same function `tk-bench-spec` uses, so a benched config is served unchanged: `TRUSS_CPU_TRELLIS`,
 `TRUSS_CPU_DYNAMIC`, `TRUSS_CPU_THREADS`, `TRUSS_CPU_SHARE`, `TRUSS_PCIE_GBPS`, `TRUSS_PCIE_FRAC`, `TRUSS_ADAPT_EVERY`,
-`TRUSS_ADAPT_SWAPS`, `TRUSS_RING_GB`, `TRUSS_HINT_K`, `TRUSS_PREFILL_ROWS` (plus the pool's own `TRUSS_CPU_PIN`,
+`TRUSS_ADAPT_SWAPS`, `TRUSS_RING_GB`, `TRUSS_HINT_K`, `TRUSS_PREFILL_ROWS`, `TRUSS_KV_INT8` (plus the pool's own `TRUSS_CPU_PIN`,
 `TRUSS_CPU_SPIN_US`). It also releases the model files' pages after upload (`Options::after_upload`, as the bench:
 the load otherwise peaks near 47 GB resident).
 
 **pm2 (port 8113, GPU 2).** `scripts/truss_serve_8113.sh` runs the TRACKER #85 bench config (trellis CPU tier, Strata
-split, PCIe share 0.2, hints 2, 22 pinned threads, Strata's profile) at n_ctx 262144, chunk 4096, on llama-paw's port
+split, PCIe share 0.2, hints 2, 22 pinned threads, Strata's profile, int8 KV from #87) at n_ctx 262144, chunk 4096, on llama-paw's port
 8113; `pm2 start scripts/truss_serve_8113.config.js` (app `truss-8113`, restart when RSS > 64 GB). Thinking: the
 GGUF template defaults to `enable_thinking` on and `reasoning_effort` xhigh. Only one of `truss-8113` and
 `paw-x3-8113` can hold the port and GPU 2.

@@ -181,12 +181,27 @@ template <class Shape> struct Partial {             // one split's state per (qu
 
 // SPLIT: cells [blockIdx.z * cells_per_split, ...) of each query, unnormalized state to `part`; else all cells, final
 // gated output to `out`.
+// int8 cache: 8 codes at dims c .. c + 7 of row `off / D` times its group's scale, as 8 fp16 into the tile
+__device__ __forceinline__ uint4 dequant8(const int8_t * code, const half * scale, size_t off, int D)
+{
+    const uint2 b = *reinterpret_cast<const uint2 *>(code + off);
+    const float sc = __half2float(scale[off / KV_GROUP]);   // rows are D = a multiple of KV_GROUP values
+    const int8_t * c8 = reinterpret_cast<const int8_t *>(&b);
+    uint4 r;
+    half2 * h = reinterpret_cast<half2 *>(&r);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) h[i] = __floats2half2_rn(c8[2 * i] * sc, c8[2 * i + 1] * sc);
+    (void) D;
+    return r;
+}
+
 template <class Shape, bool SPLIT>
-__global__ void __launch_bounds__(32 * ATTN_WARPS) attn_kernel(const half * q, const float * gate, const half * k,
-                                                               const half * v, const int * blocks,
+__global__ void __launch_bounds__(32 * ATTN_WARPS) attn_kernel(const half * q, const float * gate, KvCache kc,
+                                                               const int * blocks,
                                                                const int * n_blocks, int pos0, half * out,
                                                                int cells_per_split, float * part)
 {
+    const half * k = kc.k16, * v = kc.v16;
     constexpr int H = Shape::H, HKV = Shape::HKV, D = Shape::D, R = Shape::RATIO, G = H / HKV;
     constexpr int NT = D / 8;   // output n8 tiles
     static_assert(G <= 16, "the query heads of one KV head fill one m16 tile");
@@ -219,8 +234,13 @@ __global__ void __launch_bounds__(32 * ATTN_WARPS) attn_kernel(const half * q, c
             if (cell < n_cells) {
                 const int p = cell < R * nsel ? R * sel[cell / R] + cell % R : R * seen + (cell - R * nsel);
                 const size_t off = ((size_t) p * HKV + kv) * D + c;
-                cp16(&sm.k[r][c], k + off);
-                cp16(&sm.v[r][c], v + off);
+                if (kc.kq) {
+                    *reinterpret_cast<uint4 *>(&sm.k[r][c]) = dequant8(kc.kq, kc.ks, off, D);
+                    *reinterpret_cast<uint4 *>(&sm.v[r][c]) = dequant8(kc.vq, kc.vs, off, D);
+                } else {
+                    cp16(&sm.k[r][c], k + off);
+                    cp16(&sm.v[r][c], v + off);
+                }
             } else {
                 *reinterpret_cast<uint4 *>(&sm.k[r][c]) = make_uint4(0, 0, 0, 0);
                 *reinterpret_cast<uint4 *>(&sm.v[r][c]) = make_uint4(0, 0, 0, 0);
@@ -423,6 +443,15 @@ template <class Shape>
 void attention(const half * q, const float * gate, const half * k, const half * v, const int * blocks,
                const int * n_blocks, int pos0, int T, half * out, void * ws, size_t ws_bytes, cudaStream_t stream)
 {
+    KvCache kc;
+    kc.k16 = const_cast<half *>(k), kc.v16 = const_cast<half *>(v);
+    attention<Shape>(q, gate, kc, blocks, n_blocks, pos0, T, out, ws, ws_bytes, stream);
+}
+
+template <class Shape>
+void attention(const half * q, const float * gate, const KvCache & kc, const int * blocks, const int * n_blocks,
+               int pos0, int T, half * out, void * ws, size_t ws_bytes, cudaStream_t stream)
+{
     if (T <= 0 || pos0 < 0) throw std::invalid_argument("dsa::attention: bad chunk");
     const size_t smem = sizeof(AttnSmem<Shape>);
     static bool attr = [&] {
@@ -438,11 +467,11 @@ void attention(const half * q, const float * gate, const half * k, const half * 
         const int per = ((max_cells + S - 1) / S + TILE - 1) / TILE * TILE;   // whole tiles per split
         auto * part = static_cast<float *>(ws);
         attn_kernel<Shape, true><<<dim3(T, Shape::HKV, S), 32 * ATTN_WARPS, smem, stream>>>(
-            q, gate, k, v, blocks, n_blocks, pos0, out, per, part);
+            q, gate, kc, blocks, n_blocks, pos0, out, per, part);
         combine_kernel<Shape><<<dim3(T, Shape::HKV), 256, 0, stream>>>(part, S, gate, out);
     } else {
         attn_kernel<Shape, false><<<dim3(T, Shape::HKV), 32 * ATTN_WARPS, smem, stream>>>(
-            q, gate, k, v, blocks, n_blocks, pos0, out, 0, nullptr);
+            q, gate, kc, blocks, n_blocks, pos0, out, 0, nullptr);
     }
     TRUSS_CUDA(cudaGetLastError());
 }
@@ -452,5 +481,7 @@ template void select<FlashNext>(const half *, const half *, int, int, int *, int
 template size_t attention_workspace_bytes<FlashNext>(int);
 template void attention<FlashNext>(const half *, const float *, const half *, const half *, const int *, const int *,
                                    int, int, half *, void *, size_t, cudaStream_t);
+template void attention<FlashNext>(const half *, const float *, const KvCache &, const int *, const int *, int, int,
+                                   half *, void *, size_t, cudaStream_t);
 
 }  // namespace truss::dsa

@@ -168,7 +168,8 @@ struct Forward::Impl {
     half * embd_d = nullptr;
 
     struct LayerState {
-        half * k = nullptr, * v = nullptr, * idx_k = nullptr;   // DSA caches
+        dsa::KvCache kv;                                        // DSA K/V cache (fp16 or int8, Options::kv_int8)
+        half * idx_k = nullptr;                                 // DSA indexer block cache
         float * idx_partial = nullptr;                          // raw indexer keys of the open block
         float * state_buf[2] = {};                              // GDN recurrence (two with speculation: a verify
         int cur = 0;                                            // window writes the other one)
@@ -266,8 +267,13 @@ struct Forward::Impl {
         const int R = DsaShape::RATIO;
         const int W = spec_rows;
         auto dsa_state = [&](LayerState & L) {
-            L.k = alloc<half>((size_t) n_ctx * c.n_head_kv * c.head_dim);
-            L.v = alloc<half>((size_t) n_ctx * c.n_head_kv * c.head_dim);
+            const size_t kvn = (size_t) n_ctx * c.n_head_kv * c.head_dim;
+            if (o.kv_int8) {   // Strata's int8 KV: 1,056 B per cell per layer instead of 2,048 (TRACKER #87)
+                L.kv.kq = alloc<int8_t>(kvn), L.kv.vq = alloc<int8_t>(kvn);
+                L.kv.ks = alloc<half>(kvn / dsa::KV_GROUP), L.kv.vs = alloc<half>(kvn / dsa::KV_GROUP);
+            } else {
+                L.kv.k16 = alloc<half>(kvn), L.kv.v16 = alloc<half>(kvn);
+            }
             L.idx_k = alloc<half>((size_t) (n_ctx / R) * c.idx_head_dim);
             L.idx_partial = alloc<float>((size_t) (R - 1) * c.idx_head_dim);
         };
@@ -1088,8 +1094,8 @@ struct Forward::Impl {
             copy(L.raw_ik, ik, (size_t) T * c.idx_head_dim);
         }
         dsa::rope_table<DsaShape>(pos0, T, c.rope_base, cs, s);
-        dsa::prepare_qkv<DsaShape>(qfull, k, v, f32(a.q_norm), f32(a.k_norm), cs, pos0, T, c.rms_eps, q16, gate, L.k,
-                                   L.v, s);
+        dsa::prepare_qkv<DsaShape>(qfull, k, v, f32(a.q_norm), f32(a.k_norm), cs, pos0, T, c.rms_eps, q16, gate, L.kv,
+                                   s);
         dsa::prepare_index<DsaShape>(iq, ik, f32(a.idx_q_norm), f32(a.idx_k_norm), cs, c.rope_base, pos0, T, c.rms_eps,
                                      L.idx_partial, iq16, L.idx_k, s);
         const size_t ws_bytes = dsa::select_workspace_bytes<DsaShape>(T, pos0 + T);
@@ -1097,7 +1103,7 @@ struct Forward::Impl {
         dsa::select<DsaShape>(iq16, L.idx_k, pos0, T, blocks, n_blocks, ws, ws_bytes, s);
         const size_t aws_bytes = dsa::attention_workspace_bytes<DsaShape>(T);
         void * aws = aws_bytes ? sc->alloc<unsigned char>(aws_bytes) : nullptr;
-        dsa::attention<DsaShape>(q16, gate, L.k, L.v, blocks, n_blocks, pos0, T, att16, aws, aws_bytes, s);
+        dsa::attention<DsaShape>(q16, gate, L.kv, blocks, n_blocks, pos0, T, att16, aws, aws_bytes, s);
         lin(a.out, att16, T, out);
         sc->release(m);
     }
@@ -1747,6 +1753,7 @@ void apply_env(ForwardOptions & o)
     f("TRUSS_ADAPT_SWAPS", o.adapt_swaps);
     f("TRUSS_HINT_K", o.hint_k);               // pre-gated prefetch width
     f("TRUSS_PREFILL_ROWS", o.prefill_rows);
+    f("TRUSS_KV_INT8", o.kv_int8);             // Strata's int8 KV
     if (const char * e = std::getenv("TRUSS_RING_GB")) o.ring_bytes_override = (size_t) (std::atof(e) * (1ull << 30));
 }
 

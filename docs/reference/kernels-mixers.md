@@ -29,6 +29,7 @@ When a query sees ≤ 512 blocks it attends to everything (plain causal attentio
 |---|---|
 | `rope_table<Shape>(pos0, T, base, cs)` | cs [T][32] float2 = (cos, sin) of pos·base^(−2p/64), **angles in fp64** (an fp32 angle is off by ~0.02 rad at 256K) |
 | `prepare_qkv<Shape>(qfull, k, v, q_norm, k_norm, cs, pos0, T, eps, q16, gate, k_cache, v_cache, stream)` | qfull [T][24][512] raw → q16 [T][24][256] fp16 (normed, roped), gate [T][24][256] fp32; k, v [T][2][256] raw → K/V cache rows pos0.. (fp16; k normed, roped) |
+| `prepare_qkv<Shape>(..., gate, const KvCache & kv, stream)` | the same into either cache format: `dsa::KvCache` fp16 (`k16`, `v16`) or **int8** (`kq`, `vq` codes + `ks`, `vs` fp16 scale per `KV_GROUP` = 64 values, scale = max\|x\|/127 rounded to fp16 before encoding): Strata's int8 KV, 1,056 B per cell per layer vs 2,048 (TRACKER #87) |
 | `prepare_index<Shape>(idx_q, idx_k, q_norm, k_norm, cs, rope_base, pos0, T, eps, partial, idx_q16, idx_k_cache, stream)` | idx_q [T][4][128] → idx_q16 (normed, roped); every block that **completes** in the chunk is pooled from raw keys (cells before pos0 come from `partial`), normed, roped at its start (own fp64 angle) into idx_k_cache [n_ctx/4][128]; `partial` [3][128] fp32 carries the open block's raw keys to the next chunk |
 
 One warp per normalized row; element i of a row lives in lane i % 32, so the rotary pair (p, p+32) is in one lane
@@ -46,6 +47,7 @@ One warp per normalized row; element i of a row lives in lane i % 32, so the rot
 | `select_workspace_bytes<Shape>(max_queries, n_ctx)` | score rows kept at once (≤ 1024) × n_ctx/4 floats |
 | `select<Shape>(idx_q16, idx_k_cache, pos0, T, blocks [T][512], n_blocks [T], ws, ws_bytes, stream)` | per query the chosen block ids, **ascending**, first `n_blocks[t]` used |
 | `attention<Shape>(q16, gate, k_cache, v_cache, blocks, n_blocks, pos0, T, out16 [T][24·256], ws, ws_bytes, stream)` | gated attention output in fp16 (the out projection's input); `ws` = `attention_workspace_bytes<Shape>(T)` (0 above `SPLIT_ROWS` = 32) |
+| `attention<Shape>(q16, gate, const KvCache & kv, ...)` | the same over either cache; int8: the gather dequantizes 8 codes × scale into the fp16 tile (plain loads, not `cp.async`), the math after it unchanged. Measured: rel 6.9-8.5e-3 vs the fp32 reference on N(0,1) data (fp16 2.2-2.9e-4); +30-65% time at 8K-row chunks, 0.08 → 0.11 ms/layer at T 4 |
 
 **select.** `score_kernel`: CTA = 64 queries × 64 blocks, 8 warps of 16 queries × 32 blocks, all 4 indexer heads'
 accumulators in registers so relu and the head sum happen before the store; fragments straight from global (the op is
@@ -74,7 +76,7 @@ reference on real data (TRACKER #48, #49).
 24K–32K (TRACKER #49). Known headroom: 2 warps/CTA and single-buffered tiles; K/V gathered once per query (neighbouring
 queries could share tiles).
 
-**Tested by.** `dsa_prefill_test` (random fp16-exact inputs vs `ref::qsa_select` / `ref::masked_attention`: selection
+**Tested by.** `dsa_prefill_test` (also the int8 cache, quantized on the host in the writer's format, against the same reference: gate rel <= 2e-2; and its attention time in the timed cases). (random fp16-exact inputs vs `ref::qsa_select` / `ref::masked_attention`: selection
 equal up to fp64 near-ties ≤ 1e-5; gated attention rel ≤ 5e-4, worst query ≤ 2e-3; includes a later chunk
 pos0 > 0), `qwen4exp_dsa_long` D (real 3,659-token data), `qwen4exp_forward decode` (blocks spanning chunks).
 

@@ -67,7 +67,7 @@ template <int E, int ROPE_DIMS> __device__ void norm_rope_at(float (&x)[E], cons
 template <class Shape>
 __global__ void qkv_kernel(const float * qfull, const float * k, const float * v, const float * q_norm,
                            const float * k_norm, const float2 * cs, int pos0, int T, float eps, half * q16,
-                           float * gate, half * k_cache, half * v_cache)
+                           float * gate, KvCache kv)
 {
     constexpr int H = Shape::H, HKV = Shape::HKV, D = Shape::D, E = D / 32, HALF = Shape::ROPE_DIMS / 2;
     const int64_t r = (int64_t) blockIdx.x * WARPS + threadIdx.x / 32;   // (token, head) of q, then of k, then v
@@ -91,9 +91,30 @@ __global__ void qkv_kernel(const float * qfull, const float * k, const float * v
 #pragma unroll
     for (int j = 0; j < E; ++j) x[j] = src[32 * j + lane];
     if (!is_v) norm_rope<E, Shape::ROPE_DIMS>(x, k_norm, cs + t * HALF, eps);
-    half * dst = (is_v ? v_cache : k_cache) + ((int64_t) pos0 * HKV + row) * D;
+    const int64_t cell_row = (int64_t) pos0 * HKV + row;   // (cell, kv head)
+    if (!kv.int8()) {
+        half * dst = (is_v ? kv.v16 : kv.k16) + cell_row * D;
 #pragma unroll
-    for (int j = 0; j < E; ++j) dst[32 * j + lane] = __float2half(x[j]);
+        for (int j = 0; j < E; ++j) dst[32 * j + lane] = __float2half(x[j]);
+        return;
+    }
+    // int8: lane holds dims 32 j + lane, so group g (dims 64 g .. 64 g + 63) is j = 2 g, 2 g + 1 across the warp
+    static_assert(KV_GROUP == 64 && E % 2 == 0, "groups of 64 = two dims per lane");
+    int8_t * code = (is_v ? kv.vq : kv.kq) + cell_row * D;
+    half * scale = (is_v ? kv.vs : kv.ks) + cell_row * (D / KV_GROUP);
+#pragma unroll
+    for (int g = 0; g < E / 2; ++g) {
+        float m = fmaxf(fabsf(x[2 * g]), fabsf(x[2 * g + 1]));
+        for (int o = 16; o; o /= 2) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        const half sh = __float2half(m / 127.f);
+        const float sc = __half2float(sh), inv = sc > 0.f ? 1.f / sc : 0.f;
+        if (lane == 0) scale[g] = sh;
+#pragma unroll
+        for (int u = 0; u < 2; ++u) {
+            const int j = 2 * g + u;
+            code[32 * j + lane] = (int8_t) fmaxf(-127.f, fminf(127.f, rintf(x[j] * inv)));
+        }
+    }
 }
 
 template <class Shape>
@@ -157,10 +178,19 @@ void prepare_qkv(const float * qfull, const float * k, const float * v, const fl
                  const float2 * cs, int pos0, int T, float eps, half * q16, float * gate, half * k_cache,
                  half * v_cache, cudaStream_t stream)
 {
+    KvCache kv;
+    kv.k16 = k_cache, kv.v16 = v_cache;
+    prepare_qkv<Shape>(qfull, k, v, q_norm, k_norm, cs, pos0, T, eps, q16, gate, kv, stream);
+}
+
+template <class Shape>
+void prepare_qkv(const float * qfull, const float * k, const float * v, const float * q_norm, const float * k_norm,
+                 const float2 * cs, int pos0, int T, float eps, half * q16, float * gate, const KvCache & kv,
+                 cudaStream_t stream)
+{
     static_assert(Shape::D % 32 == 0, "head dim in lane strides");
     const int64_t rows = (int64_t) T * (Shape::H + 2 * Shape::HKV);
-    qkv_kernel<Shape><<<grid(rows), THREADS, 0, stream>>>(qfull, k, v, q_norm, k_norm, cs, pos0, T, eps, q16, gate,
-                                                          k_cache, v_cache);
+    qkv_kernel<Shape><<<grid(rows), THREADS, 0, stream>>>(qfull, k, v, q_norm, k_norm, cs, pos0, T, eps, q16, gate, kv);
     TRUSS_CUDA(cudaGetLastError());
 }
 
@@ -190,6 +220,8 @@ template void carry_partial<FlashNext>(const float *, int, int, float *, cudaStr
 template void rope_table<FlashNext>(int, int, float, float2 *, cudaStream_t);
 template void prepare_qkv<FlashNext>(const float *, const float *, const float *, const float *, const float *,
                                      const float2 *, int, int, float, half *, float *, half *, half *, cudaStream_t);
+template void prepare_qkv<FlashNext>(const float *, const float *, const float *, const float *, const float *,
+                                     const float2 *, int, int, float, half *, float *, const KvCache &, cudaStream_t);
 template void prepare_index<FlashNext>(const float *, const float *, const float *, const float *, const float2 *,
                                        float, int, int, float, float *, half *, half *, cudaStream_t);
 

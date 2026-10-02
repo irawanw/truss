@@ -20,8 +20,20 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <cstdint>
 
 namespace truss::dsa {
+
+// A layer's K/V cache [n_ctx][HKV][D]: fp16 (k16, v16), or int8 codes (kq, vq) with an fp16 scale per 64 values
+// (ks, vs [n_ctx][HKV][D / 64]; value = code * scale, scale = max |x| / 127 of the group): Strata's int8 KV format,
+// 1,056 B per cell per layer instead of 2,048 (TRACKER #87). int8 when kq is set.
+struct KvCache {
+    half * k16 = nullptr, * v16 = nullptr;
+    int8_t * kq = nullptr, * vq = nullptr;
+    half * ks = nullptr, * vs = nullptr;
+    __host__ __device__ bool int8() const { return kq != nullptr; }
+};
+constexpr int KV_GROUP = 64;
 
 struct FlashNext {                    // Qwen3.8 Flash-Next DSA layers
     static constexpr int H = 24, HKV = 2, D = 256;                   // attention heads, head dim
@@ -50,5 +62,9 @@ template <class Shape> size_t attention_workspace_bytes(int max_queries);
 template <class Shape>
 void attention(const half * q, const float * gate, const half * k, const half * v, const int * blocks,
                const int * n_blocks, int pos0, int T, half * out, void * ws, size_t ws_bytes, cudaStream_t stream);
+// the same over either cache format (int8: the gather dequantizes into the fp16 tile; the math after it is unchanged)
+template <class Shape>
+void attention(const half * q, const float * gate, const KvCache & kv, const int * blocks, const int * n_blocks,
+               int pos0, int T, half * out, void * ws, size_t ws_bytes, cudaStream_t stream);
 
 }  // namespace truss::dsa

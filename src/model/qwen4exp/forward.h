@@ -81,6 +81,9 @@ struct ForwardOptions {
                                               // carved from the ring's spare region, so rows past the prompt's real
                                               // length evict cached experts for the whole run; pass the prompt's
                                               // length and step run() by it (TRACKER #70)
+    // DSA K/V caches as int8 codes + an fp16 scale per 64 values (Strata's served KV format, dsa::KvCache): half the
+    // VRAM of fp16 (6.4 -> 3.3 GB at 256K for the 12 layers + the MTP layer: ~2,000 more resident experts)
+    bool kv_int8 = false;
     int hint_k = 4;                           // pre-gated prefetch: per row, the next layer's top hint_k predicted
                                               // experts start copying early (0: off; 3-6 measured equal, TRACKER #59)
     // Called once upload() has the weights on the device but before the constructor does anything else expensive
@@ -92,7 +95,7 @@ struct ForwardOptions {
 
 // The decode-tier sweep knobs from the environment, applied on top of `o` (each only when set): TRUSS_CPU_SHARE,
 // TRUSS_CPU_THREADS, TRUSS_CPU_DYNAMIC, TRUSS_CPU_TRELLIS, TRUSS_PCIE_GBPS, TRUSS_PCIE_FRAC, TRUSS_ADAPT_EVERY,
-// TRUSS_ADAPT_SWAPS, TRUSS_RING_GB, TRUSS_HINT_K, TRUSS_PREFILL_ROWS. tk-bench-spec and the C API (so the server)
+// TRUSS_ADAPT_SWAPS, TRUSS_RING_GB, TRUSS_HINT_K, TRUSS_PREFILL_ROWS, TRUSS_KV_INT8. tk-bench-spec and the C API (so the server)
 // both call it, so a config benched is the config served.
 void apply_env(ForwardOptions & o);
 

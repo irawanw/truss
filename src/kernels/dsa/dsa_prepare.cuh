@@ -10,6 +10,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "kernels/dsa/dsa_prefill.cuh"   // KvCache
+
 namespace truss::dsa {
 
 // cs [T][ROPE_DIMS / 2] for positions pos0 .. pos0 + T - 1
@@ -21,6 +23,11 @@ template <class Shape>
 void prepare_qkv(const float * qfull, const float * k, const float * v, const float * q_norm, const float * k_norm,
                  const float2 * cs, int pos0, int T, float eps, half * q16, float * gate, half * k_cache,
                  half * v_cache, cudaStream_t stream);
+// the same into either cache format (int8: each 64-value group quantized with its own fp16 scale)
+template <class Shape>
+void prepare_qkv(const float * qfull, const float * k, const float * v, const float * q_norm, const float * k_norm,
+                 const float2 * cs, int pos0, int T, float eps, half * q16, float * gate, const KvCache & kv,
+                 cudaStream_t stream);
 
 // idx_q [T][IH][ID], idx_k [T][ID] raw -> idx_q16 [T][IH][ID]; every block that completes in the chunk is mean-pooled,
 // normed and roped at its start into idx_k_cache [n_ctx / RATIO][ID]. partial [RATIO - 1][ID] fp32 carries the raw

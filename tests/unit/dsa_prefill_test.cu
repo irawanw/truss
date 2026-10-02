@@ -63,6 +63,30 @@ double rel(const float * a, const float * b, size_t n)
     return std::sqrt(num / std::max(den, 1e-30));
 }
 
+// Strata's int8 KV format of a host cache [cells][HKV][D]: codes + fp16 scale per KV_GROUP values (as qkv_kernel)
+struct Q8Cache {
+    int8_t * q = nullptr;
+    half * s = nullptr;
+    Q8Cache(const std::vector<float> & x)
+    {
+        const size_t n = x.size(), G = dsa::KV_GROUP;
+        std::vector<int8_t> hq(n);
+        std::vector<half> hs(n / G);
+        for (size_t g = 0; g < n / G; ++g) {
+            float m = 0.f;
+            for (size_t i = 0; i < G; ++i) m = std::max(m, std::fabs(x[g * G + i]));
+            hs[g] = __float2half(m / 127.f);
+            const float sc = __half2float(hs[g]), inv = sc > 0.f ? 1.f / sc : 0.f;
+            for (size_t i = 0; i < G; ++i)
+                hq[g * G + i] = (int8_t) std::max(-127.f, std::min(127.f, std::rint(x[g * G + i] * inv)));
+        }
+        q = dalloc<int8_t>(n), s = dalloc<half>(n / G);
+        TRUSS_CUDA(cudaMemcpy(q, hq.data(), n, cudaMemcpyHostToDevice));
+        TRUSS_CUDA(cudaMemcpy(s, hs.data(), n / G * 2, cudaMemcpyHostToDevice));
+    }
+    ~Q8Cache() { cudaFree(q), cudaFree(s); }
+};
+
 int run(int n_ctx, int pos0, int T, bool check, std::mt19937 & rng)
 {
     const int nb = n_ctx / R;
@@ -92,6 +116,19 @@ int run(int n_ctx, int pos0, int T, bool check, std::mt19937 & rng)
     cudaEventElapsedTime(&ms_att, e[1], e[2]);
     std::printf("n_ctx=%-6d pos0=%-6d T=%-5d select %.2f ms, attention %.2f ms = %.2f us/token/layer", n_ctx, pos0, T,
                 ms_sel, ms_att, (ms_sel + ms_att) * 1e3 / T);
+    if (!check) {   // the int8 cache's attention time (the gather dequantizes)
+        Q8Cache kq(k.h), vq(v.h);
+        dsa::KvCache kc;
+        kc.kq = kq.q, kc.ks = kq.s, kc.vq = vq.q, kc.vs = vq.s;
+        dsa::attention<Shape>(cq, cg, kc, blocks, n_blocks, pos0, T, out, aws, aws_bytes, nullptr);
+        cudaEventRecord(e[1]);
+        dsa::attention<Shape>(cq, cg, kc, blocks, n_blocks, pos0, T, out, aws, aws_bytes, nullptr);
+        cudaEventRecord(e[2]);
+        TRUSS_CUDA(cudaEventSynchronize(e[2]));
+        float ms8;
+        cudaEventElapsedTime(&ms8, e[1], e[2]);
+        std::printf(", int8 KV attention %.2f ms", ms8);
+    }
 
     bool ok = true;
     if (check) {
@@ -151,9 +188,18 @@ int run(int n_ctx, int pos0, int T, bool check, std::mt19937 & rng)
         for (int t = 0; t < T; ++t)
             worst = std::max(worst, rel(&got[(size_t) t * H * D], &want_o[(size_t) t * H * D], (size_t) H * D));
         const double all = rel(got.data(), want_o.data(), got.size());
-        ok = bad_count == 0 && worst_gap <= 1e-5 && all <= 5e-4 && worst <= 2e-3;
-        std::printf(" | select: bad %ld, swaps %ld (worst gap %.1e) | attention rel %.1e, worst query %.1e", bad_count,
-                    swaps, worst_gap, all, worst);
+        // the same attention over the int8 cache (Strata's KV format), against the same fp32 reference
+        Q8Cache kq(k.h), vq(v.h);
+        dsa::KvCache kc;
+        kc.kq = kq.q, kc.ks = kq.s, kc.vq = vq.q, kc.vs = vq.s;
+        dsa::attention<Shape>(cq, cg, kc, blocks, n_blocks, pos0, T, out, aws, aws_bytes, nullptr);
+        TRUSS_CUDA(cudaMemcpy(got_h.data(), out, got_h.size() * 2, cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < got.size(); ++i) got[i] = __half2float(got_h[i]);
+        const double all8 = rel(got.data(), want_o.data(), got.size());
+        // int8 rounding of K and V (step = max/127 per 64 values): ~1% relative on N(0, 1) data; gate 2e-2
+        ok = bad_count == 0 && worst_gap <= 1e-5 && all <= 5e-4 && worst <= 2e-3 && all8 <= 2e-2;
+        std::printf(" | select: bad %ld, swaps %ld (worst gap %.1e) | attention rel %.1e, worst query %.1e, int8 KV rel %.1e",
+                    bad_count, swaps, worst_gap, all, worst, all8);
         cudaFree(d_sel);
         cudaFree(ref_out);
     }
