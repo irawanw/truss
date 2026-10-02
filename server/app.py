@@ -201,6 +201,15 @@ def make_app(engine: Engine) -> FastAPI:
 
     _END, KEEPALIVE = object(), object()
 
+    def too_long(ids):
+        """llama-server's 400 for a prompt that does not fit (clients such as omp match its message and compact), sent
+        before any response starts; the engine's own error came mid-stream and reached the client as a dead stream."""
+        if len(ids) < engine.model.n_ctx:
+            return None
+        return JSONResponse({"error": {"code": 400, "message": "the request exceeds the available context size, try "
+                                       "increasing it", "type": "exceed_context_size_error",
+                                       "n_prompt_tokens": len(ids), "n_ctx": engine.model.n_ctx}}, status_code=400)
+
     async def tokens(req: Request, ids, p, keepalive=None):
         """engine.generate driven from a worker thread, so the event loop never blocks on the engine (or its lock).
         On a client disconnect, or when the caller stops early, the generator is closed: it logs its line and releases
@@ -246,6 +255,8 @@ def make_app(engine: Engine) -> FastAPI:
         prompt = await anyio.to_thread.run_sync(
             lambda: engine.chat.prompt(normalize_messages(body["messages"]), tools=tools, template_kwargs=kw))
         ids = await anyio.to_thread.run_sync(engine.chat.encode, prompt)
+        if (r := too_long(ids)) is not None:
+            return r
         p = params(body)
         engine.log(f"request: temperature {p['temperature']} top_p {p['top_p']} top_k {p['top_k']} min_p {p['min_p']}, "
                    f"{len(tools or [])} tools, thinking {'on' if thinking else 'off'}")
@@ -270,11 +281,20 @@ def make_app(engine: Engine) -> FastAPI:
                         elif d:
                             yield chunk({field: d})
                 yield chunk({"role": "assistant", "content": ""})
-                async for item in tokens(req, ids, p, keepalive=5.0):
+                n_gen, items = 0, tokens(req, ids, p, keepalive=5.0)
+                while True:
+                    try:
+                        item = await items.__anext__()
+                    except StopAsyncIteration:
+                        break
+                    except (TrussError, ValueError) as e:   # the response has started: report in-stream
+                        yield "data: " + json.dumps({"error": {"code": 500, "message": str(e), "type": "server_error"}}) + "\n\n"
+                        break
                     if item is KEEPALIVE:
                         yield chunk({"content": ""})
                         continue
                     tok, delta, finish = item
+                    n_gen += tok is not None
                     for c in out(split.push(delta)):
                         yield c
                     if finish:
@@ -286,6 +306,12 @@ def make_app(engine: Engine) -> FastAPI:
                             if calls.calls and finish == "stop":
                                 finish = "tool_calls"
                         yield chunk({}, finish)
+                if (body.get("stream_options") or {}).get("include_usage"):
+                    # omp sizes the context from this (without it, its bar read 19% at a full 262K)
+                    yield "data: " + json.dumps({"id": rid, "object": "chat.completion.chunk", "created": created,
+                                                 "model": engine.name, "choices": [],
+                                                 "usage": {"prompt_tokens": len(ids), "completion_tokens": n_gen,
+                                                           "total_tokens": len(ids) + n_gen}}) + "\n\n"
                 yield "data: [DONE]\n\n"
             return StreamingResponse(events(), media_type="text/event-stream")
 
@@ -315,6 +341,8 @@ def make_app(engine: Engine) -> FastAPI:
     async def completions(req: Request):
         body = await req.json()
         ids = await anyio.to_thread.run_sync(engine.chat.encode, body["prompt"])
+        if (r := too_long(ids)) is not None:
+            return r
         p = params(body)
         text, n, finish = "", 0, "length"
         async for tok, delta, fin in tokens(req, ids, p):

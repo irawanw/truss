@@ -146,6 +146,15 @@ call stays `content`. Before this the XML came back as plain text, and agent cli
 including 0, wins; temperature 0 is greedy). They were temperature 1.0 with no cut, and clients that send no sampling
 fields (they relied on llama-paw's defaults on this port) got stray tokens: 1,200-token English answers, 3 seeds each,
 had 5-6 CJK runs per answer (one inside a tool name, `bash样的`) at the old defaults and none at these.
+**Context full.** A prompt of n_ctx tokens or more gets llama-server's 400 before any response starts
+(`exceed_context_size_error`, "the request exceeds the available context size, try increasing it", with
+`n_prompt_tokens` and `n_ctx`); omp matches that message and compacts. An engine error after the stream started is
+sent as an SSE `{"error": ...}` event and the stream ends with `[DONE]`. Before, the engine's
+`exceeds n_ctx` error was raised inside the started stream (ASGI "response already started"): omp saw a dead stream,
+retried, and 46 requests failed this way. With `stream_options.include_usage` the stream ends with a usage chunk
+(`choices: []`, prompt/completion/total tokens) as OpenAI and llama-server send; omp sizes its context bar and
+compaction from it (it read 19% while the real prompt was 262K).
+
 **Streaming never goes quiet.** The first chunk (role) is sent before the prompt read; while the engine yields nothing
 for 5 s (a long prompt read, a wait for the lock behind another request) an empty-content chunk is sent
 (`tokens(..., keepalive=5.0)`). The first tool-call version held a call's whole text until the end: an agent's file
