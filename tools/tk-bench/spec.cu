@@ -1,8 +1,12 @@
 // Speculative (MTP) greedy decode vs plain greedy decode on the full model: the same prompt, N generated tokens each
 // way; the token sequences must be identical (verify windows, rollback and the MTP cache must not change the
 // output), and the speculative run's speed and tokens per verify pass are printed. Exit code 1 on a mismatch.
-// usage: tk-bench-spec <model.gguf> <mtp.gguf> @prompt.i32 [tokens=128] [drafts=3] [usage file|-] [n_ctx=65536]
-//                      [chunk=8192] [draft vocab ids file|-] [cpu tier dir|-] [draft min p=0]
+// Several prompts (@a.i32,@b.i32,...): each runs plain + spec in turn in one process (reset between), one line per
+// prompt, and the breakdown below sums the spec phases of all of them (TRACKER #84: a change of numerics changes the
+// greedy text of one prompt, and with it the tokens per pass and the experts per pass; a set of prompts averages
+// that out). TRUSS_BENCH_PLAIN=0 skips the plain runs (no identity check, faster sweeps).
+// usage: tk-bench-spec <model.gguf> <mtp.gguf> @prompt.i32[,@prompt2.i32...] [tokens=128] [drafts=3] [usage file|-]
+//                      [n_ctx=65536] [chunk=8192] [draft vocab ids file|-] [cpu tier dir|-] [draft min p=0]
 #include "core/cuda_check.h"
 #include "kernels/sampling/argmax.cuh"
 #include "model/qwen4exp/config.h"
@@ -76,7 +80,18 @@ int main(int argc, char ** argv)
         const q::Config c = q::Config::from_gguf(*file);
         const q::Weights w = q::bind(*file, c);
         const q::Mtp mtp = q::bind_mtp(*mfile, c);
-        const std::vector<int32_t> tok = read_ids(argv[3]);
+        std::vector<std::vector<int32_t>> prompts;
+        {
+            const std::string list = argv[3];
+            for (size_t a = 0; a <= list.size();) {
+                const size_t b = std::min(list.find(',', a), list.size());
+                prompts.push_back(read_ids(list.substr(a, b - a).c_str()));
+                a = b + 1;
+            }
+        }
+        size_t longest = 0;
+        for (const auto & p : prompts) longest = std::max(longest, p.size());
+        const bool do_plain = !(std::getenv("TRUSS_BENCH_PLAIN") && std::atoi(std::getenv("TRUSS_BENCH_PLAIN")) == 0);
         const int N = argc > 4 ? std::atoi(argv[4]) : 128, nd = argc > 5 ? std::atoi(argv[5]) : 3;
         const int n_ctx = argc > 7 ? std::atoi(argv[7]) : 65536, chunk = argc > 8 ? std::atoi(argv[8]) : 8192;
         const std::string draft_vocab = argc > 9 && std::string(argv[9]) != "-" ? argv[9] : "";
@@ -87,7 +102,7 @@ int main(int argc, char ** argv)
         o.spec_rows = nd + 1;
         // the prompt path's VRAM is sized by the prompt, not by max_chunk: a chunk cap above the prompt's real
         // length holds cached experts out of the ring's spare region for the whole run (TRACKER #70)
-        const int step = (int) std::min<size_t>(chunk, tok.size());
+        const int step = (int) std::min<size_t>(chunk, longest);
         o.prefill_rows = step;
         if (!draft_vocab.empty()) {
             FILE * fv = std::fopen(draft_vocab.c_str(), "rb");
@@ -121,89 +136,134 @@ int main(int argc, char ** argv)
         mfile->release_pages();
         std::printf("experts: %d resident, ring %.2f GB; drafts %d\n", f.hot_experts(), f.experts().ring_bytes() / 1e9, nd);
 
-        // plain greedy
-        std::vector<int32_t> ref;
-        prompt(f, tok, step);
-        int32_t t;
-        g.rows(f, (int) (tok.size() - 1) % step, 1, &t);
-        auto t0 = std::chrono::steady_clock::now();
-        for (int i = 0; i < N; ++i) {
-            ref.push_back(t);
-            f.run(&t, 1);
-            g.rows(f, 0, 1, &t);
-        }
-        const double plain = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-
-        // speculative
-        f.reset();
-        f.cpu_stats(true);   // CPU tier time below covers the spec phase only
-        f.cpu_shape_reset();   // CPU shape below covers the spec phase only
-        double sect[6];      // layer sections, reset after the prompt below so they cover the spec phase only
-        prompt(f, tok, step);
-        g.rows(f, (int) (tok.size() - 1) % step, 1, &t);
-        f.section_ms(sect, true);
-        { double m4[4], d3[3], pm; long dn, pc, pr; f.section_moe_ms(m4, true); f.driver_ms(d3, dn, true); f.ple_host_ms(pm, pc, pr, true); }
-        std::vector<int32_t> got;
-        const runtime::ExpertStore::Stats st0 = f.experts().stats();
-        int passes = 0;
-        long drafted = 0, accepted = 0;
-        // device-side time per section (events bracket device work; host waits excluded): splits GPU compute from
-        // driver/CPU/PCIe stalls (TRACKER #61: pass-time breakdown without nsys, which needs root here).
+        // per prompt: plain greedy (unless TRUSS_BENCH_PLAIN=0), then speculative; every counter below is read and
+        // reset around the spec phase only, and summed over the prompts
+        struct Sum {
+            double spec_s = 0, plain_s = 0, ms_draft = 0, ms_verify = 0, ms_head = 0, sect[6] = {}, m4[4] = {}, d3[3] = {};
+            double ple_ms = 0, cpu_wait_us = 0;
+            long passes = 0, tokens = 0, drafted = 0, accepted = 0, dn = 0, ple_calls = 0, ple_rows = 0, cpu_waits = 0;
+            long long item_us = 0, ph[4] = {}, sh[4] = {};
+            long asked = 0, misses = 0, hinted = 0;
+            double bytes = 0, hint_bytes = 0;
+            int identical = 0, compared = 0;
+        } S;
         cudaEvent_t e0, e1;
         TRUSS_CUDA(cudaEventCreate(&e0));
         TRUSS_CUDA(cudaEventCreate(&e1));
-        float ms_draft = 0.f, ms_verify = 0.f, ms_head = 0.f;
-        t0 = std::chrono::steady_clock::now();
-        while ((int) got.size() < N) {
-            int32_t win[9], best[9];
-            win[0] = t;
-            TRUSS_CUDA(cudaEventRecord(e0, f.stream()));
-            const int nw = f.draft(t, nd, win + 1);
-            TRUSS_CUDA(cudaEventRecord(e1, f.stream()));
-            TRUSS_CUDA(cudaEventSynchronize(e1));
-            { float m = 0; TRUSS_CUDA(cudaEventElapsedTime(&m, e0, e1)); ms_draft += m; }
-            TRUSS_CUDA(cudaEventRecord(e0, f.stream()));
-            f.verify(win, nw + 1);
-            TRUSS_CUDA(cudaEventRecord(e1, f.stream()));
-            TRUSS_CUDA(cudaEventSynchronize(e1));
-            { float m = 0; TRUSS_CUDA(cudaEventElapsedTime(&m, e0, e1)); ms_verify += m; }
-            TRUSS_CUDA(cudaEventRecord(e0, f.stream()));
-            g.rows(f, 0, nw + 1, best);
-            TRUSS_CUDA(cudaEventRecord(e1, f.stream()));
-            TRUSS_CUDA(cudaEventSynchronize(e1));
-            { float m = 0; TRUSS_CUDA(cudaEventElapsedTime(&m, e0, e1)); ms_head += m; }
-            int j = 0;
-            while (j < nw && best[j] == win[j + 1]) ++j;
-            f.accept(j + 1);
-            for (int i = 0; i <= j; ++i) got.push_back(win[i]);
-            t = best[j];
-            ++passes, drafted += nw, accepted += j;
-        }
-        const double spec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        got.resize(N);
-        int same = 0;
-        while (same < N && got[same] == ref[same]) ++same;
-        std::printf("plain: %d tokens in %.2f s = %.1f tok/s\n", N, plain, N / plain);
-        std::printf("spec : %d tokens in %.2f s = %.1f tok/s, %d passes (%.2f tokens/pass), drafts accepted %ld of %ld\n",
-                    (int) got.size(), spec, N / spec, passes, (double) N / passes, accepted, drafted);
-        const runtime::ExpertStore::Stats & st = f.experts().stats();
-        std::printf("       per pass: %.1f cold experts routed, %.1f fetched on demand (%.1f MB), %.1f prefetched (%.1f MB)\n",
-                    (double) (st.experts_asked - st0.experts_asked) / passes, (double) (st.misses - st0.misses) / passes,
-                    (st.bytes - st0.bytes) / 1e6 / passes, (double) (st.hinted - st0.hinted) / passes,
-                    (st.hint_bytes - st0.hint_bytes) / 1e6 / passes);
-        const auto cs = f.cpu_stats();
-        if (cs.second) {
-            long long ph[4];
+        for (size_t pi = 0; pi < prompts.size(); ++pi) {
+            const std::vector<int32_t> & tok = prompts[pi];
+            std::vector<int32_t> ref;
+            int32_t t;
+            double plain = 0;
+            if (do_plain) {
+                f.reset();
+                prompt(f, tok, step);
+                g.rows(f, (int) (tok.size() - 1) % step, 1, &t);
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < N; ++i) {
+                    ref.push_back(t);
+                    f.run(&t, 1);
+                    g.rows(f, 0, 1, &t);
+                }
+                plain = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            }
+
+            // speculative
+            f.reset();
+            prompt(f, tok, step);
+            g.rows(f, (int) (tok.size() - 1) % step, 1, &t);
+            f.cpu_stats(true);
+            f.cpu_shape_reset();
+            double sect[6], m4[4], d3[3], pm;
+            long dn, pc, pr;
+            f.section_ms(sect, true);
+            f.section_moe_ms(m4, true);
+            f.driver_ms(d3, dn, true);
+            f.ple_host_ms(pm, pc, pr, true);
+            const long long item0 = f.cpu_item_us();
+            long long ph0[4];
+            f.cpu_phase_us(ph0);
+            std::vector<int32_t> got;
+            const runtime::ExpertStore::Stats st0 = f.experts().stats();
+            int passes = 0;
+            long drafted = 0, accepted = 0;
+            // device-side time per section (events bracket device work; host waits excluded): splits GPU compute from
+            // driver/CPU/PCIe stalls (TRACKER #61: pass-time breakdown without nsys, which needs root here).
+            float ms_draft = 0.f, ms_verify = 0.f, ms_head = 0.f;
+            const auto t0 = std::chrono::steady_clock::now();
+            while ((int) got.size() < N) {
+                int32_t win[9], best[9];
+                win[0] = t;
+                TRUSS_CUDA(cudaEventRecord(e0, f.stream()));
+                const int nw = f.draft(t, nd, win + 1);
+                TRUSS_CUDA(cudaEventRecord(e1, f.stream()));
+                TRUSS_CUDA(cudaEventSynchronize(e1));
+                { float m = 0; TRUSS_CUDA(cudaEventElapsedTime(&m, e0, e1)); ms_draft += m; }
+                TRUSS_CUDA(cudaEventRecord(e0, f.stream()));
+                f.verify(win, nw + 1);
+                TRUSS_CUDA(cudaEventRecord(e1, f.stream()));
+                TRUSS_CUDA(cudaEventSynchronize(e1));
+                { float m = 0; TRUSS_CUDA(cudaEventElapsedTime(&m, e0, e1)); ms_verify += m; }
+                TRUSS_CUDA(cudaEventRecord(e0, f.stream()));
+                g.rows(f, 0, nw + 1, best);
+                TRUSS_CUDA(cudaEventRecord(e1, f.stream()));
+                TRUSS_CUDA(cudaEventSynchronize(e1));
+                { float m = 0; TRUSS_CUDA(cudaEventElapsedTime(&m, e0, e1)); ms_head += m; }
+                int j = 0;
+                while (j < nw && best[j] == win[j + 1]) ++j;
+                f.accept(j + 1);
+                for (int i = 0; i <= j; ++i) got.push_back(win[i]);
+                t = best[j];
+                ++passes, drafted += nw, accepted += j;
+            }
+            const double spec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            got.resize(N);
+            int same = 0;
+            if (do_plain)
+                while (same < N && got[same] == ref[same]) ++same;
+            std::printf("prompt %zu (%zu tokens): %s", pi, tok.size(), do_plain ? "" : "");
+            if (do_plain) std::printf("plain %.1f tok/s, ", N / plain);
+            std::printf("spec %.1f tok/s, %.2f tokens/pass", N / spec, (double) N / passes);
+            if (do_plain) std::printf(", identical %d of %d", same, N);
+            std::printf("\n");
+            // accumulate
+            S.spec_s += spec, S.plain_s += plain, S.passes += passes, S.tokens += N, S.drafted += drafted;
+            S.accepted += accepted, S.ms_draft += ms_draft, S.ms_verify += ms_verify, S.ms_head += ms_head;
+            if (do_plain) S.identical += same, S.compared += N;
+            f.section_ms(sect), f.section_moe_ms(m4), f.driver_ms(d3, dn), f.ple_host_ms(pm, pc, pr);
+            for (int k = 0; k < 6; ++k) S.sect[k] += sect[k];
+            for (int k = 0; k < 4; ++k) S.m4[k] += m4[k];
+            for (int k = 0; k < 3; ++k) S.d3[k] += d3[k];
+            S.dn += dn, S.ple_ms += pm, S.ple_calls += pc, S.ple_rows += pr;
+            const auto cs = f.cpu_stats();
+            S.cpu_wait_us += cs.first, S.cpu_waits += cs.second;
+            S.item_us += f.cpu_item_us() - item0;
+            long long ph[4], sh[4];
             f.cpu_phase_us(ph);
-            std::printf("       CPU tier: %.2f ms/pass in wait over %ld waits (items sum %.2f ms/pass)\n",
-                        cs.first / 1e3 / passes, cs.second, f.cpu_item_us() / 1e3 / passes);
-            std::printf("       CPU phases ms/pass: gate/up %.2f + silu %.2f + h-quant %.2f + down %.2f\n",
-                        ph[0] / 1e3 / passes, ph[1] / 1e3 / passes, ph[2] / 1e3 / passes, ph[3] / 1e3 / passes);
-            long long sh[4];
             f.cpu_shape(sh);
+            for (int k = 0; k < 4; ++k) S.ph[k] += ph[k] - ph0[k], S.sh[k] += sh[k];
+            const runtime::ExpertStore::Stats & st = f.experts().stats();
+            S.asked += st.experts_asked - st0.experts_asked, S.misses += st.misses - st0.misses;
+            S.hinted += st.hinted - st0.hinted;
+            S.bytes += st.bytes - st0.bytes, S.hint_bytes += st.hint_bytes - st0.hint_bytes;
+        }
+        TRUSS_CUDA(cudaEventDestroy(e0));
+        TRUSS_CUDA(cudaEventDestroy(e1));
+
+        const double passes = (double) S.passes;
+        if (do_plain) std::printf("plain: %ld tokens in %.2f s = %.1f tok/s\n", S.tokens, S.plain_s, S.tokens / S.plain_s);
+        std::printf("spec : %ld tokens in %.2f s = %.1f tok/s, %ld passes (%.2f tokens/pass), drafts accepted %ld of %ld\n",
+                    S.tokens, S.spec_s, S.tokens / S.spec_s, S.passes, S.tokens / passes, S.accepted, S.drafted);
+        std::printf("       per pass: %.1f cold experts routed, %.1f fetched on demand (%.1f MB), %.1f prefetched (%.1f MB)\n",
+                    S.asked / passes, S.misses / passes, S.bytes / 1e6 / passes, S.hinted / passes,
+                    S.hint_bytes / 1e6 / passes);
+        if (S.cpu_waits) {
+            std::printf("       CPU tier: %.2f ms/pass in wait over %ld waits (items sum %.2f ms/pass)\n",
+                        S.cpu_wait_us / 1e3 / passes, S.cpu_waits, S.item_us / 1e3 / passes);
+            std::printf("       CPU phases ms/pass: gate/up %.2f + silu %.2f + h-quant %.2f + down %.2f\n",
+                        S.ph[0] / 1e3 / passes, S.ph[1] / 1e3 / passes, S.ph[2] / 1e3 / passes, S.ph[3] / 1e3 / passes);
             std::printf("       CPU calls/pass %.1f: %.1f distinct experts, %.1f slots, R = %.2f rows/expert\n",
-                        sh[0] / (double) passes, sh[1] / (double) passes, sh[2] / (double) passes,
-                        sh[2] / (double) std::max(1LL, sh[1]));
+                        S.sh[0] / passes, S.sh[1] / passes, S.sh[2] / passes, S.sh[2] / (double) std::max(1LL, S.sh[1]));
         }
         {
             long dc = 0, dp = 0;
@@ -214,37 +274,31 @@ int main(int argc, char ** argv)
                             dc, dp, cc, ce);
         }
         std::printf("       device ms/pass: draft %.2f + verify %.2f + head %.2f = %.2f (rest: host stalls/gaps)\n",
-                    ms_draft / passes, ms_verify / passes, ms_head / passes,
-                    (ms_draft + ms_verify + ms_head) / passes);
-        f.section_ms(sect);
-        if (sect[0] > 0)
+                    S.ms_draft / passes, S.ms_verify / passes, S.ms_head / passes,
+                    (S.ms_draft + S.ms_verify + S.ms_head) / passes);
+        if (S.sect[0] > 0)
             std::printf("       layer device ms/pass: ple+hc_mix %.2f + mixer %.2f + hc_mix %.2f + routed MoE %.2f "
                         "+ shared %.2f + cpu join/combine %.2f = %.2f\n",
-                        sect[0] / passes, sect[1] / passes, sect[2] / passes, sect[3] / passes, sect[4] / passes,
-                        sect[5] / passes, (sect[0] + sect[1] + sect[2] + sect[3] + sect[4] + sect[5]) / passes);
-        double m4[4];
-        f.section_moe_ms(m4);
-        if (m4[0] + m4[1] + m4[2] + m4[3] > 0)
+                        S.sect[0] / passes, S.sect[1] / passes, S.sect[2] / passes, S.sect[3] / passes,
+                        S.sect[4] / passes, S.sect[5] / passes,
+                        (S.sect[0] + S.sect[1] + S.sect[2] + S.sect[3] + S.sect[4] + S.sect[5]) / passes);
+        if (S.m4[0] + S.m4[1] + S.m4[2] + S.m4[3] > 0)
             std::printf("       routed MoE ms/pass: router+publish %.2f + wait for the host plan %.2f + wait for copies %.2f "
-                        "+ expert kernel %.2f\n", m4[0] / passes, m4[1] / passes, m4[2] / passes, m4[3] / passes);
+                        "+ expert kernel %.2f\n", S.m4[0] / passes, S.m4[1] / passes, S.m4[2] / passes, S.m4[3] / passes);
         if (f.adapt_admitted()) std::printf("       adaptive tier: %ld experts admitted\n", f.adapt_admitted());
-        {
-            double pm;
-            long pc, pr;
-            f.ple_host_ms(pm, pc, pr);
-            if (pc) std::printf("       PLE host gather ms/pass: %.2f (%.1f calls, %.0f table rows per pass)\n", pm / passes,
-                                (double) pc / passes, (double) pr / passes);
-        }
-        double d3[3];
-        long dn = 0;
-        f.driver_ms(d3, dn);
-        if (dn)
+        if (S.ple_calls)
+            std::printf("       PLE host gather ms/pass: %.2f (%.1f calls, %.0f table rows per pass)\n", S.ple_ms / passes,
+                        S.ple_calls / passes, S.ple_rows / passes);
+        if (S.dn)
             std::printf("       driver ms/pass: split %.2f + CPU start %.2f + copies and plan %.2f (%.1f layers/pass)\n",
-                        d3[0] / passes, d3[1] / passes, d3[2] / passes, (double) dn / passes);
-        TRUSS_CUDA(cudaEventDestroy(e0));
-        TRUSS_CUDA(cudaEventDestroy(e1));
-        std::printf("tokens identical to plain greedy: %d of %d  %s\n", same, N, same == N ? "PASS" : "FAIL");
-        return same == N ? 0 : 1;
+                        S.d3[0] / passes, S.d3[1] / passes, S.d3[2] / passes, S.dn / passes);
+        if (!do_plain) {
+            std::printf("tokens identical to plain greedy: not checked (TRUSS_BENCH_PLAIN=0)\n");
+            return 0;
+        }
+        std::printf("tokens identical to plain greedy: %d of %d  %s\n", S.identical, S.compared,
+                    S.identical == S.compared ? "PASS" : "FAIL");
+        return S.identical == S.compared ? 0 : 1;
     } catch (const std::exception & e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
         return 1;
