@@ -104,6 +104,8 @@ One `truss_model` = one model file, one sequence, on the current CUDA device (`C
 | `truss_reset(m)` | new sequence |
 | `truss_eval(m, tokens, n, logits)` | append n tokens (split into `max_chunk` chunks); write the last token's next-token logits (n_vocab floats; NULL skips) |
 | `truss_eval_argmax(m, tokens, n, &next)` | same, greedy token on the device (no logits copy) |
+| `truss_eval_sample(m, tokens, n, &sampling, &next)` | same, a sample on the device (`truss_sampling`: temperature > 0, top_p, top_k, min_p, seed; each sampled row advances the model's random-stream counter) |
+| `truss_spec_step_sampled(m, next, &sampling, emitted, &n, &new_next)` | `truss_spec_step` for sampled decoding (Strata's sampled verify): every verify row is sampled on the device; drafts are accepted while the row's sample equals the draft, so each emitted token is a sample of the model's own conditional |
 
 Returns 0 / pointer on success, −1 / NULL on failure (every C++ exception is caught at the boundary). The logits
 buffer is allocated before the engine so the expert budget sees the remaining memory. A second architecture becomes a
@@ -131,7 +133,8 @@ request whose client went away left the generator suspended holding the lock, an
 server (seen with an agent client on 8113). `max_tokens` defaults to the rest of the context (llama-server's
 `n_predict -1`; it was 1,024, which cut xhigh thinking short). Prefix reuse: if the new prompt starts with every token already in
 the engine's sequence, only the new tokens are evaluated; otherwise reset (the GDN state cannot rewind). Greedy
-(`temperature ≤ 0`) uses `eval_argmax` after the prompt and then, with `--mtp`, speculative rounds (`spec_step`),
+(`temperature ≤ 0`) uses `eval_argmax` after the prompt and then, with `--mtp`, speculative rounds (`spec_step`);
+sampled requests use `eval_sample` and `spec_step_sampled` (device sampling, speculation as well; `min_p` accepted),
 emitting each round's tokens in order (a stop token or string inside a round ends the reply; the engine keeps the
 round's later tokens, and prefix reuse tracks them); sampling copies logits. Stops on the GGUF EOS id, `<|im_end|>`,
 `<|endoftext|>`, a stop string, `max_tokens`, or n_ctx. After each request it logs one line (stdout and `--log`):

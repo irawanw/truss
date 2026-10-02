@@ -57,6 +57,21 @@ per-layer binding is one function (`bind_layer`) shared by `bind` and `bind_mtp`
 Bit-exact vs llama-paw's `ple_embd` (parity test). `Forward` keeps the last n−1 tokens (`tail`) so chunks hash as one
 sequence.
 
+## `ple_reader.h`, `ple_reader.cc` — PLE rows by parallel reads (TRACKER #88)
+
+`PleReader(file, table, scale, row_bytes, threads = 64, cache_rows = 1M)`; `issue(rows, n)` → ticket, then
+`collect(ticket, emb16 [n][160])`. Copies Strata's `ngram::PleReader`: each call's pages (a 160 B row may straddle
+two 4 KiB pages, plus the page of its fp16 scale) are deduplicated and read with `pread` by a pool of worker threads,
+many in flight; a row cache (row + scale, clock eviction, ~162 MB at 1M rows) serves repeats. Reads are buffered by
+default (pages already in the page cache cost microseconds; `TRUSS_PLE_ODIRECT=1` = Strata's unbuffered reads, which
+measured slower here because they re-read cached pages); `TRUSS_PLE_THREADS` overrides the pool size. One ticket in
+flight. Output is bit-identical to `ple_gather` (`ple_reader_test`).
+
+Measured (`ple_reader_test`, 4,096-token chunk = 65K rows; mmap path ~14 µs/row): 16 threads O_DIRECT 13.7 µs/row,
+64 threads O_DIRECT 6.7-10.1, **64 threads buffered 2.2-6.7**, 128 threads the same as 64 (the SSD is the limit).
+`Forward` uses it when `Options::ple_file` is set (bench and C API set it; `TRUSS_PLE_DIRECT=0` = the mapping): rows
+go to a pinned stage (`ple_stage`, an event guards reuse), so `ple()` no longer ends in a stream synchronize.
+
 ## `reference.h`, `reference.cu` — the math, block by block
 
 fp32 blocks on the reference ops (kernels-reference.md), one sequence from position 0, temporaries from a

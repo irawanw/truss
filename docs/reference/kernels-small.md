@@ -66,6 +66,17 @@ greedy decoding copies 4 bytes instead of 1 MB of logits per token.
 probability: `out = map ? map[argmax] : argmax`, `prob = exp(x_max - logsumexp(x))`. The MTP draft head scores the
 `draft_vocab` rows and stops drafting once `prob < Options::draft_min_p`.
 
+
+## `src/kernels/sampling/sample.{cuh,cu}`
+
+`sampling::sample(x [rows][n], n, rows, params, counter, out [rows], stream)`: one 1024-thread block per row. y = x /
+temperature; the cut is a logit threshold (kept: y >= cut): min_p from the maximum, top-k and top-p by 40-step
+bisection on the value (block reductions in a fixed order), so tokens tied at the cut are all kept; then Gumbel-max
+over the kept tokens (argmax y − log(−log u), u from a splitmix64 hash of (seed, counter + row, token)): an exact draw
+of the truncated softmax, deterministic for the same (seed, counter). Used by `truss_eval_sample` and
+`truss_spec_step_sampled` (one launch for a whole verify window). Tested by `sample_test` (empirical frequencies vs
+the exact truncated distribution within sampling noise, no draw outside the kept set, determinism; vocab 64-512 and
+248,077).
 ## Tested by
 
 No unit test per small op: each is checked inside the layer chain. `qwen4exp_parity` checks the reference blocks

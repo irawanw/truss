@@ -21,6 +21,11 @@ class Params(ctypes.Structure):   # truss_params
                 ("draft_min_p", ctypes.c_float)]
 
 
+class Sampling(ctypes.Structure):   # truss_sampling
+    _fields_ = [("temperature", ctypes.c_float), ("top_p", ctypes.c_float), ("top_k", ctypes.c_int),
+                ("min_p", ctypes.c_float), ("seed", ctypes.c_uint64)]
+
+
 class Model:
     """mtp: MTP draft GGUF (enables spec_step); cpu_dir: CPU expert tier (needs expert_usage)."""
 
@@ -47,6 +52,9 @@ class Model:
             "truss_open_params": (p, [ctypes.c_char_p, ctypes.POINTER(Params)]),
             "truss_spec_step": (c_int, [p, ctypes.c_int32, i32p, ctypes.POINTER(c_int), i32p]),
             "truss_drafts": (c_int, [p]),
+            "truss_eval_sample": (c_int, [p, i32p, c_int, ctypes.POINTER(Sampling), i32p]),
+            "truss_spec_step_sampled": (c_int, [p, ctypes.c_int32, ctypes.POINTER(Sampling), i32p,
+                                                ctypes.POINTER(c_int), i32p]),
         }
         for name, (res, args) in sig.items():
             fn = getattr(lib, name)
@@ -113,4 +121,19 @@ class Model:
         greedy token). Requires the model opened with mtp."""
         n, new = ctypes.c_int(), ctypes.c_int32()
         self._check(self._lib.truss_spec_step(self._m, nxt, self._emitted, ctypes.byref(n), ctypes.byref(new)))
+        return list(self._emitted[:n.value]), new.value
+
+    def eval_sample(self, tokens, sp: Sampling) -> int:
+        """Append tokens; returns a sample (on the device) of the next token."""
+        arr = np.ascontiguousarray(tokens, dtype=np.int32)
+        out = ctypes.c_int32()
+        self._check(self._lib.truss_eval_sample(self._m, arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), len(arr),
+                                                ctypes.byref(sp), ctypes.byref(out)))
+        return out.value
+
+    def spec_step_sampled(self, nxt: int, sp: Sampling):
+        """spec_step for sampled decoding: drafts accepted while each verify row's sample equals the draft."""
+        n, new = ctypes.c_int(), ctypes.c_int32()
+        self._check(self._lib.truss_spec_step_sampled(self._m, nxt, ctypes.byref(sp), self._emitted, ctypes.byref(n),
+                                                      ctypes.byref(new)))
         return list(self._emitted[:n.value]), new.value

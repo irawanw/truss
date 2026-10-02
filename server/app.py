@@ -21,8 +21,8 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from server.chat import Chat, Detokenizer, sample
-from server.truss_ctypes import Model, TrussError
+from server.chat import Chat, Detokenizer
+from server.truss_ctypes import Model, Sampling, TrussError
 
 
 class Engine:
@@ -46,7 +46,7 @@ class Engine:
             with open(self.log_path, "a") as f:
                 f.write(line + "\n")
 
-    def generate(self, prompt_ids, max_tokens, temperature, top_p, top_k, seed, stop_strings):
+    def generate(self, prompt_ids, max_tokens, temperature, top_p, top_k, seed, stop_strings, min_p=0.0):
         """Yields (token id, text delta, finish reason or None); the last item has the finish reason."""
         with self.lock:
             n_prompt = len(prompt_ids)
@@ -57,14 +57,16 @@ class Engine:
             if not reuse:
                 self.model.reset()
                 self.cached = []
-            rng = np.random.default_rng(seed)
             greedy = temperature <= 0
+            # sampled requests sample on the device and speculate too (Strata's sampled verify)
+            sp = None if greedy else Sampling(temperature, top_p if top_p and top_p > 0 else 1.0, top_k or 0, min_p or 0.0,
+                                              (seed if seed is not None else np.random.SeedSequence().entropy) % (1 << 64))
 
             def step(tokens):
                 self.cached += list(tokens)
                 if greedy:
                     return self.model.eval_argmax(tokens)
-                return sample(self.model.eval(tokens), temperature, top_p, top_k, rng)
+                return self.model.eval_sample(tokens, sp)
 
             t0 = time.time()
             try:
@@ -74,7 +76,7 @@ class Engine:
                 raise
             t1 = time.time()
             detok, text, n_gen, finish = Detokenizer(self.chat), "", 0, "length"
-            spec = greedy and self.model.drafts > 0
+            spec = self.model.drafts > 0
             drafted = accepted = 0
             pending = []   # tokens the engine already holds that are still to be emitted (speculative rounds)
             try:
@@ -82,7 +84,7 @@ class Engine:
                     if spec and not pending:   # one round: nxt plus the accepted drafts enter the sequence
                         if self.model.position + 1 >= self.model.n_ctx:
                             break
-                        emitted, after = self.model.spec_step(nxt)
+                        emitted, after = self.model.spec_step(nxt) if greedy else self.model.spec_step_sampled(nxt, sp)
                         self.cached += emitted
                         drafted += self.model.drafts
                         accepted += len(emitted) - 1
@@ -165,6 +167,7 @@ def make_app(engine: Engine) -> FastAPI:
         return dict(max_tokens=int(body.get("max_tokens") or body.get("max_completion_tokens") or engine.model.n_ctx),
                     temperature=float(body.get("temperature", 1.0) if body.get("temperature") is not None else 1.0),
                     top_p=float(body.get("top_p") or 1.0), top_k=int(body.get("top_k") or 0), seed=body.get("seed"),
+                    min_p=float(body.get("min_p") or 0.0),
                     stop_strings=[stop] if isinstance(stop, str) else list(stop))
 
     _END = object()

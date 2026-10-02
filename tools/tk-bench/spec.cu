@@ -114,6 +114,7 @@ int main(int argc, char ** argv)
         o.draft_min_p = min_p;
         o.doorbell = !(argc > 12 && std::string(argv[12]) == "sync");
         o.cpu_dir = cpu_dir;
+        o.ple_file = file.get();   // PLE rows by O_DIRECT reads (TRUSS_PLE_DIRECT=0: the mapping)
         q::apply_env(o);   // TRUSS_CPU_*, TRUSS_PCIE_*, TRUSS_ADAPT_*, TRUSS_HINT_K, TRUSS_RING_GB, TRUSS_PREFILL_ROWS
         if (argc > 6 && std::string(argv[6]) != "-")
             o.expert_usage = runtime::ExpertStore::load_usage(argv[6], c.n_layer, c.n_expert);   // MTP: Forward adds

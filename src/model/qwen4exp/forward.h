@@ -84,6 +84,9 @@ struct ForwardOptions {
     // DSA K/V caches as int8 codes + an fp16 scale per 64 values (Strata's served KV format, dsa::KvCache): half the
     // VRAM of fp16 (6.4 -> 3.3 GB at 256K for the 12 layers + the MTP layer: ~2,000 more resident experts)
     bool kv_int8 = false;
+    // the model file the weights are bound from: with it the PLE table rows are read by PleReader (O_DIRECT, many in
+    // flight, row cache) instead of page faults through the mapping (TRACKER #88). nullptr: the mapping.
+    const gguf::File * ple_file = nullptr;
     int hint_k = 4;                           // pre-gated prefetch: per row, the next layer's top hint_k predicted
                                               // experts start copying early (0: off; 3-6 measured equal, TRACKER #59)
     // Called once upload() has the weights on the device but before the constructor does anything else expensive

@@ -43,6 +43,7 @@ target_link_libraries(truss_reference PUBLIC truss_core)
 add_library(truss_models STATIC
   src/model/qwen4exp/config.cc
   src/model/qwen4exp/ple.cc
+  src/model/qwen4exp/ple_reader.cc
   src/model/qwen4exp/weights.cc
   src/model/qwen4exp/reference.cu)
 target_link_libraries(truss_models PUBLIC truss_formats truss_reference)
@@ -86,6 +87,7 @@ add_library(truss_kernels STATIC
   src/kernels/ffn/ffn_ops.cu
   src/kernels/ple/ple_prefill.cu
   src/kernels/sampling/argmax.cu
+  src/kernels/sampling/sample.cu
   src/kernels/spec/rollback.cu
   src/kernels/mtp/mtp_ops.cu)
 target_include_directories(truss_kernels PUBLIC src)
@@ -109,6 +111,10 @@ target_compile_options(cpu_trellis_test PRIVATE -O2 -mavx2 -mfma -mf16c)
 target_link_libraries(cpu_trellis_test PRIVATE truss_cpu)
 add_executable(q8_gemm_test tests/unit/q8_gemm_test.cu)
 target_link_libraries(q8_gemm_test PRIVATE truss_kernels truss_reference)
+add_executable(sample_test tests/unit/sample_test.cu)
+target_link_libraries(sample_test PRIVATE truss_kernels)
+add_executable(ple_reader_test tests/unit/ple_reader_test.cc)
+target_link_libraries(ple_reader_test PRIVATE truss_models)
 add_executable(gemv_multi_test tests/unit/gemv_multi_test.cu)
 target_link_libraries(gemv_multi_test PRIVATE truss_kernels)
 

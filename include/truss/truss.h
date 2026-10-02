@@ -62,6 +62,25 @@ int truss_eval_argmax(truss_model * m, const int32_t * tokens, int n, int32_t * 
 int truss_spec_step(truss_model * m, int32_t next, int32_t * emitted, int * n_emitted, int32_t * new_next);
 int truss_drafts(const truss_model * m);            /* 0: opened without MTP */
 
+/* Sampling on the device (kernels/sampling/sample.cuh): temperature > 0; top_p >= 1, top_k <= 0, min_p <= 0 are off.
+   Each sampled row draws from its own random stream (seed, a per-model counter that every sampled row advances). */
+typedef struct truss_sampling {
+    float temperature;
+    float top_p;
+    int top_k;
+    float min_p;
+    uint64_t seed;
+} truss_sampling;
+
+/* truss_eval, then a sample of the last token's next-token distribution in *next */
+int truss_eval_sample(truss_model * m, const int32_t * tokens, int n, const truss_sampling * sp, int32_t * next);
+
+/* truss_spec_step for sampled decoding (Strata's sampled verify): every verify row is sampled with `sp`; drafts are
+   accepted while the row's sample equals the draft, and the first row that differs gives *new_next. Each emitted
+   token is a sample of the model's own distribution given the tokens before it, whatever the drafts were. */
+int truss_spec_step_sampled(truss_model * m, int32_t next, const truss_sampling * sp, int32_t * emitted,
+                            int * n_emitted, int32_t * new_next);
+
 #ifdef __cplusplus
 }
 #endif

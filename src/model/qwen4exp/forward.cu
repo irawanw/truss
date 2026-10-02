@@ -19,6 +19,7 @@
 #include "kernels/sampling/argmax.cuh"
 #include "kernels/spec/rollback.cuh"
 #include "model/qwen4exp/ple.h"
+#include "model/qwen4exp/ple_reader.h"
 #include "runtime/doorbell.cuh"
 #include "runtime/expert_store.h"
 
@@ -143,6 +144,10 @@ struct Forward::Impl {
     std::chrono::steady_clock::time_point drv_t[3];   // driver thread only: doorbell seen, split done, CPU started
     double drv_ms[3] = { 0, 0, 0 };                    // summed: split, CPU start, copies + plan (driver_ms)
     double ple_host_ms = 0;                            // host time of the PLE row hash + gather + fp16 convert
+    std::unique_ptr<PleReader> ple_reader;           // Options::ple_file: rows read with O_DIRECT, not page faults
+    half * ple_stage = nullptr;                        // pinned [rows][E]: the gathered rows for the device copy
+    size_t ple_stage_n = 0;
+    cudaEvent_t ple_copied = nullptr;                  // the last copy out of ple_stage has been read
     long ple_calls = 0, ple_rows_n = 0;                // (ple_host_ms(); the rows are table rows read)
     long drv_n = 0;
     std::atomic<long> jobs_pushed{ 0 };   // the driver spins on this before it sleeps on dq_cv (Strata's host spins)
@@ -330,6 +335,12 @@ struct Forward::Impl {
         // memory and uploaded the hot set, so from here the mapping is dead weight. Releasing before load_cpu_tier
         // keeps a ~24 GB resident peak off the books while that vector allocates (TRACKER #72).
         if (o.after_upload) o.after_upload();
+        if (o.ple_file && w.ple_table) {   // PLE rows by O_DIRECT reads (TRACKER #88)
+            ple_reader = std::make_unique<PleReader>(*o.ple_file, *w.ple_table, *w.ple_scale, c.ple_head_dim);
+            ple_stage_n = (size_t) std::max(max_chunk, prefill_rows) * c.ple_heads() * c.ple_head_dim;
+            TRUSS_CUDA(cudaMallocHost(&ple_stage, ple_stage_n * sizeof(half)));
+            TRUSS_CUDA(cudaEventCreateWithFlags(&ple_copied, cudaEventDisableTiming));
+        }
         if (!o.cpu_dir.empty()) load_cpu_tier(o, hot);
         else if (o.cpu_trellis) load_cpu_tier_trellis(o, hot);
         use_doorbell = o.doorbell;
@@ -364,6 +375,8 @@ struct Forward::Impl {
 
     ~Impl()
     {
+        if (ple_stage) cudaFreeHost(ple_stage);
+        if (ple_copied) cudaEventDestroy(ple_copied);
         if (driver.joinable()) {
             {
                 std::lock_guard<std::mutex> g(dq_mu);
@@ -1023,18 +1036,30 @@ struct Forward::Impl {
         seq.insert(seq.end(), tokens, tokens + T);
         std::vector<int32_t> rows(seq.size() * H);
         ple_rows(c, seq.data(), (int) seq.size(), rows.data());
-        std::vector<float> emb((size_t) T * E);
-        ple_gather(c, w, rows.data() + (size_t) n_prev * H, T, emb.data());
-        std::vector<half> emb16(emb.size());
-        for (size_t i = 0; i < emb.size(); ++i) emb16[i] = __float2half(emb[i]);
+        std::vector<half> emb16;
+        const half * host16;
+        if (ple_reader) {   // O_DIRECT reads into the pinned stage (the previous copy out of it has been read)
+            require((size_t) T * E <= ple_stage_n, "PLE stage too small for the chunk");
+            const int tk = ple_reader->issue(rows.data() + (size_t) n_prev * H, (size_t) T * H);
+            TRUSS_CUDA(cudaEventSynchronize(ple_copied));
+            ple_reader->collect(tk, ple_stage);
+            host16 = ple_stage;
+        } else {
+            std::vector<float> emb((size_t) T * E);
+            ple_gather(c, w, rows.data() + (size_t) n_prev * H, T, emb.data());
+            emb16.resize(emb.size());
+            for (size_t i = 0; i < emb.size(); ++i) emb16[i] = __float2half(emb[i]);
+            host16 = emb16.data();
+        }
         ple_host_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - th0).count();
         ++ple_calls, ple_rows_n += (long) T * H;
 
         const size_t m = sc->mark();
-        half * e16 = sc->alloc<half>(emb16.size());
+        half * e16 = sc->alloc<half>((size_t) T * E);
         float * key = sc->alloc((size_t) T * c.hc_dim()), * value = sc->alloc((size_t) T * c.d_model);
         float * gate = sc->alloc((size_t) T * c.hc), * normed = sc->alloc((size_t) T * c.hc_dim());
-        TRUSS_CUDA(cudaMemcpyAsync(e16, emb16.data(), emb16.size() * 2, cudaMemcpyHostToDevice, s));
+        TRUSS_CUDA(cudaMemcpyAsync(e16, host16, (size_t) T * E * 2, cudaMemcpyHostToDevice, s));
+        if (ple_reader) TRUSS_CUDA(cudaEventRecord(ple_copied, s));
         const Act ea = quant(e16, T, c.ple_heads() * c.ple_head_dim);
         lin_multi({ { p.key, key }, { p.value, value } }, ea, T);
         ple::gate(key, res, f32(p.norm_key), f32(p.norm_query), T, c.hc, c.d_model, c.rms_eps, gate, s);
@@ -1043,7 +1068,7 @@ struct Forward::Impl {
         ple::apply(value, gate, f32(p.norm_conv), d(p.conv1d).as<half>(), L.ple_hist, T, c.hc, c.d_model, c.ple_conv,
                    c.ple_ngram, c.rms_eps, normed, res, s);
         if (tentative) copy(L.normed_rows, normed, (size_t) T * c.hc_dim());
-        TRUSS_CUDA(cudaStreamSynchronize(s));   // emb16 is a host temporary
+        if (!ple_reader) TRUSS_CUDA(cudaStreamSynchronize(s));   // emb16 is a host temporary (the stage is not)
         sc->release(m);
     }
 
@@ -1754,6 +1779,7 @@ void apply_env(ForwardOptions & o)
     f("TRUSS_HINT_K", o.hint_k);               // pre-gated prefetch width
     f("TRUSS_PREFILL_ROWS", o.prefill_rows);
     f("TRUSS_KV_INT8", o.kv_int8);             // Strata's int8 KV
+    if (const char * e = std::getenv("TRUSS_PLE_DIRECT"); e && !std::atoi(e)) o.ple_file = nullptr;   // A/B: the mapping
     if (const char * e = std::getenv("TRUSS_RING_GB")) o.ring_bytes_override = (size_t) (std::atof(e) * (1ull << 30));
 }
 
