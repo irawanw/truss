@@ -125,12 +125,19 @@ truss_model * truss_open_params(const char * gguf_path, const truss_params * p)
                 o.cpu_share = p->cpu_share;
                 o.cpu_threads = p->cpu_threads;
             }
+            q::apply_env(o);   // the bench's decode-tier knobs (TRUSS_CPU_TRELLIS, TRUSS_PCIE_FRAC, TRUSS_HINT_K, ...)
+            // drop the shards' file pages once the weights are on the device (a ~47 GB resident peak otherwise, TRACKER #72)
+            o.after_upload = [&] {
+                m->file->release_pages();
+                if (m->mtp_file) m->mtp_file->release_pages();
+            };
             // device buffers before the engine: its expert budget takes the memory left
             TRUSS_CUDA(cudaMalloc(&m->logits, sizeof(float) * m->config.n_vocab * (m->drafts + 1)));
             TRUSS_CUDA(cudaMalloc(&m->next, sizeof(int)));
             TRUSS_CUDA(cudaMalloc(&m->spec_next, sizeof(int) * (m->drafts + 1)));
             TRUSS_CUDA(cudaMallocHost(&m->spec_host, sizeof(int) * (m->drafts + 1)));
             m->fwd = std::make_unique<q::Forward>(m->config, m->weights, m->n_ctx, m->max_chunk, o);
+            m->file->release_pages();
             return m.release();
         },
         nullptr);

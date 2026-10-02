@@ -29,6 +29,7 @@
 #include <array>
 #include <atomic>
 #include <tuple>
+#include <type_traits>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -1730,5 +1731,23 @@ void Forward::accept(int n)
 }
 
 int Forward::draft(int32_t next, int n, int32_t * out) { return m_->draft(next, pos_, n, out); }
+
+void apply_env(ForwardOptions & o)
+{
+    auto f = [](const char * k, auto & v) {
+        if (const char * e = std::getenv(k)) v = (std::remove_reference_t<decltype(v)>) std::atof(e);
+    };
+    f("TRUSS_CPU_SHARE", o.cpu_share);
+    f("TRUSS_CPU_THREADS", o.cpu_threads);
+    f("TRUSS_CPU_DYNAMIC", o.cpu_dynamic);     // Strata's split
+    f("TRUSS_CPU_TRELLIS", o.cpu_trellis);     // CPU tier from the pack's own bytes
+    f("TRUSS_PCIE_GBPS", o.pcie_gbps);
+    f("TRUSS_PCIE_FRAC", o.pcie_frac);         // fixed PCIe share of the misses
+    f("TRUSS_ADAPT_EVERY", o.adapt_every);     // adaptive tier
+    f("TRUSS_ADAPT_SWAPS", o.adapt_swaps);
+    f("TRUSS_HINT_K", o.hint_k);               // pre-gated prefetch width
+    f("TRUSS_PREFILL_ROWS", o.prefill_rows);
+    if (const char * e = std::getenv("TRUSS_RING_GB")) o.ring_bytes_override = (size_t) (std::atof(e) * (1ull << 30));
+}
 
 }  // namespace truss::qwen4exp

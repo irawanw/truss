@@ -90,6 +90,12 @@ struct ForwardOptions {
     std::function<void()> after_upload;
 };
 
+// The decode-tier sweep knobs from the environment, applied on top of `o` (each only when set): TRUSS_CPU_SHARE,
+// TRUSS_CPU_THREADS, TRUSS_CPU_DYNAMIC, TRUSS_CPU_TRELLIS, TRUSS_PCIE_GBPS, TRUSS_PCIE_FRAC, TRUSS_ADAPT_EVERY,
+// TRUSS_ADAPT_SWAPS, TRUSS_RING_GB, TRUSS_HINT_K, TRUSS_PREFILL_ROWS. tk-bench-spec and the C API (so the server)
+// both call it, so a config benched is the config served.
+void apply_env(ForwardOptions & o);
+
 class Forward {
 public:
     using Options = ForwardOptions;

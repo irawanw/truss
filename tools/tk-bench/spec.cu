@@ -114,16 +114,7 @@ int main(int argc, char ** argv)
         o.draft_min_p = min_p;
         o.doorbell = !(argc > 12 && std::string(argv[12]) == "sync");
         o.cpu_dir = cpu_dir;
-        if (const char * e = std::getenv("TRUSS_CPU_SHARE")) o.cpu_share = (float) std::atof(e);   // sweeps
-        if (const char * e = std::getenv("TRUSS_CPU_THREADS")) o.cpu_threads = std::atoi(e);
-        if (const char * e = std::getenv("TRUSS_CPU_DYNAMIC")) o.cpu_dynamic = std::atoi(e) != 0;   // Strata split
-        if (const char * e = std::getenv("TRUSS_CPU_TRELLIS")) o.cpu_trellis = std::atoi(e) != 0;   // CPU from the pack
-        if (const char * e = std::getenv("TRUSS_PCIE_GBPS")) o.pcie_gbps = (float) std::atof(e);
-        if (const char * e = std::getenv("TRUSS_PCIE_FRAC")) o.pcie_frac = (float) std::atof(e);   // fixed share
-        if (const char * e = std::getenv("TRUSS_ADAPT_EVERY")) o.adapt_every = std::atoi(e);   // adaptive tier
-        if (const char * e = std::getenv("TRUSS_ADAPT_SWAPS")) o.adapt_swaps = std::atoi(e);
-        if (const char * e = std::getenv("TRUSS_RING_GB")) o.ring_bytes_override = (size_t) std::atof(e) * (1ull << 30);
-        if (const char * e = std::getenv("TRUSS_HINT_K")) o.hint_k = std::atoi(e);   // pre-gated prefetch width
+        q::apply_env(o);   // TRUSS_CPU_*, TRUSS_PCIE_*, TRUSS_ADAPT_*, TRUSS_HINT_K, TRUSS_RING_GB, TRUSS_PREFILL_ROWS
         if (argc > 6 && std::string(argv[6]) != "-")
             o.expert_usage = runtime::ExpertStore::load_usage(argv[6], c.n_layer, c.n_expert);   // MTP: Forward adds
                                                                                                // the mean layer
