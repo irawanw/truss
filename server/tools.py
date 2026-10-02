@@ -16,7 +16,7 @@ conversions (as llama-server's Qwen3-Coder parser does):
 
     messages = normalize_messages(body["messages"])        # string arguments -> dict, before templating
     content, calls = parse_calls(text, tools)               # after generation: calls out of the content
-    split = ToolStream(); split.push(delta) ... split.finish(tools)   # the streaming form
+    ts = ToolStream(tools); ts.push(delta) ... ts.finish()       # the streaming form, incremental
 
 A parameter value is kept as text when the tool's schema types it as a string (or the tool is not in the request);
 otherwise it is parsed as JSON (numbers, booleans, objects, arrays), falling back to text.
@@ -97,29 +97,134 @@ def parse_calls(text: str, tools=None):
 
 
 class ToolStream:
-    """Streams content deltas until a <tool_call> starts, then holds the rest for parse_calls at the end. Holds back
-    only a tail that could be the start of the tag."""
+    """Streaming form, incremental like llama-server: content until a <tool_call>; then, per call, a first delta with
+    the id and name as soon as `<function=NAME>` is complete, and the arguments JSON in fragments as the model writes
+    them (a string value is streamed escaped as it arrives; other types are emitted at their </parameter>). A call that
+    writes a whole file streams for minutes; holding it until the end (a229de0) stalled clients ("stream stalled while
+    waiting for the next event"). Text after the first call is dropped (the template asks for no suffix).
 
-    def __init__(self):
-        self.held, self.calling = "", False
+        ts = ToolStream(tools)
+        for kind, x in ts.push(delta): ...   # ("content", text) or ("call", OpenAI tool_calls delta with index)
+        for kind, x in ts.finish(): ...      # closes an unterminated call
+        ts.calls                             # number of calls emitted
+    """
 
-    def push(self, delta: str) -> str:
-        if self.calling:
-            self.held += delta
-            return ""
-        buf = self.held + delta
-        i = buf.find(OPEN)
-        if i >= 0:
-            self.calling, self.held = True, buf[i:]
-            return buf[:i]
-        keep = max((k for k in range(1, len(OPEN)) if buf.endswith(OPEN[:k])), default=0)
-        self.held = buf[len(buf) - keep:]
-        return buf[:len(buf) - keep]
+    def __init__(self, tools=None):
+        self.types = _schema_types(tools)
+        self.buf, self.state, self.calls = "", "text", 0
+        self.first, self.strip_nl, self.typ = True, False, None
 
-    def finish(self, tools=None):
-        """(text still to send as content, [tool_call])."""
-        held, self.held = self.held, ""
-        if not self.calling:
-            return held, []
-        content, calls = parse_calls(held, tools)
-        return ("" if calls else held), calls
+    def _arg(self, s):
+        return ("call", {"index": self.calls - 1, "function": {"arguments": s}})
+
+    @staticmethod
+    def _partial(buf, tags):
+        """buf could still become one of tags (a proper prefix)."""
+        return any(t.startswith(buf) and t != buf for t in tags)
+
+    def push(self, delta: str):
+        self.buf += delta
+        out = []
+        while True:
+            b = self.buf
+            if self.state == "text":
+                i = b.find(OPEN)
+                if i >= 0:
+                    if self.calls == 0 and b[:i]:
+                        out.append(("content", b[:i]))
+                    self.buf, self.state = b[i + len(OPEN):], "name"
+                    continue
+                keep = max((k for k in range(1, len(OPEN)) if b.endswith(OPEN[:k])), default=0)
+                if self.calls == 0 and b[:len(b) - keep]:
+                    out.append(("content", b[:len(b) - keep]))
+                self.buf = b[len(b) - keep:]
+                return out
+            if self.state == "name":
+                m = re.match(r"\s*<function=([^>\n]+)>", b)
+                if not m:
+                    return out
+                name = m.group(1).strip()
+                self.calls += 1
+                self.known = self.types.get(name)
+                out.append(("call", {"index": self.calls - 1, "id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                                     "function": {"name": name, "arguments": ""}}))
+                self.buf, self.state, self.first = b[m.end():], "params", True
+                continue
+            if self.state == "params":
+                s = b.lstrip()
+                m = re.match(r"<parameter=([^>\n]+)>", s)
+                if m:
+                    key = m.group(1).strip()
+                    self.typ = self.known.get(key) if self.known is not None else "string"
+                    lead = "{" if self.first else ", "
+                    self.first = False
+                    if self.typ in ("string", None):
+                        out.append(self._arg(lead + json.dumps(key) + ": \""))
+                        self.state = "str"
+                    else:
+                        out.append(self._arg(lead + json.dumps(key) + ": "))
+                        self.state = "raw"
+                    self.buf, self.strip_nl = s[m.end():], True
+                    continue
+                if s.startswith("</function>"):
+                    out.append(self._arg("{}" if self.first else "}"))
+                    self.buf, self.state = s[len("</function>"):], "end"
+                    continue
+                if not s or self._partial(s, ("<parameter=", "</function>")) or s.startswith("<parameter="):
+                    return out
+                self.buf = s[1:]   # stray text between parameters
+                continue
+            if self.state in ("str", "raw"):
+                if self.strip_nl:
+                    if not b:
+                        return out
+                    if b[0] == "\n":
+                        b = b[1:]
+                    self.buf, self.strip_nl = b, False
+                i = b.find("</parameter>")
+                if i < 0:
+                    if self.state == "raw":
+                        return out
+                    # hold back a possible partial closing tag and one newline that may precede it
+                    keep = max((k for k in range(1, len("\n</parameter>")) if b.endswith("\n</parameter>"[:k])), default=0)
+                    keep = max(keep, max((k for k in range(1, len("</parameter>")) if b.endswith("</parameter>"[:k])), default=0))
+                    if b[:len(b) - keep]:
+                        out.append(self._arg(json.dumps(b[:len(b) - keep])[1:-1]))
+                    self.buf = b[len(b) - keep:]
+                    return out
+                v = b[:i]
+                if v.endswith("\n"):
+                    v = v[:-1]
+                if self.state == "str":
+                    out.append(self._arg(json.dumps(v)[1:-1] + "\""))
+                else:
+                    out.append(self._arg(json.dumps(_value(v, self.typ), ensure_ascii=False)))
+                self.buf, self.state = b[i + len("</parameter>"):], "params"
+                continue
+            if self.state == "end":
+                i = b.find("</tool_call>")
+                if i < 0:
+                    if not self._partial(b.lstrip(), ("</tool_call>",)) and b.strip():
+                        self.state = "text"   # no closing tag: treat what follows as text
+                        continue
+                    return out
+                self.buf, self.state = b[i + len("</tool_call>"):], "text"
+                continue
+
+    def finish(self):
+        """Closes whatever is open at the end of the reply."""
+        out, b = [], self.buf
+        self.buf = ""
+        if self.state == "text":
+            if self.calls == 0 and b:
+                out.append(("content", b))
+        elif self.state in ("str", "raw"):
+            v = b[:-1] if b.endswith("\n") else b
+            if self.state == "str":
+                out.append(self._arg(json.dumps(v)[1:-1] + "\"}"))
+            else:
+                out.append(self._arg(json.dumps(_value(v, self.typ), ensure_ascii=False) + "}"))
+        elif self.state == "params":
+            out.append(self._arg("{}" if self.first else "}"))
+        self.state = "text"
+        return out

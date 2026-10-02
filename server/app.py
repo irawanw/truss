@@ -22,6 +22,7 @@ import time
 import uuid
 
 import anyio
+import asyncio
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, Request
@@ -179,22 +180,32 @@ def make_app(engine: Engine) -> FastAPI:
                     top_k=get("top_k", 40, int), min_p=get("min_p", 0.05, float), seed=body.get("seed"),
                     stop_strings=[stop] if isinstance(stop, str) else list(stop))
 
-    _END = object()
+    _END, KEEPALIVE = object(), object()
 
-    async def tokens(req: Request, ids, p):
+    async def tokens(req: Request, ids, p, keepalive=None):
         """engine.generate driven from a worker thread, so the event loop never blocks on the engine (or its lock).
         On a client disconnect, or when the caller stops early, the generator is closed: it logs its line and releases
-        the engine lock (a suspended, never-closed generator held the lock and deadlocked the next request)."""
+        the engine lock (a suspended, never-closed generator held the lock and deadlocked the next request).
+        With `keepalive` (seconds), KEEPALIVE is yielded whenever the engine has produced nothing for that long (a
+        long prompt read, a wait for the lock), so a streaming client's stall timer sees traffic."""
         gen = engine.generate(ids, **p)
+        task = None
         try:
             while True:
-                item = await anyio.to_thread.run_sync(next, gen, _END)
+                task = asyncio.ensure_future(anyio.to_thread.run_sync(next, gen, _END))
+                while not (await asyncio.wait({task}, timeout=keepalive))[0]:
+                    yield KEEPALIVE
+                    if await req.is_disconnected():
+                        return
+                item, task = task.result(), None
                 if item is _END:
                     return
                 yield item
                 if await req.is_disconnected():
                     return
         finally:
+            if task is not None:   # the worker thread is inside next(gen): let it return before closing gen
+                await asyncio.shield(task)
             gen.close()
 
     @app.get("/health")
@@ -227,27 +238,33 @@ def make_app(engine: Engine) -> FastAPI:
                     return "data: " + json.dumps({"id": rid, "object": "chat.completion.chunk", "created": created,
                                                   "model": engine.name,
                                                   "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}) + "\n\n"
-                split, calls = ThinkSplitter(thinking), ToolStream() if tools else None
+                split, calls = ThinkSplitter(thinking), ToolStream(tools) if tools else None
+
+                def emit(pairs):
+                    for kind, x in pairs:
+                        yield chunk({"tool_calls": [x]} if kind == "call" else {"content": x})
 
                 def out(pairs):
                     for field, d in pairs:
                         if field == "content" and calls:
-                            d = calls.push(d)
-                        if d:
+                            yield from emit(calls.push(d))
+                        elif d:
                             yield chunk({field: d})
-                async for tok, delta, finish in tokens(req, ids, p):
+                yield chunk({"role": "assistant", "content": ""})
+                async for item in tokens(req, ids, p, keepalive=5.0):
+                    if item is KEEPALIVE:
+                        yield chunk({"content": ""})
+                        continue
+                    tok, delta, finish = item
                     for c in out(split.push(delta)):
                         yield c
                     if finish:
                         for c in out(split.flush()):
                             yield c
                         if calls:
-                            rest, found = calls.finish(tools)
-                            if rest:
-                                yield chunk({"content": rest})
-                            for k, call in enumerate(found):
-                                yield chunk({"tool_calls": [dict(call, index=k)]})
-                            if found and finish == "stop":
+                            for c in emit(calls.finish()):
+                                yield c
+                            if calls.calls and finish == "stop":
                                 finish = "tool_calls"
                         yield chunk({}, finish)
                 yield "data: [DONE]\n\n"
