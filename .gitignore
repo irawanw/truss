@@ -1,2 +1,4 @@
 build/
 __pycache__/
+# internal-only: tracked on disk, never pushed to GitHub
+/TRACKER.md

@@ -1,6 +1,6 @@
 # TRUSS handover — decode speed work (2026-09-30)
 
-Read first: [TRACKER.md](../TRACKER.md) rows #56–#60 (every measurement below has a row) and
+Read first: TRACKER.md (kept locally, internal-only — not in this repo) rows #56-#60 (every measurement below has a row) and
 [docs/reference/](reference/README.md) (every source file). Rules: [CODE.md](CODE.md), `~/ML_projects/STORAGE.md`.
 
 ## 1. Goal and user constraints
