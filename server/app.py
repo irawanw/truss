@@ -17,6 +17,7 @@ usage: CUDA_VISIBLE_DEVICES=2 python3 -m server.app --model <gguf> --tokenizer <
 """
 import argparse
 import json
+import os
 import threading
 import time
 import uuid
@@ -45,6 +46,7 @@ class Engine:
                                      self.chat.token_id("<|im_end|>"), self.chat.token_id("<|endoftext|>"))
                          if i is not None and i >= 0}
         self.name, self.log_path, self.log_tag = a.name, a.log, a.log_tag
+        self.dump_dir = a.dump_dir
         self.cached = []               # tokens in the engine's sequence
         self.lock = threading.Lock()
 
@@ -53,6 +55,22 @@ class Engine:
         if self.log_path:
             with open(self.log_path, "a") as f:
                 f.write(line + "\n")
+
+    def dump(self, prompt_ids, text, finish, sampling, keep=20):
+        """--dump-dir: one JSON per request (prompt tail, generated text, finish, sampling), the newest `keep` kept;
+        for diagnosing replies after the fact (e.g. a 32K-token reply that hit the client's cap)."""
+        if not self.dump_dir:
+            return
+        try:
+            os.makedirs(self.dump_dir, exist_ok=True)
+            path = os.path.join(self.dump_dir, time.strftime("%Y%m%d-%H%M%S") + f"-{len(prompt_ids)}.json")
+            with open(path, "w") as f:
+                json.dump({"n_prompt": len(prompt_ids), "prompt_tail": self.chat.tok.decode(prompt_ids[-4000:]),
+                           "finish": finish, "sampling": sampling, "text": text}, f, ensure_ascii=False)
+            for old in sorted(os.listdir(self.dump_dir))[:-keep]:
+                os.remove(os.path.join(self.dump_dir, old))
+        except OSError as e:
+            print(f"dump failed: {e}", flush=True)
 
     def generate(self, prompt_ids, max_tokens, temperature, top_p, top_k, seed, stop_strings, min_p=0.0):
         """Yields (token id, text delta, finish reason or None); the last item has the finish reason."""
@@ -122,6 +140,7 @@ class Engine:
                 self.log(f"{self.log_tag}: prompt {n_prompt} tokens = {reuse} reused + {n_prompt - reuse} read in "
                          f"{read * 1e3:.0f} ms ({(n_prompt - reuse) / max(read, 1e-9):.1f} tok/s), {n_gen} generated "
                          f"in {gen_s * 1e3:.0f} ms ({n_gen / max(gen_s, 1e-9):.1f} tok/s), drafts accepted {accepted} of {drafted}")
+                self.dump(prompt_ids, text, finish, dict(temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p))
             yield None, "", finish
 
 
@@ -339,6 +358,7 @@ def main():
     ap.add_argument("--name", default="flash-next-truss")
     ap.add_argument("--log", default=None, help="append one line per request here")
     ap.add_argument("--log-tag", default="truss serve")
+    ap.add_argument("--dump-dir", default=None, help="keep the last 20 requests (prompt tail + reply) here as JSON")
     a = ap.parse_args()
     engine = Engine(a)
     print(f"truss: model loaded, n_ctx {engine.model.n_ctx}, listening on {a.host}:{a.port}", flush=True)

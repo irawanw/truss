@@ -153,6 +153,8 @@ write (18,442 tokens, 303 s) sent no events and the client gave up ("stream stal
 event"). Measured after the fix: a 6.3K-char file write, 2,922 events, max gap 2.45 s; a 60K-token prompt queued
 behind another request, 8 keepalives, max gap 5.00 s.
 
+`--dump-dir DIR` (off by default; the pm2 script leaves it off) keeps the last 20 requests as JSON (prompt tail, reply text, finish, sampling) for diagnosing a reply after the fact.
+
 Each chat request also logs `request: temperature … top_p … top_k … min_p …, N tools, thinking on|off`.
 
 **Engine.generate.** One request at a time (lock). The handlers drive it from a worker thread (`tokens()` in
