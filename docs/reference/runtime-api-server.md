@@ -10,6 +10,12 @@ only 41% of routed entries: the pack's experts are 0.6-2.5 MB and the most-route
 decode 75.5 -> 81.6 tok/s. `TRUSS_ROUTE_TRACE=<file>` (Forward) writes every decode layer's routing for offline
 policy replays (`flashnext/20261002_truss_d0/scripts/cache_replay.py`).
 
+**Ring eviction: CLOCK in place (TRACKER #91).** `fetch` sets a per-expert reference bit on a ring hit; when
+`ring_put` reaches the oldest entry in its way and that entry's bit is set, the entry stays where it is, loses the
+bit, goes to the back of the FIFO order and the head skips past it (no copy). At most `TRUSS_RING_CLOCK` skips per
+copy (default 8; 0 = plain FIFO). Not for hint copies: their protection check covers only the unskipped region and
+the current layer's kernel may still read the ring. Replay at 256K: FIFO 240 -> ~207 misses/pass (LRU 208).
+
 **Problem.** Flash-Next's routed experts are 37 GiB; after dense weights, caches and scratch a 3090 has ~13–16 GiB
 for them. The rest (cold, ~24 GB) must come over PCIe (13.5 GB/s pinned, x8) when used.
 

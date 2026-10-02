@@ -229,6 +229,10 @@ int main(int argc, char ** argv)
             std::printf("\n");
             // accumulate
             S.pre_s += pre, S.pre_tok += (long) tok.size(), S.pre_ple += pre_ple / 1e3;
+            if (const char * dp = std::getenv("TRUSS_BENCH_DUMP")) {   // the spec tokens, appended per prompt
+                FILE * fd = std::fopen(dp, pi ? "ab" : "wb");
+                if (fd) std::fwrite(got.data(), 4, std::min<size_t>(got.size(), N), fd), std::fclose(fd);
+            }
             S.spec_s += spec, S.plain_s += plain, S.passes += passes, S.tokens += N, S.drafted += drafted;
             S.accepted += accepted, S.ms_draft += ms_draft, S.ms_verify += ms_verify, S.ms_head += ms_head;
             if (do_plain) S.identical += same, S.compared += N;

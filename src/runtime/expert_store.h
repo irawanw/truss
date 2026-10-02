@@ -135,6 +135,7 @@ private:
         int32_t * ring_meta_host = nullptr;                         // pinned mirror of ring_meta, [3][n_expert][2]
         std::vector<int64_t> ring_at;                               // [expert] byte offset in the ring, -1: absent
         std::vector<uint8_t> pend;                                  // [expert] admitted, copy not known to have landed
+        std::vector<uint8_t> ref;                                   // [expert] ring entry used since it was copied in
         const half * suh[3] = {}, * svh[3] = {};
         int n_expert = 0;
     };

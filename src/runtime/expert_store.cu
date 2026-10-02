@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <climits>
 #include <cstdio>
 #include <cstring>
@@ -240,6 +241,7 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
         Y.cold_off.assign(E, -1);
         Y.ring_at.assign(E, -1);
         Y.pend.assign(E, 0);
+        Y.ref.assign(E, 0);
         uint8_t * slot_dst = base_ + (l % 2) * slot_;
         size_t cold_pos = 0;
         for (int e = 0; e < E; ++e) {
@@ -368,15 +370,40 @@ bool ExpertStore::ring_put(int l, int e, bool hint)
         }
         head_ = 0;
     }
-    while (!fifo_.empty() && fifo_.front().off >= head_ && fifo_.front().off < head_ + need) {
-        layers_[fifo_.front().layer].ring_at[fifo_.front().expert] = -1;
-        layers_[fifo_.front().layer].pend[fifo_.front().expert] = 0;
+    // CLOCK in place (TRACKER #91): the oldest entry in the way that was used since it came in stays where it is,
+    // loses its bit and goes to the back of the order, and the head skips past it (no copy). Replay at 256K: FIFO
+    // 240 -> ~207 misses/pass, LRU 208. At most `clock_max` skips per copy (TRUSS_RING_CLOCK; 0 = plain FIFO).
+    static const int clock_max = std::getenv("TRUSS_RING_CLOCK") ? std::atoi(std::getenv("TRUSS_RING_CLOCK")) : 8;
+    for (int skips = 0;;) {
+        if (head_ + need > (int64_t) ring_) {   // wrap again (a skip may have pushed the head to the end)
+            while (!fifo_.empty() && fifo_.front().off >= head_) {
+                layers_[fifo_.front().layer].ring_at[fifo_.front().expert] = -1;
+                layers_[fifo_.front().layer].pend[fifo_.front().expert] = 0;
+                fifo_.pop_front();
+            }
+            head_ = 0;
+        }
+        if (fifo_.empty() || fifo_.front().off < head_ || fifo_.front().off >= head_ + need) break;
+        const RingEntry f = fifo_.front();
+        Layer & F = layers_[f.layer];
         fifo_.pop_front();
+        // not for hints: their protection check above covers only the unskipped region, and the current layer's
+        // kernel may still read the ring (demand fetches and admissions wait for compute first)
+        if (!hint && F.ref[f.expert] && skips < clock_max && !(f.layer == l && f.expert == e)) {
+            F.ref[f.expert] = 0;
+            fifo_.push_back(f);
+            head_ = f.off + (int64_t) align_up(F.bytes[f.expert]);
+            ++skips;
+            continue;
+        }
+        F.ring_at[f.expert] = -1;
+        F.pend[f.expert] = 0;
     }
     const int64_t off = head_;
     head_ += need;
     fifo_.push_back({ l, e, off });
     Y.ring_at[e] = off;
+    Y.ref[e] = 0;
     uint8_t * at = base_ + off;
     TRUSS_CUDA(cudaMemcpyAsync(at, Y.host + Y.cold_off[e], Y.bytes[e], cudaMemcpyHostToDevice, copy_));
     for (int p = 0; p < 3; ++p) Y.ring_meta_host[(size_t) p * 2 * Y.n_expert + 2 * e + 1] = unit_offset(at + Y.part[p][e], base_, l);
@@ -440,6 +467,7 @@ bool ExpertStore::fetch(int l, const int * ids, int n, cudaStream_t compute)
         const int e = ids[i];
         if (e < 0 || e >= Y.n_expert) throw std::out_of_range("ExpertStore::fetch: expert id " + std::to_string(e));
         if (Y.cold_off[e] < 0 || std::find(need.begin(), need.end(), e) != need.end()) continue;
+        if (Y.ring_at[e] >= 0) Y.ref[e] = 1;   // a ring hit: CLOCK's second chance
         need.push_back(e);
     }
     stats_.experts_asked += (long) need.size();
