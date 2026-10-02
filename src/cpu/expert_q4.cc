@@ -155,11 +155,12 @@ void preconvert_scales(const Q4Expert & e, float * out)
 }
 
 // one logical CPU per physical core this process may run on (the first allowed SMT sibling), from sysfs, as Strata's
-// pool (kernels/cpu/pool.cpp physical_cores): two workers on SMT siblings share one core's pipes
+// pool (kernels/cpu/pool.cpp physical_cores): two workers on SMT siblings share one core's pipes. The siblings follow.
 static std::vector<int> physical_cores()
 {
     std::vector<int> out;
     std::vector<std::pair<long, long>> seen;
+    std::vector<std::pair<std::pair<long, long>, int>> siblings;
     cpu_set_t set;
     CPU_ZERO(&set);
     if (sched_getaffinity(0, sizeof set, &set) != 0) return out;
@@ -176,10 +177,18 @@ static std::vector<int> physical_cores()
             return v;
         };
         const std::pair<long, long> key{ topo("physical_package_id"), topo("core_id") };
-        if (std::find(seen.begin(), seen.end(), key) != seen.end()) continue;
+        if (std::find(seen.begin(), seen.end(), key) != seen.end()) {
+            siblings.push_back({ key, c });
+            continue;
+        }
         seen.push_back(key);
         out.push_back(c);
     }
+    // then the SMT siblings, in core order, without core 0's (the driver thread's core): pool sizes above the
+    // physical core count pin their extra workers there (TRACKER #93)
+    const auto core0 = seen.empty() ? std::pair<long, long>{ -1, -1 } : seen[0];
+    for (const auto & [key, c] : siblings)
+        if (key != core0) out.push_back(c);
     return out;
 }
 

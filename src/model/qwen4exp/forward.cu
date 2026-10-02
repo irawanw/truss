@@ -148,6 +148,12 @@ struct Forward::Impl {
     // Header: int32 n_store, n_expert, K, then per (layer, expert) int32 bytes and uint8 hot. Records: int32 layer, T,
     // ids [T * K]; layer -1 (T 0) marks a sequence reset.
     FILE * route_trace = nullptr;
+    static double vram_used()   // GiB in use on the device (TRACKER #93 breakdown)
+    {
+        size_t f, t;
+        TRUSS_CUDA(cudaMemGetInfo(&f, &t));
+        return (t - f) / 1073741824.0;
+    }
     std::unique_ptr<PleReader> ple_reader;           // Options::ple_file: rows read with O_DIRECT, not page faults
     half * ple_stage = nullptr;                        // pinned [rows][E]: the gathered rows for the device copy
     size_t ple_stage_n = 0;
@@ -240,7 +246,9 @@ struct Forward::Impl {
         draft_min_p = o.draft_min_p;
         TRUSS_CUDA(cudaStreamCreate(&s));
         TRUSS_CUBLAS(cublasCreate(&blas));
+        const double vram0 = vram_used();   // the CUDA context and anything before this Forward
         upload();
+        const double vram_w = vram_used();
         if (o.after_upload) o.after_upload();
         const int small_rows = std::min(max_chunk, FETCH_ROWS);
         mtp = o.mtp;
@@ -273,6 +281,7 @@ struct Forward::Impl {
         window_ws = alloc<unsigned char>(moe::workspace_bytes<MoeShape>());
         moe::workspace_init<MoeShape>(window_ws, s);
         TRUSS_CUDA(cudaMallocHost(&ids_host, sizeof(int) * 2 * FETCH_ROWS * MoeShape::TOPK));   // routing + prediction
+        const double vram_st0 = vram_used();
         st.resize(c.n_layer);
         const int R = DsaShape::RATIO;
         const int W = spec_rows;
@@ -311,6 +320,7 @@ struct Forward::Impl {
             }
         }
         if (mtp) dsa_state(mst);
+        const double vram_st = vram_used();
         std::vector<runtime::ExpertLayer> tables;
         for (const Layer & L : w.layers) tables.push_back({ &L.moe.gate, &L.moe.up, &L.moe.down });
         if (mtp) tables.push_back({ &mtp->layer.moe.gate, &mtp->layer.moe.up, &mtp->layer.moe.down });
@@ -329,6 +339,12 @@ struct Forward::Impl {
             constexpr size_t MARGIN = 768ull << 20;   // cuBLAS workspaces, the CUDA context's growth
             require(free_b > MARGIN, "no device memory left for the routed experts");
             expert_budget = free_b - MARGIN;
+            const double gb = 1073741824.0;
+            std::fprintf(stderr, "VRAM: %.2f GiB total, %.2f GiB in use before the experts = context and before %.2f + "
+                                 "weights %.2f + buffers %.2f + KV/state %.2f + more buffers %.2f; routed experts get "
+                                 "%.2f GiB (margin %.2f)\n",
+                         total_b / gb, (total_b - free_b) / gb, vram0, vram_w - vram0, vram_st0 - vram_w,
+                         vram_st - vram_st0, (total_b - free_b) / gb - vram_st, expert_budget / gb, MARGIN / gb);
         }
         runtime::ExpertStore::Sizes z;
         z.ring_bytes = o.ring_bytes_override ? o.ring_bytes_override : o.ring_bytes;
