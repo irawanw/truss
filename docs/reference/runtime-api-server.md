@@ -102,7 +102,7 @@ One `truss_model` = one model file, one sequence, on the current CUDA device (`C
 | `truss_n_vocab`, `truss_n_ctx`, `truss_position` | sizes; tokens in the sequence |
 | `truss_meta_string(m, key)` / `truss_meta_int(m, key, def)` | GGUF metadata (chat template, stop ids, ...) |
 | `truss_reset(m)` | new sequence |
-| `truss_eval(m, tokens, n, logits)` | append n tokens (split into `max_chunk` chunks); write the last token's next-token logits (n_vocab floats; NULL skips) |
+| `truss_eval(m, tokens, n, logits)` | append n tokens (split into `max_chunk` chunks; a prompt of at most `TRUSS_FETCH_PROMPT` tokens (default 0) into `Forward::fetch_rows()` = 32-token decode-path chunks, which move only the experts its rows route to: at 256K 72 tokens 2,373 -> 1,531 ms, but 256 tokens 2,376 -> 5,749 ms, so the server uses 96, TRACKER #89); write the last token's next-token logits (n_vocab floats; NULL skips) |
 | `truss_eval_argmax(m, tokens, n, &next)` | same, greedy token on the device (no logits copy) |
 | `truss_eval_sample(m, tokens, n, &sampling, &next)` | same, a sample on the device (`truss_sampling`: temperature > 0, top_p, top_k, min_p, seed; each sampled row advances the model's random-stream counter) |
 | `truss_spec_step_sampled(m, next, &sampling, emitted, &n, &new_next)` | `truss_spec_step` for sampled decoding (Strata's sampled verify): every verify row is sampled on the device; drafts are accepted while the row's sample equals the draft, so each emitted token is a sample of the model's own conditional |
@@ -161,7 +161,7 @@ params, the same function `tk-bench-spec` uses, so a benched config is served un
 the load otherwise peaks near 47 GB resident).
 
 **pm2 (port 8113, GPU 2).** `scripts/truss_serve_8113.sh` runs the TRACKER #85 bench config (trellis CPU tier, Strata
-split, PCIe share 0.2, hints 2, 22 pinned threads, Strata's profile, int8 KV from #87) at n_ctx 262144, chunk 4096, on llama-paw's port
+split, PCIe share 0.2, hints 2, 22 pinned threads, Strata's profile, int8 KV from #87) at n_ctx 262144, chunk 8192 (4096 streamed every cold layer twice as often: 21.7K prompt 1,481 tok/s), on llama-paw's port
 8113; `pm2 start scripts/truss_serve_8113.config.js` (app `truss-8113`, restart when RSS > 64 GB). Thinking: the
 GGUF template defaults to `enable_thinking` on and `reasoning_effort` xhigh. Only one of `truss-8113` and
 `paw-x3-8113` can hold the port and GPU 2.

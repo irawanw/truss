@@ -139,6 +139,7 @@ public:
     void reset();
 
     int position() const { return pos_; }   // tokens consumed so far
+    static int fetch_rows();                // run() chunks of at most this many tokens take the fetch (decode) path
     int hot_experts() const;                // resident experts, all layers
     size_t cold_bytes() const;              // streamed per chunk
     // CPU tier benchmark stats (0, 0 without Options::cpu_dir): total microseconds in ExpertPool::wait() and its

@@ -1625,6 +1625,7 @@ Forward::~Forward() = default;
 cudaStream_t Forward::stream() const { return m_->s; }
 
 int Forward::hot_experts() const { return m_->n_hot; }
+int Forward::fetch_rows() { return Impl::FETCH_ROWS; }
 
 size_t Forward::cold_bytes() const { return m_->experts->cold_bytes(); }
 

@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <string>
@@ -66,9 +67,13 @@ void eval(truss_model & m, const int32_t * tokens, int n)
     if (m.fwd->position() + n > m.n_ctx)
         throw std::length_error("truss_eval: sequence of " + std::to_string(m.fwd->position() + n) +
                                 " tokens exceeds n_ctx " + std::to_string(m.n_ctx));
+    // A short prompt runs as decode-sized chunks (fetch path: only the experts its rows route to move), not as a
+    // prompt chunk that streams every cold expert layer (~2.3 s at 256K whatever the length; TRACKER #89).
+    const int fetch_max = std::getenv("TRUSS_FETCH_PROMPT") ? std::atoi(std::getenv("TRUSS_FETCH_PROMPT")) : 0;
+    const int step = n <= fetch_max ? std::min(m.max_chunk, q::Forward::fetch_rows()) : m.max_chunk;
     int last = 0;
-    for (int s = 0; s < n; s += m.max_chunk) {
-        last = std::min(m.max_chunk, n - s);
+    for (int s = 0; s < n; s += step) {
+        last = std::min(step, n - s);
         m.fwd->run(tokens + s, last);
     }
     m.fwd->head(last - 1, 1, m.logits);

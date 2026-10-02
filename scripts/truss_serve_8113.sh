@@ -8,11 +8,12 @@ cd "$(dirname "$0")/.."
 export CUDA_VISIBLE_DEVICES=2
 export TRUSS_CPU_TRELLIS=1 TRUSS_CPU_DYNAMIC=1 TRUSS_PCIE_FRAC=0.2 TRUSS_HINT_K=2 TRUSS_CPU_THREADS=22 TRUSS_CPU_PIN=1
 export TRUSS_KV_INT8=1   # Strata's int8 KV (TRACKER #87): +2,340 resident experts at 256K
+export TRUSS_FETCH_PROMPT=96   # prompts <= 96 tokens take the fetch path: 72 tokens 2.37 -> 1.53 s (TRACKER #89)
 D=$HOME/ML_projects/flashnext
 exec python3 -m server.app \
   --model $D/20260918_ngram_q8/data/qwen38-flash-next-paw-x3-q8_0-00001-of-00002.gguf \
   --tokenizer /data/www/Qwen3.8-27B-DFlash2-EXL3-5.0bpw/models/Qwen3.8-27B-EXL3-3.5bpw/tokenizer.json \
-  --n-ctx 262144 --chunk 4096 \
+  --n-ctx 262144 --chunk 8192 \
   --expert-usage data/usage_strata_rank.f32 \
   --mtp $D/20260930_truss_tg/data/mtp_x3/flashnext-mtp-x3k3.gguf --drafts 3 \
   --draft-vocab data/draft_vocab_en.bin --draft-min-p 0.5 \
