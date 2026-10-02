@@ -47,6 +47,18 @@ void trellis_prep(const TrellisMat & W, const float * x, int ldx, int R, float *
 // y[r][c] (stride ld_y) = (svh * H128(W a_r))[c] for c in [c0, c1), both multiples of 128.
 void trellis_gemv(const TrellisMat & W, const float * P, int R, int c0, int c1, float * y, int ld_y);
 
+// The same product in pieces, for the pool's input-split items (TRACKER #82): an item reads one contiguous run of
+// k-slices (tiles are k-slice major) instead of a strided column range, and prepares only its own inputs (the input
+// Hadamard is per 128-block). Partial products over input blocks add up to the whole one before the output
+// Hadamard; the caller sums them in a fixed order, then applies trellis_out.
+// W restricted to inputs [i0, i1) (multiples of 128), all outputs: prepare it with trellis_prep on x + i0
+TrellisMat trellis_inputs(const TrellisMat & W, int i0, int i1);
+// c[r][j] (stride ldc) = (W a_r)[c0 + j], j < c1 - c0: the raw product, before the output Hadamard and svh
+void trellis_gemv_raw(const TrellisMat & W, const float * P, int R, int c0, int c1, float * c, int ldc);
+// y[r][j] (stride ld_y) = svh[c0 + j] * H128(c_r)[j] for the columns [c0, c1) of W (multiples of 128) held at c
+// (stride ldc); c is overwritten by the Hadamard
+void trellis_out(const TrellisMat & W, float * c, int R, int ldc, int c0, int c1, float * y, int ld_y);
+
 // one weight, decoded bit by bit (the reference for tests). round16: the GPU's fp16 value (trellis_gemv uses it only
 // with TRUSS_TRELLIS_ROUND=1; by default the fp32 codebook value, at most half an fp16 ulp away)
 float trellis_weight_ref(const TrellisMat & W, int o, int i, bool round16 = false);

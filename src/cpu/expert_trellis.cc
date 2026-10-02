@@ -500,31 +500,58 @@ void trellis_prep(const TrellisMat & W, const float * x, int ldx, int R, float *
     }
 }
 
-void trellis_gemv(const TrellisMat & W, const float * P, int R, int c0, int c1, float * y, int ld_y)
+TrellisMat trellis_inputs(const TrellisMat & W, int i0, int i1)
+{
+    if (i0 < 0 || i1 > W.in || i0 >= i1 || i0 % 128 || i1 % 128) throw std::invalid_argument("trellis_inputs: range");
+    TrellisMat s = W;
+    s.tiles = W.tiles + (size_t) (i0 / 16) * (W.out / 16) * 8 * W.K;   // k-slice major: slices i0/16 .. are contiguous
+    s.in = i1 - i0;
+    s.suh = W.suh + i0;
+    return s;
+}
+
+void trellis_gemv_raw(const TrellisMat & W, const float * P, int R, int c0, int c1, float * c, int ldc)
 {
     if (W.K < 1 || W.K > 6) throw std::invalid_argument("trellis_gemv: K must be 1 .. 6");
-    if (c0 % 128 || c1 % 128 || c1 > W.out || c1 - c0 > MAX_COLS || R < 1 || R > MAXR)
+    if (c0 % 128 || c1 % 128 || c1 > W.out || c0 >= c1 || R < 1 || R > MAXR)
         throw std::invalid_argument("trellis_gemv: column range / rows");
-    alignas(32) float c[MAXR * 512];
+    alignas(32) float buf[MAXR * 512];
     alignas(32) uint8_t col[256 * (32 * 4 + 32)];   // gemv_tiles4's byte-swapped column (in <= 4096)
     // The GPU rounds each decoded weight to fp16 (hfma2). Rounding here costs ~40% of the loop (Zen 2's vector
     // integer pipes are the limit) and changes a weight by at most half an fp16 ulp (~5e-4 relative), far below the
     // codebook's own quantization error, so it is off unless TRUSS_TRELLIS_ROUND=1.
     const bool round = round_weights();
-    // at most 512 columns per pass of the buffer
-    for (int b0 = c0; b0 < c1; b0 += 512) {
+    for (int b0 = c0; b0 < c1; b0 += 512) {   // at most 512 columns per pass of the kernels' buffer
         const int b1 = std::min(c1, b0 + 512), nb = b1 - b0;
-        if (W.K <= 4 && use_i16() && !round) dispatch_i16k(W, P, R, b0 / 16, b1 / 16, c, col);
-        else if (W.K <= 4) dispatch4(W, P, R, round, b0 / 16, b1 / 16, c, col);
-        else dispatch6(W, P, R, round, b0 / 16, b1 / 16, c);
-        for (int r = 0; r < R; ++r) {
-            float * cr = c + (size_t) r * 512;
-            for (int b = 0; b < nb; b += 128) hadamard128(cr + b);
-            float * yr = y + (size_t) r * ld_y + (b0 - c0);
-            for (int j = 0; j < nb; j += 8)
-                _mm256_storeu_ps(yr + j, _mm256_mul_ps(_mm256_loadu_ps(cr + j),
-                                                       _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(W.svh + b0 + j)))));
-        }
+        if (W.K <= 4 && use_i16() && !round) dispatch_i16k(W, P, R, b0 / 16, b1 / 16, buf, col);
+        else if (W.K <= 4) dispatch4(W, P, R, round, b0 / 16, b1 / 16, buf, col);
+        else dispatch6(W, P, R, round, b0 / 16, b1 / 16, buf);
+        for (int r = 0; r < R; ++r) std::memcpy(c + (size_t) r * ldc + (b0 - c0), buf + (size_t) r * 512, sizeof(float) * nb);
+    }
+}
+
+void trellis_out(const TrellisMat & W, float * c, int R, int ldc, int c0, int c1, float * y, int ld_y)
+{
+    if (c0 % 128 || c1 % 128 || c1 > W.out || c0 >= c1) throw std::invalid_argument("trellis_out: column range");
+    const int n = c1 - c0;
+    for (int r = 0; r < R; ++r) {
+        float * cr = c + (size_t) r * ldc;
+        float * yr = y + (size_t) r * ld_y;
+        for (int b = 0; b < n; b += 128) hadamard128(cr + b);
+        for (int j = 0; j < n; j += 8)
+            _mm256_storeu_ps(yr + j, _mm256_mul_ps(_mm256_loadu_ps(cr + j),
+                                                   _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(W.svh + c0 + j)))));
+    }
+}
+
+void trellis_gemv(const TrellisMat & W, const float * P, int R, int c0, int c1, float * y, int ld_y)
+{
+    if (c1 - c0 > MAX_COLS) throw std::invalid_argument("trellis_gemv: column range / rows");
+    alignas(32) float c[MAXR * 512];
+    for (int b0 = c0; b0 < c1; b0 += 512) {
+        const int b1 = std::min(c1, b0 + 512);
+        trellis_gemv_raw(W, P, R, b0, b1, c, 512);
+        trellis_out(W, c, R, 512, b0, b1, y + (b0 - c0), ld_y);
     }
 }
 

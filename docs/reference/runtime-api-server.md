@@ -197,7 +197,7 @@ summation order differs.
 beside it). Probe (`tools/tk-bench/cpu_q4.cc`): 8 threads 10.3 experts/ms at 4 rows, 16 threads 16.8.
 
 **Pool scheduling.** Items are taken lock-free from one atomic ticket = phase << 20 | item index; a phase's last item
-prepares what the next phase reads (q4s: quantize h; trellis: prepare h for down) and then publishes the next phase's
+prepares what the next phase reads (q4s: quantize h; trellis: nothing, its items prepare their own inputs) and then publishes the next phase's
 ticket. Before 10-01 the phase and the index were two atomics: a worker could read the old phase, take index 0 of the
 new one after a flip, run the wrong item and retire it against the old phase, so a pending count never reached zero
 and the call hung (seen with the trellis tier's 3 phases; `cpu_trellis_test` now runs 3,000 small calls).
@@ -245,7 +245,8 @@ step:
 
 The codebook's affine part is a per-row term: Σ wᵢaᵢ = kinv·Σ bytesumᵢ·aᵢ + (1024·kinv + kbias)·Σ aᵢ.
 
-Activations are int16 with one scale per row (amax/32767) taken from the fp32 Hadamard output. Weight m and m+4 read
+Activations are int16 with one scale per prepared row (amax/32767) taken from the fp32 Hadamard output; through the
+pool a row is prepared per input block (below), so the scale is per block, which is finer. Weight m and m+4 read
 the same inputs, so a prepared slice is the 8 inputs a[16kt+8v ..] written twice for v = 0, 1, then the scale and Σa.
 The row stride is still `trellis_prep_floats(in, 1)`.
 
@@ -264,13 +265,32 @@ Measured (`cpu_trellis_test`, K 3, loadavg ~23):
 
 `TRUSS_TRELLIS_I16=0` (or `TRUSS_TRELLIS_ROUND=1`) selects `gemv_tiles4`. K 5-6 keep `gemv_tiles`.
 
-**In the pool.** Slots carry `t` (a `TrellisExpert`) instead of `e`; one call is all one kind. Phases: 0 prepare each
-group's gate/up activations; 1 gate and up as separate 128-column items (10 per expert: a decode layer hands the CPU
-~0.5-2 experts, and with gate+up per item only 5 of 12 threads had work); at the flip h = silu(gate)·up and its
-down activations are prepared; 2 down in 128-column items (20 per expert). `last_call_ms()` is the call's own time
-(start to its last item), which the dynamic split now averages instead of the driver thread's start-to-wait time
-(that included issuing the PCIe copies and overstated the CPU's cost, so it got only 7% of the misses).
-Small-call latency (`cpu_trellis_test`, 12 threads, loaded box): 1 expert 0.20 ms, 2 experts 0.27, 4 experts 0.46.
+**Pieces of a product** (for the pool's input-split items, TRACKER #82). `trellis_inputs(W, i0, i1)` is W over inputs
+[i0, i1) (multiples of 128): tiles are k-slice major, so it is a pointer offset (+ `suh` offset), and its bytes are one
+contiguous run; prepare it with `trellis_prep` on x + i0. `trellis_gemv_raw` writes the raw product c = W·a before the
+output Hadamard and svh; partial products over input blocks add up to the whole one. `trellis_out` applies
+svh·H128 to columns [c0, c1) held in a buffer (in place Hadamard). `trellis_gemv` = raw + out per 512 columns (same
+results as before).
+
+**In the pool.** Slots carry `t` (a `TrellisExpert`) instead of `e`; one call is all one kind. Items are
+input-split (TRACKER #82), three phases:
+- 0: (expert, gate | up, input block of `TRUSS_CPU_TR_GU_IN` = 256 inputs): prepare the rows over that block only and
+  write the raw partial product, all 640 columns (10 items per matrix, 20 per expert);
+- 1: (expert, h block of 128, `TRUSS_CPU_TR_DN_COLS` = 640 columns of down): rebuild the h block from the gate/up
+  partials (sum in block order, svh·H128 — the output Hadamard is per 128-block, so the block stands alone —
+  silu(gate)·up), prepare it, write down's raw partial over it (20 items per expert);
+- 2: (128 output columns): for every slot, down's partials summed in block order, svh·H128, added into y with the
+  slot's weight in slot order (20 items).
+
+No serial step: the old pool prepared gate/up per expert (phase 0 had G items) and h for down at the flip on one
+thread, and read 128-column items that take 768 B of every 3,840 B slice row. D0 measured those as 40 µs of a 211 µs
+two-expert call plus 1.25x thread time per item (`flashnext/20261002_truss_d0`). Pool probe, 22 pinned threads, K 3,
+1 row: 1 / 2 / 4 / 8 experts per call 0.167 / 0.188 / 0.310 / 0.600 → 0.10 / 0.118 / 0.221 / 0.425 ms. Summation
+orders are fixed, so results do not depend on scheduling; error vs exact 4.8e-5 (one scale per row: 6.2e-5; the
+GPU's fp16 activations 3.8e-4). Engine (spec, share 0.2, 22 pinned threads): CPU wait 8.4-8.9 → 5.6-5.8 ms/pass,
+68.6-79.7 → 77.9-83.6 tok/s. Slice CPU-tier KL vs all-resident 2.09e-4.
+`last_call_ms()` is the call's own time (start to its last item), which the dynamic split averages instead of the
+driver thread's start-to-wait time (that included issuing the PCIe copies and overstated the CPU's cost).
 Idle workers spin `TRUSS_CPU_SPIN_US` µs (default 20,000, Strata's `kSpinBeforeSleep`) and block only when the
 spin times out. `start()`, the phase flips and the end of a call take no lock: they store the state (seq_cst) and
 call `wake()`, which locks and notifies only when `sleepers_ > 0`. The caller spins in `wait()`.

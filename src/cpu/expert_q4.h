@@ -80,7 +80,8 @@ public:
     // the last call's own duration, start() to its last item (not to wait()'s return): what the CPU took, without
     // whatever the caller did before calling wait(). 0 for an empty call.
     double last_call_ms() const { return last_ms_; }   // sum of item() compute time (all threads, caller included)
-    // phase breakdown of item_us_ (same clock): gate/up gemv, silu, h-quantize, down gemv
+    // phase breakdown of item_us_ (same clock): gate/up gemv, silu, h-quantize, down gemv. Trellis: gate = phase 0
+    // items, down = phase 1 items (incl. their h block), hq = phase 2 items (down reduced, weighted into y; not in item_us_)
     long long gate_us() const { return gate_us_; }
     long long silu_us() const { return silu_us_; }
     long long hq_us() const { return hq_us_; }
@@ -97,7 +98,6 @@ private:
         const Q4Expert * e;
         const TrellisExpert * t;
         std::vector<int> rows;
-        size_t p_gu = 0, p_d = 0;           // trellis: offsets of its prepared gate/up and down activations in tp_
     };
     void worker();
     void item(int i, int phase);
@@ -105,7 +105,6 @@ private:
     void retire(int phase);                  // one item finished: phase flip or call done
     void run_items();                        // grab + run until the current phase has no items left
     void quantize_h();   // quantize every group's h rows into hq_/hd_ (once, by the last phase-0 worker)
-    void prep_down();    // trellis: every group's h rows prepared for down (once, at the gate/up -> down flip)
     void item_trellis(int i, int phase);
     void finish();
 
@@ -122,7 +121,8 @@ private:
     // seq_cst), so either the notifier sees the sleeper or the sleeper sees the new state.
     std::atomic<int> sleepers_{ 0 };
     void wake();                             // after a state change: lock + notify if anyone may sleep
-    // q4s: phase 0 gate/up, 1 down. trellis: 0 prep gate/up activations, 1 gate/up, 2 down.
+    // q4s: phase 0 gate/up, 1 down. trellis: 0 gate/up partials per input block, 1 down partials per h block,
+    // 2 output columns (down's partials reduced, weighted into y).
     // ticket_ = phase << TICKET_SHIFT | next item, one atomic: a worker that read the phase and then took an index
     // separately could take index 0 of the next phase after a flip, run the wrong item and retire it against the old
     // phase, leaving a pending count that never reaches 0 (the call hung; TRACKER #73).
@@ -146,8 +146,9 @@ private:
     std::vector<int8_t> hq_;                // [group][row][D_FF], quantized once at the phase 0->1 flip
     std::vector<float> hd_;                 // [group][row][D_FF / 32] its scales
     std::vector<float> out_;                // [group][row][D_MODEL]
-    std::vector<float> tp_;                 // trellis: per group [gate P][up P][down P] (trellis_prep layouts)
-    std::vector<float> g_;                  // trellis: [group][row][D_FF] gate output (up output in h_ until the flip)
+    std::vector<float> pg_;                 // trellis: [group][gate, up][input block][row][D_FF] raw partials
+    std::vector<float> pd_;                 // trellis: [group][h block][row][D_MODEL] down's raw partials
+    std::vector<int> slot_g_, slot_k_;      // trellis: each slot's group and its row index within the group
     std::chrono::steady_clock::time_point t_start_;
     double last_ms_ = 0;
     std::atomic<long long> wait_us_{ 0 };   // benchmark stats (see wait_us())

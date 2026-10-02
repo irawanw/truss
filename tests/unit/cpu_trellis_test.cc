@@ -95,6 +95,43 @@ double check(int K, int in, int out, int R, std::mt19937 & g, double * exact = n
     return std::sqrt(err / ref);
 }
 
+// one projection in fp64 from bit-decoded weights (dense cache per matrix): y = svh * H128(W a), a = H128(suh * x),
+// fp16-rounded first when act16 (the GPU's activations)
+void proj_exact(const TrellisMat & m, const double * x, bool act16, double * y)
+{
+    static std::vector<std::pair<const uint32_t *, std::vector<float>>> cache;
+    auto it = std::find_if(cache.begin(), cache.end(), [&](const auto & e) { return e.first == m.tiles; });
+    if (it == cache.end()) {
+        std::vector<float> W((size_t) m.out * m.in);
+        for (int o = 0; o < m.out; ++o)
+            for (int i = 0; i < m.in; ++i) W[(size_t) o * m.in + i] = trellis_weight_ref(m, o, i);
+        cache.emplace_back(m.tiles, std::move(W));
+        it = cache.end() - 1;
+    }
+    std::vector<double> a(m.in), c(m.out);
+    for (int i = 0; i < m.in; ++i) a[i] = x[i] * _cvtsh_ss(m.suh[i]);
+    for (int b = 0; b < m.in; b += 128) h128(&a[b]);
+    if (act16)
+        for (auto & v : a) v = r16((float) v);
+    for (int o = 0; o < m.out; ++o) {
+        double s = 0;
+        for (int i = 0; i < m.in; ++i) s += (double) it->second[(size_t) o * m.in + i] * a[i];
+        c[o] = s;
+    }
+    for (int b = 0; b < m.out; b += 128) h128(&c[b]);
+    for (int o = 0; o < m.out; ++o) y[o] = c[o] * _cvtsh_ss(m.svh[o]);
+}
+
+// a whole expert in fp64 (silu * up between the projections, rounded to fp16 like the GPU's h when act16)
+void expert_exact(const TrellisExpert & e, const float * xf, bool act16, double * y)
+{
+    std::vector<double> x(xf, xf + 2560), g(640), u(640);
+    proj_exact(e.gate, x.data(), act16, g.data());
+    proj_exact(e.up, x.data(), act16, u.data());
+    for (int j = 0; j < 640; ++j) g[j] = g[j] / (1.0 + std::exp(-g[j])) * u[j];
+    proj_exact(e.down, g.data(), act16, y);
+}
+
 double ms_since(std::chrono::steady_clock::time_point t0)
 {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -190,8 +227,23 @@ int main(int argc, char ** argv)
             expert(*sl.t, xs.data() + sl.row * 2560, 1, P.data(), gg.data(), uu.data(), yo.data());
             for (int c = 0; c < 2560; ++c) ref[sl.row * 2560 + c] += sl.w * yo[c];
         }
-        double e = 0, r = 0;
-        for (int i = 0; i < 4 * 2560; ++i) e += (y[i] - ref[i]) * (double) (y[i] - ref[i]), r += ref[i] * (double) ref[i];
+        // vs an fp64 reference from bit-decoded weights: the pool (input-split items, one int16 scale per input block)
+        // and expert() per slot (one scale per row) against exact activations, and the GPU's fp16 activations
+        std::vector<double> ex64(4 * 2560, 0.0), g64(4 * 2560, 0.0), o64(2560);
+        for (const Slot & sl : slots) {
+            expert_exact(*sl.t, xs.data() + sl.row * 2560, false, o64.data());
+            for (int c = 0; c < 2560; ++c) ex64[sl.row * 2560 + c] += sl.w * o64[c];
+            expert_exact(*sl.t, xs.data() + sl.row * 2560, true, o64.data());
+            for (int c = 0; c < 2560; ++c) g64[sl.row * 2560 + c] += sl.w * o64[c];
+        }
+        double e = 0, r = 0, ep = 0, eg = 0, rx = 0;
+        for (int i = 0; i < 4 * 2560; ++i) {
+            e += (y[i] - ref[i]) * (double) (y[i] - ref[i]), r += ref[i] * (double) ref[i];
+            ep += (y[i] - ex64[i]) * (y[i] - ex64[i]), eg += (g64[i] - ex64[i]) * (g64[i] - ex64[i]);
+            rx += ex64[i] * ex64[i];
+        }
+        double es = 0;
+        for (int i = 0; i < 4 * 2560; ++i) es += (ref[i] - ex64[i]) * (ref[i] - ex64[i]);
         bool same = true;
         for (int t = 0; t < 4; ++t) {
             std::vector<Slot> one;
@@ -201,10 +253,13 @@ int main(int argc, char ** argv)
             pool.run(xs.data() + t * 2560, 1, one, y1.data());
             same &= std::memcmp(y1.data(), y.data() + t * 2560, 2560 * 4) == 0;
         }
-        const bool pass = std::sqrt(e / r) < 1e-6 && same;
+        // pass: no further from the exact product than the GPU's fp16 activations are (as the kernel checks above)
+        const bool pass = std::sqrt(ep / rx) <= std::sqrt(eg / rx) && same;
         ok &= pass;
-        std::printf("pool, 4 rows x 3 trellis slots: rel %.1e vs per-slot experts, rows equal to 1-row calls: %s  %s\n",
-                    std::sqrt(e / r), same ? "yes" : "no", pass ? "ok" : "FAIL");
+        std::printf("pool, 4 rows x 3 trellis slots: vs exact %.2e (per-slot expert() %.2e, GPU fp16 act %.2e), vs "
+                    "per-slot %.1e, rows equal to 1-row calls: %s  %s\n",
+                    std::sqrt(ep / rx), std::sqrt(es / rx), std::sqrt(eg / rx), std::sqrt(e / r), same ? "yes" : "no",
+                    pass ? "ok" : "FAIL");
         // stress: many small calls (1-3 rows, 1-4 experts): phase flips race with workers grabbing items; a lost
         // item would hang here (the pre-ticket pool did, TRACKER #73)
         {

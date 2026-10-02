@@ -24,8 +24,25 @@ constexpr int GU_CHUNK_DEF = 64, DN_CHUNK_DEF = 256;
 // ~0.5-1 ms; the old 40,000 pauses (~0.65 ms on Zen 2) let the workers fall asleep between layers, and start() then
 // spent 0.27 ms per layer on the mutex and the futex wakes (13.9 ms per pass, TRACKER #77)
 constexpr int SPIN_US_DEF = 20000;
-// trellis items: gate/up and down columns per item (multiples of 128: the output Hadamard blocks)
-constexpr int TR_GU_COLS = 128, TR_DN_COLS = 128;
+// trellis items are input-split (TRACKER #82): an item reads one contiguous run of k-slices of one matrix and
+// prepares only its own inputs (the input Hadamard is per 128-block), so there is no serial preparation step and no
+// strided column walk (D0: column items of 128 cost 1.25x the thread time of contiguous ones, and the two serial
+// preparation steps 40 us of a 211 us two-expert call). Gate/up: TR_GU_IN inputs x all 640 columns per item. Down:
+// one 128-input block (its h slice is rebuilt by the item from the gate/up partials: their output Hadamard is per
+// 128-block too) x TR_DN_COLS columns. Overridable (TRUSS_CPU_TR_GU_IN, TRUSS_CPU_TR_DN_COLS) for the sweep.
+// Phase 2 (the end of the call): item = 128 output columns, for every slot: down's partials summed in block order,
+// output transform, weighted add into y in slot order (was serial in the caller: 13 us per expert, 20% of a call).
+constexpr int TR_GU_IN_DEF = 256, TR_DN_COLS_DEF = 640, TR_DN_IN = 128, TR_OUT_COLS = 128;
+int tr_gu_in()
+{
+    static const int v = getenv("TRUSS_CPU_TR_GU_IN") ? atoi(getenv("TRUSS_CPU_TR_GU_IN")) : TR_GU_IN_DEF;
+    return v;
+}
+int tr_dn_cols()
+{
+    static const int v = getenv("TRUSS_CPU_TR_DN_COLS") ? atoi(getenv("TRUSS_CPU_TR_DN_COLS")) : TR_DN_COLS_DEF;
+    return v;
+}
 int gu_chunk()
 {
     static const int v = getenv("TRUSS_CPU_GU_CHUNK") ? atoi(getenv("TRUSS_CPU_GU_CHUNK")) : GU_CHUNK_DEF;
@@ -227,19 +244,23 @@ void ExpertPool::start(const float * x, int T, const std::vector<Slot> & slots, 
     if (hq_.size() < G * MAX_ROWS * D_FF) hq_.resize(G * MAX_ROWS * D_FF);
     if (hd_.size() < G * MAX_ROWS * D_FF / BLOCK) hd_.resize(G * MAX_ROWS * D_FF / BLOCK);
     if (out_.size() < G * MAX_ROWS * D_MODEL) out_.resize(G * MAX_ROWS * D_MODEL);
-    if (trellis_) {   // 0: prep gate/up per group, 1: gate/up in 128-column items, 2: down in 256-column items
-        size_t off = 0;
-        for (Group & gr : groups_) {
-            const int R = (int) gr.rows.size();
-            gr.p_gu = off, off += 2 * (size_t) trellis_prep_floats(D_MODEL, R);
-            gr.p_d = off, off += (size_t) trellis_prep_floats(D_FF, R);
-        }
-        if (tp_.size() < off) tp_.resize(off);
+    if (trellis_) {   // 0: gate/up partials per input block, 1: down partials per (h block, column range)
+        if (D_MODEL % tr_gu_in() || tr_gu_in() % 128 || D_MODEL % tr_dn_cols() || tr_dn_cols() % 128)
+            throw std::invalid_argument("cpu::ExpertPool: TRUSS_CPU_TR_GU_IN / TR_DN_COLS");
+        const size_t nbg = D_MODEL / tr_gu_in(), nbd = D_FF / TR_DN_IN;
+        if (pg_.size() < G * 2 * nbg * MAX_ROWS * D_FF) pg_.resize(G * 2 * nbg * MAX_ROWS * D_FF);
+        if (pd_.size() < G * nbd * MAX_ROWS * D_MODEL) pd_.resize(G * nbd * MAX_ROWS * D_MODEL);
         n_phases_ = 3;
-        phase_items_[0] = (int) G;
-        phase_items_[1] = (int) G * 2 * (D_FF / TR_GU_COLS);   // gate and up are separate items (small calls)
-        if (g_.size() < G * MAX_ROWS * D_FF) g_.resize(G * MAX_ROWS * D_FF);
-        phase_items_[2] = (int) G * (D_MODEL / TR_DN_COLS);
+        phase_items_[0] = (int) (G * 2 * nbg);
+        phase_items_[1] = (int) (G * nbd * (D_MODEL / tr_dn_cols()));
+        phase_items_[2] = D_MODEL / TR_OUT_COLS;
+        slot_g_.resize(slots_.size()), slot_k_.resize(slots_.size());
+        for (size_t i = 0; i < slots_.size(); ++i) {
+            const Slot & sl = slots_[i];
+            slot_g_[i] = (int) (std::find_if(groups_.begin(), groups_.end(), [&](const Group & gr) { return gr.t == sl.t; }) - groups_.begin());
+            const std::vector<int> & rows = groups_[slot_g_[i]].rows;
+            slot_k_[i] = (int) (std::find(rows.begin(), rows.end(), sl.row) - rows.begin());
+        }
     } else {
         n_phases_ = 2;
         phase_items_[0] = (int) G * (D_FF / gu_chunk());
@@ -265,58 +286,75 @@ void ExpertPool::wake()
     cv_.notify_all();
 }
 
-// trellis items. phase 0: one group's gate and up activations prepared (Hadamard, permutation); phase 1: gate and up
-// for TR_GU_COLS columns, then h = silu(gate) * up; phase 2: down for TR_DN_COLS columns (its activations were
-// prepared at the flip, prep_down)
+// trellis items (input-split, see TR_GU_IN_DEF). Fixed summation orders throughout: the result does not depend on
+// which thread ran which item.
+// Phase 0, item (group, gate|up, input block b): prepare the group's rows over inputs [b * TR_GU_IN, +TR_GU_IN) and
+// write the raw partial product, all 640 columns, into pg_.
+// Phase 1, item (group, h block b of 128, column range): h[b] = silu(gate) * up on that block, where gate =
+// svh * H128(sum of gate partials in block order) (the output Hadamard is per 128-block, so the block is
+// self-contained); prepare it and write down's raw partial over that input block into pd_.
+// Phase 2, item (128 output columns): every slot's down output on those columns = svh * H128(sum of down's partials
+// in block order), added into y with its weight in slot order (rows without slots: 0).
 void ExpertPool::item_trellis(int i, int phase)
 {
     const auto t0 = std::chrono::steady_clock::now();
-    if (phase == 0) {
-        const Group & gr = groups_[i];
-        float * P = &tp_[gr.p_gu];
-        const size_t step = (size_t) trellis_prep_floats(D_MODEL, 1);
-        const size_t up_off = (size_t) trellis_prep_floats(D_MODEL, (int) gr.rows.size());
-        for (size_t k = 0; k < gr.rows.size(); ++k) {
-            const float * x = x_ + (size_t) gr.rows[k] * D_MODEL;
-            trellis_prep(gr.t->gate, x, D_MODEL, 1, P + k * step);
-            trellis_prep(gr.t->up, x, D_MODEL, 1, P + up_off + k * step);
+    thread_local std::vector<float> P;   // the item's prepared rows
+    const int nbg = D_MODEL / tr_gu_in(), nbd = D_FF / TR_DN_IN;
+    if (phase == 2) {
+        const int c0 = i * TR_OUT_COLS;
+        for (int t = 0; t < T_; ++t) std::fill(y_ + (size_t) t * D_MODEL + c0, y_ + (size_t) t * D_MODEL + c0 + TR_OUT_COLS, 0.f);
+        alignas(32) float c[TR_OUT_COLS], o[TR_OUT_COLS];
+        for (size_t si = 0; si < slots_.size(); ++si) {
+            const int gi = slot_g_[si], k = slot_k_[si];
+            std::fill(c, c + TR_OUT_COLS, 0.f);
+            for (int b = 0; b < nbd; ++b) {   // block order
+                const float * p = &pd_[(((size_t) gi * nbd + b) * MAX_ROWS + k) * D_MODEL + c0];
+                for (int j = 0; j < TR_OUT_COLS; j += 8)
+                    _mm256_store_ps(c + j, _mm256_add_ps(_mm256_load_ps(c + j), _mm256_loadu_ps(p + j)));
+            }
+            trellis_out(groups_[gi].t->down, c, 1, TR_OUT_COLS, c0, c0 + TR_OUT_COLS, o, TR_OUT_COLS);
+            float * y = y_ + (size_t) slots_[si].row * D_MODEL + c0;
+            const __m256 w = _mm256_set1_ps(slots_[si].w);
+            for (int j = 0; j < TR_OUT_COLS; j += 8) _mm256_storeu_ps(y + j, _mm256_fmadd_ps(w, _mm256_load_ps(o + j), _mm256_loadu_ps(y + j)));
         }
         hq_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
-    } else if (phase == 1) {   // gate or up for TR_GU_COLS columns: gate into g_, up into h_ (silu * up at the flip)
-        const int per = 2 * (D_FF / TR_GU_COLS), gi = i / per, r = i % per, up = r >= per / 2;
-        const int c0 = (r % (per / 2)) * TR_GU_COLS;
+    } else if (phase == 0) {
+        const int per = 2 * nbg, gi = i / per, r = i % per, up = r >= nbg, b = r % nbg, IN = tr_gu_in();
         const Group & gr = groups_[gi];
         const int R = (int) gr.rows.size();
-        const float * P = &tp_[gr.p_gu] + (up ? trellis_prep_floats(D_MODEL, R) : 0);
-        float * dst = (up ? &h_[0] : &g_[0]) + (size_t) gi * MAX_ROWS * D_FF + c0;
-        trellis_gemv(up ? gr.t->up : gr.t->gate, P, R, c0, c0 + TR_GU_COLS, dst, D_FF);
+        const TrellisMat W = trellis_inputs(up ? gr.t->up : gr.t->gate, b * IN, (b + 1) * IN);
+        const size_t step = (size_t) trellis_prep_floats(IN, 1);
+        if (P.size() < step * MAX_ROWS) P.resize(step * MAX_ROWS);
+        for (int k = 0; k < R; ++k) trellis_prep(W, x_ + (size_t) gr.rows[k] * D_MODEL + b * IN, D_MODEL, 1, &P[k * step]);
+        trellis_gemv_raw(W, P.data(), R, 0, D_FF, &pg_[(((size_t) gi * 2 + up) * nbg + b) * MAX_ROWS * D_FF], D_FF);
         gate_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
     } else {
-        const int per = D_MODEL / TR_DN_COLS, gi = i / per, c0 = (i % per) * TR_DN_COLS;
+        const int ncr = D_MODEL / tr_dn_cols(), per = nbd * ncr, gi = i / per, b = (i % per) / ncr, cr = (i % per) % ncr;
         const Group & gr = groups_[gi];
-        trellis_gemv(gr.t->down, &tp_[gr.p_d], (int) gr.rows.size(), c0, c0 + TR_DN_COLS,
-                     &out_[(size_t) gi * MAX_ROWS * D_MODEL + c0], D_MODEL);
+        const int R = (int) gr.rows.size(), j0 = b * TR_DN_IN;
+        alignas(32) float g[MAX_ROWS][TR_DN_IN], u[MAX_ROWS][TR_DN_IN], h[MAX_ROWS][TR_DN_IN];
+        for (int k = 0; k < R; ++k) {
+            for (int up = 0; up < 2; ++up) {
+                float * a = up ? u[k] : g[k];
+                std::fill(a, a + TR_DN_IN, 0.f);
+                for (int bb = 0; bb < nbg; ++bb) {   // block order
+                    const float * p = &pg_[((((size_t) gi * 2 + up) * nbg + bb) * MAX_ROWS + k) * D_FF + j0];
+                    for (int j = 0; j < TR_DN_IN; j += 8)
+                        _mm256_store_ps(a + j, _mm256_add_ps(_mm256_load_ps(a + j), _mm256_loadu_ps(p + j)));
+                }
+                trellis_out(up ? gr.t->up : gr.t->gate, a, 1, TR_DN_IN, j0, j0 + TR_DN_IN, a, TR_DN_IN);
+            }
+            for (int j = 0; j < TR_DN_IN; ++j) h[k][j] = g[k][j] / (1.f + std::exp(-g[k][j])) * u[k][j];
+        }
+        const TrellisMat W = trellis_inputs(gr.t->down, j0, j0 + TR_DN_IN);
+        const size_t step = (size_t) trellis_prep_floats(TR_DN_IN, 1);
+        if (P.size() < step * MAX_ROWS) P.resize(step * MAX_ROWS);
+        for (int k = 0; k < R; ++k) trellis_prep(W, h[k], TR_DN_IN, 1, &P[k * step]);
+        const int c0 = cr * tr_dn_cols();
+        trellis_gemv_raw(W, P.data(), R, c0, c0 + tr_dn_cols(), &pd_[((size_t) gi * nbd + b) * MAX_ROWS * D_MODEL + c0], D_MODEL);
         down_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
     }
     item_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
-}
-
-// every group's h = silu(gate) * up, prepared for the down projection, once, at the gate/up -> down flip
-void ExpertPool::prep_down()
-{
-    const auto t0 = std::chrono::steady_clock::now();
-    const size_t step = (size_t) trellis_prep_floats(D_FF, 1);
-    for (size_t gi = 0; gi < groups_.size(); ++gi) {
-        const Group & gr = groups_[gi];
-        for (size_t k = 0; k < gr.rows.size(); ++k) {
-            float * h = &h_[((size_t) gi * MAX_ROWS + k) * D_FF];
-            const float * g = &g_[((size_t) gi * MAX_ROWS + k) * D_FF];
-            for (int j = 0; j < D_FF; ++j) h[j] = g[j] / (1.f + std::exp(-g[j])) * h[j];
-        }
-        for (size_t k = 0; k < gr.rows.size(); ++k)
-            trellis_prep(gr.t->down, &h_[((size_t) gi * MAX_ROWS + k) * D_FF], D_FF, 1, &tp_[gr.p_d + k * step]);
-    }
-    hq_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
 }
 
 // phase 0: gate and up rows of one chunk, then h = silu(gate) * up; phase 1: h quantized, down rows of one chunk
@@ -398,8 +436,7 @@ void ExpertPool::retire(int ph)
 {
     if (pending_[ph].fetch_sub(1, std::memory_order_acq_rel) != 1) return;
     if (ph + 1 < n_phases_) {
-        if (!trellis_) quantize_h();
-        else if (ph == 1) prep_down();
+        if (!trellis_) quantize_h();   // trellis: nothing to prepare (each item prepares its own inputs)
         // seq_cst store, then wake(): a sleeper registered in sleepers_ before checking open() under mu_, so either
         // it sees the flip or wake() sees it (a lost wakeup hung calls before, TRACKER #73)
         ticket_.store((ph + 1) << TICKET_SHIFT);   // after the flip's preparation
@@ -481,6 +518,7 @@ void ExpertPool::reset_stats()
 // y[t] = sum over the slots of row t, in slot order, of w * the expert's output row
 void ExpertPool::finish()
 {
+    if (trellis_) return;   // phase 2 items wrote y
     std::fill(y_, y_ + (size_t) T_ * D_MODEL, 0.f);
     for (const Slot & s : slots_) {
         const int gi = (int) (std::find_if(groups_.begin(), groups_.end(), [&](const Group & gr) { return gr.e == s.e && gr.t == s.t; }) -
