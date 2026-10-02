@@ -70,6 +70,9 @@ struct ForwardOptions {
     // Meant with pcie_frac 0 and hint_k 0: no copies inside a pass at all.
     int adapt_every = 0;
     int adapt_swaps = 96;
+    // admission threshold on the decayed count; decay per round. TRACKER #92: admitting 64/pass at >= 1 cut CPU misses
+    // 20% but its copies delayed the demand fetches (shared copy stream): off by default (adapt_every 0)
+    float adapt_min = 2.f, adapt_decay = 0.7f;
     std::vector<int32_t> draft_vocab;         // MTP drafts score only these token ids (empty: all), e.g.
                                               // data/draft_vocab_en.bin: the draft head reads 16% of the output
                                               // matrix; verify keeps the output exact
@@ -99,7 +102,7 @@ struct ForwardOptions {
 
 // The decode-tier sweep knobs from the environment, applied on top of `o` (each only when set): TRUSS_CPU_SHARE,
 // TRUSS_CPU_THREADS, TRUSS_CPU_DYNAMIC, TRUSS_CPU_TRELLIS, TRUSS_PCIE_GBPS, TRUSS_PCIE_FRAC, TRUSS_ADAPT_EVERY,
-// TRUSS_ADAPT_SWAPS, TRUSS_RING_GB, TRUSS_HINT_K, TRUSS_PREFILL_ROWS, TRUSS_KV_INT8, TRUSS_PLAN_ALPHA. tk-bench-spec and the C API (so the server)
+// TRUSS_ADAPT_SWAPS, TRUSS_RING_GB, TRUSS_HINT_K, TRUSS_PREFILL_ROWS, TRUSS_KV_INT8, TRUSS_PLAN_ALPHA, TRUSS_ADAPT_MIN, TRUSS_ADAPT_DECAY. tk-bench-spec and the C API (so the server)
 // both call it, so a config benched is the config served.
 void apply_env(ForwardOptions & o);
 

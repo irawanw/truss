@@ -169,6 +169,7 @@ struct Forward::Impl {
     // adaptive tier (Options::adapt_every): decayed routing counts per (store layer, expert), written by the driver
     // thread in serve(), read between passes by adapt()
     int adapt_every = 0, adapt_swaps = 96;
+    float adapt_min = 2.f, adapt_decay = 0.7f;
     long decode_passes = 0;
     std::vector<float> route_usage;
     double dyn_s1 = 0, dyn_sn = 0, dyn_st = 0, dyn_snn = 0, dyn_snt = 0;
@@ -353,6 +354,7 @@ struct Forward::Impl {
         pcie_ms_byte = 1.0 / (o.pcie_gbps * 1e6);
         pcie_frac = o.pcie_frac;
         adapt_every = o.adapt_every, adapt_swaps = o.adapt_swaps;
+        adapt_min = o.adapt_min, adapt_decay = o.adapt_decay;
         if (adapt_every > 0) route_usage.assign((size_t) n_store * c.n_expert, 0.f);
         if (const char * rt = std::getenv("TRUSS_ROUTE_TRACE")) {
             route_trace = std::fopen(rt, "wb");
@@ -1431,7 +1433,7 @@ struct Forward::Impl {
         for (int l = 0; l < n_store; ++l)
             for (int e = 0; e < c.n_expert; ++e) {
                 const float u = route_usage[(size_t) l * c.n_expert + e];
-                if (u >= 2.f && !experts->on_device(l, e)) cand.emplace_back(u, l, e);
+                if (u >= adapt_min && !experts->on_device(l, e)) cand.emplace_back(u, l, e);
             }
         const size_t n = std::min(cand.size(), (size_t) adapt_swaps);
         std::partial_sort(cand.begin(), cand.begin() + (ptrdiff_t) n, cand.end(),
@@ -1439,7 +1441,7 @@ struct Forward::Impl {
         std::vector<std::pair<int, int>> le;
         for (size_t i = 0; i < n; ++i) le.push_back({ std::get<1>(cand[i]), std::get<2>(cand[i]) });
         experts->admit(le, s);
-        for (float & u : route_usage) u *= 0.7f;
+        for (float & u : route_usage) u *= adapt_decay;
     }
 
     void commit_tail(const int32_t * tokens, int T)   // the PLE window's predecessors for the next chunk
@@ -1804,6 +1806,8 @@ void apply_env(ForwardOptions & o)
     f("TRUSS_PCIE_FRAC", o.pcie_frac);         // fixed PCIe share of the misses
     f("TRUSS_ADAPT_EVERY", o.adapt_every);     // adaptive tier
     f("TRUSS_ADAPT_SWAPS", o.adapt_swaps);
+    f("TRUSS_ADAPT_MIN", o.adapt_min);
+    f("TRUSS_ADAPT_DECAY", o.adapt_decay);
     f("TRUSS_HINT_K", o.hint_k);               // pre-gated prefetch width
     f("TRUSS_PREFILL_ROWS", o.prefill_rows);
     f("TRUSS_KV_INT8", o.kv_int8);             // Strata's int8 KV
