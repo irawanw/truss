@@ -4,6 +4,12 @@ One sequence at a time. A new prompt that extends the sequence already in the en
 evaluates the new tokens; anything else starts a new sequence (the GDN state cannot be rewound). Greedy decoding
 takes the argmax on the device; sampling copies the logits.
 
+Tool calls: the model's <tool_call> XML is returned as OpenAI `tool_calls` (finish_reason "tool_calls"), and
+assistant tool calls in the history have their JSON-string arguments parsed before templating (server/tools.py).
+
+Sampling defaults are llama-server's (temperature 0.8, top_k 40, top_p 0.95, min_p 0.05), so a client that sends no
+sampling parameters gets what it got from llama-paw on this port; temperature 0 is greedy.
+
 Each request logs one line (to stdout and --log) in the format flashnext_strata_bench.py parses, so that bench runs
 unchanged against TRUSS; --log-tag sets its prefix (the bench counts "strata serve: prompt").
 
@@ -22,6 +28,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from server.chat import Chat, Detokenizer
+from server.tools import ToolStream, normalize_messages, parse_calls
 from server.truss_ctypes import Model, Sampling, TrussError
 
 
@@ -164,10 +171,12 @@ def make_app(engine: Engine) -> FastAPI:
 
     def params(body):
         stop = body.get("stop") or []
+        def get(key, default, cast):
+            v = body.get(key)
+            return cast(default if v is None else v)
         return dict(max_tokens=int(body.get("max_tokens") or body.get("max_completion_tokens") or engine.model.n_ctx),
-                    temperature=float(body.get("temperature", 1.0) if body.get("temperature") is not None else 1.0),
-                    top_p=float(body.get("top_p") or 1.0), top_k=int(body.get("top_k") or 0), seed=body.get("seed"),
-                    min_p=float(body.get("min_p") or 0.0),
+                    temperature=get("temperature", 0.8, float), top_p=get("top_p", 0.95, float),
+                    top_k=get("top_k", 40, int), min_p=get("min_p", 0.05, float), seed=body.get("seed"),
                     stop_strings=[stop] if isinstance(stop, str) else list(stop))
 
     _END = object()
@@ -201,10 +210,15 @@ def make_app(engine: Engine) -> FastAPI:
         body = await req.json()
         kw = dict(body.get("chat_template_kwargs") or {})
         thinking = kw.get("enable_thinking", True) is not False
+        tools = body.get("tools") or None
+        if body.get("tool_choice") == "none":
+            tools = None
         prompt = await anyio.to_thread.run_sync(
-            lambda: engine.chat.prompt(body["messages"], tools=body.get("tools"), template_kwargs=kw))
+            lambda: engine.chat.prompt(normalize_messages(body["messages"]), tools=tools, template_kwargs=kw))
         ids = await anyio.to_thread.run_sync(engine.chat.encode, prompt)
         p = params(body)
+        engine.log(f"request: temperature {p['temperature']} top_p {p['top_p']} top_k {p['top_k']} min_p {p['min_p']}, "
+                   f"{len(tools or [])} tools, thinking {'on' if thinking else 'off'}")
         rid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
 
         if body.get("stream"):
@@ -213,13 +227,28 @@ def make_app(engine: Engine) -> FastAPI:
                     return "data: " + json.dumps({"id": rid, "object": "chat.completion.chunk", "created": created,
                                                   "model": engine.name,
                                                   "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}) + "\n\n"
-                split = ThinkSplitter(thinking)
-                async for tok, delta, finish in tokens(req, ids, p):
-                    for field, d in split.push(delta):
-                        yield chunk({field: d})
-                    if finish:
-                        for field, d in split.flush():
+                split, calls = ThinkSplitter(thinking), ToolStream() if tools else None
+
+                def out(pairs):
+                    for field, d in pairs:
+                        if field == "content" and calls:
+                            d = calls.push(d)
+                        if d:
                             yield chunk({field: d})
+                async for tok, delta, finish in tokens(req, ids, p):
+                    for c in out(split.push(delta)):
+                        yield c
+                    if finish:
+                        for c in out(split.flush()):
+                            yield c
+                        if calls:
+                            rest, found = calls.finish(tools)
+                            if rest:
+                                yield chunk({"content": rest})
+                            for k, call in enumerate(found):
+                                yield chunk({"tool_calls": [dict(call, index=k)]})
+                            if found and finish == "stop":
+                                finish = "tool_calls"
                         yield chunk({}, finish)
                 yield "data: [DONE]\n\n"
             return StreamingResponse(events(), media_type="text/event-stream")
@@ -232,7 +261,14 @@ def make_app(engine: Engine) -> FastAPI:
             if fin:
                 finish = fin
         reasoning, content = split_reasoning(text, thinking)
+        found = []
+        if tools:
+            content, found = parse_calls(content, tools)
         msg = {"role": "assistant", "content": content}
+        if found:
+            msg["tool_calls"] = found
+            if finish == "stop":
+                finish = "tool_calls"
         if reasoning:
             msg["reasoning_content"] = reasoning
         return JSONResponse({"id": rid, "object": "chat.completion", "created": created, "model": engine.name,

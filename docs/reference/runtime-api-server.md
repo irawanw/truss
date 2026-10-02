@@ -132,11 +132,21 @@ dispatch on `general.architecture` inside `truss_open`.
 | `truss_ctypes.py` | `Model(gguf, n_ctx, max_chunk, expert_usage, mtp, drafts, cpu_dir, cpu_share, cpu_threads)` (the `truss_params` struct), `spec_step(next) → (tokens appended, next token)`, ctypes signatures for every C function, `eval(tokens) → logits` (numpy view reused per call), `eval_argmax`, `reset`, `meta_string/int`, `position`. ctypes releases the GIL during calls |
 | `chat.py` | `Chat(tokenizer_json, template)`: HF `tokenizers` tokenizer (NFC-normalizing like training; llama.cpp skips NFC — the only difference found on real text), chat template from the GGUF rendered by transformers `apply_chat_template`; `Detokenizer` (text deltas, holds back incomplete UTF-8); `sample()` (temperature, top-k, top-p; numpy) |
 | `app.py` | `Engine` (model + the sequence in it + lock) and the FastAPI app |
+| `tools.py` | OpenAI tool calling for the template's XML call format (`<tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call>`): `normalize_messages` (history tool-call `arguments` JSON strings → dicts; the template iterates `arguments|items`), `parse_calls(text, tools)` (calls out of the content; a value stays text when the tool's schema types it `string`, else JSON with a text fallback; an unterminated last call is still parsed), `ToolStream` (streaming: content until `<tool_call>`, the rest held and parsed at the end) |
 
 **Endpoints.** `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (messages, tools, `max_tokens`,
-`temperature`, `top_p`, `top_k`, `seed`, `stop`, `stream`, `chat_template_kwargs` e.g. `enable_thinking`),
+`temperature`, `top_p`, `top_k`, `min_p`, `seed`, `tool_choice`, `stop`, `stream`, `chat_template_kwargs` e.g. `enable_thinking`),
 `POST /v1/completions` (raw prompt). With thinking on (template default) the text up to `</think>` is returned as
 `reasoning_content`, the rest as `content` (`ThinkSplitter` in streaming, holds back a possible partial tag).
+With `tools` in the request (and `tool_choice` not `"none"`), calls in the content are returned as OpenAI `tool_calls`
+(streamed as `tool_calls` deltas with `index` at the end) with `finish_reason: "tool_calls"`; any text before the first
+call stays `content`. Before this the XML came back as plain text, and agent clients never saw a call.
+
+**Sampling defaults** are llama-server's: temperature 0.8, top_k 40, top_p 0.95, min_p 0.05 (an explicit value,
+including 0, wins; temperature 0 is greedy). They were temperature 1.0 with no cut, and clients that send no sampling
+fields (they relied on llama-paw's defaults on this port) got stray tokens: 1,200-token English answers, 3 seeds each,
+had 5-6 CJK runs per answer (one inside a tool name, `bash样的`) at the old defaults and none at these.
+Each chat request also logs `request: temperature … top_p … top_k … min_p …, N tools, thinking on|off`.
 
 **Engine.generate.** One request at a time (lock). The handlers drive it from a worker thread (`tokens()` in
 `make_app`: `anyio.to_thread` per item), so the event loop never blocks on the engine; on a client disconnect (or an
