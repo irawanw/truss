@@ -24,8 +24,10 @@ GGUF stores Q8_0 as interleaved 34-byte blocks (fp16 d + 32 int8), which cannot 
 | `q8_repack(blocks, in, out, q, d, stream)` | GGUF Q8_0 blocks (device) → `Q8Matrix` storage; `in % 64 == 0` | exact | load time only |
 | `q8_quantize_act(x, rows, in, xq, xd, stream)` (fp32 or **fp16** x overloads) | x [rows][in] → xq int8 [rows][in], xd fp16 [rows][in/32] | llama's Q8_1: d = amax/127, q = round(x/d) | 0.02–0.6 ms per matmul at 8K rows |
 | `q8_gemm(W, xq, xd, rows, y, stream)` | y fp32 [rows][out] = W·x; any rows/out, `in % 64 == 0` | **exactly llama-paw's** (int32 block dot, fp32 fold `acc += c·d_w·d_x`), = `ref::linear(LLAMA)` to 3e-7 | 65–94 TOPS at 8K rows (TRACKER #43) |
-| `q8_gemv(W, xq, xd, rows ≤ GEMV_ROWS = 8, y, stream)` | same as q8_gemm for decode rows | same, only fp32 summation order differs (= q8_gemm to 1.8e-7) | 740–790 GB/s on the big shapes (~85% of peak) (TRACKER #54) |
-| `f32_gemv(W, in, out, x, rows, y, stream)` | fp32 W [out][in] · x for decode-sized rows (router, shared-expert gate) | one warp per output, fixed reduction order: row-invariant, unlike cuBLAS SGEMM, whose algorithm depends on the row count (it flipped near-tied experts: 1-token steps vs 4-token windows differed by 3% rel in logits, TRACKER #60) | `Forward::lin32` uses it for ≤ 32 rows, cuBLAS above |
+| `q8_gemv(W, xq, xd, rows ≤ GEMV_ROWS = 8, y, stream)` | same as q8_gemm for decode rows | same, only fp32 summation order differs (= q8_gemm to 1.8e-7) | 720–780 GB/s on the big shapes; hc down 7.0 µs, hc up 6.4 µs at 1 row (was ~10.6 / ~15, TRACKER #83) |
+| `q8_gemv_multi(W[], y[], n ≤ MULTI_MAX = 8, xq, xd, rows, stream)` | several matrices with the same `in` on the same activations, one launch | each matrix bit-identical to its own `q8_gemv` (mapping from `in` only) | 4 rows: hc down+inject 7.8 µs (2 launches 12.5), GDN inputs 58 µs (73), DSA inputs 51 µs (67), shared gate+up 6.7 µs (11.2) (`gemv_multi_test`) |
+| `f32_gemv_multi(W[], out[], y[], n, in, x, rows, stream)` | the same for fp32 weights | each bit-identical to `f32_gemv` | router + hint router + shared gate 17.8 µs (3 launches 45.2) |
+| `f32_gemv(W, in, out, x, rows, y, stream)` | fp32 W [out][in] · x for decode-sized rows (router, shared-expert gate) | `f32_gemv_multi` with one matrix: 1 or 2 warps per output (from `in`), fixed reduction order: row-invariant, unlike cuBLAS SGEMM, whose algorithm depends on the row count (it flipped near-tied experts: 1-token steps vs 4-token windows differed by 3% rel in logits, TRACKER #60) | `Forward::lin32` uses it for ≤ 32 rows, cuBLAS above |
 | `q8_gemm_a16(W, x_half, rows, y, w16, cublas, stream)` | fp16 activations: dequantize W to `w16` (scratch, in·out halfs) then `cublasGemmEx` fp16 in / fp32 accumulate | one fp16 rounding of each weight (≤ 2^-12 rel); no activation quantization | 47–71 TFLOPS (TRACKER #44) |
 | `q8_gather(W, ids, n, q, d, stream)` | rows `ids` of W copied in Q8Matrix layout (q int8 [n][in], d fp16 [n][in/32]) into a new matrix: the MTP draft head over `Options::draft_vocab` (40,525 of 248,320 rows, 16% of the head's bytes) | exact | load time only |
 | `q8_rows(W, ids, n, out, stream)` | out fp32 [n][in] = rows `ids` of W (token embedding) | exact | — |
@@ -46,14 +48,23 @@ Q8 block, so each int32 result is scaled once per block: `acc += float(c) · d_w
 bytes makes the fragment loads conflict-free. The per-block fold (~12 ALU ops per mma) is what limits it; tried and
 rejected: magic-number int→float, 2 blocks/SM (spills), 64×128 tiles (all slower, TRACKER #43).
 
-`q8_gemv`: one warp per output row; lane l takes 32-blocks l, l+32, ...; two 16-byte loads of weights and 8 `dp4a`
-per activation row per block; warp shuffle reduction. `ROWS` is a template parameter (1..8).
+`q8_gemv` = `q8_gemv_multi` with one matrix (TRACKER #83). Per output: two 16-byte loads of weights and 8 `dp4a` per
+activation row per 32-block. The mapping depends on `in` only (never the row count or the launch's other matrices):
+- short rows (`in/32 < 32` blocks): LPO = 4, 8 or 16 lanes per output, several outputs per warp; lane l takes blocks
+  l, l + LPO, ... (hc up, 320 inputs: was 22 of 32 lanes idle);
+- long rows: WPO = 2 (≥ 128 blocks) or 4 (≥ 256) warps per output, warp w takes blocks lane + 32w, step 32·WPO,
+  partials reduced in shared memory in warp order (hc down, 10240 → 324: was 324 warps on 82 SMs);
+- otherwise one warp per output, lane l takes blocks l, l + 32, ...
+Shuffle reduction inside the lane group. `ROWS` is a template parameter (1..8). Outputs of all matrices of a launch are
+numbered through prefix sums (a short linear search per warp). `f32_gemv_multi`: lane l reads float4 l, l + 32, ...
+(+ 32·32·w with 2 warps per output when `in` ≥ 2048), rows in groups of 8.
 
 ## Invariants
 
 - `in % 64 == 0` for repack/gemm/a16 (all Flash-Next shapes satisfy it; 320 = 5·64), `in % 32 == 0` for gemv.
 - Outputs are written, never accumulated: callers need no zeroing.
-- **Row invariance:** `q8_gemm` and `q8_gemv` give each row a result independent of the other rows. cuBLAS
+- **Row invariance:** `q8_gemm` and `q8_gemv` give each row a result independent of the other rows; the `_multi`
+  forms also give each matrix a result independent of the matrices fused with it (`gemv_multi_test`). cuBLAS
   (`q8_gemm_a16`) does not: it picks algorithms by row count (2.5e-6 rel between row counts, `q8_gemm_test` prefix
   line, TRACKER #51).
 

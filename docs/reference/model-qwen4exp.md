@@ -98,7 +98,11 @@ profile_routes(on), route_counts()   // routing profile [layer][expert] (the usa
 | `window_ws`, `ids_host`, `route_counts` | `moe::window` workspace; pinned routing buffer for the expert fetch; routing profile while on |
 
 **Per chunk.** See the table in [README.md](README.md). Mode choices inside:
-- `lin`: Q8_1 → `q8_gemv` (≤ 8 rows) / `q8_gemm`; FP16 → `q8_gemm_a16`. `lin32`: cuBLAS SGEMM for F32 weights.
+- `lin`: Q8_1 → `q8_gemv` (≤ 8 rows) / `q8_gemm`; FP16 → `q8_gemm_a16`. `lin32`: `f32_gemv` (≤ 32 rows) / cuBLAS
+  SGEMM for F32 weights. `lin_multi` / `lin32_multi`: projections of the same input in one launch at decode sizes
+  (`q8_gemv_multi` / `f32_gemv_multi`, bit-identical to separate calls; separate `lin`/`lin32` above): GDN
+  qkv/gate/alpha/beta, DSA q/k/v/idx_q/idx_k, hc down + inject, shared gate + up, PLE key + value, and router + next
+  layer's router (pre-gating hint) + shared-expert gate (`ffn`, so `sg` is computed with the router, TRACKER #83).
   An input read by several projections is quantized once (`quant()` → `Act`, in the caller's scratch scope): GDN
   qkv/gate/alpha/beta, DSA q/k/v/indexer, hc down + inject, shared gate + up, PLE key + value.
 - MTP drafts may score only the token ids in `Options::draft_vocab` (e.g. `data/draft_vocab_en.bin`, Strata's

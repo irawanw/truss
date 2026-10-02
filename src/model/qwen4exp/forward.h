@@ -153,6 +153,10 @@ public:
     // pool, issuing the copies and writing the plan (read between passes only)
     void driver_ms(double out[3], long & n, bool reset = false) const;
     long adapt_admitted() const;              // experts admitted by the adaptive tier since construction
+    // host time of the PLE layers' n-gram row hash, table gather (the mmap of the GGUF: page faults for rows not in
+    // the page cache) and fp16 conversion, ms summed over calls since the last reset, with the table rows read.
+    // Always counted (two clock reads per PLE layer call).
+    void ple_host_ms(double & ms, long & calls, long & rows, bool reset = false) const;
     const runtime::ExpertStore & experts() const;   // residency and fetch statistics (the MTP block, when present,
                                                     // is store layer n_layer)
 

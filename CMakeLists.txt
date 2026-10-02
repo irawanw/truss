@@ -109,6 +109,8 @@ target_compile_options(cpu_trellis_test PRIVATE -O2 -mavx2 -mfma -mf16c)
 target_link_libraries(cpu_trellis_test PRIVATE truss_cpu)
 add_executable(q8_gemm_test tests/unit/q8_gemm_test.cu)
 target_link_libraries(q8_gemm_test PRIVATE truss_kernels truss_reference)
+add_executable(gemv_multi_test tests/unit/gemv_multi_test.cu)
+target_link_libraries(gemv_multi_test PRIVATE truss_kernels)
 
 add_executable(gdn_prefill_test tests/unit/gdn_prefill_test.cu)
 target_link_libraries(gdn_prefill_test PRIVATE truss_kernels truss_reference)

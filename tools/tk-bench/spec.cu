@@ -142,7 +142,7 @@ int main(int argc, char ** argv)
         prompt(f, tok, step);
         g.rows(f, (int) (tok.size() - 1) % step, 1, &t);
         f.section_ms(sect, true);
-        { double m4[4], d3[3]; long dn; f.section_moe_ms(m4, true); f.driver_ms(d3, dn, true); }
+        { double m4[4], d3[3], pm; long dn, pc, pr; f.section_moe_ms(m4, true); f.driver_ms(d3, dn, true); f.ple_host_ms(pm, pc, pr, true); }
         std::vector<int32_t> got;
         const runtime::ExpertStore::Stats st0 = f.experts().stats();
         int passes = 0;
@@ -228,6 +228,13 @@ int main(int argc, char ** argv)
             std::printf("       routed MoE ms/pass: router+publish %.2f + wait for the host plan %.2f + wait for copies %.2f "
                         "+ expert kernel %.2f\n", m4[0] / passes, m4[1] / passes, m4[2] / passes, m4[3] / passes);
         if (f.adapt_admitted()) std::printf("       adaptive tier: %ld experts admitted\n", f.adapt_admitted());
+        {
+            double pm;
+            long pc, pr;
+            f.ple_host_ms(pm, pc, pr);
+            if (pc) std::printf("       PLE host gather ms/pass: %.2f (%.1f calls, %.0f table rows per pass)\n", pm / passes,
+                                (double) pc / passes, (double) pr / passes);
+        }
         double d3[3];
         long dn = 0;
         f.driver_ms(d3, dn);

@@ -141,6 +141,8 @@ struct Forward::Impl {
     std::deque<Job> jobs;
     std::chrono::steady_clock::time_point drv_t[3];   // driver thread only: doorbell seen, split done, CPU started
     double drv_ms[3] = { 0, 0, 0 };                    // summed: split, CPU start, copies + plan (driver_ms)
+    double ple_host_ms = 0;                            // host time of the PLE row hash + gather + fp16 convert
+    long ple_calls = 0, ple_rows_n = 0;                // (ple_host_ms(); the rows are table rows read)
     long drv_n = 0;
     std::atomic<long> jobs_pushed{ 0 };   // the driver spins on this before it sleeps on dq_cv (Strata's host spins)
     bool driver_stop = false;
@@ -953,6 +955,39 @@ struct Forward::Impl {
                                  y, out));
     }
 
+    // Several projections of the same activations. Decode rows: one launch (dense::q8_gemv_multi / f32_gemv_multi,
+    // TRACKER #83: D0 counted 2,672 launches per pass, the small ones far below bandwidth); each matrix's result is
+    // bit-identical to its own lin()/lin32() at those rows. Larger row counts: one lin()/lin32() each.
+    using Proj = std::pair<T, float *>;
+    void lin_multi(const std::vector<Proj> & ps, const Act & a, int rows)
+    {
+        if (act == Activations::Q8_1 && rows <= dense::GEMV_ROWS && ps.size() > 1 && ps.size() <= (size_t) dense::MULTI_MAX) {
+            const dense::Q8Matrix * W[dense::MULTI_MAX];
+            float * y[dense::MULTI_MAX];
+            for (size_t i = 0; i < ps.size(); ++i) W[i] = &q8.at(ps[i].first), y[i] = ps[i].second;
+            dense::q8_gemv_multi(W, y, (int) ps.size(), a.q, a.d, rows, s);
+            return;
+        }
+        for (const Proj & p : ps) lin(p.first, a, rows, p.second);
+    }
+    void lin32_multi(const std::vector<Proj> & ps, const float * x, int rows)
+    {
+        if (rows <= FETCH_ROWS && ps.size() > 1 && ps.size() <= (size_t) dense::MULTI_MAX) {
+            const float * W[dense::MULTI_MAX];
+            float * y[dense::MULTI_MAX];
+            int out[dense::MULTI_MAX];
+            const int in = (int) d(ps[0].first).ne[0];
+            for (size_t i = 0; i < ps.size(); ++i) {
+                const DTensor & t = d(ps[i].first);
+                if ((int) t.ne[0] != in) throw std::runtime_error("lin32_multi: inputs differ");
+                W[i] = t.as<float>(), out[i] = (int) t.ne[1], y[i] = ps[i].second;
+            }
+            dense::f32_gemv_multi(W, out, y, (int) ps.size(), in, x, rows, s);
+            return;
+        }
+        for (const Proj & p : ps) lin32(p.first, x, rows, p.second);
+    }
+
     // hyper-connection mix: mixed [T][d] (fp32 and fp16), inject [T][hc] when h.inject
     void hc_mix(const HyperConnection & h, const float * res, int T, float * mixed, half * mixed16, float * inject)
     {
@@ -964,17 +999,18 @@ struct Forward::Impl {
         float * gate = sc->alloc((size_t) T * c.hc_dim());
         hc::norm(res, f32(h.norm), T, c.hc, c.d_model, c.rms_eps, xn16, rstd, s);
         const Act xa = quant(xn16, T, c.hc_dim());
-        lin(h.down, xa, T, lo);
+        if (h.inject) lin_multi({ { h.down, lo }, { h.inject, inject } }, xa, T);   // inject reads the same xa
+        else lin(h.down, xa, T, lo);
         hc::silu(lo, T * c.hc_rank, 1.f / c.hc, lo16, s);
         lin(h.up, lo16, T, gate);
         hc::collapse(res, rstd, f32(h.norm), gate, T, c.hc, c.d_model, mixed, mixed16, s);
-        if (h.inject) lin(h.inject, xa, T, inject);
         sc->release(m);
     }
 
     void ple(const Ple & p, LayerState & L, const int32_t * tokens, int T, bool tentative)
     {
         // n-gram window across chunks: hash [tail | chunk] and keep the chunk's rows
+        const auto th0 = std::chrono::steady_clock::now();
         const int H = c.ple_heads(), E = H * c.ple_head_dim, n_prev = (int) tail.size();
         std::vector<int32_t> seq(tail);
         seq.insert(seq.end(), tokens, tokens + T);
@@ -984,6 +1020,8 @@ struct Forward::Impl {
         ple_gather(c, w, rows.data() + (size_t) n_prev * H, T, emb.data());
         std::vector<half> emb16(emb.size());
         for (size_t i = 0; i < emb.size(); ++i) emb16[i] = __float2half(emb[i]);
+        ple_host_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - th0).count();
+        ++ple_calls, ple_rows_n += (long) T * H;
 
         const size_t m = sc->mark();
         half * e16 = sc->alloc<half>(emb16.size());
@@ -991,8 +1029,7 @@ struct Forward::Impl {
         float * gate = sc->alloc((size_t) T * c.hc), * normed = sc->alloc((size_t) T * c.hc_dim());
         TRUSS_CUDA(cudaMemcpyAsync(e16, emb16.data(), emb16.size() * 2, cudaMemcpyHostToDevice, s));
         const Act ea = quant(e16, T, c.ple_heads() * c.ple_head_dim);
-        lin(p.key, ea, T, key);
-        lin(p.value, ea, T, value);
+        lin_multi({ { p.key, key }, { p.value, value } }, ea, T);
         ple::gate(key, res, f32(p.norm_key), f32(p.norm_query), T, c.hc, c.d_model, c.rms_eps, gate, s);
         const size_t hist = (size_t) (c.ple_conv - 1) * c.ple_ngram * c.hc_dim();
         if (tentative) copy(L.hist_snap, L.ple_hist, hist);
@@ -1015,10 +1052,7 @@ struct Forward::Impl {
         float * core = sc->alloc((size_t) T * vd);
         half * o16 = sc->alloc<half>((size_t) T * vd);
         const Act ia = quant(in16, T, c.d_model);
-        lin(g.qkv, ia, T, qkv);
-        lin(g.gate, ia, T, z);
-        lin(g.alpha, ia, T, alpha);
-        lin(g.beta, ia, T, beta_raw);
+        lin_multi({ { g.qkv, qkv }, { g.gate, z }, { g.alpha, alpha }, { g.beta, beta_raw } }, ia, T);
         if (tentative) {   // accept() may redo the accepted rows from these
             copy(L.conv_snap, L.conv, (size_t) (c.ssm_conv - 1) * c.conv_dim());
             copy(L.raw_qkv, qkv, (size_t) T * c.conv_dim());
@@ -1047,11 +1081,7 @@ struct Forward::Impl {
         int * blocks = sc->alloc<int>((size_t) T * DsaShape::TOP_BLOCKS), * n_blocks = sc->alloc<int>(T);
         half * att16 = sc->alloc<half>((size_t) T * H * D);
         const Act ia = quant(in16, T, c.d_model);
-        lin(a.q, ia, T, qfull);
-        lin(a.k, ia, T, k);
-        lin(a.v, ia, T, v);
-        lin(a.idx_q, ia, T, iq);
-        lin(a.idx_k, ia, T, ik);
+        lin_multi({ { a.q, qfull }, { a.k, k }, { a.v, v }, { a.idx_q, iq }, { a.idx_k, ik } }, ia, T);
         if (tentative) {
             copy(L.partial_snap, L.idx_partial, (size_t) (DsaShape::RATIO - 1) * c.idx_head_dim);
             copy(L.raw_ik, ik, (size_t) T * c.idx_head_dim);
@@ -1090,16 +1120,23 @@ struct Forward::Impl {
         float * routed = sc->alloc((size_t) T * dm), * y = sc->alloc((size_t) T * dm);
         float * g = sc->alloc((size_t) T * F), * u = sc->alloc((size_t) T * F), * sg = sc->alloc(T);
         half * mid16 = sc->alloc<half>((size_t) T * F);
-        lin32(mo.router, in, T, logits);
+        // the router, the next layer's router on this input (pre-gating hint, TRACKER #58) and the shared-expert
+        // gate read the same fp32 rows: one launch at decode sizes
+        const bool hint = !stream && hint_k > 0 && l + 1 < c.n_layer;
+        float * pl = nullptr;
+        if (hint) pl = sc->alloc((size_t) T * E);
+        {
+            std::vector<Proj> ps{ { mo.router, logits }, { mo.shexp_gate_inp, sg } };
+            if (hint) ps.push_back({ w.layers[l + 1].moe.router, pl });
+            lin32_multi(ps, in, T);
+        }
         ffn::route(logits, T, E, K, ids, wts, s);
         if (route_counts) ffn::count(ids, T * K, route_counts + (size_t) l * E, s);
         if (!stream && use_doorbell && T <= cpu::MAX_ROWS) {   // no host sync: the driver thread serves this FFN
-            const bool hint = hint_k > 0 && l + 1 < c.n_layer;
             int * pred = nullptr;
             if (hint) {
-                float * pl = sc->alloc((size_t) T * E), * pw = sc->alloc((size_t) T * K);
+                float * pw = sc->alloc((size_t) T * K);
                 pred = sc->alloc<int>((size_t) T * K);
-                lin32(w.layers[l + 1].moe.router, in, T, pl);
                 ffn::route(pl, T, E, K, pred, pw, s);
             }
             const bool cpu_on = cpu_tier && l < c.n_layer;
@@ -1125,12 +1162,10 @@ struct Forward::Impl {
         } else if (!stream) {   // fetch the few cold experts this chunk routes to
             // pre-gating: the next layer's router on this layer's input predicts 72% of its experts (TRACKER #58);
             // their copies start behind this layer's, one sync for both id sets
-            const bool hint = hint_k > 0 && l + 1 < c.n_layer;
             int * pred = nullptr;
             if (hint) {
-                float * pl = sc->alloc((size_t) T * E), * pw = sc->alloc((size_t) T * K);
+                float * pw = sc->alloc((size_t) T * K);
                 pred = sc->alloc<int>((size_t) T * K);
-                lin32(w.layers[l + 1].moe.router, in, T, pl);
                 ffn::route(pl, T, E, K, pred, pw, s);
                 TRUSS_CUDA(cudaMemcpyAsync(ids_host + T * K, pred, sizeof(int) * T * K, cudaMemcpyDeviceToHost, s));
             }
@@ -1188,11 +1223,9 @@ struct Forward::Impl {
         }
         if (sect) sect_record(l, 4);   // shared expert + the CPU tier's join (its spin lands in this section)
         const Act ia = quant(in16, T, c.d_model);
-        lin(mo.shexp_gate, ia, T, g);
-        lin(mo.shexp_up, ia, T, u);
+        lin_multi({ { mo.shexp_gate, g }, { mo.shexp_up, u } }, ia, T);
         ffn::swiglu(g, u, T * F, mid16, s);
-        lin(mo.shexp_down, mid16, T, y);
-        lin32(mo.shexp_gate_inp, in, T, sg);
+        lin(mo.shexp_down, mid16, T, y);   // sg (shared-expert gate) came with the router
         if (sect) sect_record(l, 5);   // section 5: the CPU tier's join (its spin is the section)
         if (cpu_rows < 0) {   // doorbell path: wait for the CPU tier's rows (mapped) and add them
             runtime::spin_until(bells[l].cpu_done, bells[l].seq, s);
@@ -1595,6 +1628,12 @@ void Forward::driver_ms(double out[3], long & n, bool reset) const
 }
 
 long Forward::adapt_admitted() const { return m_->experts->admitted(); }
+
+void Forward::ple_host_ms(double & ms, long & calls, long & rows, bool reset) const
+{
+    ms = m_->ple_host_ms, calls = m_->ple_calls, rows = m_->ple_rows_n;
+    if (reset) m_->ple_host_ms = 0, m_->ple_calls = 0, m_->ple_rows_n = 0;
+}
 
 void Forward::section_moe_ms(double out[4], bool reset) const
 {

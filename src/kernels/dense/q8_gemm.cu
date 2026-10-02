@@ -185,44 +185,6 @@ __global__ void dequant_kernel(const int8_t * __restrict__ q, const half * __res
     o[1] = __floats2half2_rn(v.z * s, v.w * s);
 }
 
-// one warp per output o; lane l takes 32-blocks l, l + 32, ...; each block = 8 dp4a per activation row
-template <int ROWS>
-__global__ void __launch_bounds__(128) gemv_kernel(const int8_t * __restrict__ q, const half * __restrict__ d, int in,
-                                                   int out, const int8_t * __restrict__ xq, const half * __restrict__ xd,
-                                                   float * __restrict__ y)
-{
-    const int o = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x % 32;
-    if (o >= out) return;
-    const int nb = in / 32;
-    float acc[ROWS] = {};
-    for (int b = lane; b < nb; b += 32) {
-        const int4 * wp = reinterpret_cast<const int4 *>(q + (size_t) o * in + b * 32);
-        const int4 w0 = __ldg(wp), w1 = __ldg(wp + 1);
-        const float dw = __half2float(d[(size_t) o * nb + b]);
-#pragma unroll
-        for (int r = 0; r < ROWS; ++r) {
-            const int4 * xp = reinterpret_cast<const int4 *>(xq + (size_t) r * in + b * 32);
-            const int4 x0 = __ldg(xp), x1 = __ldg(xp + 1);
-            int s = 0;
-            s = __dp4a(w0.x, x0.x, s), s = __dp4a(w0.y, x0.y, s), s = __dp4a(w0.z, x0.z, s), s = __dp4a(w0.w, x0.w, s);
-            s = __dp4a(w1.x, x1.x, s), s = __dp4a(w1.y, x1.y, s), s = __dp4a(w1.z, x1.z, s), s = __dp4a(w1.w, x1.w, s);
-            acc[r] += (float) s * (dw * __half2float(xd[(size_t) r * nb + b]));
-        }
-    }
-#pragma unroll
-    for (int r = 0; r < ROWS; ++r) {
-        float v = acc[r];
-        for (int m = 16; m; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
-        if (lane == 0) y[(size_t) r * out + o] = v;
-    }
-}
-
-template <int ROWS>
-void gemv_rows(const Q8Matrix & W, const int8_t * xq, const half * xd, float * y, cudaStream_t stream)
-{
-    gemv_kernel<ROWS><<<(W.out + 3) / 4, 128, 0, stream>>>(W.q, W.d, W.in, W.out, xq, xd, y);
-}
-
 // one block per row
 __global__ void rows_kernel(const int8_t * __restrict__ q, const half * __restrict__ d, const int * ids, int in,
                             float * out)
@@ -232,31 +194,151 @@ __global__ void rows_kernel(const int8_t * __restrict__ q, const half * __restri
         out[(size_t) blockIdx.x * in + i] = q[r * in + i] * __half2float(d[r * (in / 32) + i / 32]);
 }
 
-// one warp per output o; lane l reads float4 l, l + 32, ... of W's row; rows in groups of 8 (W re-read per group)
-__global__ void __launch_bounds__(128) f32_gemv_kernel(const float * __restrict__ W, int in, int out,
-                                                       const float * __restrict__ x, int rows, float * __restrict__ y)
+// ---- multi-matrix gemv (decode): several matrices that read the same activations, one launch (TRACKER #83) ----
+// D0 measured 2,672 launches per pass and small projections far below bandwidth: hc inject (10240 -> 4) one block
+// of 4 warps, 9.4 us; hc up (320 inputs = 10 blocks) 22 of 32 lanes idle; hc down (324 outputs) too few warps.
+// Mapping, from the input width only (never the row count or the other matrices of the launch, so a row's result
+// does not depend on the window size or on what it is fused with):
+//   LPO lanes per output (in / 32 blocks < 32: 4, 8 or 16; several outputs per warp), lane sl takes blocks
+//   sl, sl + LPO, ...; reduction by shuffles inside the lane group;
+//   WPO warps per output (few outputs, long rows: 2 or 4), warp wi takes blocks lane + 32 wi, step 32 WPO;
+//   partial sums reduced in shared memory in warp order. Fixed orders throughout.
+struct MultiQ8 {
+    const int8_t * q[MULTI_MAX];
+    const half * d[MULTI_MAX];
+    float * y[MULTI_MAX];
+    int start[MULTI_MAX + 1];   // output prefix sums
+    int n;
+};
+
+template <int ROWS, int LPO, int WPO>
+__global__ void __launch_bounds__(128) gemv_multi_kernel(MultiQ8 m, int in, const int8_t * __restrict__ xq,
+                                                         const half * __restrict__ xd)
 {
-    const int o = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x % 32;
-    if (o >= out) return;
-    const float4 * w = reinterpret_cast<const float4 *>(W + (size_t) o * in);
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, nb = in / 32;
+    int o, sl, step;
+    if (WPO == 1) o = blockIdx.x * (4 * 32 / LPO) + warp * (32 / LPO) + lane / LPO, sl = lane % LPO, step = LPO;
+    else o = blockIdx.x * (4 / WPO) + warp / WPO, sl = lane + 32 * (warp % WPO), step = 32 * WPO;
+    const bool valid = o < m.start[m.n];
+    int seg = 0;
+    if (valid)
+        while (o >= m.start[seg + 1]) ++seg;
+    const int oo = valid ? o - m.start[seg] : 0;
+    float acc[ROWS] = {};
+    if (valid) {
+        const int8_t * q = m.q[seg] + (size_t) oo * in;
+        const half * d = m.d[seg] + (size_t) oo * nb;
+        for (int b = sl; b < nb; b += step) {
+            const int4 * wp = reinterpret_cast<const int4 *>(q + b * 32);
+            const int4 w0 = __ldg(wp), w1 = __ldg(wp + 1);
+            const float dw = __half2float(d[b]);
+#pragma unroll
+            for (int r = 0; r < ROWS; ++r) {
+                const int4 * xp = reinterpret_cast<const int4 *>(xq + (size_t) r * in + b * 32);
+                const int4 x0 = __ldg(xp), x1 = __ldg(xp + 1);
+                int s = 0;
+                s = __dp4a(w0.x, x0.x, s), s = __dp4a(w0.y, x0.y, s), s = __dp4a(w0.z, x0.z, s), s = __dp4a(w0.w, x0.w, s);
+                s = __dp4a(w1.x, x1.x, s), s = __dp4a(w1.y, x1.y, s), s = __dp4a(w1.z, x1.z, s), s = __dp4a(w1.w, x1.w, s);
+                acc[r] += (float) s * (dw * __half2float(xd[(size_t) r * nb + b]));
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r)
+        for (int k = (WPO == 1 ? LPO : 32) / 2; k; k >>= 1) acc[r] += __shfl_xor_sync(0xffffffffu, acc[r], k);
+    if (WPO == 1) {
+        if (valid && sl == 0)
+#pragma unroll
+            for (int r = 0; r < ROWS; ++r) m.y[seg][(size_t) r * (m.start[seg + 1] - m.start[seg]) + oo] = acc[r];
+        return;
+    }
+    __shared__ float part[4][ROWS];
+    if (lane == 0)
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) part[warp][r] = acc[r];
+    __syncthreads();
+    if (valid && lane == 0 && warp % WPO == 0)
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            float v = part[warp][r];
+            for (int k = 1; k < WPO; ++k) v += part[warp + k][r];
+            m.y[seg][(size_t) r * (m.start[seg + 1] - m.start[seg]) + oo] = v;
+        }
+}
+
+template <int ROWS>
+void gemv_multi_rows(const MultiQ8 & m, int in, const int8_t * xq, const half * xd, cudaStream_t stream)
+{
+    const int nb = in / 32, outs = m.start[m.n];
+    // long rows get 2 or 4 warps per output: the long-row matrices of this model have few outputs (hc down 10240 ->
+    // 324: 1,296 warps at 4; out-proj 6144 -> 2560), and one warp per output leaves the 82 SMs short of warps
+    const int wpo = nb >= 256 ? 4 : nb >= 128 ? 2 : 1;
+    const int lpo = nb >= 32 ? 32 : nb > 8 ? 16 : nb > 4 ? 8 : 4;
+    if (lpo < 32) {
+        const int per = 4 * 32 / lpo, grid = (outs + per - 1) / per;
+        if (lpo == 16) gemv_multi_kernel<ROWS, 16, 1><<<grid, 128, 0, stream>>>(m, in, xq, xd);
+        else if (lpo == 8) gemv_multi_kernel<ROWS, 8, 1><<<grid, 128, 0, stream>>>(m, in, xq, xd);
+        else gemv_multi_kernel<ROWS, 4, 1><<<grid, 128, 0, stream>>>(m, in, xq, xd);
+    } else if (wpo == 1) gemv_multi_kernel<ROWS, 32, 1><<<(outs + 3) / 4, 128, 0, stream>>>(m, in, xq, xd);
+    else if (wpo == 2) gemv_multi_kernel<ROWS, 32, 2><<<(outs + 1) / 2, 128, 0, stream>>>(m, in, xq, xd);
+    else gemv_multi_kernel<ROWS, 32, 4><<<outs, 128, 0, stream>>>(m, in, xq, xd);
+}
+
+// fp32 weights: lane l reads float4 l, l + 32, ... (+ 32 * 32 wi with WPO warps per output); rows in groups of 8
+struct MultiF32 {
+    const float * W[MULTI_MAX];
+    float * y[MULTI_MAX];
+    int start[MULTI_MAX + 1];
+    int n;
+};
+
+template <int WPO>
+__global__ void __launch_bounds__(128) f32_gemv_multi_kernel(MultiF32 m, int in, const float * __restrict__ x, int rows)
+{
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int o = blockIdx.x * (4 / WPO) + warp / WPO, wi = warp % WPO;
+    const bool valid = o < m.start[m.n];
+    int seg = 0;
+    if (valid)
+        while (o >= m.start[seg + 1]) ++seg;
+    const int oo = valid ? o - m.start[seg] : 0, out = valid ? m.start[seg + 1] - m.start[seg] : 0;
+    const float4 * w = reinterpret_cast<const float4 *>(m.W[seg] + (size_t) oo * in);
+    __shared__ float part[4][8];
     for (int r0 = 0; r0 < rows; r0 += 8) {
         const int R = min(8, rows - r0);
         float acc[8] = {};
-        for (int i = lane; i < in / 4; i += 32) {
-            const float4 a = __ldg(w + i);
+        if (valid)
+            for (int i = lane + 32 * wi; i < in / 4; i += 32 * WPO) {
+                const float4 a = __ldg(w + i);
+#pragma unroll
+                for (int r = 0; r < 8; ++r)
+                    if (r < R) {
+                        const float4 b = reinterpret_cast<const float4 *>(x + (size_t) (r0 + r) * in)[i];
+                        acc[r] += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+                    }
+            }
+#pragma unroll
+        for (int r = 0; r < 8; ++r)
+            for (int k = 16; k; k >>= 1) acc[r] += __shfl_xor_sync(0xffffffffu, acc[r], k);
+        if (WPO == 1) {
+#pragma unroll
+            for (int r = 0; r < 8; ++r)
+                if (valid && r < R && lane == 0) m.y[seg][(size_t) (r0 + r) * out + oo] = acc[r];
+            continue;
+        }
+        if (lane == 0)
+#pragma unroll
+            for (int r = 0; r < 8; ++r) part[warp][r] = acc[r];
+        __syncthreads();
+        if (valid && lane == 0 && wi == 0)
 #pragma unroll
             for (int r = 0; r < 8; ++r)
                 if (r < R) {
-                    const float4 b = reinterpret_cast<const float4 *>(x + (size_t) (r0 + r) * in)[i];
-                    acc[r] += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+                    float v = part[warp][r];
+                    for (int k = 1; k < WPO; ++k) v += part[warp + k][r];
+                    m.y[seg][(size_t) (r0 + r) * out + oo] = v;
                 }
-        }
-#pragma unroll
-        for (int r = 0; r < 8; ++r) {
-            float v = acc[r];
-            for (int m = 16; m; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
-            if (r < R && lane == 0) y[(size_t) (r0 + r) * out + o] = v;
-        }
+        __syncthreads();
     }
 }
 
@@ -278,26 +360,14 @@ void q8_gather(const Q8Matrix & W, const int * ids, int n, int8_t * q, half * d,
 
 void f32_gemv(const float * W, int in, int out, const float * x, int rows, float * y, cudaStream_t stream)
 {
-    if (in % 128) throw std::runtime_error("f32_gemv: in must be a multiple of 128");
-    f32_gemv_kernel<<<(out + 3) / 4, 128, 0, stream>>>(W, in, out, x, rows, y);
-    TRUSS_CUDA(cudaGetLastError());
+    f32_gemv_multi(&W, &out, &y, 1, in, x, rows, stream);   // one kernel for the router, fused or alone
 }
 
 void q8_gemv(const Q8Matrix & W, const int8_t * xq, const half * xd, int rows, float * y, cudaStream_t stream)
 {
     if (W.in % 32) throw std::runtime_error("q8_gemv: in must be a multiple of 32");
-    switch (rows) {
-    case 1: gemv_rows<1>(W, xq, xd, y, stream); break;
-    case 2: gemv_rows<2>(W, xq, xd, y, stream); break;
-    case 3: gemv_rows<3>(W, xq, xd, y, stream); break;
-    case 4: gemv_rows<4>(W, xq, xd, y, stream); break;
-    case 5: gemv_rows<5>(W, xq, xd, y, stream); break;
-    case 6: gemv_rows<6>(W, xq, xd, y, stream); break;
-    case 7: gemv_rows<7>(W, xq, xd, y, stream); break;
-    case 8: gemv_rows<8>(W, xq, xd, y, stream); break;
-    default: throw std::runtime_error("q8_gemv: rows must be 1.." + std::to_string(GEMV_ROWS));
-    }
-    TRUSS_CUDA(cudaGetLastError());
+    const Q8Matrix * w = &W;
+    q8_gemv_multi(&w, &y, 1, xq, xd, rows, stream);   // its lane/warp mapping (short rows, few outputs)
 }
 
 void q8_rows(const Q8Matrix & W, const int * ids, int n, float * out, cudaStream_t stream)
@@ -351,6 +421,45 @@ void q8_gemm(const Q8Matrix & W, const int8_t * xq, const half * xd, int rows, f
     if (W.in % KC) throw std::runtime_error("q8_gemm: in must be a multiple of 64, got " + std::to_string(W.in));
     const dim3 grid((W.out + BM - 1) / BM, (rows + BN - 1) / BN);
     gemm_kernel<<<grid, THREADS, 0, stream>>>(W, xq, xd, rows, y);
+    TRUSS_CUDA(cudaGetLastError());
+}
+
+void q8_gemv_multi(const Q8Matrix * const * W, float * const * y, int n, const int8_t * xq, const half * xd, int rows,
+                   cudaStream_t stream)
+{
+    if (n < 1 || n > MULTI_MAX) throw std::runtime_error("q8_gemv_multi: 1.." + std::to_string(MULTI_MAX) + " matrices");
+    MultiQ8 m{};
+    m.n = n, m.start[0] = 0;
+    for (int i = 0; i < n; ++i) {
+        if (W[i]->in != W[0]->in || W[i]->in % 32) throw std::runtime_error("q8_gemv_multi: same in, multiple of 32");
+        m.q[i] = W[i]->q, m.d[i] = W[i]->d, m.y[i] = y[i], m.start[i + 1] = m.start[i] + W[i]->out;
+    }
+    const int in = W[0]->in;
+    switch (rows) {
+    case 1: gemv_multi_rows<1>(m, in, xq, xd, stream); break;
+    case 2: gemv_multi_rows<2>(m, in, xq, xd, stream); break;
+    case 3: gemv_multi_rows<3>(m, in, xq, xd, stream); break;
+    case 4: gemv_multi_rows<4>(m, in, xq, xd, stream); break;
+    case 5: gemv_multi_rows<5>(m, in, xq, xd, stream); break;
+    case 6: gemv_multi_rows<6>(m, in, xq, xd, stream); break;
+    case 7: gemv_multi_rows<7>(m, in, xq, xd, stream); break;
+    case 8: gemv_multi_rows<8>(m, in, xq, xd, stream); break;
+    default: throw std::runtime_error("q8_gemv_multi: rows must be 1.." + std::to_string(GEMV_ROWS));
+    }
+    TRUSS_CUDA(cudaGetLastError());
+}
+
+void f32_gemv_multi(const float * const * W, const int * out, float * const * y, int n, int in, const float * x,
+                    int rows, cudaStream_t stream)
+{
+    if (n < 1 || n > MULTI_MAX) throw std::runtime_error("f32_gemv_multi: 1.." + std::to_string(MULTI_MAX) + " matrices");
+    if (in % 128) throw std::runtime_error("f32_gemv_multi: in must be a multiple of 128");
+    MultiF32 m{};
+    m.n = n, m.start[0] = 0;
+    for (int i = 0; i < n; ++i) m.W[i] = W[i], m.y[i] = y[i], m.start[i + 1] = m.start[i] + out[i];
+    const int outs = m.start[n];   // warps per output from `in` only (router 2560 -> 512: 2), as q8_gemv_multi
+    if (in < 2048) f32_gemv_multi_kernel<1><<<(outs + 3) / 4, 128, 0, stream>>>(m, in, x, rows);
+    else f32_gemv_multi_kernel<2><<<(outs + 1) / 2, 128, 0, stream>>>(m, in, x, rows);
     TRUSS_CUDA(cudaGetLastError());
 }
 
