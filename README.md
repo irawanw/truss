@@ -38,6 +38,26 @@ curl localhost:8090/v1/chat/completions -H 'Content-Type: application/json' \
 
 Tests and benchmarks: [docs/reference/tests-tools.md](docs/reference/tests-tools.md).
 
+## Credits
+
+TRUSS is an independent, from-scratch implementation (no shared code, no fork), but two projects shaped
+how it's built:
+
+- **[Strata](https://github.com/Niko1221/Strata)** (Niko1221, MIT) is where the serving architecture comes
+  from. Running a 125B MoE on one consumer GPU means most experts can't live in VRAM, and Strata's answer —
+  keep the hot experts on the GPU, compute the rest on the CPU from RAM, hand off between them through a
+  flag in pinned memory instead of a blocking copy, and recover the lost speed with speculative decoding —
+  is the shape TRUSS's engine follows and the bar its benchmarks are measured against. The specific
+  techniques (CPU-resident experts, the async doorbell handoff, adaptive/usage-ranked residency, an int8 KV
+  layout, accepting speculative drafts row-by-row) were studied from Strata's engine and reimplemented here
+  independently, not copied: see `docs/06-truss.md` and `docs/reference/` for what each piece does in TRUSS
+  and how it differs.
+- **[ExLlamaV3](https://github.com/turboderp-org/exllamav3)** (turboderp, MIT) is where the weight codec
+  comes from. Its EXL3 format (a QTIP-style trellis/Viterbi quantizer) is the basis for the X3 / X3.1
+  codec that compresses this model's experts to ~2.6 bits/weight on GPU; TRUSS's decode kernels and its
+  encoder's refit/drift step port that design (`docs/reference/kernels-trellis-moe.md`,
+  `docs/reference/formats-core.md`).
+
 ## Layout
 
 ```
