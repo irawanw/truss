@@ -84,6 +84,7 @@ struct ForwardOptions {
     // DSA K/V caches as int8 codes + an fp16 scale per 64 values (Strata's served KV format, dsa::KvCache): half the
     // VRAM of fp16 (6.4 -> 3.3 GB at 256K for the 12 layers + the MTP layer: ~2,000 more resident experts)
     bool kv_int8 = false;
+    double plan_alpha = 0.0;                  // hot set ranked by usage / bytes^plan_alpha (ExpertStore::Sizes)
     // the model file the weights are bound from: with it the PLE table rows are read by PleReader (O_DIRECT, many in
     // flight, row cache) instead of page faults through the mapping (TRACKER #88). nullptr: the mapping.
     const gguf::File * ple_file = nullptr;
@@ -98,7 +99,7 @@ struct ForwardOptions {
 
 // The decode-tier sweep knobs from the environment, applied on top of `o` (each only when set): TRUSS_CPU_SHARE,
 // TRUSS_CPU_THREADS, TRUSS_CPU_DYNAMIC, TRUSS_CPU_TRELLIS, TRUSS_PCIE_GBPS, TRUSS_PCIE_FRAC, TRUSS_ADAPT_EVERY,
-// TRUSS_ADAPT_SWAPS, TRUSS_RING_GB, TRUSS_HINT_K, TRUSS_PREFILL_ROWS, TRUSS_KV_INT8. tk-bench-spec and the C API (so the server)
+// TRUSS_ADAPT_SWAPS, TRUSS_RING_GB, TRUSS_HINT_K, TRUSS_PREFILL_ROWS, TRUSS_KV_INT8, TRUSS_PLAN_ALPHA. tk-bench-spec and the C API (so the server)
 // both call it, so a config benched is the config served.
 void apply_env(ForwardOptions & o);
 

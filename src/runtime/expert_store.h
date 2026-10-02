@@ -41,13 +41,18 @@ public:
     struct Sizes {
         size_t ring_bytes = 4ull << 30;   // decode FIFO (grown to fit the prompt path)
         size_t stream_extra = 0;          // bytes a prompt chunk borrows after the two slots (spare())
+        // plan(): experts ranked by usage / bytes^plan_alpha. 1 = routed mass per byte (the profile's knapsack
+        // optimum); 0 = by usage: on real 256K routing it cut LRU-ring misses 234 -> 208/pass and miss bytes
+        // 501 -> 388 MB/pass at equal VRAM (the profile's mass on small rarely-routed experts does not show up,
+        // and our most-routed experts are the large high-K ones; TRACKER #90)
+        double plan_alpha = 0.0;
     };
     // ring = max(ring_bytes, 2 x the largest cold layer + stream_extra), 256-aligned
     static size_t ring_size(const std::vector<ExpertLayer> & layers, const HotSet & hot, const Sizes & z);
     static size_t device_bytes(const std::vector<ExpertLayer> & layers, const HotSet & hot, const Sizes & z);
 
     // The hot set whose device_bytes fit `budget`. With `usage` (routed counts, [layer][expert] flattened): every
-    // layer first gets its top `floor` experts by count per byte, then greedy by count per byte over all layers; the
+    // layer first gets its top `floor` experts by count / bytes^plan_alpha, then greedy in that order over all layers; the
     // floor (steps of 8) with the most hot usage wins, since a layer with few hot experts makes the stream slots
     // large. Without usage: the same count per layer, index order.
     static HotSet plan(const std::vector<ExpertLayer> & layers, size_t budget, const Sizes & z,

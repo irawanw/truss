@@ -144,6 +144,10 @@ struct Forward::Impl {
     std::chrono::steady_clock::time_point drv_t[3];   // driver thread only: doorbell seen, split done, CPU started
     double drv_ms[3] = { 0, 0, 0 };                    // summed: split, CPU start, copies + plan (driver_ms)
     double ple_host_ms = 0;                            // host time of the PLE row hash + gather + fp16 convert
+    // TRUSS_ROUTE_TRACE=<file>: every decode layer's routing (driver thread), for offline cache-policy replays.
+    // Header: int32 n_store, n_expert, K, then per (layer, expert) int32 bytes and uint8 hot. Records: int32 layer, T,
+    // ids [T * K]; layer -1 (T 0) marks a sequence reset.
+    FILE * route_trace = nullptr;
     std::unique_ptr<PleReader> ple_reader;           // Options::ple_file: rows read with O_DIRECT, not page faults
     half * ple_stage = nullptr;                        // pinned [rows][E]: the gathered rows for the device copy
     size_t ple_stage_n = 0;
@@ -327,6 +331,7 @@ struct Forward::Impl {
         }
         runtime::ExpertStore::Sizes z;
         z.ring_bytes = o.ring_bytes_override ? o.ring_bytes_override : o.ring_bytes;
+        z.plan_alpha = o.plan_alpha;
         if (prefill_rows > FETCH_ROWS) z.stream_extra = big_bytes();
         const runtime::ExpertStore::HotSet hot = runtime::ExpertStore::plan(tables, expert_budget, z, usage);
         for (const auto & h : hot) n_hot += (int) std::count(h.begin(), h.end(), 1);
@@ -349,6 +354,18 @@ struct Forward::Impl {
         pcie_frac = o.pcie_frac;
         adapt_every = o.adapt_every, adapt_swaps = o.adapt_swaps;
         if (adapt_every > 0) route_usage.assign((size_t) n_store * c.n_expert, 0.f);
+        if (const char * rt = std::getenv("TRUSS_ROUTE_TRACE")) {
+            route_trace = std::fopen(rt, "wb");
+            require(route_trace != nullptr, std::string("cannot write ") + rt);
+            const int32_t hdr[3] = { n_store, c.n_expert, c.n_expert_used };
+            std::fwrite(hdr, 4, 3, route_trace);
+            for (int l = 0; l < n_store; ++l)
+                for (int e = 0; e < c.n_expert; ++e) {
+                    const int32_t b = (int32_t) experts->bytes_of(l, e);
+                    const uint8_t hot = experts->host_part(l, e, 0) == nullptr;
+                    std::fwrite(&b, 4, 1, route_trace), std::fwrite(&hot, 1, 1, route_trace);
+                }
+        }
         setup_doorbells();
         if (prefill_rows > FETCH_ROWS) {   // the prompt path's buffers, carved from the ring's spare region
             auto * p = static_cast<unsigned char *>(experts->spare());
@@ -375,6 +392,7 @@ struct Forward::Impl {
 
     ~Impl()
     {
+        if (route_trace) std::fclose(route_trace);
         if (ple_stage) cudaFreeHost(ple_stage);
         if (ple_copied) cudaEventDestroy(ple_copied);
         if (driver.joinable()) {
@@ -475,6 +493,11 @@ struct Forward::Impl {
         CpuTier * ct = j.cpu ? cpu_tier.get() : nullptr;
         if (!route_usage.empty())
             for (int i = 0; i < n; ++i) route_usage[(size_t) l * c.n_expert + b.ids[i]] += 1.f;
+        if (route_trace) {
+            const int32_t h[2] = { l, j.T };
+            std::fwrite(h, 4, 2, route_trace);
+            std::fwrite(b.ids, 4, (size_t) n, route_trace);
+        }
         std::vector<cpu::Slot> slots;
         std::vector<int> gpu_ids;
         gpu_ids.reserve(n);
@@ -1738,6 +1761,10 @@ void Forward::head(int first, int n, float * logits) { m_->head(first, n, logits
 
 void Forward::reset()
 {
+    if (m_->route_trace) {   // the driver is idle between passes; the marker separates sequences
+        const int32_t h[2] = { -1, 0 };
+        std::fwrite(h, 4, 2, m_->route_trace);
+    }
     m_->reset();
     pos_ = 0;
 }
@@ -1780,6 +1807,7 @@ void apply_env(ForwardOptions & o)
     f("TRUSS_HINT_K", o.hint_k);               // pre-gated prefetch width
     f("TRUSS_PREFILL_ROWS", o.prefill_rows);
     f("TRUSS_KV_INT8", o.kv_int8);             // Strata's int8 KV
+    f("TRUSS_PLAN_ALPHA", o.plan_alpha);       // hot-set ranking: usage / bytes^alpha
     if (const char * e = std::getenv("TRUSS_PLE_DIRECT"); e && !std::atoi(e)) o.ple_file = nullptr;   // A/B: the mapping
     if (const char * e = std::getenv("TRUSS_RING_GB")) o.ring_bytes_override = (size_t) (std::atof(e) * (1ull << 30));
 }

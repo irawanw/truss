@@ -3,6 +3,7 @@
 #include "core/cuda_check.h"
 
 #include <algorithm>
+#include <cmath>
 #include <climits>
 #include <cstdio>
 #include <cstring>
@@ -123,7 +124,9 @@ ExpertStore::HotSet ExpertStore::plan(const std::vector<ExpertLayer> & layers, s
             cold_all[l] += size[(size_t) l * n_expert + e];
         }
     }
-    auto better = [&](int a, int b) { return (double) usage[a] / size[a] > (double) usage[b] / size[b]; };
+    std::vector<double> score(size.size());
+    for (size_t i = 0; i < size.size(); ++i) score[i] = usage[i] / std::pow((double) size[i], z.plan_alpha);
+    auto better = [&](int a, int b) { return score[a] > score[b]; };
     std::vector<int> order(size.size());
     for (size_t i = 0; i < order.size(); ++i) order[i] = (int) i;
     std::stable_sort(order.begin(), order.end(), better);

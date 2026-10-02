@@ -4,6 +4,12 @@
 
 ## `src/runtime/expert_store.h`, `expert_store.cu` — which experts live where
 
+**Hot-set ranking (TRACKER #90).** `plan()` ranks by `usage / bytes^Sizes::plan_alpha` (default 0: by usage). Per byte
+(alpha 1, the old rule) is the knapsack optimum for the profile's own counts, but on real 256K routing that set covered
+only 41% of routed entries: the pack's experts are 0.6-2.5 MB and the most-routed are the large ones. By usage:
+decode 75.5 -> 81.6 tok/s. `TRUSS_ROUTE_TRACE=<file>` (Forward) writes every decode layer's routing for offline
+policy replays (`flashnext/20261002_truss_d0/scripts/cache_replay.py`).
+
 **Problem.** Flash-Next's routed experts are 37 GiB; after dense weights, caches and scratch a 3090 has ~13–16 GiB
 for them. The rest (cold, ~24 GB) must come over PCIe (13.5 GB/s pinned, x8) when used.
 
