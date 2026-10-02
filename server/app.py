@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 
+import anyio
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, Request
@@ -161,10 +162,28 @@ def make_app(engine: Engine) -> FastAPI:
 
     def params(body):
         stop = body.get("stop") or []
-        return dict(max_tokens=int(body.get("max_tokens") or body.get("max_completion_tokens") or 1024),
+        return dict(max_tokens=int(body.get("max_tokens") or body.get("max_completion_tokens") or engine.model.n_ctx),
                     temperature=float(body.get("temperature", 1.0) if body.get("temperature") is not None else 1.0),
                     top_p=float(body.get("top_p") or 1.0), top_k=int(body.get("top_k") or 0), seed=body.get("seed"),
                     stop_strings=[stop] if isinstance(stop, str) else list(stop))
+
+    _END = object()
+
+    async def tokens(req: Request, ids, p):
+        """engine.generate driven from a worker thread, so the event loop never blocks on the engine (or its lock).
+        On a client disconnect, or when the caller stops early, the generator is closed: it logs its line and releases
+        the engine lock (a suspended, never-closed generator held the lock and deadlocked the next request)."""
+        gen = engine.generate(ids, **p)
+        try:
+            while True:
+                item = await anyio.to_thread.run_sync(next, gen, _END)
+                if item is _END:
+                    return
+                yield item
+                if await req.is_disconnected():
+                    return
+        finally:
+            gen.close()
 
     @app.get("/health")
     def health():
@@ -179,19 +198,20 @@ def make_app(engine: Engine) -> FastAPI:
         body = await req.json()
         kw = dict(body.get("chat_template_kwargs") or {})
         thinking = kw.get("enable_thinking", True) is not False
-        prompt = engine.chat.prompt(body["messages"], tools=body.get("tools"), template_kwargs=kw)
-        ids = engine.chat.encode(prompt)
+        prompt = await anyio.to_thread.run_sync(
+            lambda: engine.chat.prompt(body["messages"], tools=body.get("tools"), template_kwargs=kw))
+        ids = await anyio.to_thread.run_sync(engine.chat.encode, prompt)
         p = params(body)
         rid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
 
         if body.get("stream"):
-            def events():
+            async def events():
                 def chunk(delta, finish=None):
                     return "data: " + json.dumps({"id": rid, "object": "chat.completion.chunk", "created": created,
                                                   "model": engine.name,
                                                   "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}) + "\n\n"
                 split = ThinkSplitter(thinking)
-                for tok, delta, finish in engine.generate(ids, **p):
+                async for tok, delta, finish in tokens(req, ids, p):
                     for field, d in split.push(delta):
                         yield chunk({field: d})
                     if finish:
@@ -202,7 +222,7 @@ def make_app(engine: Engine) -> FastAPI:
             return StreamingResponse(events(), media_type="text/event-stream")
 
         text, n, finish = "", 0, "length"
-        for tok, delta, fin in engine.generate(ids, **p):
+        async for tok, delta, fin in tokens(req, ids, p):
             if tok is not None:
                 text += delta
                 n += 1
@@ -219,10 +239,10 @@ def make_app(engine: Engine) -> FastAPI:
     @app.post("/v1/completions")
     async def completions(req: Request):
         body = await req.json()
-        ids = engine.chat.encode(body["prompt"])
+        ids = await anyio.to_thread.run_sync(engine.chat.encode, body["prompt"])
         p = params(body)
         text, n, finish = "", 0, "length"
-        for tok, delta, fin in engine.generate(ids, **p):
+        async for tok, delta, fin in tokens(req, ids, p):
             if tok is not None:
                 text += delta
                 n += 1

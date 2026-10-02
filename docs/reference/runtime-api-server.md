@@ -124,7 +124,12 @@ dispatch on `general.architecture` inside `truss_open`.
 `POST /v1/completions` (raw prompt). With thinking on (template default) the text up to `</think>` is returned as
 `reasoning_content`, the rest as `content` (`ThinkSplitter` in streaming, holds back a possible partial tag).
 
-**Engine.generate.** One request at a time (lock). Prefix reuse: if the new prompt starts with every token already in
+**Engine.generate.** One request at a time (lock). The handlers drive it from a worker thread (`tokens()` in
+`make_app`: `anyio.to_thread` per item), so the event loop never blocks on the engine; on a client disconnect (or an
+early stop) the generator is closed, which logs the request line and releases the lock. Before this, a streamed
+request whose client went away left the generator suspended holding the lock, and the next request deadlocked the
+server (seen with an agent client on 8113). `max_tokens` defaults to the rest of the context (llama-server's
+`n_predict -1`; it was 1,024, which cut xhigh thinking short). Prefix reuse: if the new prompt starts with every token already in
 the engine's sequence, only the new tokens are evaluated; otherwise reset (the GDN state cannot rewind). Greedy
 (`temperature ≤ 0`) uses `eval_argmax` after the prompt and then, with `--mtp`, speculative rounds (`spec_step`),
 emitting each round's tokens in order (a stop token or string inside a round ends the reply; the engine keeps the
