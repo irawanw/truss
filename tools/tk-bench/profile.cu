@@ -39,6 +39,10 @@ int main(int argc, char ** argv)
     }
     try {
         const auto file = gguf::File::open(argv[1]);
+        if (const char * ov = std::getenv("TRUSS_EXPERT_OVERLAY")) {   // X3.1 experts over the served GGUF (#118)
+            file->overlay(ov);
+            std::fprintf(stderr, "expert overlay %s: %zu tensors replaced\n", ov, file->overlaid());
+        }
         const q::Config c = q::Config::from_gguf(*file);
         const q::Weights w = q::bind(*file, c);
         const int gen = std::atoi(argv[3]), chunk = 8192;

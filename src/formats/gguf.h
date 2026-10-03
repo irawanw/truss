@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -57,6 +58,12 @@ public:
     File(const File &) = delete;
     File & operator=(const File &) = delete;
 
+    // Overlay (TRACKER #118, B7): map another GGUF (single or split) whose tensors replace this file's tensors of the
+    // same name (and add any new ones); its metadata is ignored. The X3.1 experts ship as an experts-only GGUF over
+    // the served one. Call before binding weights.
+    void overlay(const std::string & path);
+    size_t overlaid() const { return overlaid_.size(); }
+
     const std::vector<Tensor> & tensors() const { return tensors_; }
     const Tensor * find(std::string_view name) const;   // nullptr if absent
     const Tensor & at(std::string_view name) const;     // throws if absent
@@ -82,13 +89,14 @@ public:
 private:
     struct Mapping { void * addr; size_t size; };
     File() = default;
-    void add_shard(const std::string & path, bool first);
+    void add_shard(const std::string & path, bool first, bool overlay = false);
 
     std::vector<std::string> paths_;
     std::vector<Mapping> maps_;
     std::vector<Tensor> tensors_;
     std::unordered_map<std::string, size_t> index_;
     std::unordered_map<std::string, Value> kv_;          // from shard 0; split.* keys of later shards are checked
+    std::unordered_set<std::string> overlaid_;           // names replaced by overlay()
 };
 
 }  // namespace truss::gguf

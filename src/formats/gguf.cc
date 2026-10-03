@@ -194,7 +194,7 @@ std::unique_ptr<File> File::open(const std::string & path)
     return f;
 }
 
-void File::add_shard(const std::string & path, bool first)
+void File::add_shard(const std::string & path, bool first, bool overlay)
 {
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) fail(path, std::strerror(errno));
@@ -224,11 +224,14 @@ void File::add_shard(const std::string & path, bool first)
             if (!std::holds_alternative<int64_t>(v) || std::get<int64_t>(v) <= 0) fail(path, "bad general.alignment");
             alignment = std::get<int64_t>(v);
         }
-        if (key == "split.no" && std::get<int64_t>(v) != shard) fail(path, "split.no does not match file name");
+        if (key == "split.no" && !overlay && std::get<int64_t>(v) != shard) fail(path, "split.no does not match file name");
         if (first) kv_.emplace(std::move(key), std::move(v));
     }
 
-    const size_t first_tensor = tensors_.size();
+    // parsed tensors and the slot each one takes: appended, or (overlay) the slot of the base tensor it replaces
+    std::vector<std::pair<Tensor, size_t>> parsed;
+    std::unordered_set<std::string> names;
+    size_t appended = 0;
     for (uint64_t i = 0; i < n_tensors; ++i) {
         Tensor t;
         t.name = c.str();
@@ -247,20 +250,40 @@ void File::add_shard(const std::string & path, bool first)
         t.bytes = (uint64_t) (t.elements() / ti->block) * ti->bytes;
         t.file_offset = c.pod<uint64_t>();       // relative to the data section for now
         t.shard = shard;
-        if (index_.count(t.name)) fail(path, "duplicate tensor " + t.name);
-        index_.emplace(t.name, tensors_.size());
-        tensors_.push_back(std::move(t));
+        size_t slot;
+        if (const auto it = index_.find(t.name); it != index_.end()) {
+            if (!overlay || overlaid_.count(t.name)) fail(path, "duplicate tensor " + t.name);
+            slot = it->second;
+            overlaid_.insert(t.name);
+        } else {
+            slot = tensors_.size() + appended++;
+        }
+        if (!names.insert(t.name).second) fail(path, "duplicate tensor " + t.name);
+        parsed.emplace_back(std::move(t), slot);
     }
 
     const uint64_t data_start = (c.pos() + alignment - 1) / alignment * alignment;
-    for (size_t i = first_tensor; i < tensors_.size(); ++i) {
-        Tensor & t = tensors_[i];
+    for (auto & [t, slot] : parsed) {
         if (t.file_offset % alignment) fail(path, t.name + ": misaligned data offset");
         t.file_offset += data_start;
         if (t.file_offset > (uint64_t) st.st_size || t.bytes > (uint64_t) st.st_size - t.file_offset)
             fail(path, t.name + ": data past end of file");
         t.data = base + t.file_offset;
+        if (slot < tensors_.size()) {
+            tensors_[slot] = std::move(t);
+        } else {
+            index_.emplace(t.name, slot);
+            tensors_.push_back(std::move(t));
+        }
     }
+}
+
+void File::overlay(const std::string & path)
+{
+    const auto [stem, count] = split_name(path);
+    if (count == 1) add_shard(path, false, true);
+    else
+        for (int i = 0; i < count; ++i) add_shard(shard_path(stem, i, count), false, true);
 }
 
 File::~File()
