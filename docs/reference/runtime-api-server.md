@@ -149,12 +149,7 @@ including 0, wins; temperature 0 is greedy). They were temperature 1.0 with no c
 fields (they relied on llama-paw's defaults on this port) got stray tokens: 1,200-token English answers, 3 seeds each,
 had 5-6 CJK runs per answer (one inside a tool name, `bash样的`) at the old defaults and none at these.
 
-**Old reasoning (`--keep-reasoning K`, TRACKER #105).** The chat template keeps the thinking of every assistant
-turn since the last user message; a long agent loop (omp) carries ~90 thinking blocks, and a degenerate habit in them
-("✓ ✓ ✓" after every clause, "hmm hmm") is copied and amplified by the next turn. With K ≥ 0 the server drops
-`reasoning_content` / `reasoning` (and a `<think>…</think>` prefix in the content) from all but the last K assistant
-turns before rendering (`tools.strip_reasoning`). Measured on the A0 replays (9 loop sites x 2 seeds): as sent 7/18
-loop, K = 2 7/18, **K = 0 0/18**. Default −1 (as sent); the pm2 script uses 0. Prefix reuse survives it: each prompt is read up to its last
+**Prompt-end checkpoint (TRACKER #105).** A client may re-send the engine's last reply without its reasoning; prefix reuse survives it: each prompt is read up to its last
 `<|im_start|>`, the engine checkpoints there (`truss_checkpoint`, ~10 ms), then reads the generation prompt; a
 request that extends that prefix but not the engine's reply (the reply now comes back without its thinking, and the
 generation prompt's `<think>\n` tokenizes differently once a reply follows it) restores the checkpoint and reads only

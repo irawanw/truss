@@ -58,7 +58,7 @@ def run(spec, last_n, n_prompt=100, n_gen=12):
     e.model = FakeModel(spec, n_prompt, last_n)
     e.chat = types.SimpleNamespace(tok=types.SimpleNamespace(decode=lambda ids, **k: "".join(f"<{i}>" for i in ids)))
     e.stop_ids, e.log_tag, e.log_path, e.dump_dir, e.cached, e.lock = set(), "test", None, None, [], threading.Lock()
-    e.ck_tokens, e.keep_reasoning, e.im_start = [], -1, None
+    e.ck_tokens, e.im_start = [], None
     e.log = lambda line: None
     out = [t for t, _, _ in e.generate(list(range(1, n_prompt + 1)), n_gen, 0.8, 0.95, 40, 7, [], 0.05,
                                        presence_penalty=1.5, penalty_last_n=last_n) if t is not None]

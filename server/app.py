@@ -30,7 +30,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from server.chat import Chat, Detokenizer
-from server.tools import ToolStream, normalize_messages, parse_calls, strip_reasoning
+from server.tools import ToolStream, normalize_messages, parse_calls
 from server.truss_ctypes import PENALTY_CAP, Model, Sampling, TrussError
 
 
@@ -49,7 +49,6 @@ class Engine:
         self.dump_dir = a.dump_dir
         self.cached = []               # tokens in the engine's sequence
         self.ck_tokens = []            # the sequence at the engine's checkpoint (the end of the last prompt)
-        self.keep_reasoning = a.keep_reasoning
         self.im_start = self.chat.token_id("<|im_start|>")
         self.lock = threading.Lock()
 
@@ -293,8 +292,6 @@ def make_app(engine: Engine) -> FastAPI:
         body = await req.json()
         kw = dict(body.get("chat_template_kwargs") or {})
         thinking = kw.get("enable_thinking", True) is not False
-        if engine.keep_reasoning >= 0:   # drop the reasoning of all but the last K assistant turns (TRACKER #105)
-            body["messages"] = strip_reasoning(body["messages"], engine.keep_reasoning)
         tools = body.get("tools") or None
         if body.get("tool_choice") == "none":
             tools = None
@@ -435,9 +432,6 @@ def main():
     ap.add_argument("--log", default=None, help="append one line per request here")
     ap.add_argument("--log-tag", default="truss serve")
     ap.add_argument("--dump-dir", default=None, help="keep the last 20 requests (prompt tail + reply) here as JSON")
-    ap.add_argument("--keep-reasoning", type=int, default=-1,
-                    help="keep the reasoning of only the last K assistant turns (-1: as the client sends it); 0 stops "
-                         "the thinking loops of long agent sessions (TRACKER #105)")
     a = ap.parse_args()
     engine = Engine(a)
     print(f"truss: model loaded, n_ctx {engine.model.n_ctx}, listening on {a.host}:{a.port}", flush=True)

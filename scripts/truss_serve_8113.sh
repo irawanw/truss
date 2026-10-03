@@ -3,8 +3,6 @@
 # TRACKER #85 (trellis CPU tier, Strata split, PCIe share 0.2, hints 2, 22 pinned threads, Strata's expert profile).
 # Thinking: the GGUF chat template defaults to enable_thinking on, reasoning_effort xhigh (clients may override with
 # chat_template_kwargs). pm2: pm2 start scripts/truss_serve_8113.config.js (only one of this and paw-x3-8113 can run).
-# --keep-reasoning 0: old turns' thinking is dropped before rendering (TRACKER #105: the omp thinking loops, 7/18 loop
-# sites -> 0/18); the engine's prompt-end checkpoint keeps the prefix reuse.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export CUDA_VISIBLE_DEVICES=2
@@ -20,5 +18,4 @@ exec python3 -m server.app \
   --mtp $D/20260930_truss_tg/data/mtp_x3/flashnext-mtp-x3k3.gguf --drafts 3 \
   --draft-vocab data/draft_vocab_en.bin --draft-min-p 0.5 \
   --host 127.0.0.1 --port 8113 --name flash-next-truss \
-  --keep-reasoning 0 \
   --log $HOME/.pm2/logs/truss-8113-requests.log

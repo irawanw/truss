@@ -60,7 +60,7 @@ def main():
     e.model = FakeModel()
     e.chat = types.SimpleNamespace(tok=types.SimpleNamespace(decode=lambda ids, **k: "".join(f"<{i}>" for i in ids)))
     e.stop_ids, e.log_tag, e.log_path, e.dump_dir, e.cached, e.lock = set(), "test", None, None, [], threading.Lock()
-    e.ck_tokens, e.keep_reasoning, e.log, e.im_start = [], 0, (lambda line: None), IM
+    e.ck_tokens, e.log, e.im_start = [], (lambda line: None), IM
     S = [IM, 7, 8]   # the generation prompt's "<|im_start|>assistant\n": the checkpoint goes before it
     ok = True
 

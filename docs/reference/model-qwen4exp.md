@@ -166,7 +166,7 @@ open block, the PLE history rows, the PLE token window (`tail`), and with MTP th
 indexer blocks, MTP rows) are left as they are, like after a verify window: rows past the checkpoint are rewritten
 before any query reads them. ~10 ms each way (PCIe). The server checkpoints every prompt just before its last `<|im_start|>` (the generation prompt's
 "`\n<think>\n`" tokenizes differently once a reply follows it) so a client that re-sends the reply without its
-reasoning (`--keep-reasoning`) still reuses the prompt. Tested by `qwen4exp_forward …
+reasoning still reuses the prompt. Tested by `qwen4exp_forward …
 checkpoint` (bit-identical continuation logits after 40 other tokens and a restore, twice).
 
 **Tunables.** `FETCH_ROWS = 32` (a 67-token prompt spent 2.1 s streaming ~24 GB before this); the expert budget
