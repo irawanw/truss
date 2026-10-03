@@ -37,19 +37,24 @@ __global__ void route_kernel(const float * logits, int T, int E, int k, int * id
 
     float kept = 0.f, my_w = 0.f;
     int my_id = -1;
+    // (probability, expert) as one 64-bit key: probabilities are >= 0 (taken: -1, never picked while k <= E), so
+    // their bits order like the values; the low word ~e makes a tie go to the lower expert. One shuffle per step.
     for (int s = 0; s < k; ++s) {
-        float best = -1.f;
-        int best_e = E;
+        unsigned long long key = 0;
 #pragma unroll
         for (int j = 0; j < PER_LANE; ++j) {
             const int e = 32 * j + lane;
-            if (e < E && (p[j] > best || (p[j] == best && e < best_e))) best = p[j], best_e = e;
+            if (e < E && p[j] >= 0.f) {
+                const unsigned long long kj = (unsigned long long) __float_as_uint(p[j]) << 32 | (unsigned) ~e;
+                key = kj > key ? kj : key;
+            }
         }
         for (int o = 16; o; o /= 2) {
-            const float ob = __shfl_xor_sync(0xffffffffu, best, o);
-            const int oe = __shfl_xor_sync(0xffffffffu, best_e, o);
-            if (ob > best || (ob == best && oe < best_e)) best = ob, best_e = oe;
+            const unsigned long long ok = __shfl_xor_sync(0xffffffffu, key, o);
+            key = ok > key ? ok : key;
         }
+        const float best = __uint_as_float((unsigned) (key >> 32));
+        const int best_e = (int) ~(unsigned) key;
         kept += best;
         if (lane == s) my_id = best_e, my_w = best;
 #pragma unroll

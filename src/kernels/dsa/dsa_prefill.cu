@@ -469,15 +469,16 @@ __global__ void __launch_bounds__(32 * ATTN_WARPS) attn_kernel(const half * q, c
     }
 }
 
-// out [t][kv G + r][d] = gated merge of the splits' states, in split order
+// out [t][kv G + r][d] = gated merge of the splits' states, in split order. One CTA per (query, KV head, head of
+// the group): a decode window had only T x HKV CTAs (34 us per call, TRACKER #111)
 template <class Shape>
 __global__ void __launch_bounds__(256) combine_kernel(const float * part, int splits, const float * gate, half * out)
 {
-    constexpr int H = Shape::H, HKV = Shape::HKV, D = Shape::D, G = H / HKV;
-    const int t = blockIdx.x, kv = blockIdx.y;
+    constexpr int H = Shape::H, HKV = Shape::HKV, D = Shape::D;
+    const int t = blockIdx.x, kv = blockIdx.y, r = blockIdx.z;
     const float * P0 = part + ((size_t) t * HKV + kv) * splits * Partial<Shape>::FLOATS;
-    for (int i = threadIdx.x; i < G * D; i += blockDim.x) {
-        const int r = i / D, d = i % D;
+    constexpr int G = H / HKV;
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
         float mm = -INFINITY;
         for (int z = 0; z < splits; ++z) mm = fmaxf(mm, P0[z * Partial<Shape>::FLOATS + G * D + r]);
         float num = 0.f, den = 0.f;
@@ -573,7 +574,7 @@ void attention(const half * q, const float * gate, const KvCache & kc, const int
         auto * part = static_cast<float *>(ws);
         attn_kernel<Shape, true><<<dim3(T, Shape::HKV, S), 32 * ATTN_WARPS, smem, stream>>>(
             q, gate, kc, blocks, n_blocks, pos0, out, per, part);
-        combine_kernel<Shape><<<dim3(T, Shape::HKV), 256, 0, stream>>>(part, S, gate, out);
+        combine_kernel<Shape><<<dim3(T, Shape::HKV, Shape::H / Shape::HKV), 256, 0, stream>>>(part, S, gate, out);
     } else {
         attn_kernel<Shape, false><<<dim3(T, Shape::HKV), 32 * ATTN_WARPS, smem, stream>>>(
             q, gate, kc, blocks, n_blocks, pos0, out, 0, nullptr);

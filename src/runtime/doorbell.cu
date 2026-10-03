@@ -43,10 +43,18 @@ __global__ void wait_plan_kernel(const volatile int * plan, const volatile int *
     for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = mapped_ids[i];
 }
 
+// x is mapped host memory: 16-byte reads (a quarter of the PCIe read requests of 4-byte ones)
 __global__ void add_mapped_kernel(float * y, const float * x, int n)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) y[i] += x[i];
+    if (4 * i + 3 < n) {
+        const float4 v = reinterpret_cast<const float4 *>(x)[i];
+        float4 w = reinterpret_cast<float4 *>(y)[i];
+        w.x += v.x, w.y += v.y, w.z += v.z, w.w += v.w;
+        reinterpret_cast<float4 *>(y)[i] = w;
+    } else {
+        for (int j = 4 * i; j < n; ++j) y[j] += x[j];
+    }
 }
 
 }  // namespace
@@ -74,7 +82,7 @@ void wait_plan(const volatile int * plan, const volatile int * need_copy, const 
 
 void add_mapped(float * y, const float * x, int n, cudaStream_t stream)
 {
-    add_mapped_kernel<<<(n + 255) / 256, 256, 0, stream>>>(y, x, n);
+    add_mapped_kernel<<<((n + 3) / 4 + 255) / 256, 256, 0, stream>>>(y, x, n);
     TRUSS_CUDA(cudaGetLastError());
 }
 
