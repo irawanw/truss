@@ -9,6 +9,7 @@
 //                      [n_ctx=65536] [chunk=8192] [draft vocab ids file|-] [cpu tier dir|-] [draft min p=0]
 #include "core/cuda_check.h"
 #include <cuda_profiler_api.h>
+#include <sys/prctl.h>
 #include "kernels/sampling/argmax.cuh"
 #include "model/qwen4exp/config.h"
 #include "model/qwen4exp/forward.h"
@@ -68,8 +69,49 @@ void prompt(q::Forward & f, const std::vector<int32_t> & tok, int chunk)
 
 }  // namespace
 
+
+// TRUSS_STACK_SIGNAL=1: SIGUSR1 makes every thread print its backtrace (raw addresses + /proc/self/maps base of
+// the executable) to stderr: a hang probe where ptrace / cuda-gdb cannot attach (TRACKER #115)
+#include <dirent.h>
+#include <execinfo.h>
+#include <signal.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+namespace {
+void dump_self(int)
+{
+    void * f[48];
+    const int n = backtrace(f, 48);
+    char h[64];
+    const int k = std::snprintf(h, sizeof h, "== tid %ld\n", (long) syscall(SYS_gettid));
+    (void) !write(2, h, (size_t) k);
+    backtrace_symbols_fd(f, n, 2);
+}
+void dump_all(int sig)
+{
+    const long self = syscall(SYS_gettid);
+    if (DIR * d = opendir("/proc/self/task")) {
+        while (dirent * e = readdir(d)) {
+            const long t = std::atol(e->d_name);
+            if (t > 0 && t != self) syscall(SYS_tgkill, getpid(), t, SIGUSR2), usleep(20000);
+        }
+        closedir(d);
+    }
+    dump_self(sig);
+}
+}  // namespace
+
 int main(int argc, char ** argv)
 {
+    // TRUSS_PTRACE_ANY=1: any process of this user may attach (cuda-gdb -p) though ptrace_scope is 1 (hang hunting,
+    // TRACKER #115)
+    if (const char * e = std::getenv("TRUSS_PTRACE_ANY"); e && std::atoi(e)) prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY);
+    if (const char * e = std::getenv("TRUSS_STACK_SIGNAL"); e && std::atoi(e)) {
+        void * pre[1];
+        backtrace(pre, 1);   // loads libgcc's unwinder now, not inside a handler
+        signal(SIGUSR1, dump_all);
+        signal(SIGUSR2, dump_self);
+    }
     if (argc < 4) {
         std::fprintf(stderr, "usage: %s <model.gguf> <mtp.gguf> @prompt.i32 [tokens] [drafts] [usage|-] [n_ctx] [chunk]\n",
                      argv[0]);
@@ -127,7 +169,8 @@ int main(int argc, char ** argv)
         q::Forward f(c, w, n_ctx, chunk, o);
         file->release_pages();
         mfile->release_pages();
-        std::printf("experts: %d resident, ring %.2f GB; drafts %d\n", f.hot_experts(), f.experts().ring_bytes() / 1e9, nd);
+        std::printf("experts: %d resident, ring %.2f GB (a prompt chunk takes %.2f GB of it); drafts %d\n", f.hot_experts(),
+                    f.experts().ring_bytes() / 1e9, f.experts().stream_area() / 1e9, nd);
 
         // per prompt: plain greedy (unless TRUSS_BENCH_PLAIN=0), then speculative; every counter below is read and
         // reset around the spec phase only, and summed over the prompts
@@ -272,6 +315,7 @@ int main(int argc, char ** argv)
         std::printf("       per pass: %.1f cold experts routed, %.1f fetched on demand (%.1f MB), %.1f prefetched (%.1f MB)\n",
                     S.asked / passes, S.misses / passes, S.bytes / 1e6 / passes, S.hinted / passes,
                     S.hint_bytes / 1e6 / passes);
+        if (f.kv_lent()) std::printf("       KV lent to the expert ring at the end: %.2f GB\n", f.kv_lent() / 1e9);
         if (S.adm_n || S.adm_bytes)
             std::printf("       admission on the idle link: %.1f experts/pass issued (%.1f MB/pass), %ld landed in all\n",
                         S.adm_n / passes, S.adm_bytes / 1e6 / passes, f.experts().admit_landed());

@@ -186,6 +186,21 @@ struct Forward::Impl {
     long decode_passes = 0;
     std::vector<float> route_usage;
     int admit_idle = 0, admit_pass = 0;                  // Options::admit_idle; claims this pass
+    std::vector<std::pair<int, size_t>> kv_seg;          // E6: (ring segment, bytes per position)
+    int kv_reserved = 0;                                 // positions of the K/V caches not lent
+
+    // E6: positions [0, upto) (and one 4,096 step ahead) belong to the caches before anything writes them; with
+    // shrink, positions past that are lent back (a new sequence, a restore)
+    void kv_reserve(int upto, bool shrink)
+    {
+        if (kv_seg.empty()) return;
+        constexpr int STEP = 4096;
+        const int R = std::min(n_ctx, (upto + STEP - 1) / STEP * STEP + STEP);
+        if (R == kv_reserved || (R < kv_reserved && !shrink)) return;
+        for (const auto & [j, row] : kv_seg) experts->reclaim(j, (size_t) R * row);
+        if (R > kv_reserved) experts->fence(s);   // copies into the reclaimed rows land before the caches are written
+        kv_reserved = R;
+    }
     float admit_min = 1.f, admit_decay = 0.9f;
     std::vector<float> admit_u;                          // decayed routing counts [layer][expert] (driver thread)
     double dyn_s1 = 0, dyn_sn = 0, dyn_st = 0, dyn_snn = 0, dyn_snt = 0;
@@ -363,6 +378,20 @@ struct Forward::Impl {
         const runtime::ExpertStore::HotSet hot = runtime::ExpertStore::plan(tables, expert_budget, z, usage);
         for (const auto & h : hot) n_hot += (int) std::count(h.begin(), h.end(), 1);
         experts = std::make_unique<runtime::ExpertStore>(tables, hot, z);
+        if (o.kv_lend) {   // E6: every DSA layer's K and V position arrays (MTP block included)
+            auto lend = [&](const LayerState & L) {
+                const size_t row = (size_t) c.n_head_kv * c.head_dim * (L.kv.int8() ? 1 : 2);
+                for (void * p : { L.kv.int8() ? (void *) L.kv.kq : (void *) L.kv.k16,
+                                  L.kv.int8() ? (void *) L.kv.vq : (void *) L.kv.v16 }) {
+                    const int j = experts->add_segment(static_cast<uint8_t *>(p), (size_t) n_ctx * row);
+                    if (j >= 0) kv_seg.push_back({ j, row });
+                }
+            };
+            for (int l = 0; l < c.n_layer; ++l)
+                if (c.mixer[l] == Mixer::DSA) lend(st[l]);
+            if (mtp) lend(mst);
+            kv_reserve(0, true);
+        }
         // The store's constructor is the last reader of the shards: it memcpy'd every cold expert into pinned host
         // memory and uploaded the hot set, so from here the mapping is dead weight. Releasing before load_cpu_tier
         // keeps a ~24 GB resident peak off the books while that vector allocates (TRACKER #72).
@@ -1460,6 +1489,7 @@ struct Forward::Impl {
         last_T = 0;
         has_pending = false;
         vw.open = false;
+        kv_reserve(0, true);
     }
 
     // One chunk of the target model at positions pos0 .. pos0 + T - 1. tentative: a verify window (accept() commits).
@@ -1469,6 +1499,7 @@ struct Forward::Impl {
         require(pos0 + T <= n_ctx, "sequence longer than n_ctx");
         require(!vw.open, "run()/verify() before accept() of the previous verify()");
         check_driver();
+        kv_reserve(pos0 + T, false);
         const bool stream = !fetch_mode(T);
         if (stream)
             require(T <= prefill_rows, "prompt chunk of " + std::to_string(T) + " tokens over prefill_rows (" +
@@ -1650,6 +1681,7 @@ struct Forward::Impl {
         });
         TRUSS_CUDA(cudaStreamSynchronize(s));
         has_pending = ck.has_pending, tail = ck.tail, last_T = 0;
+        kv_reserve(ck.pos, true);
         return ck.pos;
     }
 
@@ -1774,6 +1806,7 @@ struct Forward::Impl {
         require(mtp && has_pending, "draft() needs an MTP block and a committed position");
         require(n >= 1 && n <= moe::MAX_ROWS, "draft count");
         require(!vw.open, "draft() before accept()");
+        kv_reserve(pos + n + 1, false);
         use(small);
         experts->begin_ring();
         sc->reset();
@@ -1898,6 +1931,7 @@ void Forward::cpu_phase_us(long long out[4]) const
 }
 
 const runtime::ExpertStore & Forward::experts() const { return *m_->experts; }
+size_t Forward::kv_lent() const { return m_->experts->lent_bytes(); }
 
 void Forward::profile_routes(bool on)
 {
@@ -1982,6 +2016,7 @@ void apply_env(ForwardOptions & o)
     f("TRUSS_ADAPT_DECAY", o.adapt_decay);
     f("TRUSS_HINT_K", o.hint_k);               // pre-gated prefetch width
     f("TRUSS_ADMIT_IDLE", o.admit_idle);       // admission on the idle link, experts per pass
+    f("TRUSS_KV_LEND", o.kv_lend);             // E6: the KV caches' unused tail lent to the expert ring
     f("TRUSS_ADMIT_MIN", o.admit_min);
     f("TRUSS_ADMIT_DECAY", o.admit_decay);
     f("TRUSS_PREFILL_ROWS", o.prefill_rows);

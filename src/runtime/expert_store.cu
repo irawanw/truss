@@ -198,6 +198,13 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
         TRUSS_CUDA(cudaEventCreateWithFlags(&released_[s], cudaEventDisableTiming));
     }
     TRUSS_CUDA(cudaEventCreateWithFlags(&compute_mark_, cudaEventDisableTiming));
+    // Every event the driver thread records is created here, on the constructing thread: cuEventCreate takes the
+    // context's write lock, which a host thread blocked in cudaLaunchKernel (its queue full behind a doorbell spin
+    // that waits for the driver) holds as a reader: the driver then never writes the plan (TRACKER #115).
+    for (cudaEvent_t * e : { &demand_ev_, &piece_ev_, &fence_ev_, &adm_ev_ })
+        TRUSS_CUDA(cudaEventCreateWithFlags(e, cudaEventDisableTiming));
+    ev_pool_.resize(LANDING_EVENTS);
+    for (cudaEvent_t & e : ev_pool_) TRUSS_CUDA(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
     TRUSS_CUDA(cudaHostAlloc(reinterpret_cast<void **>(&signal_src_), sizeof(int) * SIGNAL_RING, cudaHostAllocDefault));
     pinned_.push_back(signal_src_);
 
@@ -217,10 +224,12 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
         }
     }
     ring_ = ring_size(layers, hot, z);
+    vend_ = (int64_t) ring_;
     for (const Layer & Y : layers_) slot_ = std::max(slot_, align_up(Y.cold));
     auto * arena = static_cast<uint8_t *>(device_alloc(hot_lo + ring_ + hot_hi, device_));
     base_ = arena + hot_lo;
     spare_ = z.stream_extra ? base_ + 2 * slot_ : nullptr;
+    stream_end_ = (int64_t) align_up(2 * slot_ + z.stream_extra);
     device_bytes_ = hot_lo + ring_ + hot_hi;
 
     uint8_t * next_hot[2] = { arena, arena + hot_lo + ring_ };
@@ -304,6 +313,7 @@ ExpertStore::~ExpertStore()
     for (cudaEvent_t e : ev_pool_) cudaEventDestroy(e);
     if (piece_ev_) cudaEventDestroy(piece_ev_);
     if (demand_ev_) cudaEventDestroy(demand_ev_);
+    if (fence_ev_) cudaEventDestroy(fence_ev_);
     if (copy_) cudaStreamDestroy(copy_);
 }
 
@@ -330,12 +340,16 @@ void ExpertStore::begin_stream(cudaStream_t compute)
 {
     std::lock_guard<std::mutex> g(adm_mu_);
     wait_compute(compute);   // decode kernels may still read the ring the slots overwrite
-    for (const RingEntry & r : fifo_) layers_[r.layer].ring_at[r.expert] = -1, layers_[r.layer].pend[r.expert] = 0;
-    fifo_.clear();
+    // The slots and the chunk's buffers take [0, stream_end_): only the entries there go. The rest of the ring and the
+    // lent KV segments keep theirs for the next decode (TRACKER #115: an agent turn's prompt used to empty the ring).
+    // The head moves past the stream area, so address order from the head is still FIFO order.
+    for (auto it = fifo_.begin(); it != fifo_.end();)
+        if (it->off < stream_end_) drop(*it), it = fifo_.erase(it);
+        else ++it;
+    if (head_ < stream_end_) head_ = stream_end_;
     hinted_.clear();
     adm_.clear();
     claims_.clear(), adm_backlog_ = 0;   // landing_ events stay: their claims are gone from the ring (checked by offset)
-    head_ = 0;
     released_recorded_[0] = released_recorded_[1] = false;
     mode_ = Mode::STREAM;
 }
@@ -352,43 +366,114 @@ void ExpertStore::prefetch(int l)
 
 // FIFO allocation: evict the oldest entries overlapping [head, head + bytes) (wrapping to 0 when the tail is too
 // short), copy the expert, point the ring meta at it.
+uint8_t * ExpertStore::real(int64_t v) const
+{
+    if (v < (int64_t) ring_) return base_ + v;
+    for (const Segment & g : segs_)
+        if (v >= g.vbase && v < g.vbase + g.size) return g.ptr + (v - g.vbase);
+    throw std::logic_error("ExpertStore: ring offset outside every region");
+}
+
+bool ExpertStore::region(int64_t v, int64_t * b, int64_t * e) const
+{
+    if (v >= 0 && v < (int64_t) ring_) return *b = 0, *e = (int64_t) ring_, true;
+    for (const Segment & g : segs_)
+        if (v >= g.vbase + g.lo && v < g.vbase + g.size) return *b = g.vbase + g.lo, *e = g.vbase + g.size, true;
+    return false;
+}
+
+int64_t ExpertStore::next_region(int64_t v, int64_t need) const
+{
+    for (const Segment & g : segs_)
+        if (g.vbase + g.lo > v && g.size - g.lo >= need) return g.vbase + g.lo;
+    return 0;   // back to the ring's own region
+}
+
+void ExpertStore::drop(const RingEntry & r)
+{
+    layers_[r.layer].ring_at[r.expert] = -1;
+    layers_[r.layer].pend[r.expert] = 0;
+}
+
+int ExpertStore::add_segment(uint8_t * ptr, size_t bytes)
+{
+    const uintptr_t u = reinterpret_cast<uintptr_t>(ptr);
+    const int64_t a = (int64_t) ((u + 255) / 256 * 256 - u);
+    const int64_t size = ((int64_t) bytes - a) / 256 * 256;
+    if (size <= 0) return -1;
+    unit_offset(ptr + a, base_, 0);   // throws if it cannot be addressed from the ring base
+    segs_.push_back({ ptr + a, vend_, size, size });   // lent by reclaim()
+    vend_ += size;
+    return (int) segs_.size() - 1;
+}
+
+void ExpertStore::reclaim(int j, size_t lo_bytes)
+{
+    std::lock_guard<std::mutex> g(adm_mu_);
+    Segment & S = segs_.at(j);
+    const int64_t lo = std::min<int64_t>(S.size, (int64_t) align_up(lo_bytes));
+    if (lo > S.lo) {   // evict what lies in [vbase, vbase + lo)
+        const int64_t a = S.vbase, b = S.vbase + lo;
+        for (auto it = fifo_.begin(); it != fifo_.end();)
+            if (it->off >= a && it->off < b) drop(*it), it = fifo_.erase(it);
+            else ++it;
+        // a head inside moves to the boundary; the next ring_put() advances from there in address order
+        if (head_ >= a && head_ < b) head_ = b;
+    }
+    S.lo = lo;
+}
+
+void ExpertStore::fence(cudaStream_t compute)
+{
+    TRUSS_CUDA(cudaEventRecord(fence_ev_, copy_));
+    TRUSS_CUDA(cudaStreamWaitEvent(compute, fence_ev_, 0));
+}
+
+size_t ExpertStore::lent_bytes() const
+{
+    size_t n = 0;
+    for (const Segment & g : segs_) n += (size_t) (g.size - g.lo);
+    return n;
+}
+
 bool ExpertStore::ring_put(int l, int e, bool hint, bool copy)
 {
     Layer & Y = layers_[l];
     const int64_t need = (int64_t) align_up(Y.bytes[e]);
+    // where this allocation lands: at the head if its region has room, else at the next region with room (0: the
+    // ring's own region again); everything from the head to there goes
+    auto target = [&] {
+        int64_t b, e2;
+        return region(head_, &b, &e2) && head_ + need <= e2 ? head_ : next_region(head_, need);
+    };
     if (hint) {   // would this allocation evict an expert the current layer's kernel reads?
-        const int64_t start = head_ + need > (int64_t) ring_ ? 0 : head_;
+        const int64_t start = target();
         for (const RingEntry & r : fifo_) {
-            const bool gone = (start == 0 && r.off >= head_) || (r.off >= start && r.off < start + need);
-            if (!gone) {
-                if (r.off >= start + need) break;   // FIFO order: later entries lie further on
+            const bool skipped = start > head_ ? r.off >= head_ && r.off < start : start < head_ && r.off >= head_;
+            const bool gone = skipped || (r.off >= start && r.off < start + need);
+            if (!gone) {   // FIFO order is address order from the head: later entries lie further on
+                if (start >= head_ ? r.off >= start + need : r.off < head_ && r.off >= start + need) break;
                 continue;
             }
             if (r.layer == protect_layer_ && std::find(protect_.begin(), protect_.end(), r.expert) != protect_.end())
                 return false;
         }
     }
-    if (head_ + need > (int64_t) ring_) {   // wrap: the tail [head, end) goes with its entries
-        while (!fifo_.empty() && fifo_.front().off >= head_) {
-            layers_[fifo_.front().layer].ring_at[fifo_.front().expert] = -1;
-            layers_[fifo_.front().layer].pend[fifo_.front().expert] = 0;
-            fifo_.pop_front();
-        }
-        head_ = 0;
-    }
+    auto advance = [&] {   // move the head to target(), evicting what lies between (the tail of a region)
+        const int64_t to = target();
+        if (to == head_) return false;
+        while (!fifo_.empty() && fifo_.front().off >= head_ && (to < head_ || fifo_.front().off < to))
+            drop(fifo_.front()), fifo_.pop_front();
+        head_ = to;
+        return true;
+    };
+    advance();
     // CLOCK in place (TRACKER #91): the oldest entry in the way that was used since it came in stays where it is,
     // loses its bit and goes to the back of the order, and the head skips past it (no copy). Replay at 256K: FIFO
     // 240 -> ~207 misses/pass, LRU 208. At most `clock_max` skips per copy (TRUSS_RING_CLOCK; 0 = plain FIFO).
     static const int clock_max = std::getenv("TRUSS_RING_CLOCK") ? std::atoi(std::getenv("TRUSS_RING_CLOCK")) : 8;
     for (int skips = 0;;) {
-        if (head_ + need > (int64_t) ring_) {   // wrap again (a skip may have pushed the head to the end)
-            while (!fifo_.empty() && fifo_.front().off >= head_) {
-                layers_[fifo_.front().layer].ring_at[fifo_.front().expert] = -1;
-                layers_[fifo_.front().layer].pend[fifo_.front().expert] = 0;
-                fifo_.pop_front();
-            }
-            head_ = 0;
-        }
+        advance();   // again: a skip may have pushed the head to a region's end
         if (fifo_.empty() || fifo_.front().off < head_ || fifo_.front().off >= head_ + need) break;
         const RingEntry f = fifo_.front();
         Layer & F = layers_[f.layer];
@@ -410,7 +495,7 @@ bool ExpertStore::ring_put(int l, int e, bool hint, bool copy)
     fifo_.push_back({ l, e, off });
     Y.ring_at[e] = off;
     Y.ref[e] = 0;
-    uint8_t * at = base_ + off;
+    uint8_t * at = real(off);
     if (copy) TRUSS_CUDA(cudaMemcpyAsync(at, Y.host + Y.cold_off[e], Y.bytes[e], cudaMemcpyHostToDevice, copy_));
     for (int p = 0; p < 3; ++p) Y.ring_meta_host[(size_t) p * 2 * Y.n_expert + 2 * e + 1] = unit_offset(at + Y.part[p][e], base_, l);
     if (!copy) return true;
@@ -449,7 +534,6 @@ void ExpertStore::admit(const std::vector<std::pair<int, int>> & le, cudaStream_
     // a ring_put of a later admission may have evicted an earlier one of this batch: keep only the resident
     adm_.erase(std::remove_if(adm_.begin(), adm_.end(), [&](const auto & x) { return layers_[x.first].ring_at[x.second] < 0; }),
                adm_.end());
-    if (!adm_ev_) TRUSS_CUDA(cudaEventCreateWithFlags(&adm_ev_, cudaEventDisableTiming));
     TRUSS_CUDA(cudaEventRecord(adm_ev_, copy_));
     adm_total_ += (long) adm_.size();
 }
@@ -457,10 +541,7 @@ void ExpertStore::admit(const std::vector<std::pair<int, int>> & le, cudaStream_
 void ExpertStore::begin_ring()
 {
     std::lock_guard<std::mutex> g(adm_mu_);
-    if (mode_ != Mode::RING) {   // first decode step after a prompt: the ring starts empty over the slots and spare
-        mode_ = Mode::RING;
-        head_ = 0;
-    }
+    if (mode_ != Mode::RING) mode_ = Mode::RING;   // decode after a prompt: the stream area is empty, the rest kept
 }
 
 bool ExpertStore::fetch(int l, const int * ids, int n, cudaStream_t compute)
@@ -513,7 +594,6 @@ bool ExpertStore::fetch(int l, const int * ids, int n, cudaStream_t compute)
                                        sizeof(int32_t) * 2 * Y.n_expert, cudaMemcpyHostToDevice, copy_));
     TRUSS_CUDA(cudaEventRecord(copied_[l % 2], copy_));
     if (changed) {   // admit_step() holds back while these demand copies run
-        if (!demand_ev_) TRUSS_CUDA(cudaEventCreateWithFlags(&demand_ev_, cudaEventDisableTiming));
         TRUSS_CUDA(cudaEventRecord(demand_ev_, copy_));
         demand_out_ = true;
     }
@@ -536,7 +616,7 @@ void ExpertStore::claim_issue(Claim & c, size_t upto)
 {
     Layer & Y = layers_[c.layer];
     const size_t n = upto - c.done;
-    TRUSS_CUDA(cudaMemcpyAsync(base_ + c.off + c.done, Y.host + Y.cold_off[c.expert] + c.done, n, cudaMemcpyHostToDevice,
+    TRUSS_CUDA(cudaMemcpyAsync(real(c.off) + c.done, Y.host + Y.cold_off[c.expert] + c.done, n, cudaMemcpyHostToDevice,
                                copy_));
     c.done = upto;
     adm_backlog_ -= n;
@@ -546,11 +626,15 @@ void ExpertStore::claim_issue(Claim & c, size_t upto)
     for (int p = 0; p < 3; ++p)
         TRUSS_CUDA(cudaMemcpyAsync(Y.ring_meta[p], Y.ring_meta_host + (size_t) p * 2 * Y.n_expert,
                                    sizeof(int32_t) * 2 * Y.n_expert, cudaMemcpyHostToDevice, copy_));
-    cudaEvent_t ev;
-    if (ev_pool_.empty()) TRUSS_CUDA(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
-    else ev = ev_pool_.back(), ev_pool_.pop_back();
-    TRUSS_CUDA(cudaEventRecord(ev, copy_));
-    landing_.push_back({ ev, { { c.layer * 65536 + c.expert, c.off } } });
+    if (ev_pool_.empty()) {   // every landing event in flight (never in practice): the newest batch takes this claim
+        landing_.back().second.push_back({ c.layer * 65536 + c.expert, c.off });
+        TRUSS_CUDA(cudaEventRecord(landing_.back().first, copy_));
+    } else {
+        const cudaEvent_t ev = ev_pool_.back();
+        ev_pool_.pop_back();
+        TRUSS_CUDA(cudaEventRecord(ev, copy_));
+        landing_.push_back({ ev, { { c.layer * 65536 + c.expert, c.off } } });
+    }
     ++stats_.admitted_claims;
 }
 
@@ -598,7 +682,6 @@ bool ExpertStore::admit_step()
     Claim & c = claims_.front();
     claim_issue(c, std::min(layers_[c.layer].bytes[c.expert], c.done + PIECE));
     if (c.done == layers_[c.layer].bytes[c.expert]) claims_.pop_front();
-    if (!piece_ev_) TRUSS_CUDA(cudaEventCreateWithFlags(&piece_ev_, cudaEventDisableTiming));
     TRUSS_CUDA(cudaEventRecord(piece_ev_, copy_));
     piece_out_ = true;
     return true;

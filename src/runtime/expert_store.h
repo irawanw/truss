@@ -91,6 +91,7 @@ public:
     size_t device_bytes() const { return device_bytes_; }
     size_t cold_bytes() const { return cold_total_; }                // pinned host bytes, streamed once per chunk
     size_t ring_bytes() const { return ring_; }
+    size_t stream_area() const { return (size_t) stream_end_; }   // what a prompt chunk evicts (slots + buffers)
     int layers() const { return (int) layers_.size(); }
     // expert e of layer l is readable by the GPU now: hot, or in the ring (ring mode; a queued copy counts, since the
     // compute that reads it waits for the copy stream)
@@ -117,6 +118,15 @@ public:
     bool claim(int l, int e);
     bool admit_step();
     size_t admit_backlog() const { return adm_backlog_; }       // claimed bytes not issued yet
+    // E6 (TRACKER #114): device regions lent to the ring (the unused tails of the KV caches). The ring is one virtual
+    // offset space: [0, ring_bytes) is its own region, then each segment; an entry never straddles a region and the
+    // head skips to the next one as it does at the ring's end. reclaim(j, lo) makes the first lo bytes of segment j
+    // unusable again (evicting what lies there) before the owner writes them; lowering lo lends them back. The
+    // caller orders its writes after the copy stream (fence()). Driver-thread work (fetch, claim) must be idle.
+    int add_segment(uint8_t * ptr, size_t bytes);
+    void reclaim(int j, size_t lo);
+    void fence(cudaStream_t compute);                           // compute waits for every copy issued so far
+    size_t lent_bytes() const;                                  // usable segment bytes now
     std::string admit_debug() const                             // TRUSS_DRIVER_DEBUG watchdog line
     {
         return "claims " + std::to_string(claims_.size()) + " landing " + std::to_string(landing_.size()) +
@@ -166,6 +176,18 @@ private:
     enum class Mode { STREAM, RING };
 
     void wait_compute(cudaStream_t compute);                        // copy stream waits for all compute queued so far
+    struct Segment {
+        uint8_t * ptr;
+        int64_t vbase, size, lo;                                // virtual start, bytes, unusable front bytes
+    };
+    std::vector<Segment> segs_;
+    int64_t stream_end_ = 0;                                    // a prompt chunk's slots + buffers: [0, stream_end_)
+    int64_t vend_ = 0;                                          // end of the virtual space (ring_ without segments)
+    uint8_t * real(int64_t v) const;                            // device address of virtual offset v
+    // the usable region holding v: [*b, *e); false when v lies in no usable region
+    bool region(int64_t v, int64_t * b, int64_t * e) const;
+    int64_t next_region(int64_t v, int64_t need) const;         // start of the next usable region after v's with room
+    void drop(const RingEntry & r);                             // forget an evicted entry
     // hint: refuse (false) to evict a protected expert; copy false: claim the slot only (claim())
     bool ring_put(int layer, int expert, bool hint = false, bool copy = true);
     struct Claim {
@@ -175,7 +197,8 @@ private:
     };
     std::deque<Claim> claims_;                                  // claim() order
     std::vector<std::pair<cudaEvent_t, std::vector<std::pair<int, int64_t>>>> landing_;   // last-piece event, claims
-    cudaEvent_t piece_ev_ = nullptr, demand_ev_ = nullptr;
+    cudaEvent_t piece_ev_ = nullptr, demand_ev_ = nullptr, fence_ev_ = nullptr;
+    static constexpr int LANDING_EVENTS = 256;
     bool piece_out_ = false, demand_out_ = false;
     std::vector<cudaEvent_t> ev_pool_;
     size_t adm_backlog_ = 0;

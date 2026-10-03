@@ -79,6 +79,11 @@ struct ForwardOptions {
     // the link has no demand copy (runtime::ExpertStore::claim / admit_step). 0: off. Replay (R3): 32/pass at C2
     // size cuts misses 153 -> 109 per pass.
     int admit_idle = 0;
+    // E6 (TRACKER #114): the K/V caches' unused tail (positions past the sequence, in 4,096-position steps with one
+    // step ahead) is lent to the expert ring as extra segments and reclaimed before those positions are written
+    // (runtime::ExpertStore::add_segment / reclaim). ~14 KB per position over the 13 DSA layers: an agent turn at
+    // 150K lends ~1.6 GB of the 3.4 GB sized for 262K.
+    bool kv_lend = false;
     float admit_min = 1.f, admit_decay = 0.9f;
     std::vector<int32_t> draft_vocab;         // MTP drafts score only these token ids (empty: all), e.g.
                                               // data/draft_vocab_en.bin: the draft head reads 16% of the output
@@ -188,6 +193,7 @@ public:
     // the page cache) and fp16 conversion, ms summed over calls since the last reset, with the table rows read.
     // Always counted (two clock reads per PLE layer call).
     void ple_host_ms(double & ms, long & calls, long & rows, bool reset = false) const;
+    size_t kv_lent() const;                         // Options::kv_lend: KV bytes lent to the expert ring now
     const runtime::ExpertStore & experts() const;   // residency and fetch statistics (the MTP block, when present,
                                                     // is store layer n_layer)
 
