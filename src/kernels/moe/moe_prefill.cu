@@ -7,6 +7,7 @@
 //             A_d = H128(silu(H128(C_g) * svh_g) * H128(C_u) * svh_u * suh_d)   (its 128 columns = one H block)
 //   down      item (expert, 64-row block, 256 D_MODEL columns): C_d = w * H128(A_d . W_d) * svh_d, fp16
 //   combine   out[t] = sum over s in routing order of C_d[pair_pos[t, s]]
+// A pair with expert id < 0 is skipped (pair_pos -1, adds nothing): the caller computes it elsewhere (CPU tier).
 // Deterministic: stable routing, fixed summation orders, no float atomics.
 //
 // GEMM warp tile: 4 weight tiles (64 columns) x 32 rows. Per 16-deep k slice a warp decodes its 4 tiles once and
@@ -108,6 +109,8 @@ __global__ void route_place(const int * __restrict__ ids, const float * __restri
             pair_tok[dest] = p / topk;
             pair_w[dest] = wts[p];
             pair_pos[p] = dest;
+        } else if (p < n_pairs) {
+            pair_pos[p] = -1;   // a skipped pair (the caller computes that expert elsewhere): no row, adds 0
         }
         __syncwarp();
         if (e >= 0 && lane == __ffs(peers) - 1) run[e] += __popc(peers);
@@ -233,6 +236,7 @@ __global__ __launch_bounds__(THREADS) void prep_kernel(Weights W, const float * 
     if (task >= n_tokens * HB * TOPK) return;
     const int t = task / (HB * TOPK), hb = (task / TOPK) % HB, s = task % TOPK;
     const int c0 = hb * 128 + lane * 4, e = ids[t * TOPK + s], dst = pair_pos[t * TOPK + s];
+    if (e < 0) return;
     const float4 v = *(const float4 *) (x + (size_t) t * D + c0);
     const half2 x01 = __floats2half2_rn(v.x, v.y), x23 = __floats2half2_rn(v.z, v.w);
     for (int p = 0; p < 2; ++p) {
@@ -396,7 +400,9 @@ __global__ void combine_kernel(const half * __restrict__ C_d, const int * __rest
     const int t = i / (D / 4), c = (i % (D / 4)) * 4;
     float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
     for (int s = 0; s < TOPK; ++s) {
-        const float4 v = h4_to_f4(*(const uint2 *) (C_d + (size_t) pair_pos[t * TOPK + s] * D + c));
+        const int q = pair_pos[t * TOPK + s];
+        if (q < 0) continue;   // skipped pair
+        const float4 v = h4_to_f4(*(const uint2 *) (C_d + (size_t) q * D + c));
         acc.x += v.x; acc.y += v.y; acc.z += v.z; acc.w += v.w;
     }
     *(float4 *) (out + (size_t) t * D + c) = acc;

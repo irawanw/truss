@@ -66,7 +66,8 @@ public:
     ExpertPool & operator=(const ExpertPool &) = delete;
 
     // y [T][D_MODEL] = sum over slots of w * expert(x[row]) (rows without slots: 0). start() returns at once; wait()
-    // blocks until y is written. x, slots and y must stay valid until wait() returns. T <= MAX_ROWS.
+    // blocks until y is written. x, slots and y must stay valid until wait() returns. Any T >= 1:
+    // an expert's rows run in groups of up to MAX_ROWS (prompt chunks; decode calls have T <= MAX_ROWS).
     void start(const float * x, int T, const std::vector<Slot> & slots, float * y);
     void wait();
     void run(const float * x, int T, const std::vector<Slot> & slots, float * y) { start(x, T, slots, y), wait(); }
@@ -148,7 +149,7 @@ private:
     std::vector<float> out_;                // [group][row][D_MODEL]
     std::vector<float> pg_;                 // trellis: [group][gate, up][input block][row][D_FF] raw partials
     std::vector<float> pd_;                 // trellis: [group][h block][row][D_MODEL] down's raw partials
-    std::vector<int> slot_g_, slot_k_;      // trellis: each slot's group and its row index within the group
+    std::vector<int> slot_g_, slot_k_;      // each slot's group and its row index within the group
     std::chrono::steady_clock::time_point t_start_;
     double last_ms_ = 0;
     std::atomic<long long> wait_us_{ 0 };   // benchmark stats (see wait_us())

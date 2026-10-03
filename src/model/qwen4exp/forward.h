@@ -85,6 +85,14 @@ struct ForwardOptions {
     // 150K lends ~1.6 GB of the 3.4 GB sized for 262K.
     bool kv_lend = false;
     float admit_min = 1.f, admit_decay = 0.9f;
+    // E7 (TRACKER #117): prompt chunks of more than 32 and at most split_rows tokens, with the CPU tier: per layer the
+    // routing comes first, then the routed cold experts with the fewest rows (at most split_t) run on the CPU pool
+    // until its estimated time (the decode split's per-expert fit + split_ms_row per extra row) meets the time of the
+    // copies left, and only those others are copied into the layer's stream slot (an agent step's tool result of
+    // 100-2K tokens streamed every cold expert, ~24 GB in ~2.5 s, TRACKER #116). 0: off.
+    int split_rows = 0;
+    int split_t = 16;
+    float split_ms_row = 0.01f;
     std::vector<int32_t> draft_vocab;         // MTP drafts score only these token ids (empty: all), e.g.
                                               // data/draft_vocab_en.bin: the draft head reads 16% of the output
                                               // matrix; verify keeps the output exact
@@ -114,7 +122,7 @@ struct ForwardOptions {
 
 // The decode-tier sweep knobs from the environment, applied on top of `o` (each only when set): TRUSS_CPU_SHARE,
 // TRUSS_CPU_THREADS, TRUSS_CPU_DYNAMIC, TRUSS_CPU_TRELLIS, TRUSS_PCIE_GBPS, TRUSS_PCIE_FRAC, TRUSS_ADAPT_EVERY,
-// TRUSS_ADAPT_SWAPS, TRUSS_RING_GB, TRUSS_HINT_K, TRUSS_PREFILL_ROWS, TRUSS_KV_INT8, TRUSS_PLAN_ALPHA, TRUSS_ADAPT_MIN, TRUSS_ADAPT_DECAY. tk-bench-spec and the C API (so the server)
+// TRUSS_ADAPT_SWAPS, TRUSS_RING_GB, TRUSS_HINT_K, TRUSS_PREFILL_ROWS, TRUSS_KV_INT8, TRUSS_PLAN_ALPHA, TRUSS_ADAPT_MIN, TRUSS_ADAPT_DECAY, TRUSS_SPLIT_ROWS, TRUSS_SPLIT_T, TRUSS_SPLIT_MS_ROW. tk-bench-spec and the C API (so the server)
 // both call it, so a config benched is the config served.
 void apply_env(ForwardOptions & o);
 
@@ -194,6 +202,8 @@ public:
     // Always counted (two clock reads per PLE layer call).
     void ple_host_ms(double & ms, long & calls, long & rows, bool reset = false) const;
     size_t kv_lent() const;                         // Options::kv_lend: KV bytes lent to the expert ring now
+    // E7 since construction: host bytes copied by split chunks, cold experts their layers gave the CPU / the GPU
+    void split_stats(long long out[3]) const;
     const runtime::ExpertStore & experts() const;   // residency and fetch statistics (the MTP block, when present,
                                                     // is store layer n_layer)
 

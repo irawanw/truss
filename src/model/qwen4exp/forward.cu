@@ -114,8 +114,8 @@ struct Forward::Impl {
             return trellis ? cpu::Slot{ row, nullptr, w, &tview[l][e] } : cpu::Slot{ row, &view[l][e], w };
         }
         std::unique_ptr<cpu::ExpertPool> pool;
-        float * x = nullptr, * w = nullptr, * y = nullptr;   // pinned [8][d], [8][k], [8][d]
-        int * ids = nullptr;                                 // pinned [8][k] routing with CPU slots as -1
+        float * x = nullptr, * w = nullptr, * y = nullptr;   // pinned [rows][d], [rows][k], [rows][d]
+        int * ids = nullptr;                                 // pinned [rows][k] routing with CPU slots as -1
         size_t bytes = 0;
     };
     std::unique_ptr<CpuTier> cpu_tier;
@@ -243,6 +243,10 @@ struct Forward::Impl {
 
     const Activations act;
     const int hint_k;                                    // Options::hint_k
+    const int split_rows, split_t;                       // Options::split_rows / split_t (E7)
+    const double split_ms_row;                           // Options::split_ms_row
+    bool split_chunk = false;                            // this prompt chunk runs E7's split (run_chunk)
+    long long split_host_bytes = 0, split_cpu_experts = 0, split_gpu_experts = 0;   // E7 stats, since construction
     dense::Q8Matrix draft_head{};                        // the output matrix's draft_vocab rows (Options::draft_vocab)
     int * draft_map = nullptr;                           // device [draft_head.out]: row -> token id
     float draft_min_p = 0.f;
@@ -264,7 +268,7 @@ struct Forward::Impl {
         : c(cc), w(ww), n_ctx(nc), max_chunk(mc),
           prefill_rows(prefill_rows_of(mc, o.prefill_rows)),
           small_scratch(scratch_bytes(cc, std::min(mc, FETCH_ROWS), nc, o.mtp)),
-          spec_rows(o.spec_rows), act(o.act), hint_k(o.hint_k)
+          spec_rows(o.spec_rows), act(o.act), hint_k(o.hint_k), split_rows(o.split_rows), split_t(o.split_t), split_ms_row(o.split_ms_row)
     {
         check_shapes();
         mtp = o.mtp;
@@ -305,7 +309,7 @@ struct Forward::Impl {
         use(small);
         window_ws = alloc<unsigned char>(moe::workspace_bytes<MoeShape>());
         moe::workspace_init<MoeShape>(window_ws, s);
-        TRUSS_CUDA(cudaMallocHost(&ids_host, sizeof(int) * 2 * FETCH_ROWS * MoeShape::TOPK));   // routing + prediction
+        TRUSS_CUDA(cudaMallocHost(&ids_host, sizeof(int) * 2 * std::max(FETCH_ROWS, split_rows) * MoeShape::TOPK));   // routing + prediction
         const double vram_st0 = vram_used();
         st.resize(c.n_layer);
         const int R = DsaShape::RATIO;
@@ -784,10 +788,11 @@ struct Forward::Impl {
         std::fprintf(stderr, "CPU tier (trellis, pinned pack bytes): %zu experts eligible (%.1f per layer), %s\n", n_cpu,
                      (double) n_cpu / c.n_layer, o.cpu_dynamic ? "dynamic split" : "static set");
         t->pool = std::make_unique<cpu::ExpertPool>(o.cpu_threads);
-        TRUSS_CUDA(cudaMallocHost(&t->x, sizeof(float) * FETCH_ROWS * c.d_model));
-        TRUSS_CUDA(cudaMallocHost(&t->w, sizeof(float) * FETCH_ROWS * c.n_expert_used));
-        TRUSS_CUDA(cudaMallocHost(&t->y, sizeof(float) * cpu::MAX_ROWS * c.d_model));
-        TRUSS_CUDA(cudaMallocHost(&t->ids, sizeof(int) * cpu::MAX_ROWS * c.n_expert_used));
+        const size_t rows = std::max({ FETCH_ROWS, cpu::MAX_ROWS, split_rows });   // E7: a split chunk's rows
+        TRUSS_CUDA(cudaMallocHost(&t->x, sizeof(float) * rows * c.d_model));
+        TRUSS_CUDA(cudaMallocHost(&t->w, sizeof(float) * rows * c.n_expert_used));
+        TRUSS_CUDA(cudaMallocHost(&t->y, sizeof(float) * rows * c.d_model));
+        TRUSS_CUDA(cudaMallocHost(&t->ids, sizeof(int) * rows * c.n_expert_used));
         cpu_tier = std::move(t);
     }
 
@@ -901,10 +906,11 @@ struct Forward::Impl {
                          (double) n_cpu / c.n_layer, t->bytes / 1e9);
         }
         t->pool = std::make_unique<cpu::ExpertPool>(o.cpu_threads);
-        TRUSS_CUDA(cudaMallocHost(&t->x, sizeof(float) * FETCH_ROWS * c.d_model));
-        TRUSS_CUDA(cudaMallocHost(&t->w, sizeof(float) * FETCH_ROWS * K));
-        TRUSS_CUDA(cudaMallocHost(&t->y, sizeof(float) * cpu::MAX_ROWS * c.d_model));
-        TRUSS_CUDA(cudaMallocHost(&t->ids, sizeof(int) * cpu::MAX_ROWS * K));
+        const size_t rows = std::max({ FETCH_ROWS, cpu::MAX_ROWS, split_rows });   // E7: a split chunk's rows
+        TRUSS_CUDA(cudaMallocHost(&t->x, sizeof(float) * rows * c.d_model));
+        TRUSS_CUDA(cudaMallocHost(&t->w, sizeof(float) * rows * K));
+        TRUSS_CUDA(cudaMallocHost(&t->y, sizeof(float) * rows * c.d_model));
+        TRUSS_CUDA(cudaMallocHost(&t->ids, sizeof(int) * rows * K));
         cpu_tier = std::move(t);
     }
 
@@ -946,7 +952,7 @@ struct Forward::Impl {
         const size_t dsa = qd * (8 + 2 + 4 + 2) + (size_t) c.n_head_kv * c.head_dim * 8 +
                            (size_t) c.idx_heads * c.idx_head_dim * 6 + c.idx_head_dim * 4 + DsaShape::ROPE_DIMS * 4 +
                            DsaShape::TOP_BLOCKS * 4 + 4;
-        const size_t ffn = (size_t) c.n_expert * 4 + c.n_expert_used * 8 + dm * 8 + (size_t) c.d_ff_shexp * 10 + 4;
+        const size_t ffn = (size_t) c.n_expert * 4 + c.n_expert_used * 12 + dm * 12 + (size_t) c.d_ff_shexp * 10 + 4;   // E7: + masked ids, CPU rows
         // MTP join: hn16, rstd, [e | hn] fp16 and its Q8_1 form (the widest GEMM input when present)
         const size_t mtp = hcd * 2 + c.hc * 4 + (size_t) c.hc * 2 * dm * (2 + 1) + (size_t) c.hc * 2 * dm / 16;
         const size_t q8_act = 2 * (hcd + hcd / 16);   // Q8_1: a shared quantized input (Act) + one per-call input
@@ -1405,6 +1411,58 @@ struct Forward::Impl {
             else moe::prefill<MoeShape>(experts->weights(l), in, ids, wts, T, routed, cur.moe_ws, cur.moe_rows, s);
             experts->release(l, s);
             cpu_rows = slots.empty() ? 0 : T;
+        } else if (split_chunk) {   // E7 (TRACKER #117): the routing first, then the CPU's experts and the GPU's copies
+            CpuTier * ct = l < c.n_layer ? cpu_tier.get() : nullptr;   // the MTP block: copies only
+            if (ct) {
+                TRUSS_CUDA(cudaMemcpyAsync(ct->x, in, sizeof(float) * T * dm, cudaMemcpyDeviceToHost, s));
+                TRUSS_CUDA(cudaMemcpyAsync(ct->w, wts, sizeof(float) * T * K, cudaMemcpyDeviceToHost, s));
+            }
+            TRUSS_CUDA(cudaMemcpyAsync(ids_host, ids, sizeof(int) * T * K, cudaMemcpyDeviceToHost, s));
+            TRUSS_CUDA(cudaStreamSynchronize(s));
+            std::vector<cpu::Slot> slots;
+            std::vector<int> gpu_ids;
+            const int * k_ids = ids;
+            if (ct) {
+                // balanced: the routed cold experts (hot ones have is_cpu 0) by ascending row count go to the CPU
+                // while its estimated time (the decode split's fit, plus split_ms_row per extra row) stays within
+                // what the copies left on PCIe would take; at most split_t rows each
+                std::vector<int> cnt(E, 0), cand;
+                std::vector<uint8_t> to_cpu(E, 0);
+                for (int j = 0; j < T * K; ++j) ++cnt[ids_host[j]];
+                double pcie = 0, cpu = cpu_ms_call;
+                for (int e = 0; e < E; ++e)
+                    if (cnt[e] > 0 && ct->is_cpu[l][e]) {
+                        cand.push_back(e);
+                        pcie += pcie_ms_byte * experts->bytes_of(l, e);
+                    }
+                std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) { return cnt[a] < cnt[b]; });
+                for (int e : cand) {
+                    const double c = cpu_ms_expert + split_ms_row * (cnt[e] - 1), q = pcie_ms_byte * experts->bytes_of(l, e);
+                    if (cnt[e] > split_t || cpu + c > pcie - q) break;
+                    cpu += c, pcie -= q, to_cpu[e] = 1;
+                }
+                for (int e : cand) to_cpu[e] ? ++split_cpu_experts : ++split_gpu_experts;
+                for (int j = 0; j < T * K; ++j) {
+                    const int e = ids_host[j];
+                    const bool on_cpu = to_cpu[e];
+                    ct->ids[j] = on_cpu ? -1 : e;
+                    if (on_cpu) slots.push_back(ct->slot(j / K, l, e, ct->w[j]));
+                    else gpu_ids.push_back(e);
+                }
+                if (!slots.empty()) {
+                    int * m_ids = sc->alloc<int>((size_t) T * K);
+                    TRUSS_CUDA(cudaMemcpyAsync(m_ids, ct->ids, sizeof(int) * T * K, cudaMemcpyHostToDevice, s));
+                    k_ids = m_ids;
+                    ct->pool->start(ct->x, T, slots, ct->y);   // CPU first: it runs while the copies land
+                }
+            } else {
+                gpu_ids.assign(ids_host, ids_host + T * K);
+            }
+            split_host_bytes += (long long) experts->prefetch_some(l, gpu_ids.data(), (int) gpu_ids.size());
+            experts->acquire(l, s);
+            moe::prefill<MoeShape>(experts->weights(l), in, k_ids, wts, T, routed, cur.moe_ws, cur.moe_rows, s);
+            experts->release(l, s);
+            cpu_rows = slots.empty() ? 0 : T;
         } else {                // whole layers stream ahead (prefetch(l + 2) while this layer computes)
             experts->acquire(l, s);
             moe::prefill<MoeShape>(experts->weights(l), in, ids, wts, T, routed, cur.moe_ws, cur.moe_rows, s);
@@ -1512,13 +1570,15 @@ struct Forward::Impl {
             experts->begin_stream(s);
             use(big);
         }
+        split_chunk = stream && cpu_tier && T <= split_rows;   // E7: per-layer copies after the routing, no prefetch
+
         sc->reset();
         int * ids = sc->alloc<int>(T);
         float * emb = sc->alloc((size_t) T * c.d_model);
         TRUSS_CUDA(cudaMemcpyAsync(ids, tokens, (size_t) T * 4, cudaMemcpyHostToDevice, s));
         dense::q8_rows(q8.at(w.token_embd), ids, T, emb, s);
         hc::expand(emb, T, c.hc, c.d_model, res, s);
-        if (stream)
+        if (stream && !split_chunk)
             for (int l = 0; l < std::min(2, n_store); ++l) experts->prefetch(l);
         const size_t base = sc->mark();
         for (int l = 0; l < c.n_layer; ++l) {
@@ -1931,6 +1991,11 @@ void Forward::cpu_phase_us(long long out[4]) const
 }
 
 const runtime::ExpertStore & Forward::experts() const { return *m_->experts; }
+void Forward::split_stats(long long out[3]) const
+{
+    out[0] = m_->split_host_bytes, out[1] = m_->split_cpu_experts, out[2] = m_->split_gpu_experts;
+}
+
 size_t Forward::kv_lent() const { return m_->experts->lent_bytes(); }
 
 void Forward::profile_routes(bool on)
@@ -2022,6 +2087,9 @@ void apply_env(ForwardOptions & o)
     f("TRUSS_PREFILL_ROWS", o.prefill_rows);
     f("TRUSS_KV_INT8", o.kv_int8);             // Strata's int8 KV
     f("TRUSS_PLAN_ALPHA", o.plan_alpha);       // hot-set ranking: usage / bytes^alpha
+    f("TRUSS_SPLIT_ROWS", o.split_rows);       // E7: short prompt chunks split cold experts CPU / PCIe
+    f("TRUSS_SPLIT_T", o.split_t);
+    f("TRUSS_SPLIT_MS_ROW", o.split_ms_row);
     if (const char * e = std::getenv("TRUSS_PLE_DIRECT"); e && !std::atoi(e)) o.ple_file = nullptr;   // A/B: the mapping
     if (const char * e = std::getenv("TRUSS_RING_GB")) o.ring_bytes_override = (size_t) (std::atof(e) * (1ull << 30));
 }

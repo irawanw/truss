@@ -127,7 +127,25 @@ int run_case(int T, const RandomLayer & L, std::mt19937 & rng)
         TRUSS_CUDA(cudaMemcpy(h.data(), d_ref, h.size() * 4, cudaMemcpyDeviceToHost));
         for (size_t i = 0; i < h.size(); ++i) prefix_diff += h[i] != a[i];
     }
-    const bool ok = !nonfinite && rel <= 5e-3 && worst <= 2e-2 && prefix_diff == 0;
+    // skipped pairs (TRACKER #117: id -1, the CPU tier computes them): equal to the same pairs at weight 0
+    int64_t skip_diff = 0;
+    {
+        std::vector<int32_t> ids_m = ids;
+        std::vector<float> w0 = w;
+        for (size_t p = 0; p < ids.size(); ++p)
+            if (rng() % 3 == 0) ids_m[p] = -1, w0[p] = 0.f;
+        int * d_ids_m = upload(ids_m);
+        float * d_w0 = upload(w0);
+        TRUSS_CUDA(cudaMemset(d_ref, 0xff, sizeof(float) * T * D));
+        moe::prefill<Shape>(L.W, d_x, d_ids_m, d_w, T, d_ref, ws, T, nullptr);
+        std::vector<float> m((size_t) T * D), z((size_t) T * D);
+        TRUSS_CUDA(cudaMemcpy(m.data(), d_ref, m.size() * 4, cudaMemcpyDeviceToHost));
+        moe::prefill<Shape>(L.W, d_x, d_ids, d_w0, T, d_ref, ws, T, nullptr);
+        TRUSS_CUDA(cudaMemcpy(z.data(), d_ref, z.size() * 4, cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < m.size(); ++i) skip_diff += !(m[i] == z[i]);
+        cudaFree(d_ids_m); cudaFree(d_w0);
+    }
+    const bool ok = !nonfinite && rel <= 5e-3 && worst <= 2e-2 && prefix_diff == 0 && skip_diff == 0;
 
     const int reps = (int) env_int("TRUSS_REPS", 10);
     cudaEvent_t e0, e1;
@@ -142,9 +160,9 @@ int run_case(int T, const RandomLayer & L, std::mt19937 & rng)
     cudaEventElapsedTime(&ms, e0, e1);
     ms /= reps;
     const double flop = 2.0 * T * TOPK * 3.0 * D * Shape::D_FF;
-    std::printf("T=%-5d rel %.2e worst token %.2e nonfinite %lld, first T/2 rows alone differ in %lld values %s | "
+    std::printf("T=%-5d rel %.2e worst token %.2e nonfinite %lld, first T/2 rows alone differ in %lld values, skip %lld %s | "
                 "%.2f ms/layer, %.1f TFLOPS, %.1f us/token/layer\n",
-                T, rel, worst, (long long) nonfinite, (long long) prefix_diff, ok ? "PASS" : "FAIL", ms, flop / (ms * 1e-3) / 1e12,
+                T, rel, worst, (long long) nonfinite, (long long) prefix_diff, (long long) skip_diff, ok ? "PASS" : "FAIL", ms, flop / (ms * 1e-3) / 1e12,
                 ms * 1e3 / T);
     cudaFree(d_ids); cudaFree(d_w); cudaFree(d_x); cudaFree(d_out); cudaFree(d_ref); cudaFree(ws); cudaFree(wws);
     return ok ? 0 : 1;

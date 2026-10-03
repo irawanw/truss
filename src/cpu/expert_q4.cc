@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <unordered_map>
 #include <cstdio>
 #include <pthread.h>
 #include <sched.h>
@@ -226,19 +227,35 @@ ExpertPool::~ExpertPool()
 
 void ExpertPool::start(const float * x, int T, const std::vector<Slot> & slots, float * y)
 {
-    if (T < 1 || T > MAX_ROWS) throw std::invalid_argument("cpu::ExpertPool: 1 .. 8 rows");
+    if (T < 1) throw std::invalid_argument("cpu::ExpertPool: no rows");
     // no lock: no worker reads the call's fields while busy_ is false (a late grab() takes an index of this call only
     // after ticket_ is reset below, i.e. after the fields are written); wake() handles sleepers
     if (busy_) throw std::logic_error("cpu::ExpertPool::start while busy");
     x_ = x, y_ = y, T_ = T, slots_ = slots;
     groups_.clear();
     trellis_ = !slots_.empty() && slots_[0].t != nullptr;
-    for (const Slot & s : slots_) {
+    // groups in first-slot order; an expert with more than MAX_ROWS rows (prompt chunks, TRACKER #117) takes one group
+    // per MAX_ROWS of them. Each slot's group and its row index in it.
+    slot_g_.resize(slots_.size()), slot_k_.resize(slots_.size());
+    std::unordered_map<const void *, std::vector<int>> of;   // expert -> its groups
+    for (size_t i = 0; i < slots_.size(); ++i) {
+        const Slot & s = slots_[i];
         if (s.row < 0 || s.row >= T) throw std::out_of_range("cpu::ExpertPool: slot row");
         if ((s.t != nullptr) != trellis_) throw std::invalid_argument("cpu::ExpertPool: q4s and trellis slots mixed");
-        auto it = std::find_if(groups_.begin(), groups_.end(), [&](const Group & gr) { return gr.e == s.e && gr.t == s.t; });
-        if (it == groups_.end()) groups_.push_back({ s.e, s.t, {} }), it = groups_.end() - 1;
-        if (std::find(it->rows.begin(), it->rows.end(), s.row) == it->rows.end()) it->rows.push_back(s.row);
+        std::vector<int> & gs = of[trellis_ ? (const void *) s.t : (const void *) s.e];
+        int g = -1, k = -1;
+        for (int gi : gs) {   // a row routed twice to the same expert shares its row
+            const std::vector<int> & rows = groups_[gi].rows;
+            const auto it = std::find(rows.begin(), rows.end(), s.row);
+            if (it != rows.end()) g = gi, k = (int) (it - rows.begin());
+        }
+        if (g < 0) {
+            if (gs.empty() || groups_[gs.back()].rows.size() == MAX_ROWS)
+                gs.push_back((int) groups_.size()), groups_.push_back({ s.e, s.t, {} });
+            g = gs.back(), k = (int) groups_[g].rows.size();
+            groups_[g].rows.push_back(s.row);
+        }
+        slot_g_[i] = g, slot_k_[i] = k;
     }
     if (!trellis_) {
         xq_.resize((size_t) T * D_MODEL);
@@ -263,13 +280,6 @@ void ExpertPool::start(const float * x, int T, const std::vector<Slot> & slots, 
         phase_items_[0] = (int) (G * 2 * nbg);
         phase_items_[1] = (int) (G * nbd * (D_MODEL / tr_dn_cols()));
         phase_items_[2] = D_MODEL / TR_OUT_COLS;
-        slot_g_.resize(slots_.size()), slot_k_.resize(slots_.size());
-        for (size_t i = 0; i < slots_.size(); ++i) {
-            const Slot & sl = slots_[i];
-            slot_g_[i] = (int) (std::find_if(groups_.begin(), groups_.end(), [&](const Group & gr) { return gr.t == sl.t; }) - groups_.begin());
-            const std::vector<int> & rows = groups_[slot_g_[i]].rows;
-            slot_k_[i] = (int) (std::find(rows.begin(), rows.end(), sl.row) - rows.begin());
-        }
     } else {
         n_phases_ = 2;
         phase_items_[0] = (int) G * (D_FF / gu_chunk());
@@ -529,12 +539,9 @@ void ExpertPool::finish()
 {
     if (trellis_) return;   // phase 2 items wrote y
     std::fill(y_, y_ + (size_t) T_ * D_MODEL, 0.f);
-    for (const Slot & s : slots_) {
-        const int gi = (int) (std::find_if(groups_.begin(), groups_.end(), [&](const Group & gr) { return gr.e == s.e && gr.t == s.t; }) -
-                              groups_.begin());
-        const std::vector<int> & rows = groups_[gi].rows;
-        const int k = (int) (std::find(rows.begin(), rows.end(), s.row) - rows.begin());
-        const float * o = &out_[((size_t) gi * MAX_ROWS + k) * D_MODEL];
+    for (size_t i = 0; i < slots_.size(); ++i) {
+        const Slot & s = slots_[i];
+        const float * o = &out_[((size_t) slot_g_[i] * MAX_ROWS + slot_k_[i]) * D_MODEL];
         float * y = y_ + (size_t) s.row * D_MODEL;
         for (int j = 0; j < D_MODEL; ++j) y[j] += s.w * o[j];
     }

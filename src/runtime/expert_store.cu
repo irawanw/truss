@@ -364,6 +364,41 @@ void ExpertStore::prefetch(int l)
     TRUSS_CUDA(cudaEventRecord(copied_[s], copy_));
 }
 
+size_t ExpertStore::prefetch_some(int l, const int * ids, int n)
+{
+    if (mode_ != Mode::STREAM) throw std::logic_error("ExpertStore::prefetch_some outside a begin_stream() chunk");
+    const Layer & Y = layers_.at(l);
+    const int s = l % 2;
+    if (released_recorded_[s]) TRUSS_CUDA(cudaStreamWaitEvent(copy_, released_[s], 0));
+    std::vector<uint8_t> want(Y.n_expert, 0);
+    for (int i = 0; i < n; ++i)
+        if (ids[i] >= 0 && Y.cold_off[ids[i]] >= 0) want[ids[i]] = 1;
+    uint8_t * slot = base_ + s * slot_;
+    size_t host_bytes = 0;
+    // host copies coalesced over experts adjacent in the layer's cold layout (expert order)
+    int64_t run0 = -1, run1 = -1;
+    auto flush = [&] {
+        if (run0 < 0) return;
+        TRUSS_CUDA(cudaMemcpyAsync(slot + run0, Y.host + run0, run1 - run0, cudaMemcpyHostToDevice, copy_));
+        host_bytes += run1 - run0;
+        run0 = run1 = -1;
+    };
+    for (int e = 0; e < Y.n_expert; ++e) {
+        if (!want[e]) continue;
+        const int64_t o = Y.cold_off[e], b = (int64_t) Y.bytes[e];
+        if (Y.ring_at[e] >= 0 && !Y.pend[e]) {   // outside [0, stream_end_) (begin_stream dropped the rest)
+            TRUSS_CUDA(cudaMemcpyAsync(slot + o, real(Y.ring_at[e]), b, cudaMemcpyDeviceToDevice, copy_));
+            continue;
+        }
+        if (run1 != o) flush();
+        if (run0 < 0) run0 = o;
+        run1 = o + b;
+    }
+    flush();
+    TRUSS_CUDA(cudaEventRecord(copied_[s], copy_));
+    return host_bytes;
+}
+
 // FIFO allocation: evict the oldest entries overlapping [head, head + bytes) (wrapping to 0 when the tail is too
 // short), copy the expert, point the ring meta at it.
 uint8_t * ExpertStore::real(int64_t v) const

@@ -316,6 +316,13 @@ int main(int argc, char ** argv)
                     S.asked / passes, S.misses / passes, S.bytes / 1e6 / passes, S.hinted / passes,
                     S.hint_bytes / 1e6 / passes);
         if (f.kv_lent()) std::printf("       KV lent to the expert ring at the end: %.2f GB\n", f.kv_lent() / 1e9);
+        {
+            long long sp[3];
+            f.split_stats(sp);
+            if (sp[1] + sp[2])
+                std::printf("       E7 split prompts: %.2f GB copied, cold experts %lld to the CPU, %lld to the GPU\n", sp[0] / 1e9,
+                            sp[1], sp[2]);
+        }
         if (S.adm_n || S.adm_bytes)
             std::printf("       admission on the idle link: %.1f experts/pass issued (%.1f MB/pass), %ld landed in all\n",
                         S.adm_n / passes, S.adm_bytes / 1e6 / passes, f.experts().admit_landed());

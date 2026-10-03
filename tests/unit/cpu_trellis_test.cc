@@ -260,6 +260,31 @@ int main(int argc, char ** argv)
                     "per-slot %.1e, rows equal to 1-row calls: %s  %s\n",
                     std::sqrt(ep / rx), std::sqrt(es / rx), std::sqrt(eg / rx), std::sqrt(e / r), same ? "yes" : "no",
                     pass ? "ok" : "FAIL");
+        // a prompt chunk's call (TRACKER #117): 40 rows; expert 0 serves 20 of them (3 groups of <= 8), the others
+        // 1-2 rows each; every row equal to its own 1-row call
+        {
+            const int T = 40;
+            std::vector<float> xl(T * 2560);
+            for (auto & v : xl) v = nd(g);
+            std::vector<Slot> sl;
+            for (int t = 0; t < T; ++t) {
+                if (t % 2 == 0) sl.push_back({ t, nullptr, 0.3f, &ex[0] });
+                sl.push_back({ t, nullptr, 0.2f, &ex[1 + t / 2] });
+            }
+            std::vector<float> yl(T * 2560);
+            pool.run(xl.data(), T, sl, yl.data());
+            bool eq = true;
+            for (int t = 0; t < T; ++t) {
+                std::vector<Slot> one;
+                for (const Slot & q : sl)
+                    if (q.row == t) one.push_back({ 0, nullptr, q.w, q.t });
+                std::vector<float> y1(2560);
+                pool.run(xl.data() + t * 2560, 1, one, y1.data());
+                eq &= std::memcmp(y1.data(), yl.data() + t * 2560, 2560 * 4) == 0;
+            }
+            ok &= eq;
+            std::printf("pool, 40 rows (one expert on 20): rows equal to 1-row calls: %s\n", eq ? "yes  ok" : "no  FAIL");
+        }
         // stress: many small calls (1-3 rows, 1-4 experts): phase flips race with workers grabbing items; a lost
         // item would hang here (the pre-ticket pool did, TRACKER #73)
         {

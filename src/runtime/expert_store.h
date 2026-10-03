@@ -73,6 +73,10 @@ public:
     void begin_ring();
     void * spare() const { return spare_; }                        // stream mode: stream_extra bytes after the slots
     void prefetch(int layer);                                      // all cold experts of the layer into slot l % 2
+    // E7 (TRACKER #117): only the cold experts ids[0 .. n) (host, repeats allowed) into their places in slot l % 2,
+    // after the routing of a short prompt chunk is known; the kernel must not read the others (masked ids). One still
+    // in the ring outside the stream area is copied on the device. Returns the bytes copied from the host.
+    size_t prefetch_some(int layer, const int * ids, int n);
     // ring mode: make ids[0 .. n) (host) resident, copying the missing ones; true when it queued any copy (ring
     // entries or meta tables), false when every id was already on the device (nothing for the GPU to wait for)
     bool fetch(int layer, const int * ids, int n, cudaStream_t compute);

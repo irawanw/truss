@@ -15,7 +15,7 @@ namespace truss::moe {
 template <class Shape> size_t prefill_workspace_bytes(int max_tokens);
 
 // out[t] = sum_s w[t][s] * FFN_{ids[t][s]}(x[t]); x, out fp32 [n_tokens][D_MODEL]; ids int32 / wts fp32
-// [n_tokens][TOPK], each row's ids distinct. n_tokens <= the workspace's max_tokens. Device work only, on `stream`.
+// [n_tokens][TOPK], each row's ids distinct; an id < 0 is skipped (adds 0). n_tokens <= the workspace's max_tokens. Device work only, on `stream`.
 template <class Shape>
 void prefill(const Weights & W, const float * x, const int * ids, const float * wts, int n_tokens, float * out,
              void * ws, int max_tokens, cudaStream_t stream);
