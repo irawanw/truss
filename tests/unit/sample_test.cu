@@ -111,7 +111,8 @@ int run_penalty(int n, int rows, int h, const sampling::PenaltyParams & pp, std:
             if (!c[t]) continue;
             float v = want[(size_t) r * n + t];
             if (pp.repeat != 1.f) v = v > 0.f ? v / pp.repeat : v * pp.repeat;
-            want[(size_t) r * n + t] = v - (float) c[t] * pp.frequency - pp.presence;
+            volatile float prod = (float) c[t] * pp.frequency;   // rounded on its own, as the kernel does
+            want[(size_t) r * n + t] = v - prod - pp.presence;
         }
     }
     float * dx;

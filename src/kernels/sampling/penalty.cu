@@ -28,7 +28,7 @@ __global__ void apply_kernel(float * x, int n, const int * hist, int h, PenaltyP
         if (c <= 0) continue;
         float v = x[k];
         if (p.repeat != 1.f) v = v > 0.f ? v / p.repeat : v * p.repeat;
-        x[k] = v - (float) c * p.frequency - p.presence;
+        x[k] = v - __fmul_rn((float) c, p.frequency) - p.presence;   // no FMA: the same rounding as the host formula
     }
 }
 
