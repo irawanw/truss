@@ -1194,6 +1194,16 @@ struct Forward::Impl {
         float * routed = sc->alloc((size_t) T * dm), * y = sc->alloc((size_t) T * dm);
         float * g = sc->alloc((size_t) T * F), * u = sc->alloc((size_t) T * F), * sg = sc->alloc(T);
         half * mid16 = sc->alloc<half>((size_t) T * F);
+        bool shared_done = false;
+        auto shared = [&] {   // y = shared expert (sg, its gate, comes with the router)
+            const size_t m2 = sc->mark();
+            const Act ia = quant(in16, T, c.d_model);
+            lin_multi({ { mo.shexp_gate, g }, { mo.shexp_up, u } }, ia, T);
+            ffn::swiglu(g, u, T * F, mid16, s);
+            lin(mo.shexp_down, mid16, T, y);
+            sc->release(m2);
+            shared_done = true;
+        };
         // the router, the next layer's router on this input (pre-gating hint, TRACKER #58) and the shared-expert
         // gate read the same fp32 rows: one launch at decode sizes
         const bool hint = !stream && hint_k > 0 && l + 1 < c.n_layer;
@@ -1224,6 +1234,9 @@ struct Forward::Impl {
                 jobs_pushed.fetch_add(1, std::memory_order_release);
             }
             dq_cv.notify_one();
+            // the shared expert does not need the plan or the copies: it runs while the driver splits and the
+            // copies land (TRACKER #112; same math, so the same output)
+            shared();
             // the driver's plan (mapped), the layer's copies when it queued any, the masked ids into d_mids
             if (sect) {   // profiling: the plan and the copies waited for apart (two launches instead of one)
                 runtime::spin_until(b.plan, seq, s);
@@ -1295,11 +1308,8 @@ struct Forward::Impl {
             experts->release(l, s);
             if (l + 2 < n_store) experts->prefetch(l + 2);   // the MTP block streams after the last layer
         }
-        if (sect) sect_record(l, 4);   // shared expert + the CPU tier's join (its spin lands in this section)
-        const Act ia = quant(in16, T, c.d_model);
-        lin_multi({ { mo.shexp_gate, g }, { mo.shexp_up, u } }, ia, T);
-        ffn::swiglu(g, u, T * F, mid16, s);
-        lin(mo.shexp_down, mid16, T, y);   // sg (shared-expert gate) came with the router
+        if (sect) sect_record(l, 4);   // shared expert (the doorbell path ran it before its wait) + the CPU join
+        if (!shared_done) shared();
         if (sect) sect_record(l, 5);   // section 5: the CPU tier's join (its spin is the section)
         if (cpu_rows < 0) {   // doorbell path: wait for the CPU tier's rows (mapped) and add them
             runtime::spin_until(bells[l].cpu_done, bells[l].seq, s);
