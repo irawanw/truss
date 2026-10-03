@@ -62,6 +62,12 @@ int truss_eval_argmax(truss_model * m, const int32_t * tokens, int n, int32_t * 
 int truss_spec_step(truss_model * m, int32_t next, int32_t * emitted, int * n_emitted, int32_t * new_next);
 int truss_drafts(const truss_model * m);            /* 0: opened without MTP */
 
+/* Sequence checkpoint (one slot, pinned host memory): truss_checkpoint saves the sequence's recurrent state at
+   truss_position(); truss_restore returns the sequence to it and returns that position (-1: none taken). A later
+   prompt that extends only the checkpointed prefix then reads only its own tail. */
+int truss_checkpoint(truss_model * m);
+int truss_restore(truss_model * m);
+
 /* Sampling on the device (kernels/sampling/sample.cuh): temperature > 0; top_p >= 1, top_k <= 0, min_p <= 0 are off.
    Each sampled row draws from its own random stream (seed, a per-model counter that every sampled row advances).
    Penalties (kernels/sampling/penalty.cuh, llama.cpp's formulas, applied before the filters): repetition_penalty 1,

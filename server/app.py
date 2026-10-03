@@ -30,7 +30,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from server.chat import Chat, Detokenizer
-from server.tools import ToolStream, normalize_messages, parse_calls
+from server.tools import ToolStream, normalize_messages, parse_calls, strip_reasoning
 from server.truss_ctypes import PENALTY_CAP, Model, Sampling, TrussError
 
 
@@ -48,6 +48,8 @@ class Engine:
         self.name, self.log_path, self.log_tag = a.name, a.log, a.log_tag
         self.dump_dir = a.dump_dir
         self.cached = []               # tokens in the engine's sequence
+        self.ck_tokens = []            # the sequence at the engine's checkpoint (the end of the last prompt)
+        self.keep_reasoning = a.keep_reasoning
         self.lock = threading.Lock()
 
     def log(self, line: str):
@@ -84,6 +86,11 @@ class Engine:
                 raise ValueError("empty prompt")
             max_tokens = max(0, min(max_tokens, self.model.n_ctx - n_prompt))
             reuse = len(self.cached) if 0 < len(self.cached) < n_prompt and prompt_ids[:len(self.cached)] == self.cached else 0
+            ck = len(self.ck_tokens)
+            if not reuse and 0 < ck < n_prompt and prompt_ids[:ck] == self.ck_tokens and self.model.restore() == ck:
+                # the last prompt is a prefix but its reply is not (the client re-sent it without its reasoning, or
+                # edited it): back to the end of that prompt instead of reading everything again
+                self.cached, reuse = list(self.ck_tokens), ck
             if not reuse:
                 self.model.reset()
                 self.cached = []
@@ -110,8 +117,10 @@ class Engine:
             t0 = time.time()
             try:
                 nxt = step(prompt_ids[reuse:])
+                self.model.checkpoint()   # the end of this prompt (~10 ms): the next request may resume here
+                self.ck_tokens = list(prompt_ids)
             except TrussError:
-                self.cached = []   # the engine's sequence is unknown now: the next request starts over
+                self.cached, self.ck_tokens = [], []   # the engine's sequence is unknown now: the next request starts over
                 raise
             t1 = time.time()
             detok, text, n_gen, finish = Detokenizer(self.chat), "", 0, "length"
@@ -273,6 +282,8 @@ def make_app(engine: Engine) -> FastAPI:
         body = await req.json()
         kw = dict(body.get("chat_template_kwargs") or {})
         thinking = kw.get("enable_thinking", True) is not False
+        if engine.keep_reasoning >= 0:   # drop the reasoning of all but the last K assistant turns (TRACKER #105)
+            body["messages"] = strip_reasoning(body["messages"], engine.keep_reasoning)
         tools = body.get("tools") or None
         if body.get("tool_choice") == "none":
             tools = None
@@ -413,6 +424,9 @@ def main():
     ap.add_argument("--log", default=None, help="append one line per request here")
     ap.add_argument("--log-tag", default="truss serve")
     ap.add_argument("--dump-dir", default=None, help="keep the last 20 requests (prompt tail + reply) here as JSON")
+    ap.add_argument("--keep-reasoning", type=int, default=-1,
+                    help="keep the reasoning of only the last K assistant turns (-1: as the client sends it); 0 stops "
+                         "the thinking loops of long agent sessions (TRACKER #105)")
     a = ap.parse_args()
     engine = Engine(a)
     print(f"truss: model loaded, n_ctx {engine.model.n_ctx}, listening on {a.host}:{a.port}", flush=True)

@@ -116,6 +116,7 @@ One `truss_model` = one model file, one sequence, on the current CUDA device (`C
 | `truss_reset(m)` | new sequence |
 | `truss_eval(m, tokens, n, logits)` | append n tokens (split into `max_chunk` chunks; a prompt of at most `TRUSS_FETCH_PROMPT` tokens (default 0) into `Forward::fetch_rows()` = 32-token decode-path chunks, which move only the experts its rows route to: at 256K 72 tokens 2,373 -> 1,531 ms, but 256 tokens 2,376 -> 5,749 ms, so the server uses 96, TRACKER #89); write the last token's next-token logits (n_vocab floats; NULL skips) |
 | `truss_eval_argmax(m, tokens, n, &next)` | same, greedy token on the device (no logits copy) |
+| `truss_checkpoint(m)` / `truss_restore(m)` | save the sequence's recurrent state at `truss_position` (one slot, pinned host) / go back to it, returning that position (−1: none) — `Forward::checkpoint` / `restore` |
 | `truss_eval_sample(m, tokens, n, &sampling, &next)` | same, a sample on the device (`truss_sampling`: temperature > 0, top_p, top_k, min_p, seed; each sampled row advances the model's random-stream counter; penalties `repetition_penalty` / `frequency_penalty` / `presence_penalty` over `history[n_history]` (host ids, the last `penalty_last_n` ≤ `TRUSS_PENALTY_CAP` 4,096 kept), counted as given — the caller includes `tokens` when they count) |
 | `truss_spec_step_sampled(m, next, &sampling, emitted, &n, &new_next)` | `truss_spec_step` for sampled decoding (Strata's sampled verify): every verify row is sampled on the device; drafts are accepted while the row's sample equals the draft, so each emitted token is a sample of the model's own conditional. Penalties: `history` is what counts before `next`; verify row t also counts `next` and drafts 1..t |
 
@@ -147,6 +148,16 @@ call stays `content`. Before this the XML came back as plain text, and agent cli
 including 0, wins; temperature 0 is greedy). They were temperature 1.0 with no cut, and clients that send no sampling
 fields (they relied on llama-paw's defaults on this port) got stray tokens: 1,200-token English answers, 3 seeds each,
 had 5-6 CJK runs per answer (one inside a tool name, `bash样的`) at the old defaults and none at these.
+
+**Old reasoning (`--keep-reasoning K`, TRACKER #105).** The chat template keeps the thinking of every assistant
+turn since the last user message; a long agent loop (omp) carries ~90 thinking blocks, and a degenerate habit in them
+("✓ ✓ ✓" after every clause, "hmm hmm") is copied and amplified by the next turn. With K ≥ 0 the server drops
+`reasoning_content` / `reasoning` (and a `<think>…</think>` prefix in the content) from all but the last K assistant
+turns before rendering (`tools.strip_reasoning`). Measured on the A0 replays (9 loop sites x 2 seeds): as sent 7/18
+loop, K = 2 7/18, **K = 0 0/18**. Default −1 (as sent); the pm2 script uses 0. Prefix reuse survives it: after each
+prompt the engine checkpoints its state (`truss_checkpoint`), and a request that extends the last prompt but not the
+engine's reply (the reply now comes back without its thinking) restores the checkpoint and reads only the rest.
+Tested by `tests/server/checkpoint_reuse_test.py` (host).
 
 **Penalties** (plan step A6, for the loop diagnosis): off by default (presence 0, frequency 0, repetition 1), so a
 client that sends none gets exactly what it got before. Sampled requests only (greedy ignores them). They count the

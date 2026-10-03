@@ -231,6 +231,16 @@ int truss_eval_argmax(truss_model * m, const int32_t * tokens, int n, int32_t * 
 
 int truss_drafts(const truss_model * m) { return m->drafts; }
 
+int truss_checkpoint(truss_model * m)
+{
+    return guarded([&] { m->fwd->checkpoint(); return 0; }, -1);
+}
+
+int truss_restore(truss_model * m)
+{
+    return guarded([&] { return m->fwd->restore(); }, -2);
+}
+
 namespace {
 sampling::SampleParams params_of(const truss_sampling * sp)
 {

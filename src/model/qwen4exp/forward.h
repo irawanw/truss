@@ -142,6 +142,13 @@ public:
     // start a new sequence (zero recurrent state, conv histories, the PLE window; caches are overwritten by position)
     void reset();
 
+    // Sequence checkpoint: checkpoint() saves the recurrent state at position() (pinned host memory, one slot,
+    // ~115 MB for Flash-Next); restore() returns the sequence to it (position() back to that point, -1 if none was
+    // taken) so a prompt that shares only the checkpoint's prefix with the engine's sequence reads only the rest.
+    // The server checkpoints the end of each prompt (its old reasoning can then be dropped without losing reuse).
+    void checkpoint();
+    int restore();
+
     int position() const { return pos_; }   // tokens consumed so far
     static int fetch_rows();                // run() chunks of at most this many tokens take the fetch (decode) path
     int hot_experts() const;                // resident experts, all layers

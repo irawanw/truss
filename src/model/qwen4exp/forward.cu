@@ -435,6 +435,7 @@ struct Forward::Impl {
                 if (p) cudaFreeHost(p);
         if (embd_d) cudaFreeHost(embd_d);
         if (calib_host) cudaFreeHost(calib_host);
+        if (ck.host) cudaFreeHost(ck.host);
         if (mtp_calib_f) std::fclose(mtp_calib_f);
         for (auto & a : sect_ev)
             for (cudaEvent_t e : a)
@@ -1506,6 +1507,68 @@ struct Forward::Impl {
         if (mtp) mtp_commit(vw.tokens.data(), vw.pos0, n, false);
     }
 
+    // Sequence checkpoint (Forward::checkpoint / restore): every recurrent piece of the committed sequence - GDN state
+    // and conv rows, the DSA indexer's open block, PLE history and token window, the MTP block's open block and
+    // pending row - copied to pinned host memory (~115 MB here, no VRAM taken from the experts). Position-indexed
+    // caches (K/V, indexer blocks, MTP rows) need no copy: rows past the checkpoint are rewritten before any query
+    // reads them, as after a verify window.
+    struct Checkpoint {
+        bool valid = false;
+        int pos = 0;
+        bool has_pending = false;
+        std::vector<int32_t> tail;
+        char * host = nullptr;   // pinned
+        size_t bytes = 0;
+    } ck;
+
+    template <class F> void each_ck_buffer(F && f)   // f(device pointer, floats) in a fixed order
+    {
+        for (int l = 0; l < c.n_layer; ++l) {
+            LayerState & L = st[l];
+            if (w.layers[l].mixer == Mixer::GDN) {
+                f(L.state(), (size_t) c.ssm_v_heads * c.ssm_state * c.ssm_state);
+                f(L.conv, (size_t) (c.ssm_conv - 1) * c.conv_dim());
+            } else if (L.idx_partial) {
+                f(L.idx_partial, (size_t) (DsaShape::RATIO - 1) * c.idx_head_dim);
+            }
+            if (L.ple_hist) f(L.ple_hist, (size_t) (c.ple_conv - 1) * c.ple_ngram * c.hc_dim());
+        }
+        if (mtp) {
+            f(mst.idx_partial, (size_t) (DsaShape::RATIO - 1) * c.idx_head_dim);
+            f(pending_h, (size_t) c.hc_dim());
+        }
+    }
+
+    void checkpoint(int pos)
+    {
+        require(!vw.open, "checkpoint() inside a verify window");
+        if (!ck.host) {
+            each_ck_buffer([&](float *, size_t n) { ck.bytes += n * sizeof(float); });
+            TRUSS_CUDA(cudaMallocHost(&ck.host, ck.bytes));
+        }
+        size_t at = 0;
+        each_ck_buffer([&](float * d, size_t n) {
+            TRUSS_CUDA(cudaMemcpyAsync(ck.host + at, d, n * sizeof(float), cudaMemcpyDeviceToHost, s));
+            at += n * sizeof(float);
+        });
+        TRUSS_CUDA(cudaStreamSynchronize(s));
+        ck.valid = true, ck.pos = pos, ck.has_pending = has_pending, ck.tail = tail;
+    }
+
+    int restore()
+    {
+        require(!vw.open, "restore() inside a verify window");
+        if (!ck.valid) return -1;
+        size_t at = 0;
+        each_ck_buffer([&](float * d, size_t n) {
+            TRUSS_CUDA(cudaMemcpyAsync(d, ck.host + at, n * sizeof(float), cudaMemcpyHostToDevice, s));
+            at += n * sizeof(float);
+        });
+        TRUSS_CUDA(cudaStreamSynchronize(s));
+        has_pending = ck.has_pending, tail = ck.tail, last_T = 0;
+        return ck.pos;
+    }
+
     // MTP calibration capture (TRUSS_MTP_CALIB=/path/file.f32): the MTP block's FFN input rows (fp32 [d_model],
     // one per true-path row) appended for an offline Hessian (gate/up share this input; the down Hessian is derived
     // from the BF16 gate/up weights). Only true-path commits (mtp_commit), never draft chains.
@@ -1808,6 +1871,15 @@ void Forward::accept(int n)
 }
 
 int Forward::draft(int32_t next, int n, int32_t * out) { return m_->draft(next, pos_, n, out); }
+
+void Forward::checkpoint() { m_->checkpoint(pos_); }
+
+int Forward::restore()
+{
+    const int p = m_->restore();
+    if (p >= 0) pos_ = p;
+    return p;
+}
 
 void apply_env(ForwardOptions & o)
 {

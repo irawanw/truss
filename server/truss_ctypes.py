@@ -74,6 +74,8 @@ class Model:
             "truss_open_params": (p, [ctypes.c_char_p, ctypes.POINTER(Params)]),
             "truss_spec_step": (c_int, [p, ctypes.c_int32, i32p, ctypes.POINTER(c_int), i32p]),
             "truss_drafts": (c_int, [p]),
+            "truss_checkpoint": (c_int, [p]),
+            "truss_restore": (c_int, [p]),
             "truss_eval_sample": (c_int, [p, i32p, c_int, ctypes.POINTER(Sampling), i32p]),
             "truss_spec_step_sampled": (c_int, [p, ctypes.c_int32, ctypes.POINTER(Sampling), i32p,
                                                 ctypes.POINTER(c_int), i32p]),
@@ -122,6 +124,17 @@ class Model:
 
     def reset(self):
         self._check(self._lib.truss_reset(self._m))
+
+    def checkpoint(self):
+        """Save the sequence's recurrent state at the current position (one slot)."""
+        self._check(self._lib.truss_checkpoint(self._m))
+
+    def restore(self) -> int:
+        """Return the sequence to the checkpoint; its position, or -1 if none was taken."""
+        r = self._lib.truss_restore(self._m)
+        if r < -1:
+            raise TrussError(self._error())
+        return r
 
     def eval(self, tokens) -> np.ndarray:
         """Append tokens; returns the last token's next-token logits (a view reused by the next call)."""

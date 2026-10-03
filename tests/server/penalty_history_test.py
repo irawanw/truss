@@ -29,6 +29,12 @@ class FakeModel:
     def reset(self):
         self.seq = []
 
+    def checkpoint(self):
+        pass
+
+    def restore(self):
+        return -1
+
     def check(self, sp):
         self.calls += 1
         want = self.seq[-self.last_n:] if self.last_n > 0 else self.seq[self.n_prompt:]
@@ -52,6 +58,7 @@ def run(spec, last_n, n_prompt=100, n_gen=12):
     e.model = FakeModel(spec, n_prompt, last_n)
     e.chat = types.SimpleNamespace(tok=types.SimpleNamespace(decode=lambda ids, **k: "".join(f"<{i}>" for i in ids)))
     e.stop_ids, e.log_tag, e.log_path, e.dump_dir, e.cached, e.lock = set(), "test", None, None, [], threading.Lock()
+    e.ck_tokens, e.keep_reasoning = [], -1
     e.log = lambda line: None
     out = [t for t, _, _ in e.generate(list(range(1, n_prompt + 1)), n_gen, 0.8, 0.95, 40, 7, [], 0.05,
                                        presence_penalty=1.5, penalty_last_n=last_n) if t is not None]

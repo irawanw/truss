@@ -55,6 +55,25 @@ def normalize_messages(messages):
     return out
 
 
+def strip_reasoning(messages, keep):
+    """Copies of the messages with the reasoning of all but the last `keep` assistant turns dropped
+    (`reasoning_content` / `reasoning`, and a `<think>...</think>` prefix in the content, which the template would
+    otherwise turn back into reasoning). The chat template keeps every assistant turn's thinking since the last user
+    message; in a long agent loop that is ~90 thinking blocks, and a degenerate habit in them ("✓ ✓ ✓", "hmm hmm")
+    is copied and amplified by the next turn (TRACKER #105: loop sites 7/18 -> 0/18 with keep 0)."""
+    idx = [i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "assistant"]
+    drop = set(idx[:max(0, len(idx) - keep)])
+    out = []
+    for i, m in enumerate(messages):
+        if i in drop:
+            m = {k: v for k, v in m.items() if k not in ("reasoning_content", "reasoning")}
+            c = m.get("content")
+            if isinstance(c, str) and "</think>" in c:
+                m["content"] = c.split("</think>", 1)[1].lstrip("\n")
+        out.append(m)
+    return out
+
+
 def _schema_types(tools):
     """{function name: {parameter: JSON-schema type}} from the request's tools."""
     types = {}

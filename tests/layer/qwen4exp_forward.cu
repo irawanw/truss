@@ -176,7 +176,7 @@ void require_tokens(int have, int need)
 int main(int argc, char ** argv)
 {
     if (argc < 4) {
-        std::fprintf(stderr, "usage: %s <slice.gguf> short|long <dump dir>\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <slice.gguf> short|stream|cpu|decode|checkpoint|long <dump dir>\n", argv[0]);
         return 2;
     }
     try {
@@ -347,6 +347,45 @@ int main(int argc, char ** argv)
             fails += !ok;
             std::printf("%s: 1-token steps vs 4-row windows rel %.1e; vs all-resident GPU: KL %.2e, top-1 %d/%d  %s\n",
                         getenv("TRUSS_TEST_NO_CPU") ? "no CPU tier" : "CPU tier", diff, kl, same, n_dec, ok ? "PASS" : "FAIL");
+            cudaFree(d_logits);
+        } else if (mode == "checkpoint") {
+            // Forward::checkpoint / restore: prompt, checkpoint, 40 other tokens (a 24-token chunk and 16 single
+            // steps), restore, then the true continuation one token at a time - its logits must be bit-identical to
+            // the same continuation straight after the prompt, and position() back at the checkpoint. Twice, so a
+            // restore from an older checkpoint after a newer run is covered too. Needs > 16 tokens.
+            const int n_dec = 16, P = T - n_dec, V = c.n_vocab;
+            require_tokens(T, n_dec + 1);
+            float * d_logits;
+            TRUSS_CUDA(cudaMalloc(&d_logits, (size_t) V * 4));
+            q::Forward p(c, w, T + 64, 2048);
+            auto continuation = [&](std::vector<float> & out) {
+                out.resize((size_t) n_dec * V);
+                for (int i = 0; i < n_dec; ++i) {
+                    p.run(tok.data() + P + i, 1);
+                    p.head(0, 1, d_logits);
+                    dtoh_sync(p, out.data() + (size_t) i * V, d_logits, (size_t) V * 4);
+                }
+            };
+            std::vector<float> want, got;
+            p.run(tok.data(), P);
+            continuation(want);
+            p.reset();
+            p.run(tok.data(), P);
+            p.checkpoint();
+            std::vector<int32_t> other(40);
+            for (int i = 0; i < 40; ++i) other[i] = tok[(i * 7 + 3) % P];
+            for (int round = 0; round < 2; ++round) {
+                p.run(other.data(), 24);
+                for (int i = 24; i < 40; ++i) p.run(other.data() + i, 1);
+                const int back = p.restore();
+                continuation(got);
+                long diff = 0;
+                for (size_t i = 0; i < got.size(); ++i) diff += got[i] != want[i];
+                const bool ok = back == P && diff == 0;
+                fails += !ok;
+                std::printf("checkpoint at %d, 40 other tokens, restore -> position %d, %d-token continuation: %ld logit "
+                            "values differ  %s\n", P, back, n_dec, diff, ok ? "PASS" : "FAIL");
+            }
             cudaFree(d_logits);
         } else if (mode == "decode") {
             const int n_dec = 32, P = T - n_dec, V = c.n_vocab;
