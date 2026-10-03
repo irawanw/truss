@@ -162,6 +162,13 @@ struct Forward::Impl {
     long drv_n = 0;
     std::atomic<long> jobs_pushed{ 0 };   // the driver spins on this before it sleeps on dq_cv (Strata's host spins)
     bool driver_stop = false;
+    // TRUSS_DRIVER_DEBUG=1: the driver's phase, and a watchdog that prints it with the stuck layer's doorbell words
+    // when no job is served for 10 s (phases: 1 job spin, 2 job sleep, 3 doorbell spin, 4 serve, 5 fetch, 6 claim,
+    // 7 pool wait, 8 admit_step)
+    std::atomic<int> dbg_phase{ 0 }, dbg_layer{ -1 }, dbg_seq{ 0 };
+    std::atomic<long> dbg_served{ 0 };
+    std::thread watchdog;
+    bool dbg_on = false;
     std::exception_ptr driver_error;
     bool use_doorbell = true;
     // Options::cpu_dynamic (Strata's split, TRACKER #73): per layer, missed experts with a host copy go to the CPU or
@@ -178,6 +185,9 @@ struct Forward::Impl {
     float adapt_min = 2.f, adapt_decay = 0.7f;
     long decode_passes = 0;
     std::vector<float> route_usage;
+    int admit_idle = 0, admit_pass = 0;                  // Options::admit_idle; claims this pass
+    float admit_min = 1.f, admit_decay = 0.9f;
+    std::vector<float> admit_u;                          // decayed routing counts [layer][expert] (driver thread)
     double dyn_s1 = 0, dyn_sn = 0, dyn_st = 0, dyn_snn = 0, dyn_snt = 0;
     long dyn_cpu = 0, dyn_pcie = 0;                      // eligible misses sent each way (stats)
     int8_t * embd_q = nullptr;                           // token embedding in pinned host memory (upload())
@@ -372,6 +382,9 @@ struct Forward::Impl {
         adapt_every = o.adapt_every, adapt_swaps = o.adapt_swaps;
         adapt_min = o.adapt_min, adapt_decay = o.adapt_decay;
         if (adapt_every > 0) route_usage.assign((size_t) n_store * c.n_expert, 0.f);
+        admit_idle = cpu_tier && use_doorbell ? o.admit_idle : 0;
+        admit_min = o.admit_min, admit_decay = o.admit_decay;
+        if (admit_idle > 0) admit_u.assign((size_t) c.n_layer * c.n_expert, 0.f);
         if (const char * rt = std::getenv("TRUSS_ROUTE_TRACE")) {
             route_trace = std::fopen(rt, "wb");
             require(route_trace != nullptr, std::string("cannot write ") + rt);
@@ -420,6 +433,7 @@ struct Forward::Impl {
             }
             dq_cv.notify_all();
             driver.join();
+            if (watchdog.joinable()) watchdog.join();
         }
         for (Bell & b : bells)
             for (void * p : { (void *) b.ids, (void *) b.pred, (void *) b.mids, (void *) b.w, (void *) b.x, (void *) b.y,
@@ -469,6 +483,30 @@ struct Forward::Impl {
             b.d_mids = alloc<int>((size_t) R * K);
         }
         driver = std::thread([this] { drive(); });
+        dbg_on = std::getenv("TRUSS_DRIVER_DEBUG") && std::atoi(std::getenv("TRUSS_DRIVER_DEBUG"));
+        if (dbg_on)
+            watchdog = std::thread([this] {
+                long last = -1;
+                int still = 0;
+                while (!driver_stop) {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    const long s = dbg_served.load();
+                    still = s == last && jobs_pushed.load() > s ? still + 1 : 0;
+                    last = s;
+                    if (still == 10) {
+                        const int l = dbg_layer.load();
+                        std::fprintf(stderr, "driver watchdog: served %ld, pushed %ld, phase %d, layer %d seq %d", s,
+                                     jobs_pushed.load(), dbg_phase.load(), l, dbg_seq.load());
+                        if (l >= 0) {
+                            const Bell & b = bells[l];
+                            std::fprintf(stderr, " | bell seq %d doorbell %d plan %d need_copy %d cpu_done %d",
+                                         b.seq, *(volatile int *) b.doorbell, *(volatile int *) b.plan,
+                                         *(volatile int *) b.need_copy, *(volatile int *) b.cpu_done);
+                        }
+                        std::fprintf(stderr, " | %s\n", experts->admit_debug().c_str());
+                    }
+                }
+            });
     }
 
     // The driver: for each queued decode FFN, wait for its doorbell, split the routed experts (CPU tier / GPU),
@@ -479,9 +517,14 @@ struct Forward::Impl {
         for (;;) {
             Job j;
             // spin first: the next layer's job arrives within ~0.5 ms during a pass, and a condvar wake costs more
-            for (int i = 0; i < 200000 && jobs_pushed.load(std::memory_order_acquire) <= taken; ++i) _mm_pause();
+            dbg_phase = 1;
+            for (int i = 0; i < 200000 && jobs_pushed.load(std::memory_order_acquire) <= taken; ++i) {
+                _mm_pause();
+                if (admit_idle > 0 && i % 64 == 0) dbg_phase = 8, experts->admit_step(), dbg_phase = 1;   // the link is ours while we wait
+            }
             {
                 std::unique_lock<std::mutex> g(dq_mu);
+                dbg_phase = 2;
                 dq_cv.wait(g, [&] { return driver_stop || !jobs.empty(); });
                 ++taken;
                 if (driver_stop && jobs.empty()) return;
@@ -489,11 +532,17 @@ struct Forward::Impl {
                 jobs.pop_front();
             }
             Bell & b = bells[j.layer];
-            while (*(volatile int *) b.doorbell < j.seq) _mm_pause();
+            dbg_layer = j.layer, dbg_seq = j.seq, dbg_phase = 3;
+            for (int i = 0; *(volatile int *) b.doorbell < j.seq; ++i) {
+                _mm_pause();
+                if (admit_idle > 0 && i % 64 == 0) dbg_phase = 8, experts->admit_step(), dbg_phase = 3;
+            }
             std::atomic_thread_fence(std::memory_order_acquire);
             drv_t[0] = std::chrono::steady_clock::now();
             try {
+                dbg_phase = 4;
                 serve(j, b);
+                ++dbg_served;
             } catch (...) {   // keep the GPU moving (its output is garbage now); the caller rethrows at its next sync
                 if (!driver_error) driver_error = std::current_exception();
                 experts->signal(j.layer, b.go, j.seq);
@@ -512,6 +561,13 @@ struct Forward::Impl {
         CpuTier * ct = j.cpu ? cpu_tier.get() : nullptr;
         if (!route_usage.empty())
             for (int i = 0; i < n; ++i) route_usage[(size_t) l * c.n_expert + b.ids[i]] += 1.f;
+        if (admit_idle > 0 && l < c.n_layer) {
+            if (l == 0) {   // a new pass
+                for (float & u : admit_u) u *= admit_decay;
+                admit_pass = 0;
+            }
+            for (int i = 0; i < n; ++i) admit_u[(size_t) l * c.n_expert + b.ids[i]] += 1.f;
+        }
         if (route_trace) {
             const int32_t h[2] = { l, j.T };
             std::fwrite(h, 4, 2, route_trace);
@@ -573,6 +629,7 @@ struct Forward::Impl {
         // the plan (masked ids in mapped b.mids) goes to the GPU through mapped words, as Strata's: a layer that needs
         // no copies is not ordered behind the copy stream (earlier layers' hints and meta uploads); one that copies
         // also waits for go, which the copy stream writes behind its copies
+        dbg_phase = 5;
         const bool copied = experts->fetch(l, gpu_ids.data(), (int) gpu_ids.size(), nullptr);
         if (copied) experts->signal(l, b.go, j.seq);   // go before the hints: this layer must not wait for the next one's copies
         *(volatile int *) b.need_copy = copied ? j.seq : 0;
@@ -596,7 +653,24 @@ struct Forward::Impl {
                 }
             experts->prefetch_hint(l, h.data(), (int) h.size());
         }
+        if (admit_idle > 0 && n_cpu > 0 && l < c.n_layer && admit_pass < admit_idle) {
+            // claim slots for the CPU's experts most worth keeping (after fetch(): its experts are protected)
+            std::vector<std::pair<float, int>> cand;
+            for (int i = 0; i < n; ++i)
+                if (to_cpu[i]) {
+                    const int e = b.ids[i];
+                    const float u = admit_u[(size_t) l * c.n_expert + e];
+                    bool dup = false;
+                    for (const auto & x : cand) dup |= x.second == e;
+                    if (!dup && u >= admit_min) cand.push_back({ u, e });
+                }
+            std::sort(cand.begin(), cand.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+            dbg_phase = 6;
+            for (size_t i = 0; i < cand.size() && i < 2 && admit_pass < admit_idle; ++i)
+                admit_pass += experts->claim(l, cand[i].second);
+        }
         if (ct) {
+            dbg_phase = 7;
             ct->pool->wait();
             if (cpu_dynamic && n_cpu > 0)   // the pool's own time (start to last item), not this thread's
                 fit_cpu_cost(n_cpu, ct->pool->last_call_ms());
@@ -1907,6 +1981,9 @@ void apply_env(ForwardOptions & o)
     f("TRUSS_ADAPT_MIN", o.adapt_min);
     f("TRUSS_ADAPT_DECAY", o.adapt_decay);
     f("TRUSS_HINT_K", o.hint_k);               // pre-gated prefetch width
+    f("TRUSS_ADMIT_IDLE", o.admit_idle);       // admission on the idle link, experts per pass
+    f("TRUSS_ADMIT_MIN", o.admit_min);
+    f("TRUSS_ADMIT_DECAY", o.admit_decay);
     f("TRUSS_PREFILL_ROWS", o.prefill_rows);
     f("TRUSS_KV_INT8", o.kv_int8);             // Strata's int8 KV
     f("TRUSS_PLAN_ALPHA", o.plan_alpha);       // hot-set ranking: usage / bytes^alpha

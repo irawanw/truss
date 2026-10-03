@@ -138,7 +138,8 @@ int main(int argc, char ** argv)
             long passes = 0, tokens = 0, drafted = 0, accepted = 0, dn = 0, ple_calls = 0, ple_rows = 0, cpu_waits = 0;
             long long item_us = 0, ph[4] = {}, sh[4] = {};
             long asked = 0, misses = 0, hinted = 0;
-            double bytes = 0, hint_bytes = 0;
+            double bytes = 0, hint_bytes = 0, adm_bytes = 0;
+            long adm_n = 0;
             int identical = 0, compared = 0;
         } S;
         cudaEvent_t e0, e1;
@@ -257,6 +258,7 @@ int main(int argc, char ** argv)
             S.asked += st.experts_asked - st0.experts_asked, S.misses += st.misses - st0.misses;
             S.hinted += st.hinted - st0.hinted;
             S.bytes += st.bytes - st0.bytes, S.hint_bytes += st.hint_bytes - st0.hint_bytes;
+            S.adm_bytes += (double) (st.admit_bytes - st0.admit_bytes), S.adm_n += st.admitted_claims - st0.admitted_claims;
         }
         TRUSS_CUDA(cudaEventDestroy(e0));
         TRUSS_CUDA(cudaEventDestroy(e1));
@@ -270,6 +272,9 @@ int main(int argc, char ** argv)
         std::printf("       per pass: %.1f cold experts routed, %.1f fetched on demand (%.1f MB), %.1f prefetched (%.1f MB)\n",
                     S.asked / passes, S.misses / passes, S.bytes / 1e6 / passes, S.hinted / passes,
                     S.hint_bytes / 1e6 / passes);
+        if (S.adm_n || S.adm_bytes)
+            std::printf("       admission on the idle link: %.1f experts/pass issued (%.1f MB/pass), %ld landed in all\n",
+                        S.adm_n / passes, S.adm_bytes / 1e6 / passes, f.experts().admit_landed());
         if (S.cpu_waits) {
             std::printf("       CPU tier: %.2f ms/pass in wait over %ld waits (items sum %.2f ms/pass)\n",
                         S.cpu_wait_us / 1e3 / passes, S.cpu_waits, S.item_us / 1e3 / passes);

@@ -73,6 +73,13 @@ struct ForwardOptions {
     // admission threshold on the decayed count; decay per round. TRACKER #92: admitting 64/pass at >= 1 cut CPU misses
     // 20% but its copies delayed the demand fetches (shared copy stream): off by default (adapt_every 0)
     float adapt_min = 2.f, adapt_decay = 0.7f;
+    // Admission on the idle link (TRACKER #113; doorbell decode with the CPU tier): after serving a layer the driver
+    // claims ring slots for up to 2 of the experts the CPU just computed (highest decayed routing count first, count
+    // >= admit_min, counts x admit_decay per pass), at most admit_idle per pass, and copies them in pieces only while
+    // the link has no demand copy (runtime::ExpertStore::claim / admit_step). 0: off. Replay (R3): 32/pass at C2
+    // size cuts misses 153 -> 109 per pass.
+    int admit_idle = 0;
+    float admit_min = 1.f, admit_decay = 0.9f;
     std::vector<int32_t> draft_vocab;         // MTP drafts score only these token ids (empty: all), e.g.
                                               // data/draft_vocab_en.bin: the draft head reads 16% of the output
                                               // matrix; verify keeps the output exact

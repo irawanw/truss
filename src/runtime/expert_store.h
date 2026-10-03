@@ -27,6 +27,7 @@
 #include <array>
 #include <cstdint>
 #include <deque>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -106,6 +107,23 @@ public:
     void admit(const std::vector<std::pair<int, int>> & le, cudaStream_t compute);
     void poll_admitted();                                          // promote the batch whose copies have landed
     bool admitting() const { return !adm_.empty(); }
+    // Admission on the idle link (TRACKER #113), driver thread only. claim(l, e) takes a ring slot for a cold expert
+    // without copying it, never evicting an expert the last fetch() needs (its kernel may be running); the expert is
+    // not on the device until its copy lands. admit_step() copies the claimed experts in PIECE-byte pieces, one piece
+    // in flight at a time and only while no demand copy is in flight, so a demand fetch queues behind at most one
+    // piece; a claim's meta table goes up behind its last piece. A fetch() that needs a claimed expert copies the rest
+    // of it at once. Returns whether admit_step() issued a copy.
+    static constexpr size_t PIECE = 256 << 10;
+    bool claim(int l, int e);
+    bool admit_step();
+    size_t admit_backlog() const { return adm_backlog_; }       // claimed bytes not issued yet
+    std::string admit_debug() const                             // TRUSS_DRIVER_DEBUG watchdog line
+    {
+        return "claims " + std::to_string(claims_.size()) + " landing " + std::to_string(landing_.size()) +
+               " piece_out " + std::to_string(piece_out_) + " demand_out " + std::to_string(demand_out_) +
+               " backlog " + std::to_string(adm_backlog_) + " mode " + std::to_string((int) mode_);
+    }
+    long admit_landed() const { return adm_landed_; }
     long admitted() const { return adm_total_; }
     size_t bytes_of(int l, int e) const { return layers_[l].bytes[e]; }
     // pinned host copy of projection p (gate, up, down) of a cold expert; nullptr for a hot one (it has none). The CPU
@@ -121,6 +139,8 @@ public:
         size_t bytes = 0;                                      // demand bytes
         long hinted = 0;                                       // copied by prefetch_hint
         size_t hint_bytes = 0;
+        size_t admit_bytes = 0;                                // copied by admit_step() / claim flushes
+        long admitted_claims = 0;                              // claims fully issued
     };
     const Stats & stats() const { return stats_; }
 
@@ -146,7 +166,25 @@ private:
     enum class Mode { STREAM, RING };
 
     void wait_compute(cudaStream_t compute);                        // copy stream waits for all compute queued so far
-    bool ring_put(int layer, int expert, bool hint = false);   // hint: refuse (false) to evict a protected expert
+    // hint: refuse (false) to evict a protected expert; copy false: claim the slot only (claim())
+    bool ring_put(int layer, int expert, bool hint = false, bool copy = true);
+    struct Claim {
+        int layer, expert;
+        int64_t off;
+        size_t done;                                            // bytes issued
+    };
+    std::deque<Claim> claims_;                                  // claim() order
+    std::vector<std::pair<cudaEvent_t, std::vector<std::pair<int, int64_t>>>> landing_;   // last-piece event, claims
+    cudaEvent_t piece_ev_ = nullptr, demand_ev_ = nullptr;
+    bool piece_out_ = false, demand_out_ = false;
+    std::vector<cudaEvent_t> ev_pool_;
+    size_t adm_backlog_ = 0;
+    // admit_step() (driver thread, idle loops) against begin_stream() / begin_ring() (the thread that enqueues): a
+    // prompt chunk must not start while a piece is being issued into what becomes its stream slots
+    std::mutex adm_mu_;
+    long adm_landed_ = 0;
+    void claim_issue(Claim & c, size_t upto);                   // copy c's bytes [done, upto)
+    void claim_flush(int layer, int expert);                    // fetch(): the rest of a claimed expert now
     std::vector<int> protect_;                                  // layer, experts the last fetch() needs
     // [layer] experts prefetch_hint() queued since that layer's last fetch(): their copies may still be in flight, so
     // a fetch() that needs one reports a copy (the GPU must wait for the copy stream)

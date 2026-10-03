@@ -300,6 +300,10 @@ ExpertStore::~ExpertStore()
     }
     if (compute_mark_) cudaEventDestroy(compute_mark_);
     if (adm_ev_) cudaEventDestroy(adm_ev_);
+    for (auto & x : landing_) cudaEventDestroy(x.first);
+    for (cudaEvent_t e : ev_pool_) cudaEventDestroy(e);
+    if (piece_ev_) cudaEventDestroy(piece_ev_);
+    if (demand_ev_) cudaEventDestroy(demand_ev_);
     if (copy_) cudaStreamDestroy(copy_);
 }
 
@@ -324,11 +328,13 @@ void ExpertStore::wait_compute(cudaStream_t compute)
 
 void ExpertStore::begin_stream(cudaStream_t compute)
 {
+    std::lock_guard<std::mutex> g(adm_mu_);
     wait_compute(compute);   // decode kernels may still read the ring the slots overwrite
     for (const RingEntry & r : fifo_) layers_[r.layer].ring_at[r.expert] = -1, layers_[r.layer].pend[r.expert] = 0;
     fifo_.clear();
     hinted_.clear();
     adm_.clear();
+    claims_.clear(), adm_backlog_ = 0;   // landing_ events stay: their claims are gone from the ring (checked by offset)
     head_ = 0;
     released_recorded_[0] = released_recorded_[1] = false;
     mode_ = Mode::STREAM;
@@ -346,7 +352,7 @@ void ExpertStore::prefetch(int l)
 
 // FIFO allocation: evict the oldest entries overlapping [head, head + bytes) (wrapping to 0 when the tail is too
 // short), copy the expert, point the ring meta at it.
-bool ExpertStore::ring_put(int l, int e, bool hint)
+bool ExpertStore::ring_put(int l, int e, bool hint, bool copy)
 {
     Layer & Y = layers_[l];
     const int64_t need = (int64_t) align_up(Y.bytes[e]);
@@ -405,8 +411,9 @@ bool ExpertStore::ring_put(int l, int e, bool hint)
     Y.ring_at[e] = off;
     Y.ref[e] = 0;
     uint8_t * at = base_ + off;
-    TRUSS_CUDA(cudaMemcpyAsync(at, Y.host + Y.cold_off[e], Y.bytes[e], cudaMemcpyHostToDevice, copy_));
+    if (copy) TRUSS_CUDA(cudaMemcpyAsync(at, Y.host + Y.cold_off[e], Y.bytes[e], cudaMemcpyHostToDevice, copy_));
     for (int p = 0; p < 3; ++p) Y.ring_meta_host[(size_t) p * 2 * Y.n_expert + 2 * e + 1] = unit_offset(at + Y.part[p][e], base_, l);
+    if (!copy) return true;
     if (hint) stats_.hint_bytes += Y.bytes[e], ++stats_.hinted;
     else stats_.bytes += Y.bytes[e], ++stats_.misses;
     return true;
@@ -449,6 +456,7 @@ void ExpertStore::admit(const std::vector<std::pair<int, int>> & le, cudaStream_
 
 void ExpertStore::begin_ring()
 {
+    std::lock_guard<std::mutex> g(adm_mu_);
     if (mode_ != Mode::RING) {   // first decode step after a prompt: the ring starts empty over the slots and spare
         mode_ = Mode::RING;
         head_ = 0;
@@ -477,7 +485,11 @@ bool ExpertStore::fetch(int l, const int * ids, int n, cudaStream_t compute)
         hinted_[l].clear();
     }
     poll_admitted();
-    for (int e : need) hinted_needed |= Y.pend[e] != 0;   // admitted, copy maybe in flight: wait for go
+    for (int e : need)
+        if (Y.pend[e]) {   // admitted or claimed, copy maybe in flight: wait for go (after the rest of a claim)
+            claim_flush(l, e);
+            hinted_needed = true;
+        }
     protect_layer_ = l;
     protect_.clear();
     for (int i = 0; i < n; ++i) protect_.push_back(ids[i]);
@@ -500,7 +512,96 @@ bool ExpertStore::fetch(int l, const int * ids, int n, cudaStream_t compute)
             TRUSS_CUDA(cudaMemcpyAsync(Y.ring_meta[p], Y.ring_meta_host + (size_t) p * 2 * Y.n_expert,
                                        sizeof(int32_t) * 2 * Y.n_expert, cudaMemcpyHostToDevice, copy_));
     TRUSS_CUDA(cudaEventRecord(copied_[l % 2], copy_));
+    if (changed) {   // admit_step() holds back while these demand copies run
+        if (!demand_ev_) TRUSS_CUDA(cudaEventCreateWithFlags(&demand_ev_, cudaEventDisableTiming));
+        TRUSS_CUDA(cudaEventRecord(demand_ev_, copy_));
+        demand_out_ = true;
+    }
     return changed || hinted_needed;
+}
+
+bool ExpertStore::claim(int l, int e)
+{
+    if (mode_ != Mode::RING) return false;
+    Layer & Y = layers_.at(l);
+    if (Y.cold_off[e] < 0 || Y.ring_at[e] >= 0) return false;
+    if (!ring_put(l, e, true, false)) return false;
+    Y.pend[e] = 1;
+    claims_.push_back({ l, e, Y.ring_at[e], 0 });
+    adm_backlog_ += Y.bytes[e];
+    return true;
+}
+
+void ExpertStore::claim_issue(Claim & c, size_t upto)
+{
+    Layer & Y = layers_[c.layer];
+    const size_t n = upto - c.done;
+    TRUSS_CUDA(cudaMemcpyAsync(base_ + c.off + c.done, Y.host + Y.cold_off[c.expert] + c.done, n, cudaMemcpyHostToDevice,
+                               copy_));
+    c.done = upto;
+    adm_backlog_ -= n;
+    stats_.admit_bytes += n;
+    if (c.done < Y.bytes[c.expert]) return;
+    // the last piece: the meta table behind it, then an event that clears pend once it has landed
+    for (int p = 0; p < 3; ++p)
+        TRUSS_CUDA(cudaMemcpyAsync(Y.ring_meta[p], Y.ring_meta_host + (size_t) p * 2 * Y.n_expert,
+                                   sizeof(int32_t) * 2 * Y.n_expert, cudaMemcpyHostToDevice, copy_));
+    cudaEvent_t ev;
+    if (ev_pool_.empty()) TRUSS_CUDA(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+    else ev = ev_pool_.back(), ev_pool_.pop_back();
+    TRUSS_CUDA(cudaEventRecord(ev, copy_));
+    landing_.push_back({ ev, { { c.layer * 65536 + c.expert, c.off } } });
+    ++stats_.admitted_claims;
+}
+
+void ExpertStore::claim_flush(int l, int e)
+{
+    for (auto it = claims_.begin(); it != claims_.end(); ++it)
+        if (it->layer == l && it->expert == e) {
+            if (layers_[l].ring_at[e] == it->off) claim_issue(*it, layers_[l].bytes[e]);
+            else adm_backlog_ -= layers_[l].bytes[e] - it->done;
+            claims_.erase(it);
+            return;
+        }
+}
+
+bool ExpertStore::admit_step()
+{
+    std::unique_lock<std::mutex> g(adm_mu_, std::try_to_lock);
+    if (!g.owns_lock()) return false;
+    // landed claims: on the device from now on (unless the ring moved on since)
+    for (size_t i = 0; i < landing_.size();) {
+        if (cudaEventQuery(landing_[i].first) != cudaSuccess) { ++i; continue; }
+        for (const auto & [le, off] : landing_[i].second) {
+            Layer & Y = layers_[le / 65536];
+            if (Y.ring_at[le % 65536] == off) Y.pend[le % 65536] = 0, ++adm_landed_;
+        }
+        ev_pool_.push_back(landing_[i].first);
+        landing_.erase(landing_.begin() + (ptrdiff_t) i);
+    }
+    if (mode_ != Mode::RING) return false;
+    while (!claims_.empty()) {   // drop claims the ring has moved past
+        Claim & c = claims_.front();
+        if (layers_[c.layer].ring_at[c.expert] == c.off) break;
+        adm_backlog_ -= layers_[c.layer].bytes[c.expert] - c.done;
+        claims_.pop_front();
+    }
+    if (claims_.empty()) return false;
+    if (piece_out_) {
+        if (cudaEventQuery(piece_ev_) != cudaSuccess) return false;
+        piece_out_ = false;
+    }
+    if (demand_out_) {
+        if (cudaEventQuery(demand_ev_) != cudaSuccess) return false;
+        demand_out_ = false;
+    }
+    Claim & c = claims_.front();
+    claim_issue(c, std::min(layers_[c.layer].bytes[c.expert], c.done + PIECE));
+    if (c.done == layers_[c.layer].bytes[c.expert]) claims_.pop_front();
+    if (!piece_ev_) TRUSS_CUDA(cudaEventCreateWithFlags(&piece_ev_, cudaEventDisableTiming));
+    TRUSS_CUDA(cudaEventRecord(piece_ev_, copy_));
+    piece_out_ = true;
+    return true;
 }
 
 void ExpertStore::prefetch_hint(int l, const int * ids, int n)
