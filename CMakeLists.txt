@@ -126,6 +126,8 @@ target_link_libraries(gdn_prefill_test PRIVATE truss_kernels truss_reference)
 add_executable(dsa_prefill_test tests/unit/dsa_prefill_test.cu)
 target_link_libraries(dsa_prefill_test PRIVATE truss_kernels truss_reference)
 
+add_executable(frac_decode_test tests/unit/frac_decode_test.cu)
+target_link_libraries(frac_decode_test PRIVATE truss_kernels truss_reference)
 add_executable(codec_v2one_test tests/unit/codec_v2one_test.cu)
 target_link_libraries(codec_v2one_test PRIVATE truss_encode)
 

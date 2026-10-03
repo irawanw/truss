@@ -6,6 +6,7 @@
 // activations), no further from the exact (unrounded-activation) product than the GPU's fp16 activations are.
 #include "cpu/expert_q4.h"
 #include "cpu/expert_trellis.h"
+#include "formats/trellis_k.h"
 
 #include <immintrin.h>
 
@@ -14,6 +15,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <string>
 #include <cstdlib>
 #include <cstring>
 #include <random>
@@ -46,7 +48,7 @@ struct Mat {
 Mat make(int K, int in, int out, std::mt19937 & g)
 {
     Mat M;
-    M.tiles.resize((size_t) in / 16 * (out / 16) * 8 * K);
+    M.tiles.resize((size_t) in / 16 * (out / 16) * (truss::formats::k_tile_u16(K) / 2));
     for (auto & w : M.tiles) w = g();
     std::uniform_real_distribution<float> s(0.5f, 1.5f);
     M.suh.resize(in), M.svh.resize(out);
@@ -156,7 +158,7 @@ int main(int argc, char ** argv)
     const int threads = argc > 1 ? std::atoi(argv[1]) : 12, Ks = argc > 2 ? std::atoi(argv[2]) : 2;
     std::mt19937 g(7);
     bool ok = true;
-    for (int K = 1; K <= 4; ++K)
+    for (int K : { 1, 2, 3, 4, 25, 35 })   // 25 / 35: K2.5 / K3.5 (formats/trellis_k.h)
         for (int R : { 1, 3, 8 }) {
             // pass: within 1e-5 of the fp16-activation reference (gemv_tiles4), or (int16 activations, gemv_i16) no
             // further from the exact product than the GPU's own fp16 activations are
@@ -164,13 +166,35 @@ int main(int argc, char ** argv)
             const double e1 = check(K, 256, 128, R, g, &x1, &g1), e2 = check(K, 128, 384, R, g, &x2, &g2);
             const bool pass = (e1 < 1e-5 && e2 < 1e-5) || (x1 <= std::max(1e-5, g1) && x2 <= std::max(1e-5, g2));
             ok &= pass;
-            std::printf("K %d rows %d: rel err %.2e / %.2e (vs exact %.2e / %.2e, GPU fp16 act %.2e / %.2e)  %s\n", K, R,
+            std::printf("K %4.1f rows %d: rel err %.2e / %.2e (vs exact %.2e / %.2e, GPU fp16 act %.2e / %.2e)  %s\n", truss::formats::k_bits(K), R,
                         e1, e2, x1, x2, g1, g2, pass ? "ok" : "FAIL");
         }
+    // half-integer rates: trellis_weight_ref against exllamav3's own decode (tests/data/frac, frac_decode_test)
+    for (int K : { 25, 35 }) {
+        const std::string base = std::string("tests/data/frac/k") + std::to_string(K) + "_gate";
+        FILE * ft = std::fopen((base + ".trellis.u16").c_str(), "rb"), * fr = std::fopen((base + ".recon.f16").c_str(), "rb");
+        if (!ft || !fr) {
+            std::printf("K %4.1f fixture: %s missing (run from the repo root), skipped\n", truss::formats::k_bits(K), base.c_str());
+            if (ft) std::fclose(ft);
+            if (fr) std::fclose(fr);
+            continue;
+        }
+        std::vector<uint32_t> t((size_t) 8 * 40 * truss::formats::k_tile_u16(K) / 2);
+        std::vector<uint16_t> rc((size_t) 128 * 640), one(1, 0);
+        const bool rd = std::fread(t.data(), 4, t.size(), ft) == t.size() && std::fread(rc.data(), 2, rc.size(), fr) == rc.size();
+        std::fclose(ft), std::fclose(fr);
+        const TrellisMat m{ t.data(), K, 128, 640, one.data(), one.data() };
+        long bad = rd ? 0 : 1;
+        for (int o = 0; rd && o < 640; ++o)
+            for (int i = 0; i < 128; ++i) bad += trellis_weight_ref(m, o, i, true) != _cvtsh_ss(rc[(size_t) i * 640 + o]);
+        ok &= bad == 0;
+        std::printf("K %4.1f fixture: trellis_weight_ref vs exllamav3 reconstruct: %ld of 81920 differ  %s\n",
+                    truss::formats::k_bits(K), bad, bad ? "FAIL" : "ok");
+    }
 
     // speed: N experts of random K-bit tiles (the bytes are what matters; values are random)
     const int n_exp = 256;   // 256 x 1.6-6.6 MB > 128 MB L3
-    const size_t gu = (size_t) 2560 / 16 * (640 / 16) * 8 * Ks, dn = gu;
+    const size_t gu = (size_t) 2560 / 16 * (640 / 16) * (truss::formats::k_tile_u16(Ks) / 2), dn = gu;
     std::vector<uint32_t> buf((gu * 2 + dn) * n_exp);
     for (size_t i = 0; i < buf.size(); ++i) buf[i] = (uint32_t) (i * 2654435761u) ^ (uint32_t) (i >> 7);
     std::vector<uint16_t> s2560(2560, _cvtss_sh(1.f, 0)), s640(640, _cvtss_sh(0.01f, 0));
@@ -182,7 +206,7 @@ int main(int argc, char ** argv)
         ex[e].down = { b + 2 * gu, Ks, 640, 2560, s640.data(), s2560.data() };
     }
     const double mb = (gu * 2 + dn) * 4 / 1e6;
-    std::printf("speed, K %d (%.2f MB per expert):\n", Ks, mb);
+    std::printf("speed, K %.1f (%.2f MB per expert):\n", truss::formats::k_bits(Ks), mb);
     std::vector<float> x(8 * 2560, 0.1f);
     for (int R : { 1, 2, 4 }) {
         std::vector<float> P(4 * 8 * 2560), gg(8 * 640), uu(8 * 640), y(8 * 2560);

@@ -27,9 +27,10 @@ void rms_norm(const float * x, const float * gamma, int gamma_rows, float * y, i
 // 1/sqrt(128)), in place; n is a multiple of 128.
 void hadamard128(float * x, int64_t n, cudaStream_t s);
 
-// Decode one trellis projection (mul1 codebook, integer K = 1..8) to W[o][i] fp32, straight from the bitstream
-// definition: 16x16 tiles stored k-tile-major (tile (kt, nt) at uint32 word (kt * out/16 + nt) * 8K); weight j of
-// a tile has the 16-bit state ending at circular stream bit (j + 1) * K, bits taken MSB-first from the uint32 words;
+// Decode one trellis projection (mul1 codebook, rate code K: integer 1..8 or 15/25/35 = K1.5/2.5/3.5, formats/trellis_k.h)
+// to W[o][i] fp32, straight from the bitstream definition: 16x16 tiles stored k-tile-major (tile (kt, nt) at uint16
+// word (kt * out/16 + nt) * k_tile_u16(K)); weight j of a tile has the 16-bit state ending at circular stream bit
+// k_window_end(K, j) ((j + 1) * K for integer K), bits taken MSB-first from the uint32 words;
 // value = fp16 fma(bytesum(state * 0x83DCD12D) + 0x6400 as fp16, 1/147.7, -10.39); j = 8 * lane + i sits at
 // (n, k) of the tile per the tensor-core fragment order (codec_mul1.cuh). No Hadamard, no suh/svh.
 void trellis_dequant(const uint16_t * words, int K, int in, int out, float * W, cudaStream_t s);

@@ -760,7 +760,7 @@ struct Forward::Impl {
                     cpu::TrellisMat m[3];
                     for (int p = 0; p < 3; ++p) {
                         const formats::ExpertTable & T = *tab[p];
-                        require(T.k[e] >= 1 && T.k[e] <= 6, "CPU tier: trellis K out of 1..6");
+                        require((T.k[e] >= 1 && T.k[e] <= 6) || T.k[e] == 25 || T.k[e] == 35, "CPU tier: trellis K out of 1..6, 25, 35");
                         m[p] = { reinterpret_cast<const uint32_t *>(experts->host_part(l, e, p)), T.k[e], (int) T.in,
                                  (int) T.out,
                                  reinterpret_cast<const uint16_t *>(T.suh->data) + (size_t) e * T.in,

@@ -26,7 +26,7 @@ namespace truss::cpu {
 
 struct TrellisMat {
     const uint32_t * tiles;   // (in/16) * (out/16) tiles of 8*K words, k-slice major
-    int K;                    // bits per weight, 1 .. 6
+    int K;                    // rate code (formats/trellis_k.h): 1 .. 6, or 25 / 35 = K2.5 / K3.5
     int in, out;              // multiples of 128
     const uint16_t * suh;     // [in] input signs/scales, fp16 bits (the pack's own tensor rows)
     const uint16_t * svh;     // [out]

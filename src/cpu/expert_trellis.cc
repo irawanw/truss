@@ -1,4 +1,5 @@
 #include "cpu/expert_trellis.h"
+#include "formats/trellis_k.h"
 
 #include <immintrin.h>
 
@@ -348,6 +349,140 @@ void gemv_i16(const TrellisMat & W, const float * P, int nt0, int nt1, float * c
                 }
 }
 
+// Half-integer rates K = KA + 0.5 (formats/trellis_k.h; TRACKER #118) on the int16 kernel above. Lane l's window m
+// starts at stream bit 4 P l + E(m) - 16 (P = 2 KA + 1 bits per weight pair, E = k_window_end of lane 0), so within an
+// octet lane i sits 4 P i bits after lane 0: a whole byte for even i, half a byte more for odd i. Per even m the
+// byte picks (as `pick`, but per lane) and the left shift of each dword are tables; states m and m + 1 (KA + 1 bits
+// apart) share m's 32-bit window as in gemv_i16 (shift <= 7, + KA + 1 + 16 <= 27 bits). Activations, sums and the
+// int32 flush are gemv_i16's.
+template <int KA, int R>
+void gemv_i16f(const TrellisMat & W, const float * P, int nt0, int nt1, float * c, int ldc, uint8_t * col)
+{
+    constexpr int PB = 2 * KA + 1, code = 10 * KA + 5;
+    const int words = formats::k_tile_u16(code) / 2, KT = W.in / 16, NT = W.out / 16, in = W.in, rs = trellis_prep_floats(in, 1);
+    const int stride = 4 * words + 32;
+    const __m256i bswap = _mm256_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12,
+                                           3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+    // per even m (index m / 2): byte offset of each half's first lane from the octet start, picks, shifts
+    int off[4][2];
+    __m256i pick[4], shl0[4], shl1[4];
+    for (int mi = 0; mi < 4; ++mi) {
+        const int m = 2 * mi;
+        alignas(32) int8_t idx[32];
+        alignas(32) int32_t sh0[8], sh1[8];
+        for (int h = 0; h < 2; ++h) {
+            off[mi][h] = (4 * PB * (4 * h) + formats::k_window_end(code, m) + 16) >> 3;
+            for (int i = 0; i < 4; ++i) {
+                const int bit = 4 * PB * (4 * h + i) + formats::k_window_end(code, m) + 16;   // in col (4 front bytes)
+                const int b = (bit >> 3) - off[mi][h];
+                for (int k = 0; k < 4; ++k) idx[16 * h + 4 * i + k] = (int8_t) (b + 3 - k);
+                sh0[4 * h + i] = 16 - (bit & 7);           // state m: (w << s) >> 16 = w >> (16 - s)
+                sh1[4 * h + i] = (bit & 7) + KA + 1;       // state m + 1 into the high half
+            }
+        }
+        pick[mi] = _mm256_load_si256(reinterpret_cast<const __m256i *>(idx));
+        shl0[mi] = _mm256_load_si256(reinterpret_cast<const __m256i *>(sh0));
+        shl1[mi] = _mm256_load_si256(reinterpret_cast<const __m256i *>(sh1));
+    }
+    const __m256i mlo = _mm256_set1_epi16((short) 0xD12D), mhi = _mm256_set1_epi16((short) 0x83DC);
+    const __m256i lo8 = _mm256_set1_epi16(0x00ff), ones8 = _mm256_set1_epi8(1);
+    const float kinv = k_inv(), cb = std::fma(1024.f, k_inv(), k_bias());
+    float scale[R], suma[R];
+    for (int r = 0; r < R; ++r) {
+        const float * tail = P + (size_t) r * rs + in;
+        scale[r] = tail[0], suma[r] = tail[1];
+    }
+    constexpr int KB = 8;
+    const int ncol = nt1 - nt0;
+    alignas(32) float facc[512 / 16][4][2][R][8];
+    std::memset(facc, 0, sizeof(float) * 8 * R * 8 * ncol);
+    auto prefetch_block = [&](int k0) {
+        for (int kt = k0; kt < std::min(KT, k0 + KB); ++kt) {
+            const char * t = reinterpret_cast<const char *>(W.tiles + ((size_t) kt * NT + nt0) * words);
+            const int n = ncol * words * 4;
+            for (int b = 0; b < n; b += 64) _mm_prefetch(t + b, _MM_HINT_T0);
+        }
+    };
+    prefetch_block(0);
+    for (int k0 = 0; k0 < KT; k0 += KB) {
+        const int k1 = std::min(KT, k0 + KB);
+        if (k1 < KT) prefetch_block(k1);
+        for (int nt = nt0; nt < nt1; ++nt) {
+            for (int kt = k0; kt < k1; ++kt) {
+                const uint32_t * t = W.tiles + ((size_t) kt * NT + nt) * words;
+                uint8_t * d = col + (size_t) (kt - k0) * stride;
+                const uint32_t last = __builtin_bswap32(t[words - 1]);
+                std::memcpy(d, &last, 4);
+                int w = 0;
+                for (; w + 8 <= words; w += 8)
+                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(d + 4 + 4 * w),
+                                        _mm256_shuffle_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(t + w)), bswap));
+                for (; w < words; ++w) {
+                    const uint32_t v = __builtin_bswap32(t[w]);
+                    std::memcpy(d + 4 + 4 * w, &v, 4);
+                }
+            }
+            for (int o = 0; o < 4; ++o) {
+                __m256i iacc[2][R];
+                for (int r = 0; r < R; ++r) iacc[0][r] = iacc[1][r] = _mm256_setzero_si256();
+                for (int kt = k0; kt < k1; ++kt) {
+                    const uint8_t * d = col + (size_t) (kt - k0) * stride + 4 * PB * o;   // lane 8o: 32 P o bits in
+                    const int16_t * q = reinterpret_cast<const int16_t *>(P) + (size_t) kt * 32;
+                    auto pair = [&](auto mc) {
+                        constexpr int mi = decltype(mc)::value, m = 2 * mi;
+                        const __m256i raw = _mm256_loadu2_m128i(reinterpret_cast<const __m128i *>(d + off[mi][1]),
+                                                                reinterpret_cast<const __m128i *>(d + off[mi][0]));
+                        const __m256i w = _mm256_shuffle_epi8(raw, pick[mi]);
+                        const __m256i s = _mm256_blend_epi16(_mm256_srlv_epi32(w, shl0[mi]), _mm256_sllv_epi32(w, shl1[mi]), 0xAA);
+                        const __m256i lo = _mm256_mullo_epi16(s, mlo);
+                        const __m256i hi = _mm256_add_epi16(_mm256_mulhi_epu16(s, mlo), _mm256_mullo_epi16(s, mhi));
+                        const __m256i bs = _mm256_add_epi16(_mm256_maddubs_epi16(lo, ones8),
+                                                            _mm256_add_epi16(_mm256_and_si256(hi, lo8), _mm256_srli_epi16(hi, 8)));
+                        constexpr int v = (m >> 1) & 1, g = m >> 2;
+                        for (int r = 0; r < R; ++r) {
+                            const __m256i av = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q + (size_t) r * rs * 2 + v * 16));
+                            iacc[g][r] = _mm256_add_epi32(iacc[g][r], _mm256_madd_epi16(bs, av));
+                        }
+                    };
+                    pair(std::integral_constant<int, 0>{}), pair(std::integral_constant<int, 1>{});
+                    pair(std::integral_constant<int, 2>{}), pair(std::integral_constant<int, 3>{});
+                }
+                for (int r = 0; r < R; ++r)
+                    for (int g = 0; g < 2; ++g) {
+                        float * f = facc[nt - nt0][o][g][r];
+                        _mm256_store_ps(f, _mm256_add_ps(_mm256_load_ps(f), _mm256_cvtepi32_ps(iacc[g][r])));
+                    }
+            }
+        }
+    }
+    for (int nt = nt0; nt < nt1; ++nt)
+        for (int o = 0; o < 4; ++o)
+            for (int r = 0; r < R; ++r)
+                for (int g = 0; g < 2; ++g) {
+                    const float * f = facc[nt - nt0][o][g][r];
+                    float * cr = c + (size_t) r * ldc + (nt - nt0) * 16 + 8 * g;
+                    const float ks = kinv * scale[r], bias = cb * suma[r];
+                    cr[2 * o] = std::fma(ks, f[0] + f[1] + f[2] + f[3], bias);
+                    cr[2 * o + 1] = std::fma(ks, f[4] + f[5] + f[6] + f[7], bias);
+                }
+}
+
+template <int KA>
+void dispatch_i16f(const TrellisMat & W, const float * P, int R, int nt0, int nt1, float * c, uint8_t * col)
+{
+    const int rs = trellis_prep_floats(W.in, 1);
+    for (int r0 = 0; r0 < R; r0 += 4) {
+        const float * Pr = P + (size_t) r0 * rs;
+        float * cr = c + (size_t) r0 * 512;
+        switch (std::min(4, R - r0)) {
+        case 1: gemv_i16f<KA, 1>(W, Pr, nt0, nt1, cr, 512, col); break;
+        case 2: gemv_i16f<KA, 2>(W, Pr, nt0, nt1, cr, 512, col); break;
+        case 3: gemv_i16f<KA, 3>(W, Pr, nt0, nt1, cr, 512, col); break;
+        default: gemv_i16f<KA, 4>(W, Pr, nt0, nt1, cr, 512, col); break;
+        }
+    }
+}
+
 template <int K>
 void dispatch_i16(const TrellisMat & W, const float * P, int R, int nt0, int nt1, float * c, uint8_t * col)
 {
@@ -426,15 +561,15 @@ void dispatch6(const TrellisMat & W, const float * P, int R, bool round, int nt0
 
 float trellis_weight_ref(const TrellisMat & W, int o, int i, bool r16)
 {
-    const int K = W.K;
-    const uint32_t * tile = W.tiles + ((size_t) (i / 16) * (W.out / 16) + o / 16) * 8 * K;
+    const int K = W.K;   // rate code (formats/trellis_k.h)
+    const uint32_t * tile = W.tiles + ((size_t) (i / 16) * (W.out / 16) + o / 16) * (formats::k_tile_u16(K) / 2);
     const int n = o % 16, k = i % 16;
     const int lane = (n % 8) * 4 + (k % 8) / 2;
     const int j = lane * 8 + (k & 1) + (k >= 8 ? 2 : 0) + (n >= 8 ? 4 : 0);
-    const int bits = 256 * K;
+    const int bits = formats::k_tile_bits(K), end = formats::k_window_end(K, j);
     uint32_t state = 0;
     for (int b = 0; b < 16; ++b) {
-        const int p = (((j + 1) * K - 16 + b) % bits + bits) % bits;
+        const int p = ((end - 16 + b) % bits + bits) % bits;
         state = (state << 1) | ((tile[p / 32] >> (31 - p % 32)) & 1u);
     }
     const uint32_t x = state * 0x83DCD12Du;
@@ -455,7 +590,7 @@ void trellis_prep(const TrellisMat & W, const float * x, int ldx, int R, float *
             _mm256_store_ps(a + i, _mm256_mul_ps(_mm256_loadu_ps(xr + i),
                                                  _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(W.suh + i)))));
         for (int b = 0; b < in; b += 128) hadamard128(a + b);
-        if (W.K <= 4 && use_i16() && !round_weights()) {   // gemv_i16: int16 [kt][v][16], then scale, sum
+        if ((W.K <= 4 && use_i16() && !round_weights()) || formats::k_frac(W.K)) {   // gemv_i16(f): int16 [kt][v][16], then scale, sum
             // lanes 2e + j of block (kt, v) read a[16 kt + 8 v + (2 (e % 4) + j)]: the 8 inputs a[16 kt + 8 v ..] twice
             const __m256 sign = _mm256_set1_ps(-0.f);
             __m256 mx = _mm256_setzero_ps();
@@ -504,7 +639,7 @@ TrellisMat trellis_inputs(const TrellisMat & W, int i0, int i1)
 {
     if (i0 < 0 || i1 > W.in || i0 >= i1 || i0 % 128 || i1 % 128) throw std::invalid_argument("trellis_inputs: range");
     TrellisMat s = W;
-    s.tiles = W.tiles + (size_t) (i0 / 16) * (W.out / 16) * 8 * W.K;   // k-slice major: slices i0/16 .. are contiguous
+    s.tiles = W.tiles + (size_t) (i0 / 16) * (W.out / 16) * (formats::k_tile_u16(W.K) / 2);   // k-slice major: slices i0/16 .. contiguous
     s.in = i1 - i0;
     s.suh = W.suh + i0;
     return s;
@@ -512,7 +647,8 @@ TrellisMat trellis_inputs(const TrellisMat & W, int i0, int i1)
 
 void trellis_gemv_raw(const TrellisMat & W, const float * P, int R, int c0, int c1, float * c, int ldc)
 {
-    if (W.K < 1 || W.K > 6) throw std::invalid_argument("trellis_gemv: K must be 1 .. 6");
+    if (!((W.K >= 1 && W.K <= 6) || W.K == 25 || W.K == 35))
+        throw std::invalid_argument("trellis_gemv: K must be 1 .. 6, 25 or 35 (K2.5 / K3.5)");
     if (c0 % 128 || c1 % 128 || c1 > W.out || c0 >= c1 || R < 1 || R > MAXR)
         throw std::invalid_argument("trellis_gemv: column range / rows");
     alignas(32) float buf[MAXR * 512];
@@ -523,7 +659,9 @@ void trellis_gemv_raw(const TrellisMat & W, const float * P, int R, int c0, int 
     const bool round = round_weights();
     for (int b0 = c0; b0 < c1; b0 += 512) {   // at most 512 columns per pass of the kernels' buffer
         const int b1 = std::min(c1, b0 + 512), nb = b1 - b0;
-        if (W.K <= 4 && use_i16() && !round) dispatch_i16k(W, P, R, b0 / 16, b1 / 16, buf, col);
+        if (W.K == 25) dispatch_i16f<2>(W, P, R, b0 / 16, b1 / 16, buf, col);   // half-integer rates: int16 only
+        else if (W.K == 35) dispatch_i16f<3>(W, P, R, b0 / 16, b1 / 16, buf, col);
+        else if (W.K <= 4 && use_i16() && !round) dispatch_i16k(W, P, R, b0 / 16, b1 / 16, buf, col);
         else if (W.K <= 4) dispatch4(W, P, R, round, b0 / 16, b1 / 16, buf, col);
         else dispatch6(W, P, R, round, b0 / 16, b1 / 16, buf);
         for (int r = 0; r < R; ++r) std::memcpy(c + (size_t) r * ldc + (b0 - c0), buf + (size_t) r * 512, sizeof(float) * nb);

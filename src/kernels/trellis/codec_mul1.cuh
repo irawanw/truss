@@ -1,4 +1,5 @@
-// Trellis codec "mul1" (PAW X3 / exllamav3 EXL3 tiles, integer rates K = 1, 2, 3, 4).
+// Trellis codec "mul1" (PAW X3 / exllamav3 EXL3 tiles, integer rates K = 1, 2, 3, 4; half-integer rates
+// K = KA + 0.5 in Mul1Frac, exllamav3 v1.5.1 "frac" tiles, formats/trellis_k.h).
 //
 // Tile: 16x16 weights, 256 16-bit trellis states shifted K bits per weight, stored as 8*K uint32. Weight value =
 // mul1 codebook of its state: bytesum(state * 0x83DCD12D) mapped to fp16 by one hfma2.
@@ -172,6 +173,54 @@ struct Mul1 {
             const uint32_t b = __shfl_sync(0xffffffffu, w, src_b);
             mul1_detail::states8_k3(a, b, s2, f0, f1);
         }
+    }
+};
+
+// Half-integer rate K = KA + 0.5 (exllamav3 v1.5.1 frac, MASK 0xAAAA; TRACKER #118): a tile is a ring of
+// 128 * (2 KA + 1) bits = 8 KA + 4 uint32, weight j's window ends at S(j) = (2 KA + 1)(j >> 1) + KA + (j & 1)(KA + 1)
+// (formats/trellis_k.h). A lane's 8 windows (j = 8 lane + m) form two groups of four; a group spans
+// 3 KA + 18 <= 32 bits, so one funnel shift of two ring words holds it: 4 shuffles per tile.
+template <int KA>
+struct Mul1Frac {
+    static_assert(KA >= 1 && KA <= 4, "mul1 frac: KA 1..4");
+    static constexpr const char * NAME = "mul1-frac";
+    static constexpr int TILE_WORDS = 8 * KA + 4;
+    static constexpr int TILES_PER_VEC = 1;
+    static constexpr int VEC_WORDS = TILE_WORDS;
+    static constexpr int P = 2 * KA + 1;                  // bits per pair of weights
+    // window m of a group ends this many bits after the group's first bit (16 = the first window's end)
+    static constexpr int D1 = 16 + KA + 1, D2 = 16 + P, D3 = 16 + P + KA + 1;
+
+    int lane, wa[2] = {}, wb[2] = {}, sh[2] = {};
+
+    __device__ explicit Mul1Frac(int lane_) : lane(lane_)
+    {
+        constexpr int R = 32 * TILE_WORDS;
+        for (int g = 0; g < 2; ++g) {
+            const int end0 = P * (4 * lane + 2 * g) + KA;    // window 8 lane + 4 g
+            const int lo = ((end0 - 16) % R + R) % R;         // ring bit of the group's first (MSB) bit
+            wa[g] = lo >> 5;
+            wb[g] = (wa[g] + 1) % TILE_WORDS;
+            sh[g] = 32 - (lo & 31);                           // chunk = 32 ring bits from lo, MSB first
+        }
+    }
+
+    __device__ bool loads(int l) const { return l < VEC_WORDS; }
+
+    __device__ __forceinline__ void tile(uint32_t w, int, FragB & f0, FragB & f1) const
+    {
+        uint32_t s[8];
+#pragma unroll
+        for (int g = 0; g < 2; ++g) {
+            const uint32_t a = __shfl_sync(0xffffffffu, w, wa[g]);
+            const uint32_t b = __shfl_sync(0xffffffffu, w, wb[g]);
+            const uint32_t c = mul1_detail::fshift(b, a, sh[g]);
+            s[4 * g + 0] = c >> 16;
+            s[4 * g + 1] = (c >> (32 - D1)) & 0xffff;
+            s[4 * g + 2] = (c >> (32 - D2)) & 0xffff;
+            s[4 * g + 3] = (c >> (32 - D3)) & 0xffff;
+        }
+        mul1_detail::codebook8(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], f0, f1);
     }
 };
 

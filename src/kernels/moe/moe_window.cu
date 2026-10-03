@@ -355,6 +355,8 @@ __device__ __forceinline__ void gemv_dispatch(int2 meta, const ProjView & P, con
         case 2: gemv_item<Mul1<2>, G>(A, a_stride, rows, B32, C, k_off, k_slices, size_n, grp, red, ready); break;
         case 3: gemv_item<Mul1<3>, G>(A, a_stride, rows, B32, C, k_off, k_slices, size_n, grp, red, ready); break;
         case 4: gemv_item<Mul1<4>, G>(A, a_stride, rows, B32, C, k_off, k_slices, size_n, grp, red, ready); break;
+        case 25: gemv_item<Mul1Frac<2>, G>(A, a_stride, rows, B32, C, k_off, k_slices, size_n, grp, red, ready); break;
+        case 35: gemv_item<Mul1Frac<3>, G>(A, a_stride, rows, B32, C, k_off, k_slices, size_n, grp, red, ready); break;
         default: break;   // unsupported rate: the pack loader rejects it before a kernel runs
     }
 }

@@ -202,6 +202,8 @@ __device__ __forceinline__ void mma_chunk_k(int K, const half * As, int n_rg, co
         case 2: mma_chunk<Mul1<2>>(As, n_rg, B32, kc, nt0, ntiles, acc); break;
         case 3: mma_chunk<Mul1<3>>(As, n_rg, B32, kc, nt0, ntiles, acc); break;
         case 4: mma_chunk<Mul1<4>>(As, n_rg, B32, kc, nt0, ntiles, acc); break;
+        case 25: mma_chunk<Mul1Frac<2>>(As, n_rg, B32, kc, nt0, ntiles, acc); break;
+        case 35: mma_chunk<Mul1Frac<3>>(As, n_rg, B32, kc, nt0, ntiles, acc); break;
         default: break;   // unsupported rate: the pack loader rejects it before a kernel runs
     }
 }

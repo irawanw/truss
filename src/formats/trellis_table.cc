@@ -32,7 +32,7 @@ ExpertTable read_expert_table(const gguf::File & f, const std::string & prefix)
     for (int e = 0; e < t.n_expert; ++e) {
         t.k[e] = m[2 * e];
         t.offset[e] = m[2 * e + 1];
-        if (t.k[e] < 1 || t.k[e] > 8) fail("expert " + std::to_string(e) + " K=" + std::to_string(t.k[e]));
+        if (!k_valid(t.k[e])) fail("expert " + std::to_string(e) + " K=" + std::to_string(t.k[e]));
         if (t.offset[e] != next)
             fail("expert " + std::to_string(e) + " at word " + std::to_string(t.offset[e]) + ", expected " +
                  std::to_string(next));

@@ -3,6 +3,7 @@
 // Shape: Flash-Next layer. Env: TRUSS_KFIX (0 = mixed 1..4 per expert), TRUSS_REPS.
 // usage: moe_prefill_test [n_tokens ...]
 #include "core/cuda_check.h"
+#include "formats/trellis_k.h"
 #include "kernels/moe/moe_prefill.cuh"
 #include "kernels/moe/moe_window.cuh"
 
@@ -43,9 +44,10 @@ struct RandomLayer {
             std::vector<int32_t> meta(2 * n_expert);
             int64_t words = 0;
             for (int e = 0; e < n_expert; ++e) {
-                meta[2 * e] = kfix ? kfix : 1 + (e + p) % 4;
+                static constexpr int RATES[] = { 1, 2, 3, 4, 25, 35 };   // 25/35: K2.5/K3.5 (formats/trellis_k.h)
+                meta[2 * e] = kfix ? kfix : RATES[(e + p) % 6];
                 meta[2 * e + 1] = (int32_t) words;
-                words += 16 * meta[2 * e] * ntiles;
+                words += formats::k_tile_u16(meta[2 * e]) * ntiles;
                 k_of[p].push_back(meta[2 * e]);
             }
             std::vector<uint16_t> tw(words);
