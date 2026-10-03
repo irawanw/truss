@@ -47,9 +47,11 @@ template <class Shape> size_t select_workspace_bytes(int max_queries, int n_ctx)
 
 // idx_q [T][IH][ID] (normed, roped), idx_k [n_blocks][ID] (pooled, normed, roped at the block start) ->
 // blocks [T][TOP_BLOCKS] (the first n_blocks[t] entries used, ascending), n_blocks [T].
+// Up to SELECT_FEW_ROWS queries take a 1024-thread form (decode); rowwise forces the prefill form (tests compare them).
+constexpr int SELECT_FEW_ROWS = 8;
 template <class Shape>
 void select(const half * idx_q, const half * idx_k, int pos0, int T, int * blocks, int * n_blocks, void * ws,
-            size_t ws_bytes, cudaStream_t stream);
+            size_t ws_bytes, cudaStream_t stream, bool rowwise = false);
 
 // Chunks of up to SPLIT_ROWS queries split each query's cells over up to 32 CTAs (flash-decoding) and need a
 // workspace of attention_workspace_bytes(T) (0 for longer chunks). Split and unsplit results differ by fp32

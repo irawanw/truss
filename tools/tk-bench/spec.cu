@@ -8,6 +8,7 @@
 // usage: tk-bench-spec <model.gguf> <mtp.gguf> @prompt.i32[,@prompt2.i32...] [tokens=128] [drafts=3] [usage file|-]
 //                      [n_ctx=65536] [chunk=8192] [draft vocab ids file|-] [cpu tier dir|-] [draft min p=0]
 #include "core/cuda_check.h"
+#include <cuda_profiler_api.h>
 #include "kernels/sampling/argmax.cuh"
 #include "model/qwen4exp/config.h"
 #include "model/qwen4exp/forward.h"
@@ -190,6 +191,9 @@ int main(int argc, char ** argv)
             // device-side time per section (events bracket device work; host waits excluded): splits GPU compute from
             // driver/CPU/PCIe stalls (TRACKER #61: pass-time breakdown without nsys, which needs root here).
             float ms_draft = 0.f, ms_verify = 0.f, ms_head = 0.f;
+            // TRUSS_BENCH_PROFRANGE=1: the decode loops are the only cudaProfilerApi range (nsys --capture-range)
+            const bool prange = std::getenv("TRUSS_BENCH_PROFRANGE") && std::atoi(std::getenv("TRUSS_BENCH_PROFRANGE"));
+            if (prange) TRUSS_CUDA(cudaProfilerStart());
             const auto t0 = std::chrono::steady_clock::now();
             while ((int) got.size() < N) {
                 int32_t win[9], best[9];
@@ -217,6 +221,7 @@ int main(int argc, char ** argv)
                 ++passes, drafted += nw, accepted += j;
             }
             const double spec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (prange) TRUSS_CUDA(cudaProfilerStop());
             got.resize(N);
             int same = 0;
             if (do_plain)

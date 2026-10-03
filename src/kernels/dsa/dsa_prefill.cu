@@ -157,6 +157,108 @@ __global__ void __launch_bounds__(SELECT_THREADS) select_kernel(const float * sc
     if (tid == 0) n_blocks[t] = TOP;
 }
 
+// Few queries (decode steps, verify windows): the same selection with 1024 threads per query, and the final pass
+// over contiguous per-thread ranges of blocks (two block scans) instead of SELECT_THREADS blocks per round with two
+// scans each (148 us per call at 150K context, TRACKER #111). Same keys, same tie rule, same output.
+constexpr int FEW_THREADS = 1024;
+
+template <class Shape>
+__global__ void __launch_bounds__(FEW_THREADS) select_few_kernel(const float * scores, int ld, int pos0, int q0,
+                                                                 int * blocks, int * n_blocks)
+{
+    constexpr int R = Shape::RATIO, TOP = Shape::TOP_BLOCKS;
+    using Scan = cub::BlockScan<int, FEW_THREADS>;
+    __shared__ typename Scan::TempStorage scan;
+    __shared__ unsigned hist[256];
+    __shared__ int after[FEW_THREADS];
+    __shared__ unsigned s_prefix, s_mask, s_need;
+    const int tq = blockIdx.x, t = q0 + tq, tid = threadIdx.x;
+    const int seen = (pos0 + t + 1) / R;
+    int * out = blocks + (size_t) t * TOP;
+    if (seen <= TOP) {
+        for (int b = tid; b < seen; b += FEW_THREADS) out[b] = b;
+        if (tid == 0) n_blocks[t] = seen;
+        return;
+    }
+    const float * row = scores + (size_t) tq * ld;
+    auto key = [&](int b) { return __float_as_uint(row[b]); };
+
+    if (tid == 0) s_prefix = 0, s_mask = 0, s_need = TOP;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int i = tid; i < 256; i += FEW_THREADS) hist[i] = 0;
+        __syncthreads();
+        const unsigned prefix = s_prefix, mask = s_mask;
+        for (int b = tid; b < seen; b += FEW_THREADS) {
+            const unsigned k = key(b);
+            if ((k & mask) == prefix) atomicAdd(&hist[(k >> shift) & 255], 1u);
+        }
+        __syncthreads();
+        if (tid < 32) {   // the bin holding the need-th largest key: warp 0, 8 bins per lane from the top
+            const int lane = tid;
+            unsigned c[8], sum = 0;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) c[i] = hist[255 - 8 * lane - i], sum += c[i];
+            unsigned incl = sum;   // keys in the bins at or above this lane's (inclusive scan from the top)
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const unsigned v = __shfl_up_sync(0xffffffffu, incl, o);
+                if (lane >= o) incl += v;
+            }
+            const unsigned need = s_need, above0 = incl - sum;
+            const bool mine = above0 < need && incl >= need;
+            if (mine) {
+                unsigned above = above0;
+                for (int i = 0; i < 8; ++i) {
+                    if (above + c[i] >= need) {
+                        const unsigned bin = 255 - 8 * lane - i;
+                        s_prefix = prefix | bin << shift;
+                        s_mask = mask | 255u << shift;
+                        s_need = need - above;
+                        break;
+                    }
+                    above += c[i];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    const unsigned kth = s_prefix;
+    const int need_eq = (int) s_need;
+
+    // thread i owns blocks [lo, hi); counts of later threads come from scans over the reversed thread order
+    const int per = (seen + FEW_THREADS - 1) / FEW_THREADS;
+    const int lo = min(seen, tid * per), hi = min(seen, lo + per);
+    int gt = 0, eq = 0;
+    for (int b = lo; b < hi; ++b) {
+        const unsigned k = key(b);
+        gt += k > kth, eq += k == kth;
+    }
+    auto later = [&](int v) {   // sum of v over the threads after this one
+        after[FEW_THREADS - 1 - tid] = v;
+        __syncthreads();
+        int x = after[tid], ex;
+        __syncthreads();
+        Scan(scan).ExclusiveSum(x, ex);
+        __syncthreads();
+        after[FEW_THREADS - 1 - tid] = ex;
+        __syncthreads();
+        const int r = after[tid];
+        __syncthreads();
+        return r;
+    };
+    const int eq_after = later(eq);
+    const int eq_keep = max(0, min(eq, need_eq - eq_after));   // this range's latest equal keys
+    int pos = later(gt + eq_keep);                              // kept blocks after this range
+    int eq_seen = 0;
+    for (int b = hi - 1; b >= lo; --b) {
+        const unsigned k = key(b);
+        bool take = k > kth;
+        if (k == kth) take = eq_seen++ < eq_keep;
+        if (take) out[TOP - 1 - pos++] = b;
+    }
+    if (tid == 0) n_blocks[t] = TOP;
+}
+
 // ---- sparse attention
 
 constexpr int ATTN_WARPS = 2, TILE = 16 * ATTN_WARPS;   // cells per gathered tile, 16 per warp
@@ -419,7 +521,7 @@ template <class Shape> size_t select_workspace_bytes(int max_queries, int n_ctx)
 
 template <class Shape>
 void select(const half * idx_q, const half * idx_k, int pos0, int T, int * blocks, int * n_blocks, void * ws,
-            size_t ws_bytes, cudaStream_t stream)
+            size_t ws_bytes, cudaStream_t stream, bool rowwise)
 {
     const int ld = (pos0 + T) / Shape::RATIO;   // blocks the last query can see
     if (T <= 0 || pos0 < 0) throw std::invalid_argument("dsa::select: bad chunk");
@@ -434,7 +536,10 @@ void select(const half * idx_q, const half * idx_k, int pos0, int T, int * block
         if (last_seen > Shape::TOP_BLOCKS)   // some query needs scores
             score_kernel<Shape><<<dim3((n_q + SQ - 1) / SQ, (last_seen + SB - 1) / SB), 256, 0, stream>>>(
                 idx_q, idx_k, pos0, q0, n_q, scores, ld);
-        select_kernel<Shape><<<n_q, SELECT_THREADS, 0, stream>>>(scores, ld, pos0, q0, blocks, n_blocks);
+        if (n_q <= SELECT_FEW_ROWS && !rowwise)
+            select_few_kernel<Shape><<<n_q, FEW_THREADS, 0, stream>>>(scores, ld, pos0, q0, blocks, n_blocks);
+        else
+            select_kernel<Shape><<<n_q, SELECT_THREADS, 0, stream>>>(scores, ld, pos0, q0, blocks, n_blocks);
     }
     TRUSS_CUDA(cudaGetLastError());
 }
@@ -477,7 +582,7 @@ void attention(const half * q, const float * gate, const KvCache & kc, const int
 }
 
 template size_t select_workspace_bytes<FlashNext>(int, int);
-template void select<FlashNext>(const half *, const half *, int, int, int *, int *, void *, size_t, cudaStream_t);
+template void select<FlashNext>(const half *, const half *, int, int, int *, int *, void *, size_t, cudaStream_t, bool);
 template size_t attention_workspace_bytes<FlashNext>(int);
 template void attention<FlashNext>(const half *, const float *, const half *, const half *, const int *, const int *,
                                    int, int, half *, void *, size_t, cudaStream_t);

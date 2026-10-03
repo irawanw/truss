@@ -211,6 +211,50 @@ int run(int n_ctx, int pos0, int T, bool check, std::mt19937 & rng)
 
 }  // namespace
 
+// select's decode form (<= SELECT_FEW_ROWS queries, 1024 threads) vs its prefill form (rowwise): the same blocks in
+// the same order, bit for bit. coarse: indexer keys rounded to 1/4 so many scores tie (the tie rule decides).
+int select_exact(int pos0, int T, bool coarse, std::mt19937 & rng)
+{
+    const int n_ctx = pos0 + T, nb = n_ctx / R;
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<half> hq((size_t) T * IH * ID), hk((size_t) nb * ID);
+    for (auto & x : hq) x = __float2half(coarse ? std::round(nd(rng)) : nd(rng));
+    for (auto & x : hk) x = __float2half(coarse ? std::round(4 * nd(rng)) / 4 : nd(rng));
+    half * iq = dalloc<half>(hq.size()), * ik = dalloc<half>(hk.size());
+    TRUSS_CUDA(cudaMemcpy(iq, hq.data(), hq.size() * 2, cudaMemcpyHostToDevice));
+    TRUSS_CUDA(cudaMemcpy(ik, hk.data(), hk.size() * 2, cudaMemcpyHostToDevice));
+    const size_t ws_bytes = dsa::select_workspace_bytes<Shape>(T, n_ctx);
+    void * ws = dalloc<unsigned char>(ws_bytes);
+    int * b0 = dalloc<int>((size_t) T * TOP), * b1 = dalloc<int>((size_t) T * TOP), * n0 = dalloc<int>(T), * n1 = dalloc<int>(T);
+    cudaEvent_t e[4];
+    for (auto & x : e) cudaEventCreate(&x);
+    dsa::select<Shape>(iq, ik, pos0, T, b0, n0, ws, ws_bytes, nullptr, true);   // warm-up
+    dsa::select<Shape>(iq, ik, pos0, T, b1, n1, ws, ws_bytes, nullptr);
+    cudaEventRecord(e[0]);
+    dsa::select<Shape>(iq, ik, pos0, T, b0, n0, ws, ws_bytes, nullptr, true);
+    cudaEventRecord(e[1]);
+    dsa::select<Shape>(iq, ik, pos0, T, b1, n1, ws, ws_bytes, nullptr);
+    cudaEventRecord(e[2]);
+    TRUSS_CUDA(cudaEventSynchronize(e[2]));
+    float ms_row, ms_few;
+    cudaEventElapsedTime(&ms_row, e[0], e[1]);
+    cudaEventElapsedTime(&ms_few, e[1], e[2]);
+    std::vector<int> h0((size_t) T * TOP), h1(h0.size()), c0(T), c1(T);
+    TRUSS_CUDA(cudaMemcpy(h0.data(), b0, h0.size() * 4, cudaMemcpyDeviceToHost));
+    TRUSS_CUDA(cudaMemcpy(h1.data(), b1, h1.size() * 4, cudaMemcpyDeviceToHost));
+    TRUSS_CUDA(cudaMemcpy(c0.data(), n0, T * 4, cudaMemcpyDeviceToHost));
+    TRUSS_CUDA(cudaMemcpy(c1.data(), n1, T * 4, cudaMemcpyDeviceToHost));
+    long bad = 0;
+    for (int t = 0; t < T; ++t) {
+        bad += c0[t] != c1[t];
+        for (int i = 0; i < c0[t]; ++i) bad += h0[(size_t) t * TOP + i] != h1[(size_t) t * TOP + i];
+    }
+    std::printf("select exact: pos0=%-6d T=%d %s rowwise %.3f ms, few %.3f ms: %s (%ld differ)\n", pos0, T,
+                coarse ? "ties  " : "random", ms_row, ms_few, bad ? "FAIL" : "ok", bad);
+    for (void * p : { (void *) iq, (void *) ik, ws, (void *) b0, (void *) b1, (void *) n0, (void *) n1 }) cudaFree(p);
+    return bad ? 1 : 0;
+}
+
 int main()
 {
     try {
@@ -227,6 +271,9 @@ int main()
         fails += run(32768, 24576, 8192, false, rng);
         fails += run(32768, 32767, 1, false, rng);    // decode step at 32K
         fails += run(32768, 32764, 4, false, rng);    // 4-token verify window at 32K
+        for (bool coarse : { false, true })
+            for (int pos0 : { 1000, 3001, 40000, 149180, 262140 - 8 })
+                for (int T : { 1, 3, 4, 8 }) fails += select_exact(pos0, T, coarse, rng);
         std::printf("%s\n", fails ? "FAIL" : "PASS");
         return fails ? 1 : 0;
     } catch (const std::exception & e) {
