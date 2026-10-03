@@ -7,7 +7,7 @@ import os
 
 import numpy as np
 
-_DEFAULT_LIB = os.path.join(os.path.dirname(__file__), "..", "build", "libtruss.so")
+_DEFAULT_LIB = os.environ.get("TRUSS_LIB") or os.path.join(os.path.dirname(__file__), "..", "build", "libtruss.so")
 
 
 class TrussError(RuntimeError):
