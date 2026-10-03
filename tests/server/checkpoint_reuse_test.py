@@ -10,6 +10,8 @@ checkpoint and reads only the rest; (3) an unrelated prompt resets; (4) the fake
 import os
 import sys
 import threading
+
+IM = 99999   # <|im_start|>
 import types
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -36,6 +38,10 @@ class FakeModel:
         self.seq, self.restores = list(self.ck), self.restores + 1
         return len(self.seq)
 
+    def eval(self, tokens):
+        self.seq += list(tokens)
+        self.fed += len(tokens)
+
     def eval_argmax(self, tokens):
         self.seq += list(tokens)
         self.fed += len(tokens)
@@ -54,7 +60,8 @@ def main():
     e.model = FakeModel()
     e.chat = types.SimpleNamespace(tok=types.SimpleNamespace(decode=lambda ids, **k: "".join(f"<{i}>" for i in ids)))
     e.stop_ids, e.log_tag, e.log_path, e.dump_dir, e.cached, e.lock = set(), "test", None, None, [], threading.Lock()
-    e.ck_tokens, e.keep_reasoning, e.log = [], 0, (lambda line: None)
+    e.ck_tokens, e.keep_reasoning, e.log, e.im_start = [], 0, (lambda line: None), IM
+    S = [IM, 7, 8]   # the generation prompt's "<|im_start|>assistant\n": the checkpoint goes before it
     ok = True
 
     def check(name, cond, detail):
@@ -62,22 +69,26 @@ def main():
         ok &= cond
         print(f"{name}: {detail}  {'PASS' if cond else 'FAIL'}")
 
-    p1 = list(range(1, 1001))
+    p1 = list(range(1, 1001)) + S
     g1, fed, rs, zs = request(e, p1)
-    check("first prompt", fed == 1000 + 4 and zs == 1, f"fed {fed}, resets {zs}")   # 4 decode steps feed tokens
+    check("first prompt", fed == 1003 + 4 and zs == 1 and e.ck_tokens == p1[:1000], f"fed {fed}, resets {zs}, "
+          f"checkpoint at {len(e.ck_tokens)}")   # 4 decode steps feed tokens; the checkpoint before <|im_start|>
     # the client re-sends the reply with its reasoning (the generated tokens) and a tool result: plain reuse (the
     # last generated token was never fed, so it is read with the tail)
-    p2 = p1 + g1 + list(range(2001, 2051))
+    p2 = p1 + g1 + list(range(2001, 2051)) + S
     g2, fed, rs, zs = request(e, p2)
-    check("reply re-sent as generated", fed == 1 + 50 + 4 and rs == 0 and zs == 0, f"fed {fed}, restores {rs}, resets {zs}")
-    # the client re-sends the reply WITHOUT its reasoning (different tokens after the last prompt): restore
-    p3 = p2 + [9001, 9002] + list(range(3001, 3031))
+    check("reply re-sent as generated", fed == 1 + 50 + 3 + 4 and rs == 0 and zs == 0, f"fed {fed}, restores {rs}, resets {zs}")
+    # the client re-sends the reply WITHOUT its reasoning: the generation prompt's last token now tokenizes differently
+    # too (\n vs \n\n), so only the part before the last <|im_start|> is shared: restore there
+    ck = len(e.ck_tokens)
+    p3 = p2[:ck] + [IM, 7, 8001] + [9001, 9002] + list(range(3001, 3031)) + S
     g3, fed, rs, zs = request(e, p3)
-    check("reply re-sent stripped", fed == 32 + 4 and rs == 1 and zs == 0, f"fed {fed}, restores {rs}, resets {zs}")
+    check("reply re-sent stripped", fed == len(p3) - ck + 4 and rs == 1 and zs == 0,
+          f"fed {fed} (prompt tail {len(p3) - ck}), restores {rs}, resets {zs}")
     check("sequence after restore", e.model.seq == p3 + g3[:-1], f"{len(e.model.seq)} tokens, prompt + generated")
     # an unrelated prompt: reset
-    g4, fed, rs, zs = request(e, list(range(7001, 7101)))
-    check("unrelated prompt", fed == 100 + 4 and zs == 1 and rs == 0, f"fed {fed}, restores {rs}, resets {zs}")
+    g4, fed, rs, zs = request(e, list(range(7001, 7101)) + S)
+    check("unrelated prompt", fed == 103 + 4 and zs == 1 and rs == 0, f"fed {fed}, restores {rs}, resets {zs}")
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 

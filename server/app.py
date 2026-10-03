@@ -50,6 +50,7 @@ class Engine:
         self.cached = []               # tokens in the engine's sequence
         self.ck_tokens = []            # the sequence at the engine's checkpoint (the end of the last prompt)
         self.keep_reasoning = a.keep_reasoning
+        self.im_start = self.chat.token_id("<|im_start|>")
         self.lock = threading.Lock()
 
     def log(self, line: str):
@@ -116,9 +117,19 @@ class Engine:
 
             t0 = time.time()
             try:
-                nxt = step(prompt_ids[reuse:])
-                self.model.checkpoint()   # the end of this prompt (~10 ms): the next request may resume here
-                self.ck_tokens = list(prompt_ids)
+                # checkpoint just before the prompt's last <|im_start|> (~10 ms): the next request may resume there.
+                # Not at the prompt's end: its generation prompt ("...assistant\n<think>\n") tokenizes differently
+                # once the reply follows it ("\n\n</think>"), but nothing before a special token can change.
+                cut = next((i for i in range(len(prompt_ids) - 1, reuse, -1) if prompt_ids[i] == self.im_start), 0)
+                if cut > reuse:
+                    self.cached += prompt_ids[reuse:cut]
+                    self.model.eval(prompt_ids[reuse:cut])
+                    self.model.checkpoint()
+                    self.ck_tokens = list(prompt_ids[:cut])
+                    reuse_from = cut
+                else:
+                    reuse_from = reuse
+                nxt = step(prompt_ids[reuse_from:])
             except TrussError:
                 self.cached, self.ck_tokens = [], []   # the engine's sequence is unknown now: the next request starts over
                 raise

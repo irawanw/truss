@@ -154,9 +154,11 @@ turn since the last user message; a long agent loop (omp) carries ~90 thinking b
 ("✓ ✓ ✓" after every clause, "hmm hmm") is copied and amplified by the next turn. With K ≥ 0 the server drops
 `reasoning_content` / `reasoning` (and a `<think>…</think>` prefix in the content) from all but the last K assistant
 turns before rendering (`tools.strip_reasoning`). Measured on the A0 replays (9 loop sites x 2 seeds): as sent 7/18
-loop, K = 2 7/18, **K = 0 0/18**. Default −1 (as sent); the pm2 script uses 0. Prefix reuse survives it: after each
-prompt the engine checkpoints its state (`truss_checkpoint`), and a request that extends the last prompt but not the
-engine's reply (the reply now comes back without its thinking) restores the checkpoint and reads only the rest.
+loop, K = 2 7/18, **K = 0 0/18**. Default −1 (as sent); the pm2 script uses 0. Prefix reuse survives it: each prompt is read up to its last
+`<|im_start|>`, the engine checkpoints there (`truss_checkpoint`, ~10 ms), then reads the generation prompt; a
+request that extends that prefix but not the engine's reply (the reply now comes back without its thinking, and the
+generation prompt's `<think>\n` tokenizes differently once a reply follows it) restores the checkpoint and reads only
+the rest. Live (8113): a 97,541-token follow-up reused 97,473 and read 68 tokens in 1.2 s (44 s without).
 Tested by `tests/server/checkpoint_reuse_test.py` (host).
 
 **Penalties** (plan step A6, for the loop diagnosis): off by default (presence 0, frequency 0, repetition 1), so a
