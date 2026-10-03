@@ -1,8 +1,11 @@
 // sampling::sample against the exact distribution: for small vocabularies (and one of the real size), the empirical
 // frequencies over many rows (one launch, each row its own random stream) match softmax(x / T) restricted to the
 // top-k / top-p / min-p set (total variation distance within sampling noise), no token outside the set is ever
-// drawn, and the same (seed, counter) draws the same token.
+// drawn, and the same (seed, counter) draws the same token. sampling::penalize against a host reference: bit-exact
+// logits per row (each row its own history, -1 padding and out-of-range ids ignored), and the count scratch back to
+// zero afterwards.
 #include "core/cuda_check.h"
+#include "kernels/sampling/penalty.cuh"
 #include "kernels/sampling/sample.cuh"
 
 #include <algorithm>
@@ -86,6 +89,54 @@ int run(int n, int rows, const sampling::SampleParams & p, std::mt19937 & rng, c
     return ok ? 0 : 1;
 }
 
+int run_penalty(int n, int rows, int h, const sampling::PenaltyParams & pp, std::mt19937 & rng, const char * what)
+{
+    std::normal_distribution<float> nd(0.f, 3.f);
+    std::uniform_int_distribution<int> tok(0, 40), pad(0, h / 2);
+    std::vector<float> x((size_t) rows * n);
+    for (float & v : x) v = nd(rng);
+    std::vector<int> hist((size_t) rows * h);
+    for (int r = 0; r < rows; ++r) {
+        const int np = pad(rng);   // a short history: -1 in front, ids clustered so tokens repeat
+        for (int i = 0; i < h; ++i) hist[(size_t) r * h + i] = i < np ? -1 : (i % 97 == 0 ? n + 5 : tok(rng) * (r + 1) % n);
+    }
+    std::vector<float> want = x;
+    for (int r = 0; r < rows; ++r) {
+        std::vector<int> c(n, 0);
+        for (int i = 0; i < h; ++i) {
+            const int t = hist[(size_t) r * h + i];
+            if (t >= 0 && t < n) ++c[t];
+        }
+        for (int t = 0; t < n; ++t) {
+            if (!c[t]) continue;
+            float v = want[(size_t) r * n + t];
+            if (pp.repeat != 1.f) v = v > 0.f ? v / pp.repeat : v * pp.repeat;
+            want[(size_t) r * n + t] = v - (float) c[t] * pp.frequency - pp.presence;
+        }
+    }
+    float * dx;
+    int * dh, * dc;
+    TRUSS_CUDA(cudaMalloc(&dx, x.size() * 4));
+    TRUSS_CUDA(cudaMalloc(&dh, hist.size() * 4));
+    TRUSS_CUDA(cudaMalloc(&dc, (size_t) rows * n * 4));
+    TRUSS_CUDA(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+    TRUSS_CUDA(cudaMemcpy(dh, hist.data(), hist.size() * 4, cudaMemcpyHostToDevice));
+    TRUSS_CUDA(cudaMemset(dc, 0, (size_t) rows * n * 4));
+    sampling::penalize(dx, n, rows, dh, h, pp, dc, nullptr);
+    std::vector<float> got(x.size());
+    std::vector<int> cnt((size_t) rows * n);
+    TRUSS_CUDA(cudaMemcpy(got.data(), dx, got.size() * 4, cudaMemcpyDeviceToHost));
+    TRUSS_CUDA(cudaMemcpy(cnt.data(), dc, cnt.size() * 4, cudaMemcpyDeviceToHost));
+    long diff = 0, changed = 0, dirty = 0;
+    for (size_t i = 0; i < x.size(); ++i) diff += got[i] != want[i], changed += want[i] != x[i];
+    for (int v : cnt) dirty += v != 0;
+    const bool ok = diff == 0 && dirty == 0 && changed > 0;
+    std::printf("%-28s n %6d, rows %d, h %4d: %ld logits penalized, %ld differ from the host, %ld counts left  %s\n",
+                what, n, rows, h, changed, diff, dirty, ok ? "PASS" : "FAIL");
+    cudaFree(dx), cudaFree(dh), cudaFree(dc);
+    return ok ? 0 : 1;
+}
+
 }  // namespace
 
 int main()
@@ -107,6 +158,13 @@ int main()
     p = {};
     p.seed = 9, p.temperature = 1.f, p.top_p = 0.95f;
     fails += run(248077, 4000, p, rng, "real vocab, top_p 0.95");
+    sampling::PenaltyParams pp;
+    pp.presence = 1.5f;
+    fails += run_penalty(512, 4, 64, pp, rng, "presence 1.5");
+    pp = {}, pp.frequency = 0.3f;
+    fails += run_penalty(512, 4, 256, pp, rng, "frequency 0.3");
+    pp = {}, pp.repeat = 1.1f, pp.frequency = 0.1f, pp.presence = 0.5f;
+    fails += run_penalty(248077, 4, 4096, pp, rng, "real vocab, all three");
     std::printf("%s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
 }

@@ -63,21 +63,33 @@ int truss_spec_step(truss_model * m, int32_t next, int32_t * emitted, int * n_em
 int truss_drafts(const truss_model * m);            /* 0: opened without MTP */
 
 /* Sampling on the device (kernels/sampling/sample.cuh): temperature > 0; top_p >= 1, top_k <= 0, min_p <= 0 are off.
-   Each sampled row draws from its own random stream (seed, a per-model counter that every sampled row advances). */
+   Each sampled row draws from its own random stream (seed, a per-model counter that every sampled row advances).
+   Penalties (kernels/sampling/penalty.cuh, llama.cpp's formulas, applied before the filters): repetition_penalty 1,
+   frequency_penalty 0 and presence_penalty 0 are off. They count `history` (n_history token ids, host memory, read
+   during the call only), of which each row keeps the last penalty_last_n (<= 0 or > TRUSS_PENALTY_CAP: the cap). */
+#define TRUSS_PENALTY_CAP 4096
 typedef struct truss_sampling {
     float temperature;
     float top_p;
     int top_k;
     float min_p;
     uint64_t seed;
+    float repetition_penalty;
+    float frequency_penalty;
+    float presence_penalty;
+    int penalty_last_n;
+    const int32_t * history;
+    int n_history;
 } truss_sampling;
 
-/* truss_eval, then a sample of the last token's next-token distribution in *next */
+/* truss_eval, then a sample of the last token's next-token distribution in *next. The penalties count `history`
+   as given: the caller includes `tokens` in it when they should count. */
 int truss_eval_sample(truss_model * m, const int32_t * tokens, int n, const truss_sampling * sp, int32_t * next);
 
 /* truss_spec_step for sampled decoding (Strata's sampled verify): every verify row is sampled with `sp`; drafts are
    accepted while the row's sample equals the draft, and the first row that differs gives *new_next. Each emitted
-   token is a sample of the model's own distribution given the tokens before it, whatever the drafts were. */
+   token is a sample of the model's own distribution given the tokens before it, whatever the drafts were. Penalties:
+   `history` is what counts before `next`; verify row t also counts `next` and drafts 1..t (Strata's per-row rule). */
 int truss_spec_step_sampled(truss_model * m, int32_t next, const truss_sampling * sp, int32_t * emitted,
                             int * n_emitted, int32_t * new_next);
 

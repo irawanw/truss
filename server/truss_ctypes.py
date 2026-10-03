@@ -21,9 +21,31 @@ class Params(ctypes.Structure):   # truss_params
                 ("draft_min_p", ctypes.c_float)]
 
 
-class Sampling(ctypes.Structure):   # truss_sampling
+PENALTY_CAP = 4096   # TRUSS_PENALTY_CAP
+
+
+class Sampling(ctypes.Structure):   # truss_sampling; penalties off unless set (history: set_history)
     _fields_ = [("temperature", ctypes.c_float), ("top_p", ctypes.c_float), ("top_k", ctypes.c_int),
-                ("min_p", ctypes.c_float), ("seed", ctypes.c_uint64)]
+                ("min_p", ctypes.c_float), ("seed", ctypes.c_uint64),
+                ("repetition_penalty", ctypes.c_float), ("frequency_penalty", ctypes.c_float),
+                ("presence_penalty", ctypes.c_float), ("penalty_last_n", ctypes.c_int),
+                ("history", ctypes.POINTER(ctypes.c_int32)), ("n_history", ctypes.c_int)]
+
+    def __init__(self, temperature, top_p, top_k, min_p, seed, repetition_penalty=1.0, frequency_penalty=0.0,
+                 presence_penalty=0.0, penalty_last_n=64):
+        super().__init__(temperature, top_p, top_k, min_p, seed, repetition_penalty, frequency_penalty,
+                         presence_penalty, penalty_last_n, None, 0)
+        self._hist = None
+
+    @property
+    def penalized(self) -> bool:
+        return self.repetition_penalty != 1.0 or self.frequency_penalty != 0.0 or self.presence_penalty != 0.0
+
+    def set_history(self, tokens):
+        """The tokens the penalties count (the last PENALTY_CAP are kept); the array lives until the next call."""
+        self._hist = np.ascontiguousarray(tokens[-PENALTY_CAP:], dtype=np.int32)
+        self.history = self._hist.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+        self.n_history = len(self._hist)
 
 
 class Model:

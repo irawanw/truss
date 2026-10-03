@@ -77,6 +77,21 @@ of the truncated softmax, deterministic for the same (seed, counter). Used by `t
 `truss_spec_step_sampled` (one launch for a whole verify window). Tested by `sample_test` (empirical frequencies vs
 the exact truncated distribution within sampling noise, no draw outside the kept set, determinism; vocab 64-512 and
 248,077).
+
+## `src/kernels/sampling/penalty.{cuh,cu}`
+
+`sampling::penalize(x [rows][n], n, rows, hist [rows][h], h, params, cnt, stream)`: repetition / frequency / presence
+penalties in place, before `sample` (llama.cpp's order and formulas, as Strata's sampler: for a token seen c > 0
+times in the row's history, x = x > 0 ? x / repeat : x · repeat, then x −= c · frequency + presence). Two launches of
+one 256-thread block per row: count the history into `cnt` (device scratch [rows][n] ints, zero on entry) with
+atomics, then the one thread whose `atomicExch` takes a token's count back to zero applies that token's penalty, so
+each token is penalized once and `cnt` is zero again on return; O(h) per row, no sort. History ids < 0 or ≥ n are
+skipped (rows are padded with −1). `penalty_rows(history, nh, feed, nfeed, rows, w, out)` (host, inline) builds the
+verify rows' histories: row t = the last w of (history, feed[0..t]) — Strata's per-row rule, so draft tokens of
+earlier rows count. Used by `truss_eval_sample` / `truss_spec_step_sampled` when a penalty is set (`truss_c.cu`
+`penalize_rows`; the model keeps `cnt` [drafts + 1][n_vocab] = 4 MB at 3 drafts, allocated before the expert budget).
+Tested by `sample_test` (bit-exact vs a host reference incl. −1 / out-of-range ids, `cnt` zero afterwards; vocab 512
+and 248,077, h up to 4,096) and `penalty_rows_test` (host). Plan step A6 (`docs/PLAN-20261003-x31-tg140-pp4000.md`).
 ## Tested by
 
 No unit test per small op: each is checked inside the layer chain. `qwen4exp_parity` checks the reference blocks

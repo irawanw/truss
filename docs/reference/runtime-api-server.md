@@ -116,8 +116,8 @@ One `truss_model` = one model file, one sequence, on the current CUDA device (`C
 | `truss_reset(m)` | new sequence |
 | `truss_eval(m, tokens, n, logits)` | append n tokens (split into `max_chunk` chunks; a prompt of at most `TRUSS_FETCH_PROMPT` tokens (default 0) into `Forward::fetch_rows()` = 32-token decode-path chunks, which move only the experts its rows route to: at 256K 72 tokens 2,373 -> 1,531 ms, but 256 tokens 2,376 -> 5,749 ms, so the server uses 96, TRACKER #89); write the last token's next-token logits (n_vocab floats; NULL skips) |
 | `truss_eval_argmax(m, tokens, n, &next)` | same, greedy token on the device (no logits copy) |
-| `truss_eval_sample(m, tokens, n, &sampling, &next)` | same, a sample on the device (`truss_sampling`: temperature > 0, top_p, top_k, min_p, seed; each sampled row advances the model's random-stream counter) |
-| `truss_spec_step_sampled(m, next, &sampling, emitted, &n, &new_next)` | `truss_spec_step` for sampled decoding (Strata's sampled verify): every verify row is sampled on the device; drafts are accepted while the row's sample equals the draft, so each emitted token is a sample of the model's own conditional |
+| `truss_eval_sample(m, tokens, n, &sampling, &next)` | same, a sample on the device (`truss_sampling`: temperature > 0, top_p, top_k, min_p, seed; each sampled row advances the model's random-stream counter; penalties `repetition_penalty` / `frequency_penalty` / `presence_penalty` over `history[n_history]` (host ids, the last `penalty_last_n` ≤ `TRUSS_PENALTY_CAP` 4,096 kept), counted as given — the caller includes `tokens` when they count) |
+| `truss_spec_step_sampled(m, next, &sampling, emitted, &n, &new_next)` | `truss_spec_step` for sampled decoding (Strata's sampled verify): every verify row is sampled on the device; drafts are accepted while the row's sample equals the draft, so each emitted token is a sample of the model's own conditional. Penalties: `history` is what counts before `next`; verify row t also counts `next` and drafts 1..t |
 
 Returns 0 / pointer on success, −1 / NULL on failure (every C++ exception is caught at the boundary). The logits
 buffer is allocated before the engine so the expert budget sees the remaining memory. A second architecture becomes a
@@ -135,7 +135,8 @@ dispatch on `general.architecture` inside `truss_open`.
 | `tools.py` | OpenAI tool calling for the template's XML call format (`<tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call>`): `normalize_messages` (history tool-call `arguments` JSON strings → dicts; the template iterates `arguments|items`), `parse_calls(text, tools)` (calls out of the content; a value stays text when the tool's schema types it `string`, else JSON with a text fallback; an unterminated last call is still parsed), `ToolStream(tools)` (streaming, incremental like llama-server: content until `<tool_call>`, then a delta with id + name once `<function=NAME>` is complete and the arguments JSON in fragments as they are generated — string values escaped as they arrive, other types at their `</parameter>`; `finish()` closes an unterminated call) |
 
 **Endpoints.** `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (messages, tools, `max_tokens`,
-`temperature`, `top_p`, `top_k`, `min_p`, `seed`, `tool_choice`, `stop`, `stream`, `chat_template_kwargs` e.g. `enable_thinking`),
+`temperature`, `top_p`, `top_k`, `min_p`, `seed`, `presence_penalty`, `frequency_penalty`, `repetition_penalty` (or
+`repeat_penalty`), `penalty_last_n` (or `repeat_last_n`), `tool_choice`, `stop`, `stream`, `chat_template_kwargs` e.g. `enable_thinking`),
 `POST /v1/completions` (raw prompt). With thinking on (template default) the text up to `</think>` is returned as
 `reasoning_content`, the rest as `content` (`ThinkSplitter` in streaming, holds back a possible partial tag).
 With `tools` in the request (and `tool_choice` not `"none"`), calls in the content are returned as OpenAI `tool_calls`
@@ -146,6 +147,13 @@ call stays `content`. Before this the XML came back as plain text, and agent cli
 including 0, wins; temperature 0 is greedy). They were temperature 1.0 with no cut, and clients that send no sampling
 fields (they relied on llama-paw's defaults on this port) got stray tokens: 1,200-token English answers, 3 seeds each,
 had 5-6 CJK runs per answer (one inside a tool name, `bash样的`) at the old defaults and none at these.
+
+**Penalties** (plan step A6, for the loop diagnosis): off by default (presence 0, frequency 0, repetition 1), so a
+client that sends none gets exactly what it got before. Sampled requests only (greedy ignores them). They count the
+last `penalty_last_n` tokens (default 64, llama-server's and Strata's) of the engine's sequence, prompt included; with
+`penalty_last_n` −1, every token this request generated (vLLM's rule, which Qwen's `presence_penalty` 0-2 advice
+assumes), capped at 4,096. Tested by `tests/server/penalty_history_test.py` (host, a fake model checks the history
+at every call, plain and speculative, both rules).
 **Context full.** A prompt of n_ctx tokens or more gets llama-server's 400 before any response starts
 (`exceed_context_size_error`, "the request exceeds the available context size, try increasing it", with
 `n_prompt_tokens` and `n_ctx`); omp matches that message and compacts. An engine error after the stream started is
@@ -164,7 +172,7 @@ behind another request, 8 keepalives, max gap 5.00 s.
 
 `--dump-dir DIR` (off by default; the pm2 script leaves it off) keeps the last 20 requests as JSON (prompt tail, reply text, finish, sampling) for diagnosing a reply after the fact.
 
-Each chat request also logs `request: temperature … top_p … top_k … min_p …, N tools, thinking on|off`.
+Each chat request also logs `request: temperature … top_p … top_k … min_p …[ presence_penalty … penalty_last_n …], N tools, thinking on|off`.
 
 **Engine.generate.** One request at a time (lock). The handlers drive it from a worker thread (`tokens()` in
 `make_app`: `anyio.to_thread` per item), so the event loop never blocks on the engine; on a client disconnect (or an
