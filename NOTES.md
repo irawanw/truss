@@ -36,17 +36,18 @@
 - Box noise: baseline row ran at load ~24; rows at load 40+ show +-20 tok/s decode swings (43.5 vs 26.2 same code).
   Do not burn kbench runs at load > ~28-30.
 
-## Now
-**PLE gather pipelining — retry pending on a quiet box.** Code kept on branch `ple-lookahead` (4f75948), HEAD
-reverted (10ecc55). What the noisy row could not decide: run 2 (load ~40) held prefill 2024 ~= baseline 2043 while
-the disk was ~10x slower than at the baseline row (run 1 of the SAME build: 1494 tok/s, PLE gather 28.3 s vs 6.7 s)
-— consistent with the pipelining absorbing slow reads, but the expected ~5 s win only shows when reads are fast
-(load ~24: read ~0.3 s/chunk, chunk compute 4.05 s -> collect wait ~0, gather -> ~1.5 s dequant-only). Retry:
-checkout `ple-lookahead`, kbench `--repeat 2` at load < ~28; keep iff decode AND prefill beat 52.3/2043, EXACT.
-Before/while retrying: add reader stats to the bench line (PleReader::stats().wait_ms vs ple_host_ms) on the
-branch so "PLE host gather" decomposes into collect-wait vs dequant+hash — if wait_ms ~= 0 and gather stays ~6 s,
-the single-threaded dequant (21M scalar float2half + unordered_map churn per chunk) is the real wall, and the fix
-is an AVX2 + parallel collect (bit-exact: int8 x scale fp32 mul -> half, same IEEE ops), not more pipelining.
+## Now (10-05 late)
+**Row = branch `ple-dequant` (3f6850a): pipelining + AVX2 put + skip-insert for prefill tickets + phase stats.**
+Quick row 1005_013552 QUICK_OK EXACT at load 50 (skip-insert keeps tokens identical; decode tickets still cache).
+- Rows so far: 1005_010443 (688cfc4, single run, no --repeat2): decode 61.8 prefill 2057 EXACT load 27.9, gather
+  5.82s (reads 2.00). 1005_011323 (688cfc4 --repeat2): decode 44.9/62.6, prefill 1694/979, loads 28.4/31.9 —
+  gather 19.48/76.74s but **reads only 0.58/0.16s => pipelining hides the disk; the HOST work in collect/issue
+  (hash, page-dedup, copies, map+cache-insert) is the wall and scales ~70x under tenant CPU/RAM pressure**.
+- Phase split (long20k, ~2.5 chunks, skip-insert build, load ~50): gather 1.18s = reads 0.52 + copy+put 0.26 +
+  insert 0.02 + ~0.38 hash/issue (ple_rows + issue page-dedup, timed in ple() not collect). Insert is now ~nil.
+- Next: kbench --repeat 2 on 3f6850a at load < ~28 (poller bg_1); keep iff decode >= 52.3 AND prefill > 2043
+  both repeats, EXACT. If phases show hash/issue dominant after this, instrument ple_rows vs issue() separately;
+  parallel collect (worker threads, hits-first barrier) stays the follow-on lever.
 
 ## Slots-depth idea: BLOCKED on VRAM (from failed run 1004_224142; keep for later)
 Real sizes: chunk buffers `big_bytes()` = **4.06 GiB** (scratch ~2.48 = 8192x285KB/row + 268MB dsa select ws;
