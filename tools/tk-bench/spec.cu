@@ -311,6 +311,9 @@ int main(int argc, char ** argv)
             f.ple_host_ms(pm, pc, pr, true, &pw, pp);
             S.ple_wait += pw;
             for (int k = 0; k < 3; ++k) S.ple_phase[k] += pp[k];
+            f.section_ms(sect);
+            f.section_moe_ms(m4);
+            f.driver_ms(d3, dn);
             for (int k = 0; k < 6; ++k) S.sect[k] += sect[k];
             for (int k = 0; k < 4; ++k) S.m4[k] += m4[k];
             for (int k = 0; k < 3; ++k) S.d3[k] += d3[k];
