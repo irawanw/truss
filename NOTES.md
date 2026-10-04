@@ -36,34 +36,39 @@
 - Box noise: baseline row ran at load ~24; rows at load 40+ show +-20 tok/s decode swings (43.5 vs 26.2 same code).
   Do not burn kbench runs at load > ~28-30.
 
-## Now (10-05 ~03:40)
-**`agent/x31-speed` = 216d52a (row D parallel collect MERGED, lead approved). Best rows: 1005_032028 decode 55.8/57.3,
-prefill 2132/2128 EXACT @23.8/26.3.** Gather copy+put 0.92->0.15s (total 1.50->0.64). ple_reader_test extended:
-parallel mixed + all-miss rows bit-identical (run `./build/ple_reader_test <gguf>` after any reader change).
-- **hint_k tested (lead --env): K=4 row 1005_024923 DIFF 51.9/62.1, 2124/2119 (wait-copies UP 10->10.9: prefetch
-  98->214MB congests the one copy stream); K=3 row 1005_025943 DIFF 58.6/52.2, 2129/2125 (profile better, join 9.7,
-  but decode in noise band). ANY hint-width change moves CPU/GPU placement -> DIFF vs golden -> human-gated.
-- **GAP CORRECTED (instrumented row 1005_033555 @load 19-20, decode 62.0 = new best sample, prefill 2132, EXACT;
-  row had a self-inflicted bug: section/moe/driver reads dropped -> layer line showed stale prefill values; fixed
-  c90a254+fix commit). TRUE per-pass split: host windows draft 1.67 + verify 40.93 + head 0.91 + ACCEPT 0.87 =
-  44.39 vs device 43.50 -> host overhead ~= accept 0.87 (per-layer GDN replay on partial accept - structural) +
-  PLE decode gather wait 0.34 (rows are new sliding-window rows every pass, reads pipelined, tail exposed).
-  Decode is ~97% device-bound; earlier "4.5ms gap" was my arithmetic error (wrong tokens/pass divisor).**
-- Decode floor at load<=20 ~= 44.4ms/pass (62 tok/s). Device verify 40.9: mixer ~7.1 (GDN state r/w BW-bound),
-  routed MoE ~20 (copies ~10 = demand link time; expert kernel ~5.25 GPU-resident experts), join ~11-16 (DRAM),
-  plan-wait ~2.7-3.6 (doorbell->split->plan dependency), ple+hc ~2.7, hc ~1.7.
-- Remaining decode levers: (a) hints/ring/coupled-sampling = config+DIFF, human-gated (reported); (b) CPU kernel
-  already at DRAM floor + op-count optimized (#76 comments in expert_trellis.cc: gemv_i16 5 mul-ops/16w, 2.8 cyc/8w,
-  bound by total ops; kmicro mine-vs-ref 3-4% = load noise, checksums identical); (c) CANDIDATE: GPU expert-kernel
-  batching (moe_window.cu, 5.25ms/pass ~36 GPU experts/pass - launch/tail overhead? placement+order neutral if
-  combine order kept) - reading moe_window.cu now.
-- Lead steer 03:35 (post row D): exact-safe decode levers = CPU expert kernel (kmicro, checksums MUST NOT change)
-  + host pass overhead (plan/readback/launchs). kmicro baseline now: K3 R1 174.6us (ref 168.2), K25 199.4 (192.6),
-  K35 203.7 (197.2) - same checksums as main ref; branch ~3-4% over ref = load noise or small real regression, recheck.
-- **Priority demand-copy stream: analyzed, SKIP** (lead approved but math says ~0 gain: all copies share one copy_
-  stream; measured wait-for-copies 10ms/pass == 132.4MB demand / 13.3GB/s -> the wait IS the demand link time,
-  not queue drain; admit claims already yield via demand_ev_/piece_out_; hints subsume it). Cross-stream meta-table
-  races make it risky anyway. Told lead in 02:36 DECISION note.
+## Now (10-05 ~04:15) - HUMAN-PAUSED
+**PAUSED by human (via lead). `agent/x31-speed` = c165e46, tree CLEAN, `ninja -j8` builds all targets. NO kbench runs
+or experiments until the lead says unpaused.**
+- Commits since kept row D (216d52a): c90a254 bench per-pass host-window timers + decode PLE wait/phases print;
+  cb65afd fix (I had dropped section/moe/driver reads in c90a254 -> stale prefill values in the decode profile);
+  f057ea6 NOTES; c165e46 stream profiler (TRUSS_STREAM_PROFILE=1: per-chunk prefetch copy-BUSY + acquire
+  exposed-WAIT events, stream_stats(); bench prints "prefill sections ms" + "prefill stream: ..."). Profiler is
+  measurement-only, zero behavior when the env is unset, compiles clean - the step in progress when paused;
+  NOT yet kbench-run.
+- Ledger facts: kept best = row D 1005_032028 (216d52a) decode 55.8/57.3, prefill 2132/2128 EXACT @23.8/26.3.
+  Instrumentation row 1005_033555: decode 62.0 (best sample) / prefill 2132 EXACT @19-20. hint_k=4 row
+  1005_024923 DIFF, hint_k=3 row 1005_025943 DIFF (placement rounding moves tokens) -> keep K=2; lead took the
+  gated decode options (hints, ring, placement, coupled sampling) to the human. Lead is building a KL gate into
+  kbench (human-approved: placement-only changes may ship if KL vs reference stays at the noise floor).
+- Decode truth (instrumented): ~97% device-bound. Host windows/pass: draft 1.67 + verify 40.93 + head 0.91 +
+  accept 0.87 = 44.39 vs device 43.50. Floor ~= 44 ms/pass ~= 62-63 tok/s at load<=20. accept 0.87 = per-layer
+  GDN replay on partial accept (structural, forward.cu accept()); PLE decode gather wait 0.34 (every pass reads
+  NEW sliding-window trigram rows; reads pipelined, tail exposed). moe_window.cu is a tuned persistent dataflow
+  kernel (TRACKER #25) and CPU gemv_i16 is op-count-optimized (#76) + at the DRAM floor - no rewrite win in sight.
+  Priority demand-copy stream skipped with math (wait-for-copies == demand MB / link rate; NOTES history).
+- Prefill truth (code read, not yet measured): stream mode = 2 whole-layer slots; prefetch(l+2) issued after
+  release(l) -> stream already runs one layer ahead WITHIN a chunk. split_rows default 0 -> served 8192-row
+  chunks stream WHOLE cold layers (~avg 0.24s copies vs ~3.85s compute per chunk -> copies should be hidden).
+  The open question the profiler answers: how much stream is EXPOSED at acquire() and at chunk boundaries.
+
+### Next steps on resume (project A: cross-chunk expert-stream pipelining, lead-approved, multi-day OK)
+1. At load<28: `kbench --env TRUSS_STREAM_PROFILE=1 --note "stream profile"`; read "prefill stream: copies X busy,
+   acquire waits Y exposed" + "prefill sections ms". If Y ~= 0 (stream hidden): cross-chunk pipelining only saves
+   the inter-chunk bubble (first-2-layer copies + host glue, est ~2-3 s/run = 3-4%) -> report to lead BEFORE
+   building. If Y is seconds: build as pitched (+17-27%, prefill 70 -> ~55-60 s).
+2. Then per lead: design + unit test for ring/protect under cross-chunk eviction; implement in small kbench-gated
+   steps (EXACT, no regression), RESULT notify per keep; keep 0.75 GB VRAM margin + host RAM budget.
+3. Server was down ~15 min for the lead's KL measurement (back up). Load rule: no rows at load >~28.
 
 ## Slots-depth idea: BLOCKED on VRAM (from failed run 1004_224142; keep for later)
 Real sizes: chunk buffers `big_bytes()` = **4.06 GiB** (scratch ~2.48 = 8192x285KB/row + 268MB dsa select ws;
