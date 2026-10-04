@@ -185,6 +185,8 @@ int main(int argc, char ** argv)
         // reset around the spec phase only, and summed over the prompts
         struct Sum {
             double spec_s = 0, plain_s = 0, ms_draft = 0, ms_verify = 0, ms_head = 0, sect[6] = {}, m4[4] = {}, d3[3] = {};
+            double hw[4] = {};   // host wall per pass stage (launch..sync): draft, verify, head, accept
+            double ple_wait = 0, ple_phase[3] = {};   // decode collect: read wait + phases
             double ple_ms = 0, cpu_wait_us = 0, pre_s = 0, pre_ple = 0, pre_wait = 0, pre_phase[3] = {};
             long pre_tok = 0;
             long passes = 0, tokens = 0, drafted = 0, accepted = 0, dn = 0, ple_calls = 0, ple_rows = 0, cpu_waits = 0;
@@ -251,6 +253,7 @@ int main(int argc, char ** argv)
             if (prange) TRUSS_CUDA(cudaProfilerStart());
             const auto t0 = std::chrono::steady_clock::now();
             while ((int) got.size() < N) {
+                const auto tA = std::chrono::steady_clock::now();
                 int32_t win[9], best[9];
                 win[0] = t;
                 TRUSS_CUDA(cudaEventRecord(e0, f.stream()));
@@ -258,22 +261,29 @@ int main(int argc, char ** argv)
                 TRUSS_CUDA(cudaEventRecord(e1, f.stream()));
                 TRUSS_CUDA(cudaEventSynchronize(e1));
                 { float m = 0; TRUSS_CUDA(cudaEventElapsedTime(&m, e0, e1)); ms_draft += m; }
+                const auto tB = std::chrono::steady_clock::now();
                 TRUSS_CUDA(cudaEventRecord(e0, f.stream()));
                 f.verify(win, nw + 1);
                 TRUSS_CUDA(cudaEventRecord(e1, f.stream()));
                 TRUSS_CUDA(cudaEventSynchronize(e1));
                 { float m = 0; TRUSS_CUDA(cudaEventElapsedTime(&m, e0, e1)); ms_verify += m; }
+                const auto tC = std::chrono::steady_clock::now();
                 TRUSS_CUDA(cudaEventRecord(e0, f.stream()));
                 g.rows(f, 0, nw + 1, best);
                 TRUSS_CUDA(cudaEventRecord(e1, f.stream()));
                 TRUSS_CUDA(cudaEventSynchronize(e1));
                 { float m = 0; TRUSS_CUDA(cudaEventElapsedTime(&m, e0, e1)); ms_head += m; }
+                const auto tD = std::chrono::steady_clock::now();
                 int j = 0;
                 while (j < nw && best[j] == win[j + 1]) ++j;
                 f.accept(j + 1);
                 for (int i = 0; i <= j; ++i) got.push_back(win[i]);
                 t = best[j];
                 ++passes, drafted += nw, accepted += j;
+                S.hw[0] += std::chrono::duration<double, std::milli>(tB - tA).count();
+                S.hw[1] += std::chrono::duration<double, std::milli>(tC - tB).count();
+                S.hw[2] += std::chrono::duration<double, std::milli>(tD - tC).count();
+                S.hw[3] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tD).count();
             }
             const double spec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             if (prange) TRUSS_CUDA(cudaProfilerStop());
@@ -297,7 +307,10 @@ int main(int argc, char ** argv)
             S.spec_s += spec, S.plain_s += plain, S.passes += passes, S.tokens += N, S.drafted += drafted;
             S.accepted += accepted, S.ms_draft += ms_draft, S.ms_verify += ms_verify, S.ms_head += ms_head;
             if (do_plain) S.identical += same, S.compared += N;
-            f.section_ms(sect), f.section_moe_ms(m4), f.driver_ms(d3, dn), f.ple_host_ms(pm, pc, pr);
+            double pw = 0, pp[3] = {};
+            f.ple_host_ms(pm, pc, pr, true, &pw, pp);
+            S.ple_wait += pw;
+            for (int k = 0; k < 3; ++k) S.ple_phase[k] += pp[k];
             for (int k = 0; k < 6; ++k) S.sect[k] += sect[k];
             for (int k = 0; k < 4; ++k) S.m4[k] += m4[k];
             for (int k = 0; k < 3; ++k) S.d3[k] += d3[k];
@@ -359,6 +372,9 @@ int main(int argc, char ** argv)
         std::printf("       device ms/pass: draft %.2f + verify %.2f + head %.2f = %.2f (rest: host stalls/gaps)\n",
                     S.ms_draft / passes, S.ms_verify / passes, S.ms_head / passes,
                     (S.ms_draft + S.ms_verify + S.ms_head) / passes);
+        std::printf("       host ms/pass: draft-window %.2f + verify-window %.2f + head-window %.2f + accept %.2f = %.2f\n",
+                    S.hw[0] / passes, S.hw[1] / passes, S.hw[2] / passes, S.hw[3] / passes,
+                    (S.hw[0] + S.hw[1] + S.hw[2] + S.hw[3]) / passes);
         if (S.sect[0] > 0)
             std::printf("       layer device ms/pass: ple+hc_mix %.2f + mixer %.2f + hc_mix %.2f + routed MoE %.2f "
                         "+ shared %.2f + cpu join/combine %.2f = %.2f\n",
@@ -368,10 +384,10 @@ int main(int argc, char ** argv)
         if (S.m4[0] + S.m4[1] + S.m4[2] + S.m4[3] > 0)
             std::printf("       routed MoE ms/pass: router+publish %.2f + wait for the host plan %.2f + wait for copies %.2f "
                         "+ expert kernel %.2f\n", S.m4[0] / passes, S.m4[1] / passes, S.m4[2] / passes, S.m4[3] / passes);
-        if (f.adapt_admitted()) std::printf("       adaptive tier: %ld experts admitted\n", f.adapt_admitted());
         if (S.ple_calls)
-            std::printf("       PLE host gather ms/pass: %.2f (%.1f calls, %.0f table rows per pass)\n", S.ple_ms / passes,
-                        S.ple_calls / passes, S.ple_rows / passes);
+            std::printf("       PLE host gather ms/pass: %.2f (%.1f calls, %.0f table rows; wait %.2f, phases hits %.2f "
+                        "copy+put %.2f insert %.2f)\n", S.ple_ms / passes, S.ple_calls / passes, S.ple_rows / passes,
+                        S.ple_wait / passes, S.ple_phase[0] / passes, S.ple_phase[1] / passes, S.ple_phase[2] / passes);
         if (S.dn)
             std::printf("       driver ms/pass: split %.2f + CPU start %.2f + copies and plan %.2f (%.1f layers/pass)\n",
                         S.d3[0] / passes, S.d3[1] / passes, S.d3[2] / passes, S.dn / passes);

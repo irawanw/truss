@@ -36,13 +36,23 @@
 - Box noise: baseline row ran at load ~24; rows at load 40+ show +-20 tok/s decode swings (43.5 vs 26.2 same code).
   Do not burn kbench runs at load > ~28-30.
 
-## Now (10-05 ~02:45)
-**LEAD RULING: KEEP the PLE family; `agent/x31-speed` = 438246e = new best (decode swings = tenant contention;
-per-pass device profile matches baseline). Merged.** Prefill proven: 2107-2125 in 6/6 runs vs 2043; gather 6.77->1.50s.
-Decode-gather check answered to lead (02:34 notify): run2s (warm) 0.59-1.05 vs run1s 1.91-2.66 = page-cache/load;
-skip-insert only re-reads ~54 boundary rows on the first decode pass (ticket re-inserts them). No fix needed.
-- **Next: TRUSS_HINT_K test (lead: kbench now takes `--env TRUSS_HINT_K=N`).** History TRACKER #85 (X3 16K): hints4
-  86.6 < hints2 90.2 -> served 2. X3.1@150K may differ. Run `kbench --repeat 2 --env TRUSS_HINT_K=4` then =3;
+## Now (10-05 ~03:40)
+**`agent/x31-speed` = 216d52a (row D parallel collect MERGED, lead approved). Best rows: 1005_032028 decode 55.8/57.3,
+prefill 2132/2128 EXACT @23.8/26.3.** Gather copy+put 0.92->0.15s (total 1.50->0.64). ple_reader_test extended:
+parallel mixed + all-miss rows bit-identical (run `./build/ple_reader_test <gguf>` after any reader change).
+- **hint_k tested (lead --env): K=4 row 1005_024923 DIFF 51.9/62.1, 2124/2119 (wait-copies UP 10->10.9: prefetch
+  98->214MB congests the one copy stream); K=3 row 1005_025943 DIFF 58.6/52.2, 2129/2125 (profile better, join 9.7,
+  but decode in noise band). ANY hint-width change moves CPU/GPU placement -> DIFF vs golden -> human-gated.
+  RECOMMENDED keep K=2 (matches #85).** Priority demand stream SKIPPED with math (wait ~= demand MB / link rate;
+  reordering cannot recover; told lead 03:10).
+- **Decode gap measured from bench logs: device draft+verify+head = 43-52 ms/pass vs wall 47.6-52.9 -> host
+  stalls/gaps ~= 4-4.5 ms/pass steady (~8-9% of decode wall). Inside it: PLE host gather 1.9-2.7 ms/pass for only
+  54 rows = ~46 us/row (SSD-ish per row!) - decode rows are NEW trigram rows every pass (sliding window), so every
+  pass pays page copies; reads should be pipelined a pass ahead (wait~0) - NOT yet instrumented for decode: NEXT
+  STEP print decode gather wait+phases (ple_host_ms already carries them), one full row to read.**
+- Lead steer 03:35 (post row D): exact-safe decode levers = CPU expert kernel (kmicro, checksums MUST NOT change)
+  + host pass overhead (plan/readback/launchs). kmicro baseline now: K3 R1 174.6us (ref 168.2), K25 199.4 (192.6),
+  K35 203.7 (197.2) - same checksums as main ref; branch ~3-4% over ref = load noise or small real regression, recheck.
   compare vs a11d378 rows (decode 36.8-62.6, 52.3-56.6 at load<=31; prefill 2107-2125). Win+EXACT -> DECISION
   with rows (human changes served config). Mechanism: hinted experts land before the next layer's split -> GPU hits
   at split time -> demand PCIe (132MB/pass, 67.8 fetches) + CPU slots shrink; wait-for-copies 10ms/pass ~= demand
