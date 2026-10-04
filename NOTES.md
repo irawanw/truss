@@ -43,26 +43,27 @@ parallel mixed + all-miss rows bit-identical (run `./build/ple_reader_test <gguf
 - **hint_k tested (lead --env): K=4 row 1005_024923 DIFF 51.9/62.1, 2124/2119 (wait-copies UP 10->10.9: prefetch
   98->214MB congests the one copy stream); K=3 row 1005_025943 DIFF 58.6/52.2, 2129/2125 (profile better, join 9.7,
   but decode in noise band). ANY hint-width change moves CPU/GPU placement -> DIFF vs golden -> human-gated.
-  RECOMMENDED keep K=2 (matches #85).** Priority demand stream SKIPPED with math (wait ~= demand MB / link rate;
-  reordering cannot recover; told lead 03:10).
-- **Decode gap measured from bench logs: device draft+verify+head = 43-52 ms/pass vs wall 47.6-52.9 -> host
-  stalls/gaps ~= 4-4.5 ms/pass steady (~8-9% of decode wall). Inside it: PLE host gather 1.9-2.7 ms/pass for only
-  54 rows = ~46 us/row (SSD-ish per row!) - decode rows are NEW trigram rows every pass (sliding window), so every
-  pass pays page copies; reads should be pipelined a pass ahead (wait~0) - NOT yet instrumented for decode: NEXT
-  STEP print decode gather wait+phases (ple_host_ms already carries them), one full row to read.**
+- **GAP CORRECTED (instrumented row 1005_033555 @load 19-20, decode 62.0 = new best sample, prefill 2132, EXACT;
+  row had a self-inflicted bug: section/moe/driver reads dropped -> layer line showed stale prefill values; fixed
+  c90a254+fix commit). TRUE per-pass split: host windows draft 1.67 + verify 40.93 + head 0.91 + ACCEPT 0.87 =
+  44.39 vs device 43.50 -> host overhead ~= accept 0.87 (per-layer GDN replay on partial accept - structural) +
+  PLE decode gather wait 0.34 (rows are new sliding-window rows every pass, reads pipelined, tail exposed).
+  Decode is ~97% device-bound; earlier "4.5ms gap" was my arithmetic error (wrong tokens/pass divisor).**
+- Decode floor at load<=20 ~= 44.4ms/pass (62 tok/s). Device verify 40.9: mixer ~7.1 (GDN state r/w BW-bound),
+  routed MoE ~20 (copies ~10 = demand link time; expert kernel ~5.25 GPU-resident experts), join ~11-16 (DRAM),
+  plan-wait ~2.7-3.6 (doorbell->split->plan dependency), ple+hc ~2.7, hc ~1.7.
+- Remaining decode levers: (a) hints/ring/coupled-sampling = config+DIFF, human-gated (reported); (b) CPU kernel
+  already at DRAM floor + op-count optimized (#76 comments in expert_trellis.cc: gemv_i16 5 mul-ops/16w, 2.8 cyc/8w,
+  bound by total ops; kmicro mine-vs-ref 3-4% = load noise, checksums identical); (c) CANDIDATE: GPU expert-kernel
+  batching (moe_window.cu, 5.25ms/pass ~36 GPU experts/pass - launch/tail overhead? placement+order neutral if
+  combine order kept) - reading moe_window.cu now.
 - Lead steer 03:35 (post row D): exact-safe decode levers = CPU expert kernel (kmicro, checksums MUST NOT change)
   + host pass overhead (plan/readback/launchs). kmicro baseline now: K3 R1 174.6us (ref 168.2), K25 199.4 (192.6),
   K35 203.7 (197.2) - same checksums as main ref; branch ~3-4% over ref = load noise or small real regression, recheck.
-  compare vs a11d378 rows (decode 36.8-62.6, 52.3-56.6 at load<=31; prefill 2107-2125). Win+EXACT -> DECISION
-  with rows (human changes served config). Mechanism: hinted experts land before the next layer's split -> GPU hits
-  at split time -> demand PCIe (132MB/pass, 67.8 fetches) + CPU slots shrink; wait-for-copies 10ms/pass ~= demand
-  bytes/link-rate -> K=4 converts demand into early-issued copies (prefetch ~98->~200MB, link capacity ~650MB).
 - **Priority demand-copy stream: analyzed, SKIP** (lead approved but math says ~0 gain: all copies share one copy_
   stream; measured wait-for-copies 10ms/pass == 132.4MB demand / 13.3GB/s -> the wait IS the demand link time,
   not queue drain; admit claims already yield via demand_ev_/piece_out_; hints subsume it). Cross-stream meta-table
   races make it risky anyway. Told lead in 02:36 DECISION note.
-- Row D candidate (code-only, if hint rows don't satisfy): parallel collect copy+put (load-47 run showed 15.9s
-  copy+put under CPU starvation; reader-pool fan-out; hits-first barrier only needed when cache_misses).
 
 ## Slots-depth idea: BLOCKED on VRAM (from failed run 1004_224142; keep for later)
 Real sizes: chunk buffers `big_bytes()` = **4.06 GiB** (scratch ~2.48 = 8192x285KB/row + 268MB dsa select ws;
