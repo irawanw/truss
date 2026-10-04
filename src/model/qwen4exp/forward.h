@@ -204,7 +204,7 @@ public:
     // host time of the PLE layers' n-gram row hash, table gather (the mmap of the GGUF: page faults for rows not in
     // the page cache) and fp16 conversion, ms summed over calls since the last reset, with the table rows read.
     // Always counted (two clock reads per PLE layer call).
-    void ple_host_ms(double & ms, long & calls, long & rows, bool reset = false) const;
+    void ple_host_ms(double & ms, long & calls, long & rows, bool reset = false, double * wait_ms = nullptr) const;
     size_t kv_lent() const;                         // Options::kv_lend: KV bytes lent to the expert ring now
     // E7 since construction: host bytes copied by split chunks, cold experts their layers gave the CPU / the GPU
     void split_stats(long long out[3]) const;

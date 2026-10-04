@@ -185,4 +185,12 @@ void PleReader::collect(int ticket, half * emb)
     }
 }
 
+double PleReader::take_wait_ms() const
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    const double w = stats_.wait_ms;
+    stats_.wait_ms = 0;
+    return w;
+}
+
 }  // namespace truss::qwen4exp

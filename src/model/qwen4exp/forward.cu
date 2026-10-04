@@ -1961,16 +1961,17 @@ void Forward::driver_ms(double out[3], long & n, bool reset) const
 
 long Forward::adapt_admitted() const { return m_->experts->admitted(); }
 
-void Forward::ple_host_ms(double & ms, long & calls, long & rows, bool reset) const
-{
-    ms = m_->ple_host_ms, calls = m_->ple_calls, rows = m_->ple_rows_n;
-    if (reset) m_->ple_host_ms = 0, m_->ple_calls = 0, m_->ple_rows_n = 0;
-}
-
 void Forward::section_moe_ms(double out[4], bool reset) const
 {
     for (int i = 0; i < 4; ++i) out[i] = m_->sect_moe[i];
     if (reset) for (int i = 0; i < 4; ++i) m_->sect_moe[i] = 0;
+}
+
+void Forward::ple_host_ms(double & ms, long & calls, long & rows, bool reset, double * wait_ms) const
+{
+    ms = m_->ple_host_ms, calls = m_->ple_calls, rows = m_->ple_rows_n;
+    if (wait_ms) *wait_ms = m_->ple_reader ? m_->ple_reader->take_wait_ms() : 0.0;
+    if (reset) m_->ple_host_ms = 0, m_->ple_calls = 0, m_->ple_rows_n = 0;
 }
 
 void Forward::cpu_shape(long long out[4]) const

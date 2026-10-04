@@ -44,6 +44,7 @@ public:
         double wait_ms = 0;                             // collect blocked on reads
     };
     const Stats & stats() const { return stats_; }
+    double take_wait_ms() const;   // collect's cumulative block on the SSD reads since the last take (resets)
 
 private:
     struct Page {
@@ -67,7 +68,7 @@ private:
     int ticket_ = 0;
     // pool
     std::vector<std::thread> pool_;
-    std::mutex mu_;
+    mutable std::mutex mu_;
     std::condition_variable cv_, done_cv_;
     std::atomic<size_t> next_{ 0 };
     size_t n_pages_ = 0, finished_ = 0;
@@ -82,7 +83,7 @@ private:
     std::vector<half> cache_scale_;
     std::vector<uint8_t> ref_;
     size_t hand_ = 0;
-    Stats stats_;
+    mutable Stats stats_;
 };
 
 }  // namespace truss::qwen4exp

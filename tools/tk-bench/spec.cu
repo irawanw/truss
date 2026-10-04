@@ -185,7 +185,7 @@ int main(int argc, char ** argv)
         // reset around the spec phase only, and summed over the prompts
         struct Sum {
             double spec_s = 0, plain_s = 0, ms_draft = 0, ms_verify = 0, ms_head = 0, sect[6] = {}, m4[4] = {}, d3[3] = {};
-            double ple_ms = 0, cpu_wait_us = 0, pre_s = 0, pre_ple = 0;
+            double ple_ms = 0, cpu_wait_us = 0, pre_s = 0, pre_ple = 0, pre_wait = 0;
             long pre_tok = 0;
             long passes = 0, tokens = 0, drafted = 0, accepted = 0, dn = 0, ple_calls = 0, ple_rows = 0, cpu_waits = 0;
             long long item_us = 0, ph[4] = {}, sh[4] = {};
@@ -225,7 +225,8 @@ int main(int argc, char ** argv)
             g.rows(f, (int) (tok.size() - 1) % step, 1, &t);
             const double pre = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp).count();
             double pre_ple;   // the prompt's PLE host gather (synchronous table reads), part of `pre`
-            f.ple_host_ms(pre_ple, pc0, pr0, true);
+            double pre_wait = 0;   // of which: collect() blocked on the PleReader's SSD reads
+            f.ple_host_ms(pre_ple, pc0, pr0, true, &pre_wait);
             f.cpu_stats(true);
             f.cpu_shape_reset();
             double sect[6], m4[4], d3[3], pm;
@@ -279,14 +280,14 @@ int main(int argc, char ** argv)
             int same = 0;
             if (do_plain)
                 while (same < N && got[same] == ref[same]) ++same;
-            std::printf("prompt %zu (%zu tokens): prefill %.0f tok/s (%.2f s, PLE host gather %.2f s), ", pi, tok.size(),
-                        tok.size() / pre, pre, pre_ple / 1e3);
+            std::printf("prompt %zu (%zu tokens): prefill %.0f tok/s (%.2f s, PLE host gather %.2f s, of which reads %.2f s), ",
+                        pi, tok.size(), tok.size() / pre, pre, pre_ple / 1e3, pre_wait / 1e3);
             if (do_plain) std::printf("plain %.1f tok/s, ", N / plain);
             std::printf("spec %.1f tok/s, %.2f tokens/pass", N / spec, (double) N / passes);
             if (do_plain) std::printf(", identical %d of %d", same, N);
             std::printf("\n");
             // accumulate
-            S.pre_s += pre, S.pre_tok += (long) tok.size(), S.pre_ple += pre_ple / 1e3;
+            S.pre_s += pre, S.pre_tok += (long) tok.size(), S.pre_ple += pre_ple / 1e3, S.pre_wait += pre_wait / 1e3;
             if (const char * dp = std::getenv("TRUSS_BENCH_DUMP")) {   // the spec tokens, appended per prompt
                 FILE * fd = std::fopen(dp, pi ? "ab" : "wb");
                 if (fd) std::fwrite(got.data(), 4, std::min<size_t>(got.size(), N), fd), std::fclose(fd);
@@ -317,8 +318,8 @@ int main(int argc, char ** argv)
 
         const double passes = (double) S.passes;
         if (do_plain) std::printf("plain: %ld tokens in %.2f s = %.1f tok/s\n", S.tokens, S.plain_s, S.tokens / S.plain_s);
-        std::printf("prefill: %ld prompt tokens in %.2f s = %.0f tok/s (PLE host gather %.2f s)\n", S.pre_tok, S.pre_s,
-                    S.pre_tok / S.pre_s, S.pre_ple);
+        std::printf("prefill: %ld prompt tokens in %.2f s = %.0f tok/s (PLE host gather %.2f s, of which reads %.2f s)\n",
+                    S.pre_tok, S.pre_s, S.pre_tok / S.pre_s, S.pre_ple, S.pre_wait);
         std::printf("spec : %ld tokens in %.2f s = %.1f tok/s, %ld passes (%.2f tokens/pass), drafts accepted %ld of %ld\n",
                     S.tokens, S.spec_s, S.tokens / S.spec_s, S.passes, S.tokens / passes, S.accepted, S.drafted);
         std::printf("       per pass: %.1f cold experts routed, %.1f fetched on demand (%.1f MB), %.1f prefetched (%.1f MB)\n",
