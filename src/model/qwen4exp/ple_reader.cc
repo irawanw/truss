@@ -8,7 +8,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <stdexcept>
+#include <thread>
 #include <string>
 
 namespace truss::qwen4exp {
@@ -174,6 +176,27 @@ int PleReader::insert(int32_t row, const int8_t * bytes, half scale)
     return s;
 }
 
+void PleReader::copy_put_rows(size_t lo, size_t hi, half * emb, double & ms) const
+{
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<int8_t> row(row_bytes_);
+    for (size_t i = lo; i < hi; ++i) {
+        if (slot_[i] >= 0) {
+            put_row(&cache_bytes_[(size_t) slot_[i] * row_bytes_], __half2float(cache_scale_[slot_[i]]),
+                    emb + i * row_bytes_, row_bytes_);
+            continue;
+        }
+        const uint64_t a = table_off_ + (uint64_t) rows_[i] * row_bytes_;
+        const uint64_t split = std::min<uint64_t>(row_bytes_, PAGE - a % PAGE);   // bytes in the first page
+        std::memcpy(row.data(), page_of(fd_table_, a), split);
+        if (split < (uint64_t) row_bytes_) std::memcpy(row.data() + split, page_of(fd_table_, a + split), row_bytes_ - split);
+        half s;
+        std::memcpy(&s, page_of(fd_scale_, scale_off_ + (uint64_t) rows_[i] * sizeof(half)), sizeof(half));
+        put_row(row.data(), __half2float(s), emb + i * row_bytes_, row_bytes_);
+    }
+    ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
 void PleReader::collect(int ticket, half * emb)
 {
     if (ticket != ticket_) throw std::logic_error("PleReader::collect: not the ticket in flight");
@@ -185,6 +208,27 @@ void PleReader::collect(int ticket, half * emb)
         if (io_errno_) throw std::runtime_error(std::string("PleReader: read failed: ") + std::strerror(io_errno_));
     }
     const size_t n = rows_.size();
+    // A prefill ticket inserts nothing, so the row cache and this ticket's pages are read-only here: copy+put
+    // fans out over ranges (hits and misses fused per row). Only decode tickets need the serial hits-first order.
+    if (!cache_misses_ && n >= 4096) {
+        constexpr unsigned P = 16;
+        const size_t span = (n + P - 1) / P;
+        std::vector<std::thread> th;
+        std::vector<double> ms(P, 0.0);
+        std::vector<std::exception_ptr> errs(P);
+        const auto tc0 = std::chrono::steady_clock::now();
+        for (unsigned p = 1; p < P; ++p)
+            th.emplace_back([this, p, span, n, emb, &ms, &errs] {
+                try { copy_put_rows((size_t) p * span, std::min((size_t) p * span + span, n), emb, ms[p]); }
+                catch (...) { errs[p] = std::current_exception(); }
+            });
+        try { copy_put_rows(0, std::min(span, n), emb, ms[0]); } catch (...) { errs[0] = std::current_exception(); }
+        for (auto & t : th) t.join();
+        for (auto & e : errs)
+            if (e) std::rethrow_exception(e);
+        stats_.phase_ms[1] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc0).count();
+        return;
+    }
     auto put = [&](size_t i, const int8_t * b, half s) { put_row(b, __half2float(s), emb + i * row_bytes_, row_bytes_); };
     // cache hits first: inserting the misses may evict a slot a hit of this ticket still points at
     const auto th0 = std::chrono::steady_clock::now();

@@ -60,6 +60,9 @@ private:
     void worker();
     const uint8_t * page_of(int fd, uint64_t off) const;   // the read page holding byte `off`
     int insert(int32_t row, const int8_t * bytes, half scale);
+    // rows [lo,hi) -> emb (hits from the cache, misses copied from the ticket's pages + dequantized). Read-only
+    // over the ticket's state, so several ranges run at once; ms receives the thread's own elapsed time.
+    void copy_put_rows(size_t lo, size_t hi, half * emb, double & ms) const;
 
     int row_bytes_;
     int fd_table_ = -1, fd_scale_ = -1;
