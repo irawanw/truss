@@ -36,18 +36,22 @@
 - Box noise: baseline row ran at load ~24; rows at load 40+ show +-20 tok/s decode swings (43.5 vs 26.2 same code).
   Do not burn kbench runs at load > ~28-30.
 
-## Now (10-05 late)
-**Row = branch `ple-dequant` (3f6850a): pipelining + AVX2 put + skip-insert for prefill tickets + phase stats.**
-Quick row 1005_013552 QUICK_OK EXACT at load 50 (skip-insert keeps tokens identical; decode tickets still cache).
-- Rows so far: 1005_010443 (688cfc4, single run, no --repeat2): decode 61.8 prefill 2057 EXACT load 27.9, gather
-  5.82s (reads 2.00). 1005_011323 (688cfc4 --repeat2): decode 44.9/62.6, prefill 1694/979, loads 28.4/31.9 —
-  gather 19.48/76.74s but **reads only 0.58/0.16s => pipelining hides the disk; the HOST work in collect/issue
-  (hash, page-dedup, copies, map+cache-insert) is the wall and scales ~70x under tenant CPU/RAM pressure**.
-- Phase split (long20k, ~2.5 chunks, skip-insert build, load ~50): gather 1.18s = reads 0.52 + copy+put 0.26 +
-  insert 0.02 + ~0.38 hash/issue (ple_rows + issue page-dedup, timed in ple() not collect). Insert is now ~nil.
-- Next: kbench --repeat 2 on 3f6850a at load < ~28 (poller bg_1); keep iff decode >= 52.3 AND prefill > 2043
-  both repeats, EXACT. If phases show hash/issue dominant after this, instrument ple_rows vs issue() separately;
-  parallel collect (worker threads, hits-first barrier) stays the follow-on lever.
+## Now (10-05 ~02:30)
+**ple-dequant family (pipelining + AVX2 put + skip-insert prefill + phases): prefill proven, keep ruling requested.**
+- Rows on `a11d378`: 1005_015512 43.8/60.0, 1628/**2125** @47/38.4; 1005_020617 36.8/58.8, **2108/2107** @~24;
+  1005_021624 56.6/48.7, **2125/2125** @30.9/35.7. All EXACT. Prefill beats baseline 2043 in 6/6 samples at loads
+  24-38 (baseline was 23.6). Decode (path untouched): 36.8-62.6, passes 52.3 whenever load <=31; every 10-min
+  kbench window caught a tenant spike that tanked one run's decode. Rule-9 letter (both repeats beat both) fails
+  ONLY on decode; keep case sent to lead via notify 02:27.
+- Gather 6.77 s -> **1.50 s** (reads 0.12; copy+put 0.92; insert 0.07; hash/issue ~0.4). At load 47 reads still
+  hidden (0.33) but copy+put exploded to 15.9 s (CPU starvation of the single collect thread) => next lever:
+  **parallel collect** (copy+put across reader pool, hits-first barrier) = row D. Also candidate: split ple_rows
+  hash from issue() page-dedup to see the ~0.4 s.
+- Branches: `agent/x31-speed` = baseline (ae50531 NOTES); `ple-lookahead` = 688cfc4; `ple-dequant` = a11d378
+  (4f75948 -> e260086 -> 688cfc4 -> b2d1f3f AVX2 -> 3f6850a skip-insert+phases -> a11d378 NOTES).
+- If keep ruling comes: make `agent/x31-speed` = ple-dequant tip (git reset --hard ple-dequant on the branch? NO -
+  safer: merge via ff is impossible (x31-speed has the revert commit); cherry-pick 4f75948 b2d1f3f 3f6850a onto
+  agent/x31-speed OR reset x31-speed to a11d378 (it only diverges by NOTES+revert which a11d378 supersedes).
 
 ## Slots-depth idea: BLOCKED on VRAM (from failed run 1004_224142; keep for later)
 Real sizes: chunk buffers `big_bytes()` = **4.06 GiB** (scratch ~2.48 = 8192x285KB/row + 268MB dsa select ws;
