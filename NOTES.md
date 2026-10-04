@@ -36,22 +36,23 @@
 - Box noise: baseline row ran at load ~24; rows at load 40+ show +-20 tok/s decode swings (43.5 vs 26.2 same code).
   Do not burn kbench runs at load > ~28-30.
 
-## Now (10-05 ~02:30)
-**ple-dequant family (pipelining + AVX2 put + skip-insert prefill + phases): prefill proven, keep ruling requested.**
-- Rows on `a11d378`: 1005_015512 43.8/60.0, 1628/**2125** @47/38.4; 1005_020617 36.8/58.8, **2108/2107** @~24;
-  1005_021624 56.6/48.7, **2125/2125** @30.9/35.7. All EXACT. Prefill beats baseline 2043 in 6/6 samples at loads
-  24-38 (baseline was 23.6). Decode (path untouched): 36.8-62.6, passes 52.3 whenever load <=31; every 10-min
-  kbench window caught a tenant spike that tanked one run's decode. Rule-9 letter (both repeats beat both) fails
-  ONLY on decode; keep case sent to lead via notify 02:27.
-- Gather 6.77 s -> **1.50 s** (reads 0.12; copy+put 0.92; insert 0.07; hash/issue ~0.4). At load 47 reads still
-  hidden (0.33) but copy+put exploded to 15.9 s (CPU starvation of the single collect thread) => next lever:
-  **parallel collect** (copy+put across reader pool, hits-first barrier) = row D. Also candidate: split ple_rows
-  hash from issue() page-dedup to see the ~0.4 s.
-- Branches: `agent/x31-speed` = baseline (ae50531 NOTES); `ple-lookahead` = 688cfc4; `ple-dequant` = a11d378
-  (4f75948 -> e260086 -> 688cfc4 -> b2d1f3f AVX2 -> 3f6850a skip-insert+phases -> a11d378 NOTES).
-- If keep ruling comes: make `agent/x31-speed` = ple-dequant tip (git reset --hard ple-dequant on the branch? NO -
-  safer: merge via ff is impossible (x31-speed has the revert commit); cherry-pick 4f75948 b2d1f3f 3f6850a onto
-  agent/x31-speed OR reset x31-speed to a11d378 (it only diverges by NOTES+revert which a11d378 supersedes).
+## Now (10-05 ~02:45)
+**LEAD RULING: KEEP the PLE family; `agent/x31-speed` = 438246e = new best (decode swings = tenant contention;
+per-pass device profile matches baseline). Merged.** Prefill proven: 2107-2125 in 6/6 runs vs 2043; gather 6.77->1.50s.
+Decode-gather check answered to lead (02:34 notify): run2s (warm) 0.59-1.05 vs run1s 1.91-2.66 = page-cache/load;
+skip-insert only re-reads ~54 boundary rows on the first decode pass (ticket re-inserts them). No fix needed.
+- **Next: TRUSS_HINT_K test (lead: kbench now takes `--env TRUSS_HINT_K=N`).** History TRACKER #85 (X3 16K): hints4
+  86.6 < hints2 90.2 -> served 2. X3.1@150K may differ. Run `kbench --repeat 2 --env TRUSS_HINT_K=4` then =3;
+  compare vs a11d378 rows (decode 36.8-62.6, 52.3-56.6 at load<=31; prefill 2107-2125). Win+EXACT -> DECISION
+  with rows (human changes served config). Mechanism: hinted experts land before the next layer's split -> GPU hits
+  at split time -> demand PCIe (132MB/pass, 67.8 fetches) + CPU slots shrink; wait-for-copies 10ms/pass ~= demand
+  bytes/link-rate -> K=4 converts demand into early-issued copies (prefetch ~98->~200MB, link capacity ~650MB).
+- **Priority demand-copy stream: analyzed, SKIP** (lead approved but math says ~0 gain: all copies share one copy_
+  stream; measured wait-for-copies 10ms/pass == 132.4MB demand / 13.3GB/s -> the wait IS the demand link time,
+  not queue drain; admit claims already yield via demand_ev_/piece_out_; hints subsume it). Cross-stream meta-table
+  races make it risky anyway. Told lead in 02:36 DECISION note.
+- Row D candidate (code-only, if hint rows don't satisfy): parallel collect copy+put (load-47 run showed 15.9s
+  copy+put under CPU starvation; reader-pool fan-out; hits-first barrier only needed when cache_misses).
 
 ## Slots-depth idea: BLOCKED on VRAM (from failed run 1004_224142; keep for later)
 Real sizes: chunk buffers `big_bytes()` = **4.06 GiB** (scratch ~2.48 = 8192x285KB/row + 268MB dsa select ws;
