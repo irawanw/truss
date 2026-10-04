@@ -42,7 +42,12 @@ int main(int argc, char ** argv)
             if (!pass) std::printf("experts: %d of %d resident, %.2f GB streamed per chunk\n", p.hot_experts(),
                                    c.n_expert * c.n_layer, p.cold_bytes() / 1e9);
             const auto t0 = std::chrono::steady_clock::now();
-            for (int s = 0; s < n; s += chunk) p.run(tok.data() + s, std::min(chunk, n - s));
+            for (int s = 0; s < n; s += chunk) {
+                const int len = std::min(chunk, n - s);
+                const bool nx = s + len < n;   // PLE lookahead: the next chunk's reads start during this one
+                p.run(tok.data() + s, len, nullptr, nx ? tok.data() + s + chunk : nullptr,
+                      nx ? std::min(chunk, n - s - chunk) : 0);
+            }
             TRUSS_CUDA(cudaStreamSynchronize(p.stream()));
             const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             std::printf("%s: %d tokens, chunks of %d, %d layers: %.1f ms = %.0f tok/s (%.2f us/token/layer)\n",

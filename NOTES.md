@@ -29,23 +29,31 @@
 | (8af5ead, pre-me) | CPU frac kernel gemv_i16f | baseline row 52.3 / 2043 | kept (it is HEAD) |
 
 ## Now (hypothesis under test)
-**Stream-slot depth (prefill).** `ExpertStore` stream mode used exactly 2 whole-layer slots: `prefetch(l+2)` into
-slot `l%2`, gated by `released_[l%2]`. With stream/layer (~56 ms, link-bound) ≈ compute/layer (~50-84 ms), the copy
-engine idles on the release gate every layer, so chunk time ≈ Σ_l max(stream_l, compute_l) ≈ 2x the max, instead of
-max(Σ stream, Σ compute). Measured 4.05 s/chunk vs 2.7 s stream bound and ~2.7-4 s compute: consistent with that
-serialization. Fix: N slots (default 4) + `prefetch(l+N)`; the copy stream then holds up to N-1 layers of copies
-queued and stays saturated; chunk time → max(total compute, total stream) + PLE host time.
-Clamp: `eff_slots = min(asked, (ring - chunk_buffers)/slot)` computed with identical inputs in plan() and the
-constructor, so the ring never grows past what the hot-set plan reserved => hot set (and decode) unchanged; the
-request is free when the ring already holds N slots + buffers.
-Env knob `TRUSS_STREAM_SLOTS` (default 4). Startup prints slots/slot GB/ring/buffers.
-Expected: prefill 2043 -> ~2600-3000, decode neutral.
+**PLE gather pipelining (prefill).** Measured: PLE host gather 6.77 s of the 73.02 s prefill (9.3%). `ple()` at layer 1
+of every chunk blocks the host in `PleReader::collect` (~0.37 s/chunk of NVMe reads + dequant) before it can issue the
+42 MB H2D; nothing queues while it blocks. Fix (this attempt): `run()` takes the *next* chunk's tokens; after the
+current chunk's collect + H2D issue, hash the next chunk's rows and `issue()` its ticket — PleReader's workers then
+read chunk c+1's pages during chunk c's ~4 s compute, so collect(c+1) returns with ~0 wait. Ticket math: only the
+latest ticket is collectable, issue(c+1) after collect(c) never blocks (reads done), single pinned stage stays safe
+via the existing `ple_copied` event gate. Tokens identical (same rows, same order, same H2D). Callers: tk-bench-spec
+prompt loop + tk-bench-prefill updated; server/C API keep default nullptr (unchanged behavior).
+Expected: prefill 2043 -> ~2250-2300 (hides ~6.4 s of 6.77; dequant stays on the host), decode neutral.
+
+## Slots-depth idea: BLOCKED on VRAM (from failed run 1004_224142; keep for later)
+Real sizes: chunk buffers `big_bytes()` = **4.06 GiB** (scratch ~2.48 = 8192x285KB/row + 268MB dsa select ws;
+moe::prefill workspace ~1.36 GiB (A_gu 839 MB [pairs=81920][2*2560] half + A_d 105 + C_d 419); residual 3x336 MB);
+one slot (largest cold layer) ~0.98 GiB; ring 6.02 GiB = 2*slot + extra. 4 slots need extra <= 2.1 GiB: would need
+~2 GiB trimmed from scratch/moe/residual (sub-batching moe::prefill by tokens could save ~0.7; aliasing one MTP
+residual ~0.34; the rest is per-layer peak, hard). The reverted attempt also crashed (cuBLAS 13): my edit deleted
+the `slot_` computation loop -> slot_=0 -> ring undersized. Design to reuse: `git show 3ea909e` (N slots,
+`eff_slots = min(req,(ring_base-extra)/slot)` with ring_base = max(z.ring_bytes, extra+slot) UNALIGNED, computed
+identically in plan() and ctor; compute slot_ from layers_ FIRST; all `%2` -> `%slots_`).
 
 ## Next ideas (after this one)
-1. If slots clamps to 3 and prefill still < 2600: per-chunk breakdown of link vs compute (instrument prefetch/acquire).
-2. PLE host gather (5 s of 73 s): the H2D of the gathered rows is issued on the *compute* stream (forward.cu ple()),
-   so it serializes with the expert stream on the same copy engine; pipeline the gather one chunk ahead
-   (PleReader issue/collect already supports it) so the H2D is small and ready.
+1. If PLE pipelining lands: also move the collect dequant off the critical path (collect on a helper thread + event;
+   ~0.5 s/run left on the table), and pipeline the 42 MB H2D on the copy stream behind an event.
+2. Per-chunk breakdown of link vs compute (instrument prefetch/acquire) — the ~1.4 s/chunk of chunk time unexplained
+   by stream(2.7)+compute(1.3)+CPU(0.7)+PLE(0.37)+mixer(0.27).
 3. Decode: plan wait 3.2 ms/pass is the host round trip for the split decision (driver: split 0.18 + CPU start 0.92
    + copies/plan 1.27). A GPU-side split with a fixed pcie_frac (do-not-repeat 33 says fixed fraction is the stable
    method) could remove the host decision from the critical path.

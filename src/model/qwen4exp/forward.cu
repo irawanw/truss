@@ -159,6 +159,10 @@ struct Forward::Impl {
     size_t ple_stage_n = 0;
     cudaEvent_t ple_copied = nullptr;                  // the last copy out of ple_stage has been read
     long ple_calls = 0, ple_rows_n = 0;                // (ple_host_ms(); the rows are table rows read)
+    // PLE lookahead: run() may describe the prompt chunk after the current one; its rows are hashed and read
+    // from disk while the current chunk computes, so the next layer-1 gather does not stall the host (E8).
+    const int32_t * ple_next = nullptr; int ple_next_T = 0;
+    bool ple_tk_valid = false; int ple_tk = -1, ple_tk_pos0 = -1;   // the prefetched ticket and its chunk's pos0
     long drv_n = 0;
     std::atomic<long> jobs_pushed{ 0 };   // the driver spins on this before it sleeps on dq_cv (Strata's host spins)
     bool driver_stop = false;
@@ -1178,7 +1182,7 @@ struct Forward::Impl {
         sc->release(m);
     }
 
-    void ple(const Ple & p, LayerState & L, const int32_t * tokens, int T, bool tentative)
+    void ple(const Ple & p, LayerState & L, const int32_t * tokens, int T, int pos0, bool tentative)
     {
         // n-gram window across chunks: hash [tail | chunk] and keep the chunk's rows
         const auto th0 = std::chrono::steady_clock::now();
@@ -1191,7 +1195,9 @@ struct Forward::Impl {
         const half * host16;
         if (ple_reader) {   // O_DIRECT reads into the pinned stage (the previous copy out of it has been read)
             require((size_t) T * E <= ple_stage_n, "PLE stage too small for the chunk");
-            const int tk = ple_reader->issue(rows.data() + (size_t) n_prev * H, (size_t) T * H);
+            int tk;
+            if (ple_tk_valid && ple_tk_pos0 == pos0) { tk = ple_tk; ple_tk_valid = false; }   // already in flight
+            else { ple_tk_valid = false; tk = ple_reader->issue(rows.data() + (size_t) n_prev * H, (size_t) T * H); }
             TRUSS_CUDA(cudaEventSynchronize(ple_copied));
             ple_reader->collect(tk, ple_stage);
             host16 = ple_stage;
@@ -1211,6 +1217,16 @@ struct Forward::Impl {
         float * gate = sc->alloc((size_t) T * c.hc), * normed = sc->alloc((size_t) T * c.hc_dim());
         TRUSS_CUDA(cudaMemcpyAsync(e16, host16, (size_t) T * E * 2, cudaMemcpyHostToDevice, s));
         if (ple_reader) TRUSS_CUDA(cudaEventRecord(ple_copied, s));
+        if (ple_reader && ple_next && ple_next_T > 0) {   // read the next chunk's rows while this chunk computes
+            const size_t keep = std::min<size_t>(seq.size(), (size_t) c.ple_ngram - 1);
+            std::vector<int32_t> nseq(seq.end() - keep, seq.end());
+            nseq.insert(nseq.end(), ple_next, ple_next + ple_next_T);
+            std::vector<int32_t> nrows(nseq.size() * H);
+            ple_rows(c, nseq.data(), (int) nseq.size(), nrows.data());
+            ple_tk = ple_reader->issue(nrows.data() + keep * H, (size_t) ple_next_T * H);
+            ple_tk_valid = true; ple_tk_pos0 = pos0 + T;
+        }
+        ple_next = nullptr; ple_next_T = 0;
         const Act ea = quant(e16, T, c.ple_heads() * c.ple_head_dim);
         lin_multi({ { p.key, key }, { p.value, value } }, ea, T);
         ple::gate(key, res, f32(p.norm_key), f32(p.norm_query), T, c.hc, c.d_model, c.rms_eps, gate, s);
@@ -1544,6 +1560,7 @@ struct Forward::Impl {
                 TRUSS_CUDA(cudaMemsetAsync(L.ple_hist, 0, sizeof(float) * (c.ple_conv - 1) * c.ple_ngram * c.hc_dim(), s));
         }
         tail.clear();
+        ple_next = nullptr; ple_next_T = 0; ple_tk_valid = false;   // a dangling ticket is replaced by the next issue
         last_T = 0;
         has_pending = false;
         vw.open = false;
@@ -1588,7 +1605,7 @@ struct Forward::Impl {
             float * inject = sc->alloc((size_t) T * c.hc);
             half * mixed16 = sc->alloc<half>((size_t) T * c.d_model);
             sect_record(l, 0);
-            if (c.is_ple(l)) ple(L.ple, st[l], tokens, T, tentative);
+            if (c.is_ple(l)) ple(L.ple, st[l], tokens, T, pos0, tentative);
             hc_mix(L.hc_attn, res, T, mixed, mixed16, inject);
             sect_record(l, 1);
             if (L.mixer == Mixer::GDN) gdn(L.gdn, st[l], mixed16, T, out, tentative);
@@ -1605,6 +1622,7 @@ struct Forward::Impl {
             }
         }
         sect_flush();
+        ple_next = nullptr; ple_next_T = 0;   // consumed by this chunk's ple(), or there was no lookahead
         last_T = T;
         if (tentative) {
             vw = { true, pos0, T, std::vector<int32_t>(tokens, tokens + T) };
@@ -2033,8 +2051,10 @@ void Forward::reset()
     pos_ = 0;
 }
 
-void Forward::run(const int32_t * tokens, int T, const LayerHook & hook)
+void Forward::run(const int32_t * tokens, int T, const LayerHook & hook, const int32_t * next, int next_T)
 {
+    if (next) require(next == tokens + T && next_T > 0, "PLE lookahead must follow the chunk");
+    m_->ple_next = next; m_->ple_next_T = next_T;
     m_->run_chunk(tokens, pos_, T, hook, false);
     pos_ += T;
 }
