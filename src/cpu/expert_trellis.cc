@@ -355,35 +355,51 @@ void gemv_i16(const TrellisMat & W, const float * P, int nt0, int nt1, float * c
 // byte picks (as `pick`, but per lane) and the left shift of each dword are tables; states m and m + 1 (KA + 1 bits
 // apart) share m's 32-bit window as in gemv_i16 (shift <= 7, + KA + 1 + 16 <= 27 bits). Activations, sums and the
 // int32 flush are gemv_i16's.
+// Per KA, the lane tables of gemv_i16f, at compile time: as runtime arrays they were 12 ymm values plus 8 offsets
+// next to the 4 constants and the 2 R accumulators, more than AVX2's 16 registers, and the inner loop spilled
+// (~1500 stack accesses in gemv_i16f<2, 1> vs ~110 in gemv_i16<3, 1>; one thread 0.68 ms/expert at K2.5 vs 0.55 at
+// K3, TRACKER #118). As constexpr data the picks and shifts are memory operands of vpshufb / vpsrlvd / vpsllvd and the
+// offsets are immediates.
+template <int KA>
+struct FracTab {
+    alignas(32) int8_t pick[4][32] = {};
+    alignas(32) int32_t shr0[4][8] = {}, shl1[4][8] = {};
+    int off[4][2] = {};
+    constexpr FracTab()
+    {
+        constexpr int PB = 2 * KA + 1, code = 10 * KA + 5;
+        for (int mi = 0; mi < 4; ++mi) {
+            const int m = 2 * mi;
+            for (int h = 0; h < 2; ++h) {
+                off[mi][h] = (4 * PB * (4 * h) + formats::k_window_end(code, m) + 16) >> 3;
+                for (int i = 0; i < 4; ++i) {
+                    const int bit = 4 * PB * (4 * h + i) + formats::k_window_end(code, m) + 16;   // in col (4 front bytes)
+                    const int b = (bit >> 3) - off[mi][h];
+                    for (int k = 0; k < 4; ++k) pick[mi][16 * h + 4 * i + k] = (int8_t) (b + 3 - k);
+                    shr0[mi][4 * h + i] = 16 - (bit & 7);           // state m: (w << s) >> 16 = w >> (16 - s)
+                    shl1[mi][4 * h + i] = (bit & 7) + KA + 1;       // state m + 1 into the high half
+                }
+            }
+        }
+    }
+};
+template <int KA>
+inline constexpr FracTab<KA> frac_tab{};
+
+// Half-integer rates K = KA + 0.5 (formats/trellis_k.h; TRACKER #118) on the int16 kernel above. Lane l's window m
+// starts at stream bit 4 P l + E(m) - 16 (P = 2 KA + 1 bits per weight pair, E = k_window_end of lane 0), so within an
+// octet lane i sits 4 P i bits after lane 0: a whole byte for even i, half a byte more for odd i. Per even m the
+// byte picks (as `pick`, but per lane) and the left shift of each dword are tables (FracTab); states m and m + 1
+// (KA + 1 bits apart) share m's 32-bit window as in gemv_i16 (shift <= 7, + KA + 1 + 16 <= 27 bits). Activations,
+// sums and the int32 flush are gemv_i16's.
 template <int KA, int R>
 void gemv_i16f(const TrellisMat & W, const float * P, int nt0, int nt1, float * c, int ldc, uint8_t * col)
 {
-    constexpr int PB = 2 * KA + 1, code = 10 * KA + 5;
-    const int words = formats::k_tile_u16(code) / 2, KT = W.in / 16, NT = W.out / 16, in = W.in, rs = trellis_prep_floats(in, 1);
-    const int stride = 4 * words + 32;
+    constexpr int PB = 2 * KA + 1, code = 10 * KA + 5, words = formats::k_tile_u16(code) / 2, stride = 4 * words + 32;
+    constexpr const FracTab<KA> & T = frac_tab<KA>;
+    const int KT = W.in / 16, NT = W.out / 16, in = W.in, rs = trellis_prep_floats(in, 1);
     const __m256i bswap = _mm256_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12,
                                            3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
-    // per even m (index m / 2): byte offset of each half's first lane from the octet start, picks, shifts
-    int off[4][2];
-    __m256i pick[4], shl0[4], shl1[4];
-    for (int mi = 0; mi < 4; ++mi) {
-        const int m = 2 * mi;
-        alignas(32) int8_t idx[32];
-        alignas(32) int32_t sh0[8], sh1[8];
-        for (int h = 0; h < 2; ++h) {
-            off[mi][h] = (4 * PB * (4 * h) + formats::k_window_end(code, m) + 16) >> 3;
-            for (int i = 0; i < 4; ++i) {
-                const int bit = 4 * PB * (4 * h + i) + formats::k_window_end(code, m) + 16;   // in col (4 front bytes)
-                const int b = (bit >> 3) - off[mi][h];
-                for (int k = 0; k < 4; ++k) idx[16 * h + 4 * i + k] = (int8_t) (b + 3 - k);
-                sh0[4 * h + i] = 16 - (bit & 7);           // state m: (w << s) >> 16 = w >> (16 - s)
-                sh1[4 * h + i] = (bit & 7) + KA + 1;       // state m + 1 into the high half
-            }
-        }
-        pick[mi] = _mm256_load_si256(reinterpret_cast<const __m256i *>(idx));
-        shl0[mi] = _mm256_load_si256(reinterpret_cast<const __m256i *>(sh0));
-        shl1[mi] = _mm256_load_si256(reinterpret_cast<const __m256i *>(sh1));
-    }
     const __m256i mlo = _mm256_set1_epi16((short) 0xD12D), mhi = _mm256_set1_epi16((short) 0x83DC);
     const __m256i lo8 = _mm256_set1_epi16(0x00ff), ones8 = _mm256_set1_epi8(1);
     const float kinv = k_inv(), cb = std::fma(1024.f, k_inv(), k_bias());
@@ -413,13 +429,12 @@ void gemv_i16f(const TrellisMat & W, const float * P, int nt0, int nt1, float * 
                 uint8_t * d = col + (size_t) (kt - k0) * stride;
                 const uint32_t last = __builtin_bswap32(t[words - 1]);
                 std::memcpy(d, &last, 4);
-                int w = 0;
-                for (; w + 8 <= words; w += 8)
-                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(d + 4 + 4 * w),
-                                        _mm256_shuffle_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(t + w)), bswap));
-                for (; w < words; ++w) {
-                    const uint32_t v = __builtin_bswap32(t[w]);
-                    std::memcpy(d + 4 + 4 * w, &v, 4);
+                // words = 20 / 28 (K2.5 / K3.5): the tail is one more vector overlapping the last, not 4 scalar swaps
+                static_assert(words >= 8);
+                for (int w = 0; w < words; w += 8) {
+                    const int at = std::min(w, words - 8);
+                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(d + 4 + 4 * at),
+                                        _mm256_shuffle_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(t + at)), bswap));
                 }
             }
             for (int o = 0; o < 4; ++o) {
@@ -430,10 +445,13 @@ void gemv_i16f(const TrellisMat & W, const float * P, int nt0, int nt1, float * 
                     const int16_t * q = reinterpret_cast<const int16_t *>(P) + (size_t) kt * 32;
                     auto pair = [&](auto mc) {
                         constexpr int mi = decltype(mc)::value, m = 2 * mi;
-                        const __m256i raw = _mm256_loadu2_m128i(reinterpret_cast<const __m128i *>(d + off[mi][1]),
-                                                                reinterpret_cast<const __m128i *>(d + off[mi][0]));
-                        const __m256i w = _mm256_shuffle_epi8(raw, pick[mi]);
-                        const __m256i s = _mm256_blend_epi16(_mm256_srlv_epi32(w, shl0[mi]), _mm256_sllv_epi32(w, shl1[mi]), 0xAA);
+                        constexpr int o0 = T.off[mi][0], o1 = T.off[mi][1];
+                        const __m256i raw = _mm256_loadu2_m128i(reinterpret_cast<const __m128i *>(d + o1),
+                                                                reinterpret_cast<const __m128i *>(d + o0));
+                        const __m256i w = _mm256_shuffle_epi8(raw, _mm256_load_si256(reinterpret_cast<const __m256i *>(T.pick[mi])));
+                        const __m256i s = _mm256_blend_epi16(
+                            _mm256_srlv_epi32(w, _mm256_load_si256(reinterpret_cast<const __m256i *>(T.shr0[mi]))),
+                            _mm256_sllv_epi32(w, _mm256_load_si256(reinterpret_cast<const __m256i *>(T.shl1[mi]))), 0xAA);
                         const __m256i lo = _mm256_mullo_epi16(s, mlo);
                         const __m256i hi = _mm256_add_epi16(_mm256_mulhi_epu16(s, mlo), _mm256_mullo_epi16(s, mhi));
                         const __m256i bs = _mm256_add_epi16(_mm256_maddubs_epi16(lo, ones8),
