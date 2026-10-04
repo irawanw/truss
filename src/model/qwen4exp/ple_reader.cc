@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <unistd.h>
+#include <immintrin.h>
 
 #include <algorithm>
 #include <chrono>
@@ -26,6 +27,26 @@ int open_direct(const std::string & path)
 }
 
 uint64_t key(int fd, uint64_t page) { return (uint64_t) fd << 48 | page; }
+
+// AVX2 + F16C: 16 int8 -> 16 fp16 per iteration; bit-identical to the scalar loop (int8 -> float is exact,
+// vmulps is IEEE RNE, vcvtps2ph rounds to nearest even like __float2half; denormals are kept). Zen 2 has both.
+__attribute__((target("avx2,f16c")))
+void put_row(const int8_t * b, float sf, half * o, int n)
+{
+    const __m256 vsf = _mm256_set1_ps(sf);
+    int j = 0;
+    for (; j + 16 <= n; j += 16) {
+        const __m128i in = _mm_loadu_si128(reinterpret_cast<const __m128i *>(b + j));
+        const __m256i w16 = _mm256_cvtepi8_epi16(in);
+        const __m256 flo = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(w16))), vsf);
+        const __m256 fhi = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(w16, 1))), vsf);
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(o + j),
+                         _mm256_cvtps_ph(flo, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(o + j + 8),
+                         _mm256_cvtps_ph(fhi, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    }
+    for (; j < n; ++j) o[j] = __float2half(b[j] * sf);
+}
 
 }  // namespace
 
@@ -163,11 +184,7 @@ void PleReader::collect(int ticket, half * emb)
         if (io_errno_) throw std::runtime_error(std::string("PleReader: read failed: ") + std::strerror(io_errno_));
     }
     const size_t n = rows_.size();
-    auto put = [&](size_t i, const int8_t * b, half s) {
-        const float sf = __half2float(s);
-        half * o = emb + i * row_bytes_;
-        for (int j = 0; j < row_bytes_; ++j) o[j] = __float2half(b[j] * sf);
-    };
+    auto put = [&](size_t i, const int8_t * b, half s) { put_row(b, __half2float(s), emb + i * row_bytes_, row_bytes_); };
     // cache hits first: inserting the misses may evict a slot a hit of this ticket still points at
     for (size_t i = 0; i < n; ++i)
         if (slot_[i] >= 0) put(i, &cache_bytes_[(size_t) slot_[i] * row_bytes_], cache_scale_[slot_[i]]);
