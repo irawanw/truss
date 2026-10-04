@@ -2092,6 +2092,8 @@ void apply_env(ForwardOptions & o)
     f("TRUSS_SPLIT_MS_ROW", o.split_ms_row);
     if (const char * e = std::getenv("TRUSS_PLE_DIRECT"); e && !std::atoi(e)) o.ple_file = nullptr;   // A/B: the mapping
     if (const char * e = std::getenv("TRUSS_RING_GB")) o.ring_bytes_override = (size_t) (std::atof(e) * (1ull << 30));
+    // a fixed VRAM budget for the routed experts instead of "all free memory": a test beside another GPU job (#118)
+    if (const char * e = std::getenv("TRUSS_EXPERT_GB")) o.expert_budget = (size_t) (std::atof(e) * (1ull << 30));
 }
 
 }  // namespace truss::qwen4exp
