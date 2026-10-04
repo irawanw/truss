@@ -8,12 +8,12 @@
   (RESULT on a new best row, DECISION on quality/config/weights change, STUCK after 3 attempts on one idea).
 
 ## Baseline facts (kbench row 1004_220442, commit 8af5ead)
-- decode 52.3 tok/s, prefill 2043 tok/s, cpu_ms/slot 1.176, exact=DIFF, load ~24.
-- **The baseline itself is DIFF** vs `data/ledger/ref_tokens.i32` (golden made by selfopt_setup from main's build).
-  Cause: the served config runs `TRUSS_CPU_DYNAMIC=1` (split decisions are timing-based) and the dynamic split is
-  known-unstable (TRACKER do-not-repeat 33). So exactness here is only controllable as *tokens identical to the
-  previous build's tokens*, not to the golden. I compare my run's `tokens.i32` against the baseline run's
-  (`logs/kbench_1004_220442/tokens.i32`) and treat that as the EXACT gate; DIFF-vs-golden status alone is not my regression.
+- decode 52.3 tok/s, prefill 2043 tok/s, cpu_ms/slot 1.176, load ~24.
+- Exactness: the golden `data/ledger/ref_tokens.i32` was RE-BASELINED by the lead (10-04 22:23) and now equals the
+  baseline run's tokens: rows 1004_224142+ compare against it and my PLE row came out EXACT. Gate = kbench's
+  `exact` column (tokens.i32 vs golden); the old DIFF rows (220442/221407/221706) predate the re-baseline.
+  The served config still runs TRUSS_CPU_DYNAMIC=1 (timing-based split, do-not-repeat 33), so keep an eye on it,
+  but as measured, tokens reproduce EXACT across runs so far.
 - VRAM (X3.1, served): 23.56 GiB total, 9.27 in use before experts (ctx 0.69 + weights 4.60 + buffers 0.13 +
   KV/state 3.85), routed experts 13.54 GiB (margin 0.75). Experts: **3,813 resident of 24,576**, ring 6.02 GB
   (a prompt chunk takes all 6.02 GB of it). CPU tier: 21,275 eligible experts, dynamic split.
@@ -27,17 +27,26 @@
 | commit | change | kbench result | verdict |
 |---|---|---|---|
 | (8af5ead, pre-me) | CPU frac kernel gemv_i16f | baseline row 52.3 / 2043 | kept (it is HEAD) |
+| 4f75948 (branch `ple-lookahead`) | PLE lookahead: next chunk's reads issued during current chunk | row 1004_233016: decode 43.5/26.2, prefill 1494/2024, EXACT, load 49 | NOT kept (rule 9); reverted 10ecc55; RETRY on a quiet box (load < ~28) |
 
-## Now (hypothesis under test)
-**PLE gather pipelining (prefill).** Measured: PLE host gather 6.77 s of the 73.02 s prefill (9.3%). `ple()` at layer 1
-of every chunk blocks the host in `PleReader::collect` (~0.37 s/chunk of NVMe reads + dequant) before it can issue the
-42 MB H2D; nothing queues while it blocks. Fix (this attempt): `run()` takes the *next* chunk's tokens; after the
-current chunk's collect + H2D issue, hash the next chunk's rows and `issue()` its ticket — PleReader's workers then
-read chunk c+1's pages during chunk c's ~4 s compute, so collect(c+1) returns with ~0 wait. Ticket math: only the
-latest ticket is collectable, issue(c+1) after collect(c) never blocks (reads done), single pinned stage stays safe
-via the existing `ple_copied` event gate. Tokens identical (same rows, same order, same H2D). Callers: tk-bench-spec
-prompt loop + tk-bench-prefill updated; server/C API keep default nullptr (unchanged behavior).
-Expected: prefill 2043 -> ~2250-2300 (hides ~6.4 s of 6.77; dequant stays on the host), decode neutral.
+## Lead standing instructions (10-05)
+- Call kbench with bash `timeout: 1200` and WAIT for it (early return => omp retry storm while the brain is down).
+- After EVERY kbench row: append a RESULT line to `SELFOPT/data/notify.txt`.
+- Revert a change unless a `--repeat 2` on a quieter box beats the baseline row.
+- Box noise: baseline row ran at load ~24; rows at load 40+ show +-20 tok/s decode swings (43.5 vs 26.2 same code).
+  Do not burn kbench runs at load > ~28-30.
+
+## Now
+**PLE gather pipelining — retry pending on a quiet box.** Code kept on branch `ple-lookahead` (4f75948), HEAD
+reverted (10ecc55). What the noisy row could not decide: run 2 (load ~40) held prefill 2024 ~= baseline 2043 while
+the disk was ~10x slower than at the baseline row (run 1 of the SAME build: 1494 tok/s, PLE gather 28.3 s vs 6.7 s)
+— consistent with the pipelining absorbing slow reads, but the expected ~5 s win only shows when reads are fast
+(load ~24: read ~0.3 s/chunk, chunk compute 4.05 s -> collect wait ~0, gather -> ~1.5 s dequant-only). Retry:
+checkout `ple-lookahead`, kbench `--repeat 2` at load < ~28; keep iff decode AND prefill beat 52.3/2043, EXACT.
+Before/while retrying: add reader stats to the bench line (PleReader::stats().wait_ms vs ple_host_ms) on the
+branch so "PLE host gather" decomposes into collect-wait vs dequant+hash — if wait_ms ~= 0 and gather stays ~6 s,
+the single-threaded dequant (21M scalar float2half + unordered_map churn per chunk) is the real wall, and the fix
+is an AVX2 + parallel collect (bit-exact: int8 x scale fp32 mul -> half, same IEEE ops), not more pipelining.
 
 ## Slots-depth idea: BLOCKED on VRAM (from failed run 1004_224142; keep for later)
 Real sizes: chunk buffers `big_bytes()` = **4.06 GiB** (scratch ~2.48 = 8192x285KB/row + 268MB dsa select ws;
