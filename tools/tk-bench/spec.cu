@@ -187,6 +187,7 @@ int main(int argc, char ** argv)
             double spec_s = 0, plain_s = 0, ms_draft = 0, ms_verify = 0, ms_head = 0, sect[6] = {}, m4[4] = {}, d3[3] = {};
             double hw[4] = {};   // host wall per pass stage (launch..sync): draft, verify, head, accept
             double ple_wait = 0, ple_phase[3] = {};   // decode collect: read wait + phases
+            double s_busy = 0, s_wait = 0;            // prefill stream: prefetch copy busy + exposed acquire wait
             double ple_ms = 0, cpu_wait_us = 0, pre_s = 0, pre_ple = 0, pre_wait = 0, pre_phase[3] = {};
             long pre_tok = 0;
             long passes = 0, tokens = 0, drafted = 0, accepted = 0, dn = 0, ple_calls = 0, ple_rows = 0, cpu_waits = 0;
@@ -293,6 +294,8 @@ int main(int argc, char ** argv)
                 while (same < N && got[same] == ref[same]) ++same;
             std::printf("prompt %zu (%zu tokens): prefill %.0f tok/s (%.2f s, PLE host gather %.2f s, of which reads %.2f s), ",
                         pi, tok.size(), tok.size() / pre, pre, pre_ple / 1e3, pre_wait / 1e3);
+            std::printf("       prefill sections ms: ple+hc %.0f + mixer %.0f + hc %.0f + moe %.0f + shared %.0f + join %.0f\n",
+                        sect[0], sect[1], sect[2], sect[3], sect[4], sect[5]);
             if (do_plain) std::printf("plain %.1f tok/s, ", N / plain);
             std::printf("spec %.1f tok/s, %.2f tokens/pass", N / spec, (double) N / passes);
             if (do_plain) std::printf(", identical %d of %d", same, N);
@@ -309,6 +312,9 @@ int main(int argc, char ** argv)
             if (do_plain) S.identical += same, S.compared += N;
             double pw = 0, pp[3] = {};
             f.ple_host_ms(pm, pc, pr, true, &pw, pp);
+            double sb = 0, sw = 0;
+            f.experts().stream_stats(sb, sw, true);
+            S.s_busy += sb, S.s_wait += sw;
             S.ple_wait += pw;
             for (int k = 0; k < 3; ++k) S.ple_phase[k] += pp[k];
             f.section_ms(sect);
@@ -375,6 +381,9 @@ int main(int argc, char ** argv)
         std::printf("       device ms/pass: draft %.2f + verify %.2f + head %.2f = %.2f (rest: host stalls/gaps)\n",
                     S.ms_draft / passes, S.ms_verify / passes, S.ms_head / passes,
                     (S.ms_draft + S.ms_verify + S.ms_head) / passes);
+        if (S.s_busy + S.s_wait)
+            std::printf("       prefill stream: prefetch copies %.2f s busy, acquire waits %.2f s exposed\n",
+                        S.s_busy / 1e3, S.s_wait / 1e3);
         std::printf("       host ms/pass: draft-window %.2f + verify-window %.2f + head-window %.2f + accept %.2f = %.2f\n",
                     S.hw[0] / passes, S.hw[1] / passes, S.hw[2] / passes, S.hw[3] / passes,
                     (S.hw[0] + S.hw[1] + S.hw[2] + S.hw[3]) / passes);

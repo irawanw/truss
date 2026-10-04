@@ -91,6 +91,9 @@ public:
     void upload(void * dst, const void * src, size_t bytes);         // a small copy (pinned src) on the copy stream
     void acquire(int layer, cudaStream_t compute);                 // compute waits for layer l's copies
     void release(int layer, cudaStream_t compute);                 // compute is done with slot l % 2 (stream mode)
+    // TRUSS_STREAM_PROFILE=1: stream-mode measurements, harvested at every mode switch. busy_ms = PCIe transfer
+    // time of the layer prefetches; wait_ms = compute-stream time spent waiting at acquire() (exposed stream).
+    void stream_stats(double & busy_ms, double & wait_ms, bool reset = false) const;
 
     size_t device_bytes() const { return device_bytes_; }
     size_t cold_bytes() const { return cold_total_; }                // pinned host bytes, streamed once per chunk
@@ -229,6 +232,14 @@ private:
     std::deque<RingEntry> fifo_;
     Mode mode_ = Mode::RING;
     std::vector<void *> device_, pinned_;
+    // TRUSS_STREAM_PROFILE=1: per-chunk stream measurements. Events are created in the ctor only when enabled.
+    bool stream_prof_ = false;
+    std::vector<cudaEvent_t> prof_pool_;                          // timing events, taken in order, all returned at harvest
+    size_t prof_used_ = 0;
+    std::vector<std::pair<cudaEvent_t, cudaEvent_t>> busy_ev_, wait_ev_;
+    mutable double prof_busy_ms_ = 0, prof_wait_ms_ = 0;
+    cudaEvent_t prof_take() { return prof_pool_[prof_used_++]; }
+    void prof_harvest();                                           // syncs the open pairs (chunk boundary only)
     cudaStream_t copy_ = nullptr;
     cudaEvent_t copied_[2] = {}, released_[2] = {}, compute_mark_ = nullptr;
     bool released_recorded_[2] = {};
