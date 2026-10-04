@@ -1197,7 +1197,9 @@ struct Forward::Impl {
             require((size_t) T * E <= ple_stage_n, "PLE stage too small for the chunk");
             int tk;
             if (ple_tk_valid && ple_tk_pos0 == pos0) { tk = ple_tk; ple_tk_valid = false; }   // already in flight
-            else { ple_tk_valid = false; tk = ple_reader->issue(rows.data() + (size_t) n_prev * H, (size_t) T * H); }
+            else { ple_tk_valid = false; tk = ple_reader->issue(rows.data() + (size_t) n_prev * H, (size_t) T * H,
+                                                                 T <= 1); }   // a chunk's rows are used once: only
+                                                                                // decode tickets populate the cache
             TRUSS_CUDA(cudaEventSynchronize(ple_copied));
             ple_reader->collect(tk, ple_stage);
             host16 = ple_stage;
@@ -1223,7 +1225,7 @@ struct Forward::Impl {
             nseq.insert(nseq.end(), ple_next, ple_next + ple_next_T);
             std::vector<int32_t> nrows(nseq.size() * H);
             ple_rows(c, nseq.data(), (int) nseq.size(), nrows.data());
-            ple_tk = ple_reader->issue(nrows.data() + keep * H, (size_t) ple_next_T * H);
+            ple_tk = ple_reader->issue(nrows.data() + keep * H, (size_t) ple_next_T * H, false);
             ple_tk_valid = true; ple_tk_pos0 = pos0 + T;
         }
         ple_next = nullptr; ple_next_T = 0;
@@ -1967,10 +1969,12 @@ void Forward::section_moe_ms(double out[4], bool reset) const
     if (reset) for (int i = 0; i < 4; ++i) m_->sect_moe[i] = 0;
 }
 
-void Forward::ple_host_ms(double & ms, long & calls, long & rows, bool reset, double * wait_ms) const
+void Forward::ple_host_ms(double & ms, long & calls, long & rows, bool reset, double * wait_ms, double * phase_ms) const
 {
     ms = m_->ple_host_ms, calls = m_->ple_calls, rows = m_->ple_rows_n;
     if (wait_ms) *wait_ms = m_->ple_reader ? m_->ple_reader->take_wait_ms() : 0.0;
+    if (phase_ms) { if (m_->ple_reader) m_->ple_reader->take_phase_ms(phase_ms);
+                    else phase_ms[0] = phase_ms[1] = phase_ms[2] = 0; }
     if (reset) m_->ple_host_ms = 0, m_->ple_calls = 0, m_->ple_rows_n = 0;
 }
 

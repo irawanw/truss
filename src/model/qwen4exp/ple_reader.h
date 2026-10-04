@@ -36,15 +36,20 @@ public:
     PleReader(const PleReader &) = delete;
     PleReader & operator=(const PleReader &) = delete;
 
-    int issue(const int32_t * rows, size_t n);
+    // cache_misses=false: read the rows but do not populate the cache — a prefill chunk's trigram rows are read
+    // once; caching them grows the map/cache working set for no reuse and slows every later lookup.
+    int issue(const int32_t * rows, size_t n, bool cache_misses = true);
     void collect(int ticket, half * emb);   // emb [n][row_bytes]
 
     struct Stats {
         uint64_t rows = 0, cache_hits = 0, pages = 0;   // rows asked for, served by the cache, 4 KiB pages read
         double wait_ms = 0;                             // collect blocked on reads
+        double phase_ms[3] = {};                        // collect's host phases: 0 hits put, 1 miss copy+put,
+                                                        // 2 miss map+insert
     };
     const Stats & stats() const { return stats_; }
     double take_wait_ms() const;   // collect's cumulative block on the SSD reads since the last take (resets)
+    void take_phase_ms(double out[3]) const;   // ditto for the host phases
 
 private:
     struct Page {
@@ -66,6 +71,7 @@ private:
     std::unordered_map<uint64_t, uint8_t *> page_at_;   // (fd << 48 | page index) -> buffer
     std::vector<uint8_t *> bufs_;                 // aligned page buffers (grown, reused)
     int ticket_ = 0;
+    bool cache_misses_ = true;   // per ticket: misses populate the cache
     // pool
     std::vector<std::thread> pool_;
     mutable std::mutex mu_;

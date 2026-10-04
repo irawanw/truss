@@ -102,7 +102,7 @@ void PleReader::worker()
     }
 }
 
-int PleReader::issue(const int32_t * rows, size_t n)
+int PleReader::issue(const int32_t * rows, size_t n, bool cache_misses)
 {
     {   // one ticket in flight: the previous one's reads write into buffers this one reuses
         std::unique_lock<std::mutex> lk(mu_);
@@ -149,6 +149,7 @@ int PleReader::issue(const int32_t * rows, size_t n)
         finished_ = 0;
         next_ = 0;
         io_errno_ = 0;
+        cache_misses_ = cache_misses;
         ++gen_;
     }
     if (n_pages_) cv_.notify_all();
@@ -186,9 +187,13 @@ void PleReader::collect(int ticket, half * emb)
     const size_t n = rows_.size();
     auto put = [&](size_t i, const int8_t * b, half s) { put_row(b, __half2float(s), emb + i * row_bytes_, row_bytes_); };
     // cache hits first: inserting the misses may evict a slot a hit of this ticket still points at
+    const auto th0 = std::chrono::steady_clock::now();
     for (size_t i = 0; i < n; ++i)
         if (slot_[i] >= 0) put(i, &cache_bytes_[(size_t) slot_[i] * row_bytes_], cache_scale_[slot_[i]]);
     std::vector<int8_t> row(row_bytes_);
+    stats_.phase_ms[0] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - th0).count();
+    double copy_ms = 0, ins_ms = 0;   // phases 1-2, folded into stats_ once (two clock reads per miss row)
+    auto tc = std::chrono::steady_clock::now();
     for (size_t i = 0; i < n; ++i) {
         if (slot_[i] >= 0) continue;
         const uint64_t a = table_off_ + (uint64_t) rows_[i] * row_bytes_;
@@ -198,8 +203,13 @@ void PleReader::collect(int ticket, half * emb)
         half s;
         std::memcpy(&s, page_of(fd_scale_, scale_off_ + (uint64_t) rows_[i] * sizeof(half)), sizeof(half));
         put(i, row.data(), s);
-        if (cap_ && !where_.count(rows_[i])) insert(rows_[i], row.data(), s);
+        const auto ti = std::chrono::steady_clock::now();
+        copy_ms += std::chrono::duration<double, std::milli>(ti - tc).count();
+        if (cache_misses_ && cap_ && !where_.count(rows_[i])) insert(rows_[i], row.data(), s);
+        tc = std::chrono::steady_clock::now();
+        ins_ms += std::chrono::duration<double, std::milli>(tc - ti).count();
     }
+    stats_.phase_ms[1] += copy_ms, stats_.phase_ms[2] += ins_ms;
 }
 
 double PleReader::take_wait_ms() const
@@ -208,6 +218,12 @@ double PleReader::take_wait_ms() const
     const double w = stats_.wait_ms;
     stats_.wait_ms = 0;
     return w;
+}
+
+void PleReader::take_phase_ms(double out[3]) const
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    for (int i = 0; i < 3; ++i) out[i] = stats_.phase_ms[i], stats_.phase_ms[i] = 0;
 }
 
 }  // namespace truss::qwen4exp
