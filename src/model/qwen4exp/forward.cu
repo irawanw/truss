@@ -55,6 +55,16 @@ using MoeShape = moe::FlashNext;
 
 namespace {
 
+// TRUSS_LOAD_TIMES=1: seconds since the library was loaded at each startup step (stderr)
+const auto load_t0 = std::chrono::steady_clock::now();
+void load_mark(const char * what)
+{
+    static const bool on = std::getenv("TRUSS_LOAD_TIMES") != nullptr;
+    if (on)
+        std::fprintf(stderr, "load %7.2f s  %s\n",
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - load_t0).count(), what);
+}
+
 void require(bool ok, const std::string & what)
 {
     if (!ok) throw std::runtime_error("qwen4exp::Forward: " + what);
@@ -270,6 +280,7 @@ struct Forward::Impl {
           small_scratch(scratch_bytes(cc, std::min(mc, FETCH_ROWS), nc, o.mtp)),
           spec_rows(o.spec_rows), act(o.act), hint_k(o.hint_k), split_rows(o.split_rows), split_t(o.split_t), split_ms_row(o.split_ms_row)
     {
+        load_mark("Forward: start");
         check_shapes();
         mtp = o.mtp;
         draft_min_p = o.draft_min_p;
@@ -277,6 +288,7 @@ struct Forward::Impl {
         TRUSS_CUBLAS(cublasCreate(&blas));
         const double vram0 = vram_used();   // the CUDA context and anything before this Forward
         upload();
+        load_mark("dense weights uploaded");
         const double vram_w = vram_used();
         if (o.after_upload) o.after_upload();
         const int small_rows = std::min(max_chunk, FETCH_ROWS);
@@ -381,7 +393,9 @@ struct Forward::Impl {
         if (prefill_rows > FETCH_ROWS) z.stream_extra = big_bytes();
         const runtime::ExpertStore::HotSet hot = runtime::ExpertStore::plan(tables, expert_budget, z, usage);
         for (const auto & h : hot) n_hot += (int) std::count(h.begin(), h.end(), 1);
+        load_mark("expert plan");
         experts = std::make_unique<runtime::ExpertStore>(tables, hot, z);
+        load_mark("expert store (hot upload + cold copy; page-locking continues in the background)");
         if (o.kv_lend) {   // E6: every DSA layer's K and V position arrays (MTP block included)
             auto lend = [&](const LayerState & L) {
                 const size_t row = (size_t) c.n_head_kv * c.head_dim * (L.kv.int8() ? 1 : 2);
@@ -406,8 +420,10 @@ struct Forward::Impl {
             TRUSS_CUDA(cudaMallocHost(&ple_stage, ple_stage_n * sizeof(half)));
             TRUSS_CUDA(cudaEventCreateWithFlags(&ple_copied, cudaEventDisableTiming));
         }
+        load_mark("after_upload + PLE reader");
         if (!o.cpu_dir.empty()) load_cpu_tier(o, hot);
         else if (o.cpu_trellis) load_cpu_tier_trellis(o, hot);
+        load_mark("CPU tier");
         use_doorbell = o.doorbell;
         cpu_dynamic = o.cpu_dynamic && cpu_tier && use_doorbell;
         pcie_ms_byte = 1.0 / (o.pcie_gbps * 1e6);
@@ -443,6 +459,8 @@ struct Forward::Impl {
                 big.mres = reinterpret_cast<float *>(p + align(sb) + wb + 2 * rb);
             }
         }
+        if (experts) experts->start_pinning();   // last: it holds the driver lock for ~3 s
+        load_mark("Forward: done");
         if (mtp) mtp_calib_open(prefill_rows);
         if (getenv("TRUSS_PROFILE_SECTIONS")) {
             sect_on = true;
@@ -992,6 +1010,34 @@ struct Forward::Impl {
         madvise((void *) lo, (size_t) (hi - lo), MADV_DONTNEED);
     }
 
+    // The dense tensors' file pages, faulted in by 16 threads (MADV_POPULATE_READ, 64 MB pieces) before the uploads
+    // read them: the pageable copies below otherwise fault every 4 KB page on one thread (~2.6 s for ~5 GB).
+    static void prefault(const std::vector<const gguf::Tensor *> & a, const std::vector<const gguf::Tensor *> & b)
+    {
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+        const long ps = sysconf(_SC_PAGESIZE);
+        if (ps <= 0) return;
+        constexpr size_t PIECE = 64u << 20;
+        std::vector<std::pair<uintptr_t, size_t>> pieces;
+        for (const auto * v : { &a, &b })
+            for (const gguf::Tensor * t : *v) {
+                if (!t || !t->data || !t->bytes) continue;
+                const uintptr_t m = (uintptr_t) ps - 1, lo = (uintptr_t) t->data & ~m,
+                                hi = ((uintptr_t) t->data + t->bytes + m) & ~m;
+                for (uintptr_t x = lo; x < hi; x += PIECE) pieces.push_back({ x, std::min<size_t>(PIECE, hi - x) });
+            }
+        std::atomic<size_t> next{ 0 };
+        std::vector<std::thread> th;
+        for (int i = 0; i < 16; ++i)
+            th.emplace_back([&] {
+                for (size_t j; (j = next.fetch_add(1)) < pieces.size();)
+                    madvise((void *) pieces[j].first, pieces[j].second, MADV_POPULATE_READ);   // best effort
+            });
+        for (auto & t : th) t.join();
+    }
+
     void upload()
     {
         std::vector<const gguf::Tensor *> plain, q8_list;
@@ -1022,6 +1068,8 @@ struct Forward::Impl {
             add(L.moe.router), add(L.moe.shexp_gate_inp), add(L.moe.shexp_gate), add(L.moe.shexp_up),
                 add(L.moe.shexp_down);
         }
+        prefault(plain, q8_list);
+        load_mark("dense weights: file pages faulted in");
         dev = std::make_unique<DeviceTensors>(plain);
         for (T t : plain) release_tensor(t);
 
@@ -1902,6 +1950,11 @@ Forward::Forward(const Config & c, const Weights & w, int n_ctx, int max_chunk, 
 }
 
 Forward::~Forward() = default;
+
+void Forward::wait_pinned()
+{
+    if (m_->experts) m_->experts->wait_pinned();
+}
 
 cudaStream_t Forward::stream() const { return m_->s; }
 

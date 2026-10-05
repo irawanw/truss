@@ -2,6 +2,8 @@
 // with bounds checks; tensor data is never copied.
 #include "formats/gguf.h"
 
+#include <algorithm>
+#include <mutex>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -15,6 +17,21 @@
 namespace truss::gguf {
 
 namespace {
+
+struct Registered { void * addr; size_t size; int fd; };
+std::mutex & registry_mu() { static std::mutex m; return m; }
+std::vector<Registered> & registry() { static std::vector<Registered> r; return r; }
+void register_mapping(void * addr, size_t size, int fd)
+{
+    std::lock_guard<std::mutex> g(registry_mu());
+    registry().push_back({ addr, size, fd });
+}
+void unregister_mapping(void * addr)
+{
+    std::lock_guard<std::mutex> g(registry_mu());
+    auto & r = registry();
+    r.erase(std::remove_if(r.begin(), r.end(), [&](const Registered & x) { return x.addr == addr; }), r.end());
+}
 
 constexpr uint32_t MAGIC = 0x46554747;     // "GGUF" little-endian
 constexpr uint32_t VERSION = 3;
@@ -204,10 +221,13 @@ void File::add_shard(const std::string & path, bool first, bool overlay)
         fail(path, std::strerror(errno));
     }
     void * addr = mmap(nullptr, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-    ::close(fd);
-    if (addr == MAP_FAILED) fail(path, std::string("mmap: ") + std::strerror(errno));
+    if (addr == MAP_FAILED) {
+        ::close(fd);
+        fail(path, std::string("mmap: ") + std::strerror(errno));
+    }
     const int shard = (int) maps_.size();
-    maps_.push_back({ addr, (size_t) st.st_size });
+    maps_.push_back({ addr, (size_t) st.st_size, fd });   // fd kept for read_mapped()
+    register_mapping(addr, (size_t) st.st_size, fd);
     paths_.push_back(path);
 
     const auto * base = static_cast<const std::byte *>(addr);
@@ -288,7 +308,37 @@ void File::overlay(const std::string & path)
 
 File::~File()
 {
-    for (auto & m : maps_) munmap(m.addr, m.size);
+    for (auto & m : maps_) {
+        unregister_mapping(m.addr);
+        munmap(m.addr, m.size);
+        ::close(m.fd);
+    }
+}
+
+bool read_mapped(const void * p, size_t n, void * dst)
+{
+    int fd = -1;
+    off_t off = 0;
+    {
+        std::lock_guard<std::mutex> g(registry_mu());
+        for (const auto & m : registry())
+            if ((const char *) p >= (const char *) m.addr && (const char *) p + n <= (const char *) m.addr + m.size) {
+                fd = m.fd;
+                off = (off_t) ((const char *) p - (const char *) m.addr);
+                break;
+            }
+    }
+    if (fd < 0) return false;
+    auto * d = static_cast<char *>(dst);
+    while (n) {
+        const ssize_t r = ::pread(fd, d, n, off);
+        if (r <= 0) {
+            if (r < 0 && errno == EINTR) continue;
+            return false;
+        }
+        d += r, off += r, n -= (size_t) r;
+    }
+    return true;
 }
 
 void File::release_pages() const

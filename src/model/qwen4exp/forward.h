@@ -133,6 +133,9 @@ public:
     // c and w must outlive the Forward (w references the file mapping the weights are uploaded from)
     Forward(const Config & c, const Weights & w, int n_ctx, int max_chunk, const Options & o = {});
     ~Forward();
+    // blocks until the expert store's cold copy is page-locked (it finishes ~3 s after the constructor returns;
+    // until then cold copies are pageable and slower): benches call it before timing
+    void wait_pinned();
     Forward(const Forward &) = delete;
     Forward & operator=(const Forward &) = delete;
 

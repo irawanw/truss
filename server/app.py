@@ -38,10 +38,19 @@ class Engine:
     """The model plus the sequence in it; generate() is the only way in and holds the lock."""
 
     def __init__(self, a):
+        # the tokenizer (transformers + torch imports, ~2.3 s) loads on a thread while the model loads: the ctypes
+        # call releases the GIL
+        chat = {}
+        tok_thread = threading.Thread(target=lambda: chat.setdefault("c", Chat(a.tokenizer, None)), daemon=True)
+        tok_thread.start()
         self.model = Model(a.model, a.n_ctx, a.chunk, a.expert_usage, mtp=a.mtp, drafts=a.drafts, cpu_dir=a.cpu_dir,
                            cpu_share=a.cpu_share, cpu_threads=a.cpu_threads, draft_vocab=a.draft_vocab,
                            draft_min_p=a.draft_min_p)
-        self.chat = Chat(a.tokenizer, self.model.meta_string("tokenizer.chat_template"))
+        tok_thread.join()
+        if "c" not in chat:
+            raise RuntimeError(f"tokenizer {a.tokenizer} failed to load (see the thread's traceback above)")
+        self.chat = chat["c"]
+        self.chat.template = self.model.meta_string("tokenizer.chat_template")
         self.stop_ids = {i for i in (self.model.meta_int("tokenizer.ggml.eos_token_id"),
                                      self.chat.token_id("<|im_end|>"), self.chat.token_id("<|endoftext|>"))
                          if i is not None and i >= 0}

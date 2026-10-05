@@ -25,10 +25,13 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace truss::runtime {
@@ -63,6 +66,10 @@ public:
 
     ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet & hot, const Sizes & z);
     ~ExpertStore();
+    // The cold copy is page-locked by a background thread that start_pinning() starts (the owner calls it after its
+    // own CUDA setup); wait_pinned() starts it if needed and blocks until it is done. Copies before that are pageable.
+    void start_pinning();
+    void wait_pinned();
     ExpertStore(const ExpertStore &) = delete;
     ExpertStore & operator=(const ExpertStore &) = delete;
 
@@ -229,6 +236,11 @@ private:
     std::deque<RingEntry> fifo_;
     Mode mode_ = Mode::RING;
     std::vector<void *> device_, pinned_;
+    uint8_t * host_region_ = nullptr;                              // every layer's cold copy: anonymous, registered
+    size_t host_region_bytes_ = 0;
+    std::unique_ptr<std::atomic<uint8_t>[]> reg_ok_;               // [layer] its cold copy is page-locked
+    std::thread reg_thread_;                                       // page-locks the cold copy after the constructor
+    std::atomic<bool> reg_stop_{ false };
     cudaStream_t copy_ = nullptr;
     cudaEvent_t copied_[2] = {}, released_[2] = {}, compute_mark_ = nullptr;
     bool released_recorded_[2] = {};

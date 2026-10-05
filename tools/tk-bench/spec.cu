@@ -171,6 +171,7 @@ int main(int argc, char ** argv)
         o.after_upload = [&] { file->release_pages(); mfile->release_pages(); };
         Greedy g(c.n_vocab);   // before the Forward: its expert budget takes the memory left
         q::Forward f(c, w, n_ctx, chunk, o);
+        f.wait_pinned();   // timed runs start with the cold copy page-locked, as before the background locking
         file->release_pages();
         mfile->release_pages();
         std::printf("experts: %d resident, ring %.2f GB (a prompt chunk takes %.2f GB of it); drafts %d\n", f.hot_experts(),

@@ -49,6 +49,11 @@ struct Tensor {
 using Value = std::variant<int64_t, double, bool, std::string, std::vector<int64_t>, std::vector<double>,
                            std::vector<bool>, std::vector<std::string>>;
 
+// Copies n bytes at p, which points into a mapping of some open File, to dst with pread() on that shard instead of
+// through the mapping: no page faults and no file pages mapped (RSS) for a bulk copy. False if p is not in a mapping
+// of an open File or a read fails (the caller then copies through the mapping). Thread-safe.
+bool read_mapped(const void * p, size_t n, void * dst);
+
 class File {
 public:
     // path: a single-file model or any shard of a split one ("...-0000N-of-0000M.gguf"); every shard is opened.
@@ -87,7 +92,7 @@ public:
     void release_pages() const;
 
 private:
-    struct Mapping { void * addr; size_t size; };
+    struct Mapping { void * addr; size_t size; int fd; };
     File() = default;
     void add_shard(const std::string & path, bool first, bool overlay = false);
 
