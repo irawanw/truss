@@ -65,6 +65,7 @@ class Model:
             "truss_n_vocab": (c_int, [p]),
             "truss_n_ctx": (c_int, [p]),
             "truss_position": (c_int, [p]),
+            "truss_progress": (None, [p, ctypes.POINTER(c_int), ctypes.POINTER(c_int)]),
             "truss_meta_string": (ctypes.c_char_p, [p, ctypes.c_char_p]),
             "truss_meta_int": (c_i64, [p, ctypes.c_char_p, c_i64]),
             "truss_reset": (c_int, [p]),
@@ -114,6 +115,12 @@ class Model:
     @property
     def position(self) -> int:
         return self._lib.truss_position(self._m)
+
+    def progress(self):
+        """(tokens run, tokens asked) of the eval running on another thread; updated per prompt chunk."""
+        d, t = ctypes.c_int(0), ctypes.c_int(0)
+        self._lib.truss_progress(self._m, ctypes.byref(d), ctypes.byref(t))
+        return d.value, t.value
 
     def meta_string(self, key: str):
         v = self._lib.truss_meta_string(self._m, key.encode())

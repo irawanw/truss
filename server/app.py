@@ -67,6 +67,25 @@ class Engine:
             with open(self.log_path, "a") as f:
                 f.write(line + "\n")
 
+    def progress(self, line: str):
+        """Live progress for the console / pm2 log only (the --log file keeps one summary line per request)."""
+        print(line, flush=True)
+
+    def watch_prefill(self, n_read, base, t0, stop):
+        """Prints one line per finished prompt chunk while a blocking eval runs on the request thread."""
+        seen = 0
+        while not stop.wait(0.5):
+            done, total = self.model.progress()
+            if done < seen:   # a second eval call (the prompt's tail after the checkpoint) restarted the counter
+                base, seen = base + seen, 0
+            if done <= seen or total <= 0:
+                continue
+            seen = done
+            run = base + done
+            rate = run / max(time.time() - t0, 1e-9)
+            self.progress(f"{self.log_tag}: prefill {run}/{n_read} tokens ({100.0 * run / n_read:.0f}%), "
+                          f"{rate:.0f} tok/s, ETA {(n_read - run) / max(rate, 1e-9):.0f} s")
+
     def dump(self, prompt_ids, text, finish, sampling, keep=20):
         """--dump-dir: one JSON per request (prompt tail, generated text, finish, sampling), the newest `keep` kept;
         for diagnosing replies after the fact (e.g. a 32K-token reply that hit the client's cap)."""
@@ -124,6 +143,12 @@ class Engine:
                 return self.model.eval_sample(tokens, sp)
 
             t0 = time.time()
+            n_read = n_prompt - reuse
+            watch_stop, watcher = threading.Event(), None
+            if n_read > 4096:   # a prompt of more than one chunk: log its progress
+                self.progress(f"{self.log_tag}: prefill start, {n_read} tokens to read ({reuse} reused)")
+                watcher = threading.Thread(target=self.watch_prefill, args=(n_read, 0, t0, watch_stop), daemon=True)
+                watcher.start()
             try:
                 # checkpoint just before the prompt's last <|im_start|> (~10 ms): the next request may resume there.
                 # Not at the prompt's end: its generation prompt ("...assistant\n<think>\n") tokenizes differently
@@ -141,7 +166,13 @@ class Engine:
             except TrussError:
                 self.cached, self.ck_tokens = [], []   # the engine's sequence is unknown now: the next request starts over
                 raise
+            finally:
+                watch_stop.set()
             t1 = time.time()
+            if watcher:
+                self.progress(f"{self.log_tag}: prefill done, {n_read} tokens in {t1 - t0:.1f} s "
+                              f"({n_read / max(t1 - t0, 1e-9):.0f} tok/s)")
+            last_log = t1
             detok, text, n_gen, finish = Detokenizer(self.chat), "", 0, "length"
             spec = self.model.drafts > 0
             drafted = accepted = 0
@@ -172,6 +203,11 @@ class Engine:
                         finish = "stop"
                         break
                     yield tok, delta, None
+                    now = time.time()
+                    if now - last_log >= 3.0:   # live decode rate in the console / pm2 log
+                        last_log = now
+                        self.progress(f"{self.log_tag}: decode {n_gen} tokens, {n_gen / max(now - t1, 1e-9):.1f} tok/s, "
+                                      f"drafts accepted {accepted} of {drafted}")
                     if not spec and n_gen < max_tokens and self.model.position < self.model.n_ctx:
                         nxt = step([nxt])
             except TrussError:

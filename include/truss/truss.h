@@ -41,6 +41,9 @@ const char * truss_last_error(void);
 int truss_n_vocab(const truss_model * m);
 int truss_n_ctx(const truss_model * m);
 int truss_position(const truss_model * m);          /* tokens in the sequence so far */
+/* progress of the eval running on another thread: tokens run so far / tokens asked (updated per chunk; 0/0 before
+   the first eval). Safe to call while an eval runs. */
+void truss_progress(const truss_model * m, int * done, int * total);
 
 /* model file metadata: string value (NULL if absent or not a string), integer value (def if absent) */
 const char * truss_meta_string(const truss_model * m, const char * key);
