@@ -2,12 +2,15 @@
 
 #include <fcntl.h>
 #include <unistd.h>
+#include <immintrin.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <stdexcept>
+#include <thread>
 #include <string>
 
 namespace truss::qwen4exp {
@@ -26,6 +29,26 @@ int open_direct(const std::string & path)
 }
 
 uint64_t key(int fd, uint64_t page) { return (uint64_t) fd << 48 | page; }
+
+// AVX2 + F16C: 16 int8 -> 16 fp16 per iteration; bit-identical to the scalar loop (int8 -> float is exact,
+// vmulps is IEEE RNE, vcvtps2ph rounds to nearest even like __float2half; denormals are kept). Zen 2 has both.
+__attribute__((target("avx2,f16c")))
+void put_row(const int8_t * b, float sf, half * o, int n)
+{
+    const __m256 vsf = _mm256_set1_ps(sf);
+    int j = 0;
+    for (; j + 16 <= n; j += 16) {
+        const __m128i in = _mm_loadu_si128(reinterpret_cast<const __m128i *>(b + j));
+        const __m256i w16 = _mm256_cvtepi8_epi16(in);
+        const __m256 flo = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(w16))), vsf);
+        const __m256 fhi = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(w16, 1))), vsf);
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(o + j),
+                         _mm256_cvtps_ph(flo, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(o + j + 8),
+                         _mm256_cvtps_ph(fhi, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    }
+    for (; j < n; ++j) o[j] = __float2half(b[j] * sf);
+}
 
 }  // namespace
 
@@ -81,7 +104,7 @@ void PleReader::worker()
     }
 }
 
-int PleReader::issue(const int32_t * rows, size_t n)
+int PleReader::issue(const int32_t * rows, size_t n, bool cache_misses)
 {
     {   // one ticket in flight: the previous one's reads write into buffers this one reuses
         std::unique_lock<std::mutex> lk(mu_);
@@ -128,6 +151,7 @@ int PleReader::issue(const int32_t * rows, size_t n)
         finished_ = 0;
         next_ = 0;
         io_errno_ = 0;
+        cache_misses_ = cache_misses;
         ++gen_;
     }
     if (n_pages_) cv_.notify_all();
@@ -152,6 +176,27 @@ int PleReader::insert(int32_t row, const int8_t * bytes, half scale)
     return s;
 }
 
+void PleReader::copy_put_rows(size_t lo, size_t hi, half * emb, double & ms) const
+{
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<int8_t> row(row_bytes_);
+    for (size_t i = lo; i < hi; ++i) {
+        if (slot_[i] >= 0) {
+            put_row(&cache_bytes_[(size_t) slot_[i] * row_bytes_], __half2float(cache_scale_[slot_[i]]),
+                    emb + i * row_bytes_, row_bytes_);
+            continue;
+        }
+        const uint64_t a = table_off_ + (uint64_t) rows_[i] * row_bytes_;
+        const uint64_t split = std::min<uint64_t>(row_bytes_, PAGE - a % PAGE);   // bytes in the first page
+        std::memcpy(row.data(), page_of(fd_table_, a), split);
+        if (split < (uint64_t) row_bytes_) std::memcpy(row.data() + split, page_of(fd_table_, a + split), row_bytes_ - split);
+        half s;
+        std::memcpy(&s, page_of(fd_scale_, scale_off_ + (uint64_t) rows_[i] * sizeof(half)), sizeof(half));
+        put_row(row.data(), __half2float(s), emb + i * row_bytes_, row_bytes_);
+    }
+    ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
 void PleReader::collect(int ticket, half * emb)
 {
     if (ticket != ticket_) throw std::logic_error("PleReader::collect: not the ticket in flight");
@@ -163,15 +208,36 @@ void PleReader::collect(int ticket, half * emb)
         if (io_errno_) throw std::runtime_error(std::string("PleReader: read failed: ") + std::strerror(io_errno_));
     }
     const size_t n = rows_.size();
-    auto put = [&](size_t i, const int8_t * b, half s) {
-        const float sf = __half2float(s);
-        half * o = emb + i * row_bytes_;
-        for (int j = 0; j < row_bytes_; ++j) o[j] = __float2half(b[j] * sf);
-    };
+    // A prefill ticket inserts nothing, so the row cache and this ticket's pages are read-only here: copy+put
+    // fans out over ranges (hits and misses fused per row). Only decode tickets need the serial hits-first order.
+    if (!cache_misses_ && n >= 4096) {
+        constexpr unsigned P = 16;
+        const size_t span = (n + P - 1) / P;
+        std::vector<std::thread> th;
+        std::vector<double> ms(P, 0.0);
+        std::vector<std::exception_ptr> errs(P);
+        const auto tc0 = std::chrono::steady_clock::now();
+        for (unsigned p = 1; p < P; ++p)
+            th.emplace_back([this, p, span, n, emb, &ms, &errs] {
+                try { copy_put_rows((size_t) p * span, std::min((size_t) p * span + span, n), emb, ms[p]); }
+                catch (...) { errs[p] = std::current_exception(); }
+            });
+        try { copy_put_rows(0, std::min(span, n), emb, ms[0]); } catch (...) { errs[0] = std::current_exception(); }
+        for (auto & t : th) t.join();
+        for (auto & e : errs)
+            if (e) std::rethrow_exception(e);
+        stats_.phase_ms[1] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc0).count();
+        return;
+    }
+    auto put = [&](size_t i, const int8_t * b, half s) { put_row(b, __half2float(s), emb + i * row_bytes_, row_bytes_); };
     // cache hits first: inserting the misses may evict a slot a hit of this ticket still points at
+    const auto th0 = std::chrono::steady_clock::now();
     for (size_t i = 0; i < n; ++i)
         if (slot_[i] >= 0) put(i, &cache_bytes_[(size_t) slot_[i] * row_bytes_], cache_scale_[slot_[i]]);
     std::vector<int8_t> row(row_bytes_);
+    stats_.phase_ms[0] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - th0).count();
+    double copy_ms = 0, ins_ms = 0;   // phases 1-2, folded into stats_ once (two clock reads per miss row)
+    auto tc = std::chrono::steady_clock::now();
     for (size_t i = 0; i < n; ++i) {
         if (slot_[i] >= 0) continue;
         const uint64_t a = table_off_ + (uint64_t) rows_[i] * row_bytes_;
@@ -181,8 +247,27 @@ void PleReader::collect(int ticket, half * emb)
         half s;
         std::memcpy(&s, page_of(fd_scale_, scale_off_ + (uint64_t) rows_[i] * sizeof(half)), sizeof(half));
         put(i, row.data(), s);
-        if (cap_ && !where_.count(rows_[i])) insert(rows_[i], row.data(), s);
+        const auto ti = std::chrono::steady_clock::now();
+        copy_ms += std::chrono::duration<double, std::milli>(ti - tc).count();
+        if (cache_misses_ && cap_ && !where_.count(rows_[i])) insert(rows_[i], row.data(), s);
+        tc = std::chrono::steady_clock::now();
+        ins_ms += std::chrono::duration<double, std::milli>(tc - ti).count();
     }
+    stats_.phase_ms[1] += copy_ms, stats_.phase_ms[2] += ins_ms;
+}
+
+double PleReader::take_wait_ms() const
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    const double w = stats_.wait_ms;
+    stats_.wait_ms = 0;
+    return w;
+}
+
+void PleReader::take_phase_ms(double out[3]) const
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    for (int i = 0; i < 3; ++i) out[i] = stats_.phase_ms[i], stats_.phase_ms[i] = 0;
 }
 
 }  // namespace truss::qwen4exp

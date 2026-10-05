@@ -213,6 +213,11 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
         TRUSS_CUDA(cudaEventCreateWithFlags(e, cudaEventDisableTiming));
     ev_pool_.resize(LANDING_EVENTS);
     for (cudaEvent_t & e : ev_pool_) TRUSS_CUDA(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+    if (std::getenv("TRUSS_STREAM_PROFILE") && std::atoi(std::getenv("TRUSS_STREAM_PROFILE"))) {
+        stream_prof_ = true;   // measurement build only: timing events for the per-chunk stream profile
+        prof_pool_.resize(1024);
+        for (cudaEvent_t & e : prof_pool_) TRUSS_CUDA(cudaEventCreate(&e));
+    }
     TRUSS_CUDA(cudaHostAlloc(reinterpret_cast<void **>(&signal_src_), sizeof(int) * SIGNAL_RING, cudaHostAllocDefault));
     pinned_.push_back(signal_src_);
 
@@ -453,6 +458,7 @@ ExpertStore::~ExpertStore()
 {
     reg_stop_ = true;
     if (reg_thread_.joinable()) reg_thread_.join();
+    for (cudaEvent_t & e : prof_pool_) cudaEventDestroy(e);
     if (copy_) cudaStreamSynchronize(copy_);
     for (void * p : device_) cudaFree(p);
     for (void * p : pinned_) cudaFreeHost(p);
@@ -496,6 +502,7 @@ void ExpertStore::wait_compute(cudaStream_t compute)
 
 void ExpertStore::begin_stream(cudaStream_t compute)
 {
+    prof_harvest();
     std::lock_guard<std::mutex> g(adm_mu_);
     wait_compute(compute);   // decode kernels may still read the ring the slots overwrite
     // The slots and the chunk's buffers take [0, stream_end_): only the entries there go. The rest of the ring and the
@@ -517,9 +524,12 @@ void ExpertStore::prefetch(int l)
     if (mode_ != Mode::STREAM) throw std::logic_error("ExpertStore::prefetch outside a begin_stream() chunk");
     const Layer & Y = layers_.at(l);
     const int s = l % 2;
+    cudaEvent_t pb0 = nullptr, pb1 = nullptr;
+    if (stream_prof_) { pb0 = prof_take(); pb1 = prof_take(); TRUSS_CUDA(cudaEventRecord(pb0, copy_)); }
     if (released_recorded_[s]) TRUSS_CUDA(cudaStreamWaitEvent(copy_, released_[s], 0));
     if (Y.cold) TRUSS_CUDA(cudaMemcpyAsync(base_ + s * slot_, Y.host, Y.cold, cudaMemcpyHostToDevice, copy_));
     TRUSS_CUDA(cudaEventRecord(copied_[s], copy_));
+    if (pb1) { TRUSS_CUDA(cudaEventRecord(pb1, copy_)); busy_ev_.push_back({pb0, pb1}); }
 }
 
 size_t ExpertStore::prefetch_some(int l, const int * ids, int n)
@@ -527,6 +537,8 @@ size_t ExpertStore::prefetch_some(int l, const int * ids, int n)
     if (mode_ != Mode::STREAM) throw std::logic_error("ExpertStore::prefetch_some outside a begin_stream() chunk");
     const Layer & Y = layers_.at(l);
     const int s = l % 2;
+    cudaEvent_t pb0 = nullptr, pb1 = nullptr;
+    if (stream_prof_) { pb0 = prof_take(); pb1 = prof_take(); TRUSS_CUDA(cudaEventRecord(pb0, copy_)); }
     if (released_recorded_[s]) TRUSS_CUDA(cudaStreamWaitEvent(copy_, released_[s], 0));
     std::vector<uint8_t> want(Y.n_expert, 0);
     for (int i = 0; i < n; ++i)
@@ -554,6 +566,7 @@ size_t ExpertStore::prefetch_some(int l, const int * ids, int n)
     }
     flush();
     TRUSS_CUDA(cudaEventRecord(copied_[s], copy_));
+    if (pb1) { TRUSS_CUDA(cudaEventRecord(pb1, copy_)); busy_ev_.push_back({pb0, pb1}); }
     return host_bytes;
 }
 
@@ -733,6 +746,7 @@ void ExpertStore::admit(const std::vector<std::pair<int, int>> & le, cudaStream_
 
 void ExpertStore::begin_ring()
 {
+    prof_harvest();
     std::lock_guard<std::mutex> g(adm_mu_);
     if (mode_ != Mode::RING) mode_ = Mode::RING;   // decode after a prompt: the stream area is empty, the rest kept
 }
@@ -919,7 +933,34 @@ void ExpertStore::upload(void * dst, const void * src, size_t bytes)
 
 void ExpertStore::acquire(int l, cudaStream_t compute)
 {
+    cudaEvent_t pw0 = nullptr;
+    if (stream_prof_ && mode_ == Mode::STREAM) { pw0 = prof_take(); TRUSS_CUDA(cudaEventRecord(pw0, compute)); }
     TRUSS_CUDA(cudaStreamWaitEvent(compute, copied_[l % 2], 0));
+    if (pw0) { const cudaEvent_t pw1 = prof_take(); TRUSS_CUDA(cudaEventRecord(pw1, compute)); wait_ev_.push_back({pw0, pw1}); }
+}
+
+void ExpertStore::prof_harvest()
+{
+    if (!stream_prof_) return;
+    for (auto & p : busy_ev_) {
+        cudaEventSynchronize(p.second);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, p.first, p.second);
+        prof_busy_ms_ += ms;
+    }
+    for (auto & p : wait_ev_) {
+        cudaEventSynchronize(p.second);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, p.first, p.second);
+        prof_wait_ms_ += ms;
+    }
+    busy_ev_.clear(); wait_ev_.clear(); prof_used_ = 0;   // all pairs synced: the pool is free again
+}
+
+void ExpertStore::stream_stats(double & busy_ms, double & wait_ms, bool reset) const
+{
+    busy_ms = prof_busy_ms_; wait_ms = prof_wait_ms_;
+    if (reset) prof_busy_ms_ = prof_wait_ms_ = 0;
 }
 
 void ExpertStore::release(int l, cudaStream_t compute)

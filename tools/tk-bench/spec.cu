@@ -64,7 +64,12 @@ struct Greedy {   // argmax of logit rows on the device, copied back
 
 void prompt(q::Forward & f, const std::vector<int32_t> & tok, int chunk)
 {
-    for (size_t s = 0; s < tok.size(); s += chunk) f.run(tok.data() + s, (int) std::min<size_t>(chunk, tok.size() - s));
+    for (size_t s = 0; s < tok.size(); s += chunk) {
+        const size_t n = std::min<size_t>(chunk, tok.size() - s);
+        const bool next = s + n < tok.size();   // describe the following chunk: its PLE reads start during this one
+        f.run(tok.data() + s, (int) n, nullptr, next ? tok.data() + s + chunk : nullptr,
+              next ? (int) std::min<size_t>(chunk, tok.size() - s - chunk) : 0);
+    }
 }
 
 }  // namespace
@@ -181,7 +186,10 @@ int main(int argc, char ** argv)
         // reset around the spec phase only, and summed over the prompts
         struct Sum {
             double spec_s = 0, plain_s = 0, ms_draft = 0, ms_verify = 0, ms_head = 0, sect[6] = {}, m4[4] = {}, d3[3] = {};
-            double ple_ms = 0, cpu_wait_us = 0, pre_s = 0, pre_ple = 0;
+            double hw[4] = {};   // host wall per pass stage (launch..sync): draft, verify, head, accept
+            double ple_wait = 0, ple_phase[3] = {};   // decode collect: read wait + phases
+            double s_busy = 0, s_wait = 0;            // prefill stream: prefetch copy busy + exposed acquire wait
+            double ple_ms = 0, cpu_wait_us = 0, pre_s = 0, pre_ple = 0, pre_wait = 0, pre_phase[3] = {};
             long pre_tok = 0;
             long passes = 0, tokens = 0, drafted = 0, accepted = 0, dn = 0, ple_calls = 0, ple_rows = 0, cpu_waits = 0;
             long long item_us = 0, ph[4] = {}, sh[4] = {};
@@ -221,7 +229,9 @@ int main(int argc, char ** argv)
             g.rows(f, (int) (tok.size() - 1) % step, 1, &t);
             const double pre = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp).count();
             double pre_ple;   // the prompt's PLE host gather (synchronous table reads), part of `pre`
-            f.ple_host_ms(pre_ple, pc0, pr0, true);
+            double pre_wait = 0;   // of which: collect() blocked on the PleReader's SSD reads
+            double pre_phase[3] = {};   // and collect's host phases: hits put / miss copy+put / miss map+insert
+            f.ple_host_ms(pre_ple, pc0, pr0, true, &pre_wait, pre_phase);
             f.cpu_stats(true);
             f.cpu_shape_reset();
             double sect[6], m4[4], d3[3], pm;
@@ -245,6 +255,7 @@ int main(int argc, char ** argv)
             if (prange) TRUSS_CUDA(cudaProfilerStart());
             const auto t0 = std::chrono::steady_clock::now();
             while ((int) got.size() < N) {
+                const auto tA = std::chrono::steady_clock::now();
                 int32_t win[9], best[9];
                 win[0] = t;
                 TRUSS_CUDA(cudaEventRecord(e0, f.stream()));
@@ -252,22 +263,29 @@ int main(int argc, char ** argv)
                 TRUSS_CUDA(cudaEventRecord(e1, f.stream()));
                 TRUSS_CUDA(cudaEventSynchronize(e1));
                 { float m = 0; TRUSS_CUDA(cudaEventElapsedTime(&m, e0, e1)); ms_draft += m; }
+                const auto tB = std::chrono::steady_clock::now();
                 TRUSS_CUDA(cudaEventRecord(e0, f.stream()));
                 f.verify(win, nw + 1);
                 TRUSS_CUDA(cudaEventRecord(e1, f.stream()));
                 TRUSS_CUDA(cudaEventSynchronize(e1));
                 { float m = 0; TRUSS_CUDA(cudaEventElapsedTime(&m, e0, e1)); ms_verify += m; }
+                const auto tC = std::chrono::steady_clock::now();
                 TRUSS_CUDA(cudaEventRecord(e0, f.stream()));
                 g.rows(f, 0, nw + 1, best);
                 TRUSS_CUDA(cudaEventRecord(e1, f.stream()));
                 TRUSS_CUDA(cudaEventSynchronize(e1));
                 { float m = 0; TRUSS_CUDA(cudaEventElapsedTime(&m, e0, e1)); ms_head += m; }
+                const auto tD = std::chrono::steady_clock::now();
                 int j = 0;
                 while (j < nw && best[j] == win[j + 1]) ++j;
                 f.accept(j + 1);
                 for (int i = 0; i <= j; ++i) got.push_back(win[i]);
                 t = best[j];
                 ++passes, drafted += nw, accepted += j;
+                S.hw[0] += std::chrono::duration<double, std::milli>(tB - tA).count();
+                S.hw[1] += std::chrono::duration<double, std::milli>(tC - tB).count();
+                S.hw[2] += std::chrono::duration<double, std::milli>(tD - tC).count();
+                S.hw[3] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tD).count();
             }
             const double spec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             if (prange) TRUSS_CUDA(cudaProfilerStop());
@@ -275,14 +293,17 @@ int main(int argc, char ** argv)
             int same = 0;
             if (do_plain)
                 while (same < N && got[same] == ref[same]) ++same;
-            std::printf("prompt %zu (%zu tokens): prefill %.0f tok/s (%.2f s, PLE host gather %.2f s), ", pi, tok.size(),
-                        tok.size() / pre, pre, pre_ple / 1e3);
+            std::printf("prompt %zu (%zu tokens): prefill %.0f tok/s (%.2f s, PLE host gather %.2f s, of which reads %.2f s), ",
+                        pi, tok.size(), tok.size() / pre, pre, pre_ple / 1e3, pre_wait / 1e3);
+            std::printf("       prefill sections ms: ple+hc %.0f + mixer %.0f + hc %.0f + moe %.0f + shared %.0f + join %.0f\n",
+                        sect[0], sect[1], sect[2], sect[3], sect[4], sect[5]);
             if (do_plain) std::printf("plain %.1f tok/s, ", N / plain);
             std::printf("spec %.1f tok/s, %.2f tokens/pass", N / spec, (double) N / passes);
             if (do_plain) std::printf(", identical %d of %d", same, N);
             std::printf("\n");
             // accumulate
-            S.pre_s += pre, S.pre_tok += (long) tok.size(), S.pre_ple += pre_ple / 1e3;
+            S.pre_s += pre, S.pre_tok += (long) tok.size(), S.pre_ple += pre_ple / 1e3, S.pre_wait += pre_wait / 1e3;
+            for (int k = 0; k < 3; ++k) S.pre_phase[k] += pre_phase[k] / 1e3;
             if (const char * dp = std::getenv("TRUSS_BENCH_DUMP")) {   // the spec tokens, appended per prompt
                 FILE * fd = std::fopen(dp, pi ? "ab" : "wb");
                 if (fd) std::fwrite(got.data(), 4, std::min<size_t>(got.size(), N), fd), std::fclose(fd);
@@ -290,7 +311,16 @@ int main(int argc, char ** argv)
             S.spec_s += spec, S.plain_s += plain, S.passes += passes, S.tokens += N, S.drafted += drafted;
             S.accepted += accepted, S.ms_draft += ms_draft, S.ms_verify += ms_verify, S.ms_head += ms_head;
             if (do_plain) S.identical += same, S.compared += N;
-            f.section_ms(sect), f.section_moe_ms(m4), f.driver_ms(d3, dn), f.ple_host_ms(pm, pc, pr);
+            double pw = 0, pp[3] = {};
+            f.ple_host_ms(pm, pc, pr, true, &pw, pp);
+            double sb = 0, sw = 0;
+            f.experts().stream_stats(sb, sw, true);
+            S.s_busy += sb, S.s_wait += sw;
+            S.ple_wait += pw;
+            for (int k = 0; k < 3; ++k) S.ple_phase[k] += pp[k];
+            f.section_ms(sect);
+            f.section_moe_ms(m4);
+            f.driver_ms(d3, dn);
             for (int k = 0; k < 6; ++k) S.sect[k] += sect[k];
             for (int k = 0; k < 4; ++k) S.m4[k] += m4[k];
             for (int k = 0; k < 3; ++k) S.d3[k] += d3[k];
@@ -313,8 +343,10 @@ int main(int argc, char ** argv)
 
         const double passes = (double) S.passes;
         if (do_plain) std::printf("plain: %ld tokens in %.2f s = %.1f tok/s\n", S.tokens, S.plain_s, S.tokens / S.plain_s);
-        std::printf("prefill: %ld prompt tokens in %.2f s = %.0f tok/s (PLE host gather %.2f s)\n", S.pre_tok, S.pre_s,
-                    S.pre_tok / S.pre_s, S.pre_ple);
+        std::printf("prefill: %ld prompt tokens in %.2f s = %.0f tok/s (PLE host gather %.2f s, of which reads %.2f s; "
+                    "phases hits %.2f copy+put %.2f insert %.2f)\n",
+                    S.pre_tok, S.pre_s, S.pre_tok / S.pre_s, S.pre_ple, S.pre_wait, S.pre_phase[0], S.pre_phase[1],
+                    S.pre_phase[2]);
         std::printf("spec : %ld tokens in %.2f s = %.1f tok/s, %ld passes (%.2f tokens/pass), drafts accepted %ld of %ld\n",
                     S.tokens, S.spec_s, S.tokens / S.spec_s, S.passes, S.tokens / passes, S.accepted, S.drafted);
         std::printf("       per pass: %.1f cold experts routed, %.1f fetched on demand (%.1f MB), %.1f prefetched (%.1f MB)\n",
@@ -350,6 +382,12 @@ int main(int argc, char ** argv)
         std::printf("       device ms/pass: draft %.2f + verify %.2f + head %.2f = %.2f (rest: host stalls/gaps)\n",
                     S.ms_draft / passes, S.ms_verify / passes, S.ms_head / passes,
                     (S.ms_draft + S.ms_verify + S.ms_head) / passes);
+        if (S.s_busy + S.s_wait)
+            std::printf("       prefill stream: prefetch copies %.2f s busy, acquire waits %.2f s exposed\n",
+                        S.s_busy / 1e3, S.s_wait / 1e3);
+        std::printf("       host ms/pass: draft-window %.2f + verify-window %.2f + head-window %.2f + accept %.2f = %.2f\n",
+                    S.hw[0] / passes, S.hw[1] / passes, S.hw[2] / passes, S.hw[3] / passes,
+                    (S.hw[0] + S.hw[1] + S.hw[2] + S.hw[3]) / passes);
         if (S.sect[0] > 0)
             std::printf("       layer device ms/pass: ple+hc_mix %.2f + mixer %.2f + hc_mix %.2f + routed MoE %.2f "
                         "+ shared %.2f + cpu join/combine %.2f = %.2f\n",
@@ -359,10 +397,10 @@ int main(int argc, char ** argv)
         if (S.m4[0] + S.m4[1] + S.m4[2] + S.m4[3] > 0)
             std::printf("       routed MoE ms/pass: router+publish %.2f + wait for the host plan %.2f + wait for copies %.2f "
                         "+ expert kernel %.2f\n", S.m4[0] / passes, S.m4[1] / passes, S.m4[2] / passes, S.m4[3] / passes);
-        if (f.adapt_admitted()) std::printf("       adaptive tier: %ld experts admitted\n", f.adapt_admitted());
         if (S.ple_calls)
-            std::printf("       PLE host gather ms/pass: %.2f (%.1f calls, %.0f table rows per pass)\n", S.ple_ms / passes,
-                        S.ple_calls / passes, S.ple_rows / passes);
+            std::printf("       PLE host gather ms/pass: %.2f (%.1f calls, %.0f table rows; wait %.2f, phases hits %.2f "
+                        "copy+put %.2f insert %.2f)\n", S.ple_ms / passes, S.ple_calls / passes, S.ple_rows / passes,
+                        S.ple_wait / passes, S.ple_phase[0] / passes, S.ple_phase[1] / passes, S.ple_phase[2] / passes);
         if (S.dn)
             std::printf("       driver ms/pass: split %.2f + CPU start %.2f + copies and plan %.2f (%.1f layers/pass)\n",
                         S.d3[0] / passes, S.d3[1] / passes, S.d3[2] / passes, S.dn / passes);

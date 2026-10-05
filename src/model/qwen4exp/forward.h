@@ -143,7 +143,11 @@ public:
     using LayerHook = std::function<void(int layer, const float * res, int T)>;
 
     // The next T tokens of the sequence (any T <= max_chunk: a prompt chunk, or one decoded token).
-    void run(const int32_t * tokens, int T, const LayerHook & hook = nullptr);
+    // For a prompt chunk, next / next_T may describe the chunk that follows it (contiguous, tokens + T): the
+    // PLE rows that chunk needs are then hashed and read from disk while this chunk computes, so the next
+    // chunk's layer-1 gather does not stall the host. Without the hint the gather still blocks its own chunk.
+    void run(const int32_t * tokens, int T, const LayerHook & hook = nullptr,
+             const int32_t * next = nullptr, int next_T = 0);
 
     // Speculative decoding (Options::spec_rows > 0). verify() runs a window of T <= spec_rows tokens (the next token
     // and the drafts after it) without committing it: head() then gives every row's logits. accept(n) keeps the
@@ -203,7 +207,8 @@ public:
     // host time of the PLE layers' n-gram row hash, table gather (the mmap of the GGUF: page faults for rows not in
     // the page cache) and fp16 conversion, ms summed over calls since the last reset, with the table rows read.
     // Always counted (two clock reads per PLE layer call).
-    void ple_host_ms(double & ms, long & calls, long & rows, bool reset = false) const;
+    void ple_host_ms(double & ms, long & calls, long & rows, bool reset = false, double * wait_ms = nullptr,
+                     double * phase_ms = nullptr) const;   // phase_ms[3]: collect's hits / copy+put / map+insert
     size_t kv_lent() const;                         // Options::kv_lend: KV bytes lent to the expert ring now
     // E7 since construction: host bytes copied by split chunks, cold experts their layers gave the CPU / the GPU
     void split_stats(long long out[3]) const;

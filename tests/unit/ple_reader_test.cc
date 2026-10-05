@@ -69,6 +69,39 @@ int main(int argc, char ** argv)
                     (unsigned long long) st.rows, (unsigned long long) st.cache_hits, (unsigned long long) st.pages,
                     st.wait_ms);
     }
+    // Parallel collect (prefill ticket: issue(..., false) with n >= 4096): bit-identical for a mix of cache
+    // hits and misses (reader with a filled cache) and for all-misses (fresh reader).
+    {
+        std::vector<int32_t> rows;
+        const int n = 16 * 4096;
+        for (int i = 0; i < n; ++i) rows.push_back((int32_t) any(rng));
+        for (int i = 0; i < 64; ++i) {   // page-straddling rows
+            const int64_t page = any(rng) % (table->bytes / 4096 - 1) + 1;
+            const int64_t r = ((int64_t) table->file_offset / 4096 * 4096 + page * 4096 - (int64_t) table->file_offset) / rb;
+            if (r >= 0 && r < n_rows) rows.push_back((int32_t) r);
+        }
+        const auto want = mapped(rows);
+        std::vector<half> got(rows.size() * rb);
+        qwen4exp::PleReader rd(*file, *table, *scale, rb, 16, (size_t) 1 << 20);
+        for (int c = 0; c < 2; ++c) rd.collect(rd.issue(rows.data(), rows.size()), got.data());   // fill the cache
+        for (int c = 0; c < 2; ++c) {   // parallel, mixed hits + misses
+            const auto t0 = std::chrono::steady_clock::now();
+            rd.collect(rd.issue(rows.data(), rows.size(), false), got.data());
+            const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+            const bool same = std::memcmp(got.data(), want.data(), got.size() * sizeof(half)) == 0;
+            fails += !same;
+            std::printf("parallel mixed call %d: %6zu rows in %8.0f us (%.3f us/row) %s\n", c, rows.size(), us,
+                        us / rows.size(), same ? "identical" : "DIFFERENT");
+        }
+        qwen4exp::PleReader fresh(*file, *table, *scale, rb, 16, (size_t) 1 << 20);
+        const auto t0 = std::chrono::steady_clock::now();
+        fresh.collect(fresh.issue(rows.data(), rows.size(), false), got.data());   // parallel, all misses
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        const bool same = std::memcmp(got.data(), want.data(), got.size() * sizeof(half)) == 0;
+        fails += !same;
+        std::printf("parallel misses:      %6zu rows in %8.0f us (%.3f us/row) %s\n", rows.size(), us,
+                    us / rows.size(), same ? "identical" : "DIFFERENT");
+    }
     std::printf("%s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
 }

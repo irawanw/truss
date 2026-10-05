@@ -36,14 +36,20 @@ public:
     PleReader(const PleReader &) = delete;
     PleReader & operator=(const PleReader &) = delete;
 
-    int issue(const int32_t * rows, size_t n);
+    // cache_misses=false: read the rows but do not populate the cache — a prefill chunk's trigram rows are read
+    // once; caching them grows the map/cache working set for no reuse and slows every later lookup.
+    int issue(const int32_t * rows, size_t n, bool cache_misses = true);
     void collect(int ticket, half * emb);   // emb [n][row_bytes]
 
     struct Stats {
         uint64_t rows = 0, cache_hits = 0, pages = 0;   // rows asked for, served by the cache, 4 KiB pages read
         double wait_ms = 0;                             // collect blocked on reads
+        double phase_ms[3] = {};                        // collect's host phases: 0 hits put, 1 miss copy+put,
+                                                        // 2 miss map+insert
     };
     const Stats & stats() const { return stats_; }
+    double take_wait_ms() const;   // collect's cumulative block on the SSD reads since the last take (resets)
+    void take_phase_ms(double out[3]) const;   // ditto for the host phases
 
 private:
     struct Page {
@@ -54,6 +60,9 @@ private:
     void worker();
     const uint8_t * page_of(int fd, uint64_t off) const;   // the read page holding byte `off`
     int insert(int32_t row, const int8_t * bytes, half scale);
+    // rows [lo,hi) -> emb (hits from the cache, misses copied from the ticket's pages + dequantized). Read-only
+    // over the ticket's state, so several ranges run at once; ms receives the thread's own elapsed time.
+    void copy_put_rows(size_t lo, size_t hi, half * emb, double & ms) const;
 
     int row_bytes_;
     int fd_table_ = -1, fd_scale_ = -1;
@@ -65,9 +74,10 @@ private:
     std::unordered_map<uint64_t, uint8_t *> page_at_;   // (fd << 48 | page index) -> buffer
     std::vector<uint8_t *> bufs_;                 // aligned page buffers (grown, reused)
     int ticket_ = 0;
+    bool cache_misses_ = true;   // per ticket: misses populate the cache
     // pool
     std::vector<std::thread> pool_;
-    std::mutex mu_;
+    mutable std::mutex mu_;
     std::condition_variable cv_, done_cv_;
     std::atomic<size_t> next_{ 0 };
     size_t n_pages_ = 0, finished_ = 0;
@@ -82,7 +92,7 @@ private:
     std::vector<half> cache_scale_;
     std::vector<uint8_t> ref_;
     size_t hand_ = 0;
-    Stats stats_;
+    mutable Stats stats_;
 };
 
 }  // namespace truss::qwen4exp
