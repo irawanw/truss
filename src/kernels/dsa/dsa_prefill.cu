@@ -286,13 +286,22 @@ template <class Shape> struct Partial {             // one split's state per (qu
 // int8 cache: 8 codes at dims c .. c + 7 of row `off / D` times its group's scale, as 8 fp16 into the tile
 __device__ __forceinline__ uint4 dequant8(const int8_t * code, const half * scale, size_t off, int D)
 {
-    const uint2 b = *reinterpret_cast<const uint2 *>(code + off);
-    const float sc = __half2float(scale[off / KV_GROUP]);   // rows are D = a multiple of KV_GROUP values
-    const int8_t * c8 = reinterpret_cast<const int8_t *>(&b);
+    const uint2 b0 = *reinterpret_cast<const uint2 *>(code + off);
+    const half2 sc = __half2half2(scale[off / KV_GROUP]);
+    uint2 b = b0;
+    b.x ^= 0x80808080u; b.y ^= 0x80808080u;   // two's complement -> offset binary
+    union U { uint32_t u; half2 h; };
+    // 0x6400 | u8 is fp16 (1024 + u8) exactly; minus 1152 gives the int8 value exactly. HMUL2 then
+    // rounds the exact product once, identically to the fp32 multiply + pack it replaces (bit-safe).
+    const half2 bias = __floats2half2_rn(1152.f, 1152.f);
+    const U t0{ __byte_perm(b.x, 0x64006400u, 0x5150) }, t1{ __byte_perm(b.x, 0x64006400u, 0x5352) };
+    const U t2{ __byte_perm(b.y, 0x64006400u, 0x5150) }, t3{ __byte_perm(b.y, 0x64006400u, 0x5352) };
     uint4 r;
     half2 * h = reinterpret_cast<half2 *>(&r);
-#pragma unroll
-    for (int i = 0; i < 4; ++i) h[i] = __floats2half2_rn(c8[2 * i] * sc, c8[2 * i + 1] * sc);
+    h[0] = __hmul2(__hsub2(t0.h, bias), sc);
+    h[1] = __hmul2(__hsub2(t1.h, bias), sc);
+    h[2] = __hmul2(__hsub2(t2.h, bias), sc);
+    h[3] = __hmul2(__hsub2(t3.h, bias), sc);
     (void) D;
     return r;
 }

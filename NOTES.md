@@ -92,3 +92,17 @@ identically in plan() and ctor; compute slot_ from layers_ FIRST; all `%2` -> `%
 4. Decode acceptance: 2.75 tok/pass; coupled draft sampling (TRACKER #109e) was measured but never shipped.
 5. CPU join 16.5 ms/pass is a pinned-DRAM-read floor (~445 MB @ 28 GB/s) unless miss bytes drop; bytes are pack
    arithmetic -> DECISION territory, do not touch.
+
+## 2026-10-06 afternoon: attention dequant workstream (USER RULE: NO SUBAGENTS - limited resources; all inline)
+- nsys prefill breakdown (GPU1, K=3, int8 KV): attn_kernel<FlashNext,0> avg 44.7 ms x ~28/chunk = ~1.25 s/chunk
+  (biggest single kernel); gate_up 1.20 s; down 0.61 s. ncu is ERR_NVGPUCTRPERM (admin-blocked) - classify by probes.
+- fp16-KV probe (TRUSS_KV_INT8=0, /tmp/pf_f16_out.log): attn avg 28.9 ms (-35%) BUT KV 3.85->7.00 GiB, experts
+  13.50->10.35 GiB, spec 64.6->51.6 tok/s. int8 KV saves 3.15 GiB (=+13 tg) but COSTS attn ~16 ms/launch:
+  the dequant8 staging loop (sync LDG + int->float cvt + scalar muls, ~20+ instr per 8 codes) is the critical path.
+- FIX (this commit): dequant8 rewritten bit-exact with fp16x2 SIMD: XOR 0x80 (two's complement -> offset binary),
+  PRMT into 0x6400|u8 (= fp16 1024+u8 exactly), HSUB2 1152 (= exact s8), HMUL2 scale (single RN, identical to the
+  fp32 path it replaces). Exhaustive proof: all 256 codes x all 65536 finite half scales, 0 mismatches (/tmp/dq_bit.cu).
+  Same loads, same tile order, same bits -> EXACT must hold.
+- Decode attn_kernel<,1> also pays it: 37.0 us int8 vs 18.8 us fp16 per launch - tg gains too if the fix works.
+- If fast dequant doesn't close the gap: next candidate is cp.async staging of codes+scales (smem 42->58.5 KB,
+  2 CTAs/SM) - measure before building; and per-layer fp16/int8 KV split knob (allocation is already per-layer).
