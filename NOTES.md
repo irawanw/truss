@@ -170,3 +170,37 @@ identically in plan() and ctor; compute slot_ from layers_ FIRST; all `%2` -> `%
 - spin+wait_plan = 15.8 ms/pass = 39% of device busy => CPU tier is the binding wait at the served point
   (sim + nsys agree). Remaining tg levers: placement/residency (lead lane, D1) and power limit (human lane).
 - Plan section 4 COMPLETE: P1 negative, D0 sim calibrated, D2 measured, P2/P3/P4/graphs all closed by stop rules.
+
+## 2026-10-06 evening: Order 2 CPU standard-quant verdict - NO encode (bench + sim, CPU-only)
+- Added tools/tk-bench/cpu_quant.cc (tk-bench-cpu-quant): one expert (gate/up 640x2560, down 2560x640,
+  down zero-padded to 768 for K-quants), formats trellis K2.5/K3.5 (truss_cpu's own kernels) + llama-paw
+  libggml-cpu AVX2 vec_dot (Q3_K/Q4_K/Q8_0), 1 thread + 22 pinned (skip core 0, pool scheme), 64 experts
+  (DRAM-bound), mlocked arenas, 5 interleaved rounds at load 33-42.
+- Pool ms/expert R=1.2: trellis_mix 0.0452 (41.0 GB/s) | Q3_K 0.0478 (47.1) | Q4_K 0.0574 (51.4) |
+  Q8_0 0.0922 (56.6); DRAM ref 57.1. BYTES rule: Q3_K +21pct bytes buys only +15pct GB/s. Padding trap:
+  down in=640 = 2.5 blocks of 256 -> 768 (+20pct down, +6.7pct expert); Q8_0 blocks by 32, no pad.
+  Bytes/expert 1.855 (3.02 bpw = today, matches pack-inspect) / 2.253 / 2.949 / 5.222 MB;
+  RAM x21296 = 39.5 / 48.0 / 62.8 / 111.2 GB - Q3_K padded BREAKS the 40-45 budget (45.0 unpadded).
+- Sim swap (ratio-scaled cpu_per_slot, sanity 61.3 vs row 61.7): tg -2.7 / -11.6 / -33.5 pct.
+  Rule (>= +8pct decode AND bpw >= 3.02): ALL FAIL. Verdict: no standard quant worth encoding; today's
+  trellis mix is simultaneously the fastest AND the smallest CPU tier. ggml dots scale per row
+  (R2 +70-80pct) while trellis amortizes row 2 in its decode loop (+10-15pct). Notified 18:46.
+- Coordination (lead 18:15): lead owns D1 placement/KV-lend/ADMIT/residency - do NOT touch those knobs.
+  ANY GPU run: flock /tmp/selfopt_gpu2.lock + one-line "GPU START/END <who> <what>" to data/notify.txt.
+  HDD /mnt/hdd READ-ONLY + flaky: never run from it; copy small pieces to NVMe only.
+
+## 2026-10-06 ~19:00: Order 3 - MTP re-encode, PAW step 1 = TRUSS_MTP_CALIB capture
+- User approved MTP re-encode with real Hessians (goal >2.8 tokens/pass; greedy tokens stay EXACT - drafts
+  are verified by the main model). Lead encodes + packs in ~/ML_projects/flashnext/20261006_mtp_reencode/
+  (data/mtp_bf16.safetensors = 31 mtp.* BF16 tensors already on NVMe; venv ~/src/venvs/exl3new).
+- PAW step 1: capture on GPU 1 under /tmp/selfopt_gpu2.lock, served env (NOW: TRUSS_KV_LEND=1
+  TRUSS_ADMIT_IDLE=64 + selfopt_brain.sh env), brain down < 15 min, GPU START/END notify lines.
+  Corpus /home/green-gpu/flashnext/x31/corpus/ids_code_1024.pt tensor [256,1024] -> .i32 prompt files,
+  SKIP the last 16 sequences (held out) -> 240 x 1024 = ~245k rows (~2.5 GB fp32) into
+  ~/ML_projects/flashnext/20261006_mtp_reencode/data/mtp_calib.f32 + README line (rows, sequences,
+  commit, env). MAIN repo build has the capture compiled (forward.cu, verified in build via strings);
+  use main's build unless the capture path needs my branch (it does not).
+- MEMORY CAUTION (box froze ~18:46 as my bench finished; brain 38 GB + renters, RAM tight): keep run host
+  footprint small, stream capture to disk, NO big mlocks; check free -g available >= 20 GB before starting.
+- PAW step 2 (later, after lead posts packed MTP GGUF): bench new MTP vs mtp_x3k3 same prompt set -
+  tokens/pass, tok/s, VRAM/resident experts, EXACT greedy tokens; interleaved A/B, 2 pairs.
