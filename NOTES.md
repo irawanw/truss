@@ -36,31 +36,29 @@
 - Box noise: baseline row ran at load ~24; rows at load 40+ show +-20 tok/s decode swings (43.5 vs 26.2 same code).
   Do not burn kbench runs at load > ~28-30.
 
-## Now (10-06 ~10:00) - FINAL: merged to main and serving (user instruction "if all pass merge + serve")
-**Branch `agent/x31-speed` = 654c31a; main = d8457ab (merge of it); brain restarted on main build = serving it.**
-- Kept-best engine = row D 216d52a family (PLE prefill pipelining + parallel collect; row 1005_032028:
-  decode 55.8/57.3, prefill 2132/2128 EXACT @23.8/26.3). Final branch row 1006_094357 @load 22.4/17.1:
-  decode 61.3/58.2 (>= kept), prefill 2014/2006 EXACT. The prefill delta vs 2132 is BOX DMA contention
-  (GPU0 neighbor 99% util, GPU3 81%; today's own d9b6c0b reference row also 2012 @21.9; PLE gather 0.96 vs
-  0.64 s, copies ~+3.7 s/150K slower), not code: the branch engine is row D's + env-gated profiler (unset =>
-  zero behavior change) + server-only truss_c.cu. Post-revert quick gate 1006_093951 EXACT too.
-- Warm handoff (85d791a) REVERTED (654c31a) on matched-load A/B: ref 1006_093116 (d9b6c0b, profiler) pp 2012
-  exposed 2.41 s vs candidate 1006_092012 pp 1991 exposed 1.93 s. Mechanism verified (exposed -20%) but pp
-  unchanged => chunks are copy-stream-bound; boundary waits are off the critical path. Re-land only on an x16
-  link (compute-bound regime) or with deeper staging (VRAM-blocked, see Slots-depth). truss_c.cu server PLE
-  lookahead KEPT and merged: serving gets the pipelined gather on full-prompt turns.
-- Profiler caveat (measured): TRUSS_STREAM_PROFILE=1 costs ~5% pp (prof_harvest host-syncs at every chunk
-  boundary). Read exposed only as a relative number; pp with profiler on is not the served number.
-- PCIe: GPU 2 link gen4 x8 of max x16 (4-way TRX40 lane split) => ~13.3 GB/s ceiling = THE wall for both
-  targets (prefill chunks copy-paced at ~46 GB/chunk; decode demand copies 10 ms/pass of 44). DECISION
-  notified 09:12: physical x16 ~doubles copy throughput -> pp ceiling ~3000+ (brief target), tg +10-12.
-- Remaining levers all gated (reported to lead/human): KL-gated hints K=3/4 (DIFF vs golden; self-reference
-  KL cannot gate placement - needs the Q8-teacher G-Q, plan §3), bigger ring (VRAM), 16K chunks (VRAM
-  +2.6-5 GB vs 0.75 margin), E7 past 2K (short prompts only), MTP re-encode W3/B6 (weights = user decision),
-  and the lead's own lanes W1 (residency replay) / W2 (device-ms) / W0.1 (interleaved --ab kbench).
-- Quiet-box truth kept for reference: decode 62.0 (1005_033555); lead's merge row 1005_165231 showed
-  71.4/78.9 EXISTS at load 6 (DIFF - his KL/startup territory). Served tg on real traffic 48-60, accept
-  34-43% by temperature; served pp ~1900-2130 by link contention, higher on prefix-reuse turns.
+## Now (10-06 ~11:45) - SERVING GPU 1 (x16), tg up, pp kernel-bound + power-capped
+**Serving: brain on GPU 1 (user order 10-06 GPU2->GPU1; edited scripts kbench:67,70 + selfopt_brain.sh:8; pm2
+saved). Served config now TRUSS_HINT_K=3 (was 2), frac 0.2. Branch a0479b6 = main d8457ab engine.**
+- GPU 1 link = x16 16.0 GT/s, holds under sustained load (GPU 2 was gen4 x8 = the old 13.3 GB/s wall).
+  Decode demand copies 2x faster: wait 9.7 -> 5.3-6.1 ms/pass. tg: K=2 -> 62.7; K=3 -> 67.9 @load17
+  (final row 1006_113004 EXACT 61.7/60.8 @21-25 vs kept row D 55.8/57.3 = +4-5 @matched load). K=4 worse
+  (59.9: prefetch 215 MB/pass ring pressure, join 14.7). frac 0.35 worse (60.5: demand bytes double 110->215
+  MB, wait-copies 10.4). frac 0.2 optimal. K=3 wins because hints LAND in time on x16 (accept 77.6% vs 73.9;
+  #85 "K=2 best" was an x8-era fact).
+- pp on GPU 1 = 1930-1952 every row: prefill is KERNEL-bound (stream exposed 0.64 s; sections 73.1 ~= wall
+  76.8; chunk = kernel chain ~87 ms/layer). Row D's 2132 on GPU 2 was copy-paced at ~equal wall (kernels ~=
+  copies at x8). Kernels are SW-Power-Cap throttled: flag ACTIVE (nvidia-smi -q -d PERFORMANCE), 246-248 W
+  pinned at the 250 W cap (default was 370 - someone set 250), SM 1200-1740 MHz (max 2115), temps 74-80 < 83
+  target. CEILING (corrected, own the over-promise): kernel-bound pp ~= 8192/(48 x t_layer); at 2115 MHz
+  t_layer ~57 ms -> pp ~2820 max; 3000 needs ~2245 MHz > boost. At 370 W expect ~2450-2650. sudo nvidia-smi
+  -pl 370 -i 1 = human action. "x16 -> 3000" claim was wrong twice: prefill kernel-bound, and 250 W cap.
+- GOLDEN MOVED (user decision): ref_tokens.i32 = GPU 1 K=3 dump (112555 == 113004 byte-identical = GPU 1 IS
+  deterministic; the earlier "self-divergence" was comparing different split modes - invalid test). Old golden
+  backed up: ledger/ref_tokens.i32.gpu2-backup-20261006. Lead: G-Q the new dump vs Q8 teacher (old-golden
+  DIFF root cause: x16 timing flips ring-admission -> CPU-vs-GPU expert placement; results differ ~2e-4
+  (cpu_trellis_test) -> argmax flip at token 137).
+- Served truth (brain log, GPU 1): tg real traffic 48-58 (long gens decay with ctx), accept 34-43% temp-0.8;
+  pp ~1900-1950 fresh full prompts, reuse turns 60-760 tok/s by suffix size.
 
 ## Main repo status (10-06 ~10:00)
 - main = d8457ab MERGED agent/x31-speed (row-D engine already in via 49b2fee; this merge adds truss_c.cu
