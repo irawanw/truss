@@ -91,6 +91,11 @@ def row_params(r):
     return q
 
 
+def q_early(p):
+    """spec-cpu lever: CPU tier may start on predicted misses before the split (plan D0 d)."""
+    return p.get("cpu_early_ms", 0.0)
+
+
 def simulate(p, rng=None):
     cs = p["clock_scale"]
     mix = (p["mixer_ms"] + p["overhead_ms"] + p["launch_gap_ms"]) * cs
@@ -118,7 +123,7 @@ def simulate(p, rng=None):
         # CPU pool: serial resource at DRAM floor; call queued behind previous layer's call
         busy = (p["cpu_wake_ms"] + p["cpu_per_slot_ms"] * p["cpu_slots"]) * p["cpu_slow"] \
             if p["cpu_slots"] > 0 else 0.0
-        cpu_start = max(getattr(simulate, "_pool_free", 0.0), serve)
+        cpu_start = max(simulate._pool_free, serve - q_early(p))
         cpu_done = cpu_start + busy
         simulate._pool_free = cpu_done
         # GPU window kernel: plan -> go -> expert compute -> cpu_done -> combine
@@ -168,43 +173,53 @@ def calibrate():
     return worst_p, worst_t
 
 
-# candidate levers = plan §2 D0 questions (a)-(d), applied to the served config (K=3 final row)
-LEVERS = dict(
-    a_hint2ahead="hints land 2 layers ahead (needs cheap predictor: previous-layer residual)",
-    b_ringslots="+1 ring slot (VRAM trade incl KV lending +1.1 GB)",
-    c_cpuslots="move per-layer CPU misses onto the idle link (lower frac)",
-    d_speccpu="speculative CPU start on predicted misses (discard on mispredict)",
-    e_k2="control: hint_k=2",
-    f_k4="control: hint_k=4",
-)
+# candidate levers = plan 2 D0 questions (a)-(e), applied to the served config (K=3 final row).
+# The calibrated model says: at the served point the CPU tier is the binding wait (~0.29 ms/layer)
+# and the link is secondary (~0.08 ms/layer); moving experts between tiers is net-neutral (frac 0.2
+# is the engine's balance point - confirmed by the f0.35 row). Gains must remove CPU-tier time or
+# cold volume, or remove launch/serialization gaps.
+LEVERS = {
+    "a_hint2ahead": ("demand->prefetch conversion (0.4 experts/layer, predictor-decay-limited): "
+                     "link FIFO unchanged total -> net ~0 while CPU binds; re-measure when CPU frees"),
+    "b_ringslots":  ("+1 ring slot: less eviction churn (-14.4 cold/pass)"),
+    "c_frac005":    ("frac 0.2->0.05: link experts back onto the CPU tier (tests the balance point)"),
+    "d_speccpu":    ("speculative CPU start at the doorbell (+0.06 ms/layer earlier, +12% mispredict waste)"),
+    "g_graphs":     ("CUDA graphs per window size: launch gaps 0.005->0.002 ms/layer-kernel"),
+    "combo_bg":     ("b + g (best without placement/weights changes)"),
+}
+
+
+def lever_row(name):
+    r = dict(ROWS[2])                                  # served config, sustained env
+    if name == "a_hint2ahead":
+        conv = 19.2                                    # 0.4 experts/layer converted
+        r["dem"] -= conv; r["pre"] += conv
+    if name in ("b_ringslots", "combo_bg"):
+        r["cold"] -= 14.4
+    if name == "c_frac005":
+        r["pcie_frac"] = 0.05
+        r["dem"] *= 0.25
+    return r
 
 
 def levers():
-    base_row = ROWS[2]  # served config row (K=3 final)
+    base_row = ROWS[2]
     q = row_params(base_row)
-    base, _ = simulate(q, random.Random(3))
-    print(f"served base pass {base:.2f} ms -> {tg_of(base, q):.1f} tok/s (row {base_row['tg']})")
-    for name in LEVERS:
-        r = dict(base_row)
-        if name == "a_hint2ahead":
-            # arrivals double in usefulness; prefetch budget same link bytes
-            r["cold"] -= 0.28 * r["cold"]          # fewer cold: half a layer more of lead time
-        if name == "b_ringslots":
-            r["cold"] -= 0.03 * r["cold"]          # less eviction churn
-        if name == "c_cpuslots":
-            r["pcie_frac"] = 0.05                  # fewer experts on CPU, more on link
-            r["dem"] *= 1.4; r["pre"] *= 0.9
-        if name == "d_speccpu":
-            pass                                   # modeled as split-latency cut on CPU start
-        if name == "e_k2":
-            r.update(hint_k=2); r.update(pre=39.8, dem=56.2, cold=413.4)
-        if name == "f_k4":
-            r.update(hint_k=4); r.update(pre=109.3, dem=59.8, cold=492.3)
+    base, stb = simulate(q, random.Random(3))
+    base_wall = base + 3.7 + 0.02 * stb["copy_busy"]
+    print(f"served base wall {base_wall:.2f} ms -> {tg_of(base_wall, q):.1f} tok/s (row {base_row['tg']})")
+    for name, desc in LEVERS.items():
+        r = lever_row(name)
         q = row_params(r)
         if name == "d_speccpu":
-            q["driver_split_ms"] = 0.02            # CPU starts ~split earlier on predicted misses
-        pm, _ = simulate(q, random.Random(3))
-        print(f"  {name:14s} {pm:7.2f} ms -> {tg_of(pm, q):5.1f} tok/s ({tg_of(pm, q) - tg_of(base, q):+.1f})")
+            q["cpu_early_ms"] = 0.06                   # CPU starts at doorbell, not at split
+            q["cpu_slow"] *= 1.12                      # mispredict waste on the DRAM floor
+        if name in ("g_graphs", "combo_bg"):
+            q["launch_gap_ms"] = 0.002
+        pm, st = simulate(q, random.Random(3))
+        wall = pm + 3.7 + 0.02 * st["copy_busy"]
+        print(f"  {name:13s} {wall:7.2f} ms -> {tg_of(wall, q):5.1f} tok/s "
+              f"({tg_of(wall, q) - tg_of(base_wall, q):+.1f})   # {desc}")
 
 
 if __name__ == "__main__":
