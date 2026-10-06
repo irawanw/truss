@@ -36,54 +36,42 @@
 - Box noise: baseline row ran at load ~24; rows at load 40+ show +-20 tok/s decode swings (43.5 vs 26.2 same code).
   Do not burn kbench runs at load > ~28-30.
 
-## Now (10-06 ~09:15) - RESUMED, goal: pp+tg as high as possible (human via chat; pm2 brain restarts allowed)
-**`agent/x31-speed` = 85d791a (warm handoff, quick-gate EXACT). Kept best stays row D 216d52a (2132/2128).**
-- Stream profile verdict (row 1006_082932, d9b6c0b + TRUSS_STREAM_PROFILE=1 @load 31; decode 27.6 there was
-  contention garbage): **prefill stream 68.9 s BUSY vs 2.40 s EXPOSED over 74.4 s = 92% busy / 3.2% exposed.**
-  Within-chunk pipelining already works; prefill is LINK-BOUND: every chunk streams its whole cold-layer set
-  (~46 GB = 47 x ~0.98 GB) at ~13.3 GB/s -> the copy stream (48 x ~74 ms = 3.8 s) paces the 4.08 s chunk; GPU
-  sections per 149k prompt: mixer 34.1 s + moe 22.4 + ple+hc 7.4 + hc 5.4 + shared 1.3 + join 0.27 (join ~0:
-  prefill MoE is GPU-only, the CPU tier serves decode). Kernel ~58 ms/layer rides inside the ~74 ms copy cadence.
-  Project A as pitched (+17-27%) DEAD; only the ~132 ms/chunk boundary bubble (2.4 s/run) is software-addressable.
-- **PCIe FACT (nvidia-smi, DECISION-notified 09:12): GPU 2 link is gen4 x8 of max x16** (4-way TRX40 lane split).
-  13.3 GB/s = the x8 ceiling. This is THE wall for both targets: pp copy-bound as above; decode demand copies
-  132 MB/pass = 10 ms/pass of the 44 ms pass. Physical x16 would ~double copy throughput: pp ceiling ~3000+
-  (brief target reachable), tg +10-12. Human/hardware action, nothing in-code.
-- **A-lite 'warm handoff' implemented (85d791a):** chunk N's Forward::run queues chunk N+1's layers 0/1 copies on
-  copy_ behind released_[0]/[1] (= release(46)/(47), the slots' last readers); begin_stream returns handed ->
-  successor chunk skips its prefetch(0)/(1). Same bytes/placement/arithmetic -> EXACT-safe (quick gate EXACT
-  1006_085008). Gate: only when successor is a streaming non-E7 chunk. truss_c.cu server loop now passes PLE
-  lookahead (next chunk) so SERVING gets both PLE pipelining and warm handoff. Bench row 1006_085508: prefill
-  1995/1990 @run-loads 23.9/28.3 = -6% vs kept 2132/2128 @23.8/26.3, decode 51.8/40.2 - SUSPECTED contention
-  (box load swung to 45 mid-row); re-measure with profiler at load <24: if exposed < ~1.0 s and pp >= kept ->
-  KEEP; else git revert 85d791a (rule: revert what doesn't help).
-- Unit test for ring/protect: DROPPED for A-lite - the change moves copy issue-time only, ring/protect/eviction
-  untouched; the event chain is 3 CUDA calls and the EXACT gate catches any stale-slot read (hint rows proved it
-  has teeth: placement moves -> DIFF). Told lead in the row RESULT.
-- Decode stays ~97% device-bound (unchanged from 10-05): floor ~44 ms/pass ~ 62-63 tok/s @load<=20; lead's own
-  quiet merge row 1005_165231 showed 71.4/78.9 EXISTS at load 6 (DIFF, his KL territory). tg levers left are
-  human-gated: KL hints (K=3/4 DIFF vs golden), ring size (VRAM), coupled sampling (#109e, +~16% via accept),
-  and the same x8 link (demand 10 ms/pass). Quiet-box EXACT row for my branch still owed (run with the re-measure).
+## Now (10-06 ~10:00) - FINAL: merged to main and serving (user instruction "if all pass merge + serve")
+**Branch `agent/x31-speed` = 654c31a; main = d8457ab (merge of it); brain restarted on main build = serving it.**
+- Kept-best engine = row D 216d52a family (PLE prefill pipelining + parallel collect; row 1005_032028:
+  decode 55.8/57.3, prefill 2132/2128 EXACT @23.8/26.3). Final branch row 1006_094357 @load 22.4/17.1:
+  decode 61.3/58.2 (>= kept), prefill 2014/2006 EXACT. The prefill delta vs 2132 is BOX DMA contention
+  (GPU0 neighbor 99% util, GPU3 81%; today's own d9b6c0b reference row also 2012 @21.9; PLE gather 0.96 vs
+  0.64 s, copies ~+3.7 s/150K slower), not code: the branch engine is row D's + env-gated profiler (unset =>
+  zero behavior change) + server-only truss_c.cu. Post-revert quick gate 1006_093951 EXACT too.
+- Warm handoff (85d791a) REVERTED (654c31a) on matched-load A/B: ref 1006_093116 (d9b6c0b, profiler) pp 2012
+  exposed 2.41 s vs candidate 1006_092012 pp 1991 exposed 1.93 s. Mechanism verified (exposed -20%) but pp
+  unchanged => chunks are copy-stream-bound; boundary waits are off the critical path. Re-land only on an x16
+  link (compute-bound regime) or with deeper staging (VRAM-blocked, see Slots-depth). truss_c.cu server PLE
+  lookahead KEPT and merged: serving gets the pipelined gather on full-prompt turns.
+- Profiler caveat (measured): TRUSS_STREAM_PROFILE=1 costs ~5% pp (prof_harvest host-syncs at every chunk
+  boundary). Read exposed only as a relative number; pp with profiler on is not the served number.
+- PCIe: GPU 2 link gen4 x8 of max x16 (4-way TRX40 lane split) => ~13.3 GB/s ceiling = THE wall for both
+  targets (prefill chunks copy-paced at ~46 GB/chunk; decode demand copies 10 ms/pass of 44). DECISION
+  notified 09:12: physical x16 ~doubles copy throughput -> pp ceiling ~3000+ (brief target), tg +10-12.
+- Remaining levers all gated (reported to lead/human): KL-gated hints K=3/4 (DIFF vs golden; self-reference
+  KL cannot gate placement - needs the Q8-teacher G-Q, plan §3), bigger ring (VRAM), 16K chunks (VRAM
+  +2.6-5 GB vs 0.75 margin), E7 past 2K (short prompts only), MTP re-encode W3/B6 (weights = user decision),
+  and the lead's own lanes W1 (residency replay) / W2 (device-ms) / W0.1 (interleaved --ab kbench).
+- Quiet-box truth kept for reference: decode 62.0 (1005_033555); lead's merge row 1005_165231 showed
+  71.4/78.9 EXISTS at load 6 (DIFF - his KL/startup territory). Served tg on real traffic 48-60, accept
+  34-43% by temperature; served pp ~1900-2130 by link contention, higher on prefix-reuse turns.
 
-### Next (in order)
-1. At load <24: `kbench --env TRUSS_STREAM_PROFILE=1 --repeat 2 --note "warm handoff profile row"` -> read
-   "prefill stream" line + pp numbers vs kept. KEEP or revert 85d791a per the rule above; RESULT notify either way.
-2. If kept: brain serves it only after main merge (lead/human action - state in RESULT).
-3. Final ladder report to lead: software within ~3% of x8-link wall; remaining gains = x16 hardware, KL gate,
-   VRAM ring, sampling gate. NOTES + notify per row.
-
-## Main repo status (10-06, read-only check)
-- main = cc53231: 49b2fee MERGED agent/x31-speed (row D parallel collect + bench instrumentation + stream profiler)
-  -> the brain (main build) already serves my kept work; 1c585aa fast startup 8.3 s (TRACKER #120); 1d38be9
-  tk-parity-kl decode-step mode (lead's KL tooling); cc53231 server console prints live pp/tg to pm2 logs.
-  Lead's master plan: main docs/PLAN-20261005-x31-decode100.md (W0 A/B bench + G-Q quality gate vs Q8 teacher,
-  W1 residency replay, W2 device-ms, W3 MTP re-encode = user decision, W4 prefill). My lane W4.1 = the handoff,
-  done pending verdict; W1-W3 are the lead's ("B handled by lead", 10-05 notify).
-- Main HEAD is DIFF vs the old golden (startup/decode-step changes) -> keep the handoff verdict on the clean
-  d9b6c0b base (85d791a); lead rebases/merges and moves the golden.
-- W4.2 16K chunks halves total prefill stream bytes (9.1 vs 18.2 chunk passes over the cold set) but needs
-  ~+2.6-5 GB VRAM (scratch 285 KB/row doubles; moe::prefill ws scales with pairs 839->1678 MB A_gu etc.) vs the
-  0.75 GB margin -> VRAM/human decision, not an exact-safe code step. Same wall as Slots-depth below.
+## Main repo status (10-06 ~10:00)
+- main = d8457ab MERGED agent/x31-speed (row-D engine already in via 49b2fee; this merge adds truss_c.cu
+  server PLE lookahead + NOTES; handoff net-reverted pre-merge). Conflict in truss_c.cu resolved keeping
+  main's prog_done counters + the lookahead args. Built -j8 clean, `pm2 restart truss-x31-brain`,
+  /v1/models answers, greedy completion verified end-to-end (prompt 59 in 1323 ms, 12 gen, drafts 10/15).
+  Earlier lead commits on main: 1c585aa fast startup 8.3 s (#120), 1d38be9 tk-parity-kl decode-step mode,
+  cc53231 live pp/tg console. Main HEAD may be DIFF vs the old golden (startup/decode-step changes) - the
+  golden is the lead's/human's to move (G-Q vs Q8 teacher, plan §3).
+- Lead's master plan: docs/PLAN-20261005-x31-decode100.md. My lane W4.1 concluded (mechanism works, reverted
+  as copy-bound); W4.2 16K chunks = VRAM/human; W1-W3 = lead + user gates.
 
 ## Slots-depth idea: BLOCKED on VRAM (from failed run 1004_224142; keep for later)
 Real sizes: chunk buffers `big_bytes()` = **4.06 GiB** (scratch ~2.48 = 8192x285KB/row + 268MB dsa select ws;
