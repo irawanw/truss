@@ -137,3 +137,36 @@ identically in plan() and ctor; compute slot_ from layers_ FIRST; all `%2` -> `%
   answer: ~63 tg combo b+g, i.e. +1.6 - the plan's 75-85 needs D1 placement + D2, not scheduling.
 - Next per plan section 4: D2 nsys 20 decode passes (top-10 kernels to TRACKER + measured launch-gap
   total = true graphs value), P2 SASS attn int8-vs-fp16 per tile, P4 inter-kernel gap sum (drop P4 <1 s).
+
+## P2 SASS study attn int8 (CLOSED 10-06, no buildable variant)
+- cuobjdump attn_kernel<FlashNext,false> (runtime dtype: int8 AND fp16 paths live in ONE instantiation):
+  4728 instr; main KV-tile loop 477 instr (backward branch 0xfb0->0x2d80), nested staging loop 102.
+- Staging loop = LDGSTS x2 (codes+scale cp.async) -> LDS -> 8x PRMT + 8x HADD2 + 8x HMUL2 (the shipped
+  fp16x2 fast dequant) -> 4x STS.128: ~1.5 ALU ops per code = floor; nothing left in the dequant itself.
+- Main loop per tile: 64 HMMA.16816.F32 + 48 LDSM = 112 (23%); staging 102; softmax/rescale ~180
+  FMUL/EX2. Tensor work is a MINORITY - the int8 tax vs fp16 (39.7 vs 28.9 ms/launch) is the
+  LDS->dequant->STS round-trip + cp.async wait, structural at this design point.
+- The plan's "dequant once into fp16 smem shared by query rows" variant IS the shipped design
+  (staging once per tile per CTA, all warps LDSM the same fp16 tile, dsa_prefill.cu:351-402).
+  Register-dequant-at-ldsm stays rejected (+640 instr/tile, analyzed prior session).
+- Verdict: 39.7 ms = floor for int8 prefill attn here. Going below needs fp16 KV (VRAM -> tg) =
+  DECISION/G-Q territory, not a kernel item. No build, no kbench.
+
+## 2026-10-06 late-evening: D2 nsys decode profile + P3/P4/graphs verdicts (ALL closed, engine untouched)
+- Bench gotcha: "spec : 7.73 s" sums BOTH prompts' spec loops; the naive last-7.73 s nsys window swallowed
+  p1's prefill tail (phantom 16x39 ms attn<,0>). Clean window = last prompt tokens/tok/s = 4.28 s
+  (TRACKER lesson 37; proper hook: TRUSS_BENCH_PROFRANGE=1 + nsys --capture-range=cudaProfilerApi, spec.cu:252).
+- D2 run (load ~35 recorded; brain down ~2.5 min, lock held, auto-restarted): p0 4063 tok pp 2077 spec 74.3
+  (3.37 tpp); p1 21708 tok pp 2079 spec 59.8 (2.56 tpp); device draft 1.68 + verify 40.18 + head 0.97 = 42.83
+  ms/pass; CPU tier 18.33 ms/pass wait; driver split 0.25 + CPU start 0.81 + copies/plan 2.43 (51.7 layers/pass).
+- Decode top-10 ms/pass (p1 window ~100 passes): spin 8.11, wait_plan 7.66, window 5.35, gemv_multi<4,32,1> 2.22,
+  gemv<1,32,1> 1.00, f32_gemv<2> 0.81, gemv<4,32,2> 0.80, route<16> 0.67, quantize 0.64 (427 launches/pass),
+  attn<,1> 0.61. 2201 launches/pass; gaps <10us = 2.13 ms/pass; >=10us = 5.22 ms/pass (waits + context slices).
+- Verdicts (plan stop rules -> NO builds, NO kbench): CUDA graphs ceiling = 2.13 + ~half of scheduling gaps
+  ~ 2.7 ms/pass = +3.8 tg (6.4%) < 10% gate => DROP. P4 prefill: sections ~= wall (exposed 0.64 s < 1 s) => DROP.
+  P3: P1 microbench already proved gemm_kernel issue-bound at 69-87 TOPS on ALL real shapes incl. gate_up =>
+  within 15% => DROP. P2: staging 102 instr/tile, fp16x2 dequant ~1.5 ops/code = floor; dequant-once-into-smem
+  IS the shipped design; 39.7 ms = int8 attn floor (below it = fp16 KV = VRAM = DECISION).
+- spin+wait_plan = 15.8 ms/pass = 39% of device busy => CPU tier is the binding wait at the served point
+  (sim + nsys agree). Remaining tg levers: placement/residency (lead lane, D1) and power limit (human lane).
+- Plan section 4 COMPLETE: P1 negative, D0 sim calibrated, D2 measured, P2/P3/P4/graphs all closed by stop rules.
