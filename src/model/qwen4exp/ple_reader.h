@@ -39,15 +39,7 @@ public:
     // cache_misses=false: read the rows but do not populate the cache — a prefill chunk's trigram rows are read
     // once; caching them grows the map/cache working set for no reuse and slows every later lookup.
     int issue(const int32_t * rows, size_t n, bool cache_misses = true);
-    // Incremental ticket (TRACKER 130, 1.B): begin() opens an empty ticket (waits for the previous one's
-    // reads first), append() adds rows and starts the new pages' reads at once; collect() waits for the
-    // ticket's pages and assembles every row appended so far. The decode spec loop keeps one ticket open
-    // across the draft chain: win[0]'s rows are read while the chain runs, each step's token's rows while
-    // the next step runs, so only the last token's rows are still exposed at the layer-1 collect().
-    int begin(bool cache_misses);
-    void append(int ticket, const int32_t * rows, size_t n);
     void collect(int ticket, half * emb);   // emb [n][row_bytes]
-    const std::vector<int32_t> & ticket_rows() const { return rows_; }   // debug: the ticket's row ids in order
 
     struct Stats {
         uint64_t rows = 0, cache_hits = 0, pages = 0;   // rows asked for, served by the cache, 4 KiB pages read
@@ -81,15 +73,15 @@ private:
     std::vector<Page> pages_;
     std::unordered_map<uint64_t, uint8_t *> page_at_;   // (fd << 48 | page index) -> buffer
     std::vector<uint8_t *> bufs_;                 // aligned page buffers (grown, reused)
-    size_t buf_used_ = 0;                         // buffers owned by the current ticket (1.B: appends continue here)
     int ticket_ = 0;
     bool cache_misses_ = true;   // per ticket: misses populate the cache
     // pool
     std::vector<std::thread> pool_;
     mutable std::mutex mu_;
     std::condition_variable cv_, done_cv_;
-    size_t next_ = 0;                     // fetched under mu_ (1.B: appends grow the ticket while workers run)
-    size_t n_pages_ = 0, finished_ = 0;   // both touched only under mu_ (workers and begin/collect)
+    std::atomic<size_t> next_{ 0 };
+    size_t n_pages_ = 0, finished_ = 0;
+    uint64_t gen_ = 0;
     bool stop_ = false;
     int io_errno_ = 0;
     // row cache
