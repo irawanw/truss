@@ -546,6 +546,7 @@ bool ExpertStore::ring_put(int l, int e, bool hint, bool copy)
     uint8_t * at = real(off);
     if (copy) TRUSS_CUDA(cudaMemcpyAsync(at, Y.host + Y.cold_off[e], Y.bytes[e], cudaMemcpyHostToDevice, copy_));
     for (int p = 0; p < 3; ++p) Y.ring_meta_host[(size_t) p * 2 * Y.n_expert + 2 * e + 1] = unit_offset(at + Y.part[p][e], base_, l);
+    Y.meta_dirty = true;   // uploaded once at the next fetch/hint/acquire of this layer (1.A)
     if (!copy) return true;
     if (hint) stats_.hint_bytes += Y.bytes[e], ++stats_.hinted;
     else stats_.bytes += Y.bytes[e], ++stats_.misses;
@@ -575,10 +576,13 @@ void ExpertStore::admit(const std::vector<std::pair<int, int>> & le, cudaStream_
         touched[l] = 1;
     }
     for (size_t l = 0; l < layers_.size(); ++l)
-        if (touched[l])
+        if (touched[l] && layers_[l].meta_dirty)
             for (int p = 0; p < 3; ++p)
+            {
                 TRUSS_CUDA(cudaMemcpyAsync(layers_[l].ring_meta[p], layers_[l].ring_meta_host + (size_t) p * 2 * layers_[l].n_expert,
                                            sizeof(int32_t) * 2 * layers_[l].n_expert, cudaMemcpyHostToDevice, copy_));
+                layers_[l].meta_dirty = false;
+            }
     // a ring_put of a later admission may have evicted an earlier one of this batch: keep only the resident
     adm_.erase(std::remove_if(adm_.begin(), adm_.end(), [&](const auto & x) { return layers_[x.first].ring_at[x.second] < 0; }),
                adm_.end());
@@ -637,10 +641,13 @@ bool ExpertStore::fetch(int l, const int * ids, int n, cudaStream_t compute)
             }
         if (!missing) break;
     }
-    if (changed)
+    if (Y.meta_dirty)   // the table goes up once here, behind every copy queued so far (1.A)
+    {
         for (int p = 0; p < 3; ++p)
             TRUSS_CUDA(cudaMemcpyAsync(Y.ring_meta[p], Y.ring_meta_host + (size_t) p * 2 * Y.n_expert,
                                        sizeof(int32_t) * 2 * Y.n_expert, cudaMemcpyHostToDevice, copy_));
+        Y.meta_dirty = false;
+    }
     TRUSS_CUDA(cudaEventRecord(copied_[l % 2], copy_));
     if (changed) {   // admit_step() holds back while these demand copies run
         TRUSS_CUDA(cudaEventRecord(demand_ev_, copy_));
@@ -671,10 +678,14 @@ void ExpertStore::claim_issue(Claim & c, size_t upto)
     adm_backlog_ -= n;
     stats_.admit_bytes += n;
     if (c.done < Y.bytes[c.expert]) return;
-    // the last piece: the meta table behind it, then an event that clears pend once it has landed
-    for (int p = 0; p < 3; ++p)
-        TRUSS_CUDA(cudaMemcpyAsync(Y.ring_meta[p], Y.ring_meta_host + (size_t) p * 2 * Y.n_expert,
-                                   sizeof(int32_t) * 2 * Y.n_expert, cudaMemcpyHostToDevice, copy_));
+    // the last piece: the meta table behind it if it is not up already (1.A), then an event that clears pend once it has landed
+    if (Y.meta_dirty)
+    {
+        for (int p = 0; p < 3; ++p)
+            TRUSS_CUDA(cudaMemcpyAsync(Y.ring_meta[p], Y.ring_meta_host + (size_t) p * 2 * Y.n_expert,
+                                       sizeof(int32_t) * 2 * Y.n_expert, cudaMemcpyHostToDevice, copy_));
+        Y.meta_dirty = false;
+    }
     if (ev_pool_.empty()) {   // every landing event in flight (never in practice): the newest batch takes this claim
         landing_.back().second.push_back({ c.layer * 65536 + c.expert, c.off });
         TRUSS_CUDA(cudaEventRecord(landing_.back().first, copy_));
@@ -741,7 +752,6 @@ void ExpertStore::prefetch_hint(int l, const int * ids, int n)
     const int next = l + 1;
     if (mode_ != Mode::RING || next >= (int) layers_.size()) return;
     Layer & Y = layers_[next];
-    bool changed = false;
     std::vector<int> seen;
     for (int i = 0; i < n; ++i) {
         const int e = ids[i];
@@ -751,12 +761,14 @@ void ExpertStore::prefetch_hint(int l, const int * ids, int n)
         if (!ring_put(next, e, true)) break;   // the next slot holds an expert this layer still reads
         if (hinted_.size() < layers_.size()) hinted_.resize(layers_.size());
         hinted_[next].push_back(e);
-        changed = true;
     }
-    if (changed)
+    if (Y.meta_dirty)   // one upload for the hinted layer, behind its copies (1.A)
+    {
         for (int p = 0; p < 3; ++p)
             TRUSS_CUDA(cudaMemcpyAsync(Y.ring_meta[p], Y.ring_meta_host + (size_t) p * 2 * Y.n_expert,
                                        sizeof(int32_t) * 2 * Y.n_expert, cudaMemcpyHostToDevice, copy_));
+        Y.meta_dirty = false;
+    }
 }
 
 void ExpertStore::signal(int l, int * flag, int seq)
@@ -777,6 +789,19 @@ void ExpertStore::acquire(int l, cudaStream_t compute)
 {
     cudaEvent_t pw0 = nullptr;
     if (stream_prof_ && mode_ == Mode::STREAM) { pw0 = prof_take(); TRUSS_CUDA(cudaEventRecord(pw0, compute)); }
+    if (mode_ == Mode::RING)
+    {   // a put that landed after fetch()'s upload (admit_step during the CPU wait): the table goes up here, and
+        // copied_ re-records behind it, so the kernel sees (meta, data) consistent (1.A)
+        Layer & Y = layers_[l];
+        if (Y.meta_dirty)
+        {
+            for (int p = 0; p < 3; ++p)
+                TRUSS_CUDA(cudaMemcpyAsync(Y.ring_meta[p], Y.ring_meta_host + (size_t) p * 2 * Y.n_expert,
+                                           sizeof(int32_t) * 2 * Y.n_expert, cudaMemcpyHostToDevice, copy_));
+            Y.meta_dirty = false;
+            TRUSS_CUDA(cudaEventRecord(copied_[l % 2], copy_));
+        }
+    }
     TRUSS_CUDA(cudaStreamWaitEvent(compute, copied_[l % 2], 0));
     if (pw0) { const cudaEvent_t pw1 = prof_take(); TRUSS_CUDA(cudaEventRecord(pw1, compute)); wait_ev_.push_back({pw0, pw1}); }
 }

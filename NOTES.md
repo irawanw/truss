@@ -243,3 +243,29 @@ identically in plan() and ctor; compute slot_ from layers_ FIRST; all `%2` -> `%
   brick wall / needs-lead. First use: DONE at end of Phase 0. Never while brain down mid-run unless the wall itself.
 - kbench fixed by lead (hash c438f387 in data/ledger/scripts.sha256): served env, --sections opt-in ONLY,
   exactness admission-off. Never compare --sections rows with plain rows.
+
+## 2026-10-06 ~22:00: ORDER 5 = Phase 1 in lead's NEW order: 1.A -> 1.B -> 1.C, tell_lead DONE before 1.D
+- Power cap now 250 W (user, grid tripping): write "250W" in every row/note. Old baseline 1006_202143 (~275W)
+  NOT comparable; eta RATIOS still fine. BASELINE-250W = row 1006_213540 @71a821e: decode 67.9, prefill 1,945,
+  CPU 1.336 ms/slot, EXACT, load 21.76 (decode up / prefill down vs 275W: prefill TDP-throttles, decode has gaps).
+- PCIe (TRACKER 128): peak 24-25 GB/s cudaMallocHost >=1MB; 18-20 malloc+cudaHostRegister (engine arena);
+  13-15 at 64KB, 1.9 at 4KB. 13.4 = engine-achieved, not peak.
+- 1.A MEASURED (from /tmp/kern_trace.csv = ledger04_204049 trace; nsys Bytes = DECIMAL MB):
+  per pass: 155 whole demand+hint experts (2.150M K3.5 x115.5 + 1.536M K2.5 x39.5) = 309 MB 18.5ms 16.7 GB/s;
+  454 admission pieces 0.262M (256KiB PIECE) = 119 MB 6.5ms 18.3; 393 ring_meta copies 4KB = 1.6 MB 0.76ms 2.1;
+  49x53KB + 12x225KB misc (PLE/DSA state-ish) 5.4MB; 43x4B signal. TOTAL 1,107 copies 435 MB 26.2ms busy =
+  16.6 GB/s. Engine counters (bench.log) confirm 433.4 MB/pass: demand 65.3=128.2MB + hint 89.8=180.9MB +
+  admission 61.3 issued=124.3MB. THE 0.4 LEDGER's "217 MB" WAS AN UNDERCOUNT -> lead's "busy <=12ms @18GB/s"
+  target assumed 217MB; honest floor = 435MB @ 19.6 (registered >=1MB) = 22.2ms. Realistic 1.A goal:
+  >=18.5 GB/s effective, busy ~22-24ms, copies 1,107 -> ~600. REPORT correction to lead.
+- 1.A DESIGN (implemented, see commits): (1) PIECE 256KiB -> 1MiB (expert_store.h); (2) meta: ring_put sets
+  Layer::meta_dirty; copies at fetch/hint/claim_issue/admit gated on dirty + clear (dedup: once per layer per
+  dirty period; invariant pend==0 => meta on device KEPT since landing/adm events record behind the gated copy);
+  acquire(l) uploads if still dirty + re-records copied_[l%2] (covers admit_step puts during CPU wait). All ring
+  mutations are engine-thread-only (forward.cu 560/575/707 + admit() between passes) => no host-meta races.
+  Kernel only reads meta for plan slots; protect_layer_/protect_ blocks evicting in-use experts.
+  (3) demand+hint MERGE into one copy: BLOCKED by layout - ALIGN=256 but K3.5 bytes 2,150,000 not div by 256
+  -> padding between adjacent ring slots -> host runs not device-contiguous. Skip, note in TRACKER.
+- 1.B/1.C NOT STARTED. 1.B = 7 MoE-boundary host stalls 7.45ms/pass (after hc::combine, before router quantize;
+  PLE gather wait 7.85ms/pass + D2H syncs prime suspects). 1.C = split wait_plan 11.01 vs spin 10.52 by driver
+  timestamps (Phase1 vs Phase2 split). Phase 5.0 (cudaHostAlloc arena) after 1.C.
