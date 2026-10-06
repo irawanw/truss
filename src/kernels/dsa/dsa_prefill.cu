@@ -263,17 +263,27 @@ __global__ void __launch_bounds__(FEW_THREADS) select_few_kernel(const float * s
 
 constexpr int ATTN_WARPS = 2, TILE = 16 * ATTN_WARPS;   // cells per gathered tile, 16 per warp
 
-template <class Shape> struct AttnSmem {
+template <class Shape, bool STAGED> struct AttnSmem {
     static constexpr int STRIDE = Shape::D + 8;         // halfs per row: 528 B, ldmatrix rows hit distinct banks
     half q[16][STRIDE];
     half k[TILE][STRIDE];
     half v[TILE][STRIDE];
+    // int8 decode path (SPLIT): raw codes + per-group scales arrive here by cp.async, then dequantize into k/v.
+    // Prefill keeps the direct path: the extra 16.5 KB halves occupancy (2 vs 3 CTAs/SM) and costs more than saves.
+    int8_t kq8[STAGED ? TILE : 1][STAGED ? Shape::D : 1], vq8[STAGED ? TILE : 1][STAGED ? Shape::D : 1];
+    half ks8[STAGED ? TILE : 1][Shape::D / KV_GROUP], vs8[STAGED ? TILE : 1][Shape::D / KV_GROUP];
 };
 
 __device__ __forceinline__ void cp16(void * dst, const void * src)
 {
     const unsigned d = (unsigned) __cvta_generic_to_shared(dst);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(d), "l"(src));
+}
+
+__device__ __forceinline__ void cp8(void * dst, const void * src)
+{
+    const unsigned d = (unsigned) __cvta_generic_to_shared(dst);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"(d), "l"(src));
 }
 
 template <class Shape> struct Partial {             // one split's state per (query, KV head, split)
@@ -283,26 +293,26 @@ template <class Shape> struct Partial {             // one split's state per (qu
 
 // SPLIT: cells [blockIdx.z * cells_per_split, ...) of each query, unnormalized state to `part`; else all cells, final
 // gated output to `out`.
-// int8 cache: 8 codes at dims c .. c + 7 of row `off / D` times its group's scale, as 8 fp16 into the tile
-__device__ __forceinline__ uint4 dequant8(const int8_t * code, const half * scale, size_t off, int D)
+// staged int8 codes x their group's scale -> 8 fp16 (offset-binary trick: XOR 0x80 turns two's
+// complement into u8, 0x6400|u8 is fp16 1024+u8 exactly, minus 1152 gives the exact s8; HMUL2
+// rounds the exact product once = same bits as the fp32 multiply + pack it replaces, proven
+// exhaustively: all 256 codes x all finite half scales, 0 mismatches).
+__device__ __forceinline__ uint4 dequant8(const int8_t * code, half sc)
 {
-    const uint2 b0 = *reinterpret_cast<const uint2 *>(code + off);
-    const half2 sc = __half2half2(scale[off / KV_GROUP]);
+    const uint2 b0 = *reinterpret_cast<const uint2 *>(code);
+    const half2 s2 = __half2half2(sc);
     uint2 b = b0;
-    b.x ^= 0x80808080u; b.y ^= 0x80808080u;   // two's complement -> offset binary
+    b.x ^= 0x80808080u; b.y ^= 0x80808080u;
     union U { uint32_t u; half2 h; };
-    // 0x6400 | u8 is fp16 (1024 + u8) exactly; minus 1152 gives the int8 value exactly. HMUL2 then
-    // rounds the exact product once, identically to the fp32 multiply + pack it replaces (bit-safe).
     const half2 bias = __floats2half2_rn(1152.f, 1152.f);
     const U t0{ __byte_perm(b.x, 0x64006400u, 0x5150) }, t1{ __byte_perm(b.x, 0x64006400u, 0x5352) };
     const U t2{ __byte_perm(b.y, 0x64006400u, 0x5150) }, t3{ __byte_perm(b.y, 0x64006400u, 0x5352) };
     uint4 r;
     half2 * h = reinterpret_cast<half2 *>(&r);
-    h[0] = __hmul2(__hsub2(t0.h, bias), sc);
-    h[1] = __hmul2(__hsub2(t1.h, bias), sc);
-    h[2] = __hmul2(__hsub2(t2.h, bias), sc);
-    h[3] = __hmul2(__hsub2(t3.h, bias), sc);
-    (void) D;
+    h[0] = __hmul2(__hsub2(t0.h, bias), s2);
+    h[1] = __hmul2(__hsub2(t1.h, bias), s2);
+    h[2] = __hmul2(__hsub2(t2.h, bias), s2);
+    h[3] = __hmul2(__hsub2(t3.h, bias), s2);
     return r;
 }
 
@@ -318,7 +328,7 @@ __global__ void __launch_bounds__(32 * ATTN_WARPS) attn_kernel(const half * q, c
     static_assert(G <= 16, "the query heads of one KV head fill one m16 tile");
     static_assert(D % 64 == 0, "row staging in 16 B chunks by 64 threads");
     extern __shared__ __align__(16) unsigned char smem_raw[];
-    auto & sm = *reinterpret_cast<AttnSmem<Shape> *>(smem_raw);
+    auto & sm = *reinterpret_cast<AttnSmem<Shape, SPLIT> *>(smem_raw);
     const int t = blockIdx.x, kv = blockIdx.y, tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
     const int g = lane / 4, qd = lane % 4;
     const int pos = pos0 + t, seen = (pos + 1) / R, nsel = n_blocks[t];
@@ -340,25 +350,56 @@ __global__ void __launch_bounds__(32 * ATTN_WARPS) attn_kernel(const half * q, c
     float m[2] = { -INFINITY, -INFINITY }, l[2] = { 0.f, 0.f };   // rows g, g + 8
     for (int c0 = begin; c0 < n_cells; c0 += TILE) {
         __syncthreads();   // previous tile consumed (and q stored, first time)
-        for (int i = tid; i < TILE * D / 8; i += 32 * ATTN_WARPS) {
-            const int r = i / (D / 8), c = 8 * (i % (D / 8)), cell = c0 + r;
-            if (cell < n_cells) {
-                const int p = cell < R * nsel ? R * sel[cell / R] + cell % R : R * seen + (cell - R * nsel);
-                const size_t off = ((size_t) p * HKV + kv) * D + c;
-                if (kc.kq) {
-                    *reinterpret_cast<uint4 *>(&sm.k[r][c]) = dequant8(kc.kq, kc.ks, off, D);
-                    *reinterpret_cast<uint4 *>(&sm.v[r][c]) = dequant8(kc.vq, kc.vs, off, D);
+        if (kc.kq && SPLIT) {   // decode path: async gather of codes + scale rows; dequant from smem below
+            for (int i = tid; i < TILE * D / 8; i += 32 * ATTN_WARPS) {
+                const int r = i / (D / 8), c = 8 * (i % (D / 8)), cell = c0 + r;
+                if (cell < n_cells) {
+                    const int p = cell < R * nsel ? R * sel[cell / R] + cell % R : R * seen + (cell - R * nsel);
+                    const size_t off = ((size_t) p * HKV + kv) * D + c;
+                    cp8(&sm.kq8[r][c], kc.kq + off);
+                    cp8(&sm.vq8[r][c], kc.vq + off);
                 } else {
-                    cp16(&sm.k[r][c], k + off);
-                    cp16(&sm.v[r][c], v + off);
+                    *reinterpret_cast<uint2 *>(&sm.kq8[r][c]) = make_uint2(0, 0);
+                    *reinterpret_cast<uint2 *>(&sm.vq8[r][c]) = make_uint2(0, 0);
                 }
-            } else {
-                *reinterpret_cast<uint4 *>(&sm.k[r][c]) = make_uint4(0, 0, 0, 0);
-                *reinterpret_cast<uint4 *>(&sm.v[r][c]) = make_uint4(0, 0, 0, 0);
+            }
+            for (int i = tid; i < TILE * 2; i += 32 * ATTN_WARPS) {   // one 8 B scale row per cell
+                const int r = i / 2, cell = c0 + r;
+                half * dst = (i & 1 ? sm.vs8 : sm.ks8)[r];
+                if (cell < n_cells) {
+                    const int p = cell < R * nsel ? R * sel[cell / R] + cell % R : R * seen + (cell - R * nsel);
+                    cp8(dst, (i & 1 ? kc.vs : kc.ks) + (size_t) (p * HKV + kv) * (D / KV_GROUP));
+                } else *reinterpret_cast<uint2 *>(dst) = make_uint2(0, 0);
+            }
+        } else {
+            for (int i = tid; i < TILE * D / 8; i += 32 * ATTN_WARPS) {
+                const int r = i / (D / 8), c = 8 * (i % (D / 8)), cell = c0 + r;
+                if (cell < n_cells) {
+                    const int p = cell < R * nsel ? R * sel[cell / R] + cell % R : R * seen + (cell - R * nsel);
+                    const size_t off = ((size_t) p * HKV + kv) * D + c;
+                    if (kc.kq) {   // prefill int8: direct fast dequant (staging halves occupancy: net loss here)
+                        *reinterpret_cast<uint4 *>(&sm.k[r][c]) = dequant8(kc.kq + off, kc.ks[off / KV_GROUP]);
+                        *reinterpret_cast<uint4 *>(&sm.v[r][c]) = dequant8(kc.vq + off, kc.vs[off / KV_GROUP]);
+                    } else {
+                        cp16(&sm.k[r][c], k + off);
+                        cp16(&sm.v[r][c], v + off);
+                    }
+                } else {
+                    *reinterpret_cast<uint4 *>(&sm.k[r][c]) = make_uint4(0, 0, 0, 0);
+                    *reinterpret_cast<uint4 *>(&sm.v[r][c]) = make_uint4(0, 0, 0, 0);
+                }
             }
         }
         asm volatile("cp.async.wait_all;\n" ::);
         __syncthreads();
+        if (kc.kq && SPLIT) {   // staged codes x scale -> fp16 tiles: same values, same order (bit-safe)
+            for (int i = tid; i < TILE * D / 8; i += 32 * ATTN_WARPS) {
+                const int r = i / (D / 8), c = 8 * (i % (D / 8));
+                *reinterpret_cast<uint4 *>(&sm.k[r][c]) = dequant8(&sm.kq8[r][c], sm.ks8[r][c / KV_GROUP]);
+                *reinterpret_cast<uint4 *>(&sm.v[r][c]) = dequant8(&sm.vq8[r][c], sm.vs8[r][c / KV_GROUP]);
+            }
+            __syncthreads();
+        }
 
         // s = q k^T over this warp's 16 cells: two n8 tiles
         float s[2][4] = {};
@@ -419,7 +460,7 @@ __global__ void __launch_bounds__(32 * ATTN_WARPS) attn_kernel(const half * q, c
     }
 
     // merge warp 1 into warp 0 through the (consumed) K/V tiles
-    static_assert(sizeof(float) * (16 * D + 32) <= sizeof(AttnSmem<Shape>::k) + sizeof(AttnSmem<Shape>::v),
+    static_assert(sizeof(float) * (16 * D + 32) <= sizeof(AttnSmem<Shape, SPLIT>::k) + sizeof(AttnSmem<Shape, SPLIT>::v),
                   "merge buffer fits in the K/V tiles");
     static_assert(ATTN_WARPS == 2, "two-way merge");
     __syncthreads();
@@ -568,10 +609,10 @@ void attention(const half * q, const float * gate, const KvCache & kc, const int
                int pos0, int T, half * out, void * ws, size_t ws_bytes, cudaStream_t stream)
 {
     if (T <= 0 || pos0 < 0) throw std::invalid_argument("dsa::attention: bad chunk");
-    const size_t smem = sizeof(AttnSmem<Shape>);
+    const size_t smem_split = sizeof(AttnSmem<Shape, true>), smem_full = sizeof(AttnSmem<Shape, false>);
     static bool attr = [&] {
-        TRUSS_CUDA(cudaFuncSetAttribute(attn_kernel<Shape, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
-        TRUSS_CUDA(cudaFuncSetAttribute(attn_kernel<Shape, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
+        TRUSS_CUDA(cudaFuncSetAttribute(attn_kernel<Shape, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_full));
+        TRUSS_CUDA(cudaFuncSetAttribute(attn_kernel<Shape, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_split));
         return true;
     }();
     (void) attr;
@@ -581,11 +622,11 @@ void attention(const half * q, const float * gate, const KvCache & kc, const int
         const int max_cells = max_query_cells<Shape>(pos0, T), S = split_count(max_cells);
         const int per = ((max_cells + S - 1) / S + TILE - 1) / TILE * TILE;   // whole tiles per split
         auto * part = static_cast<float *>(ws);
-        attn_kernel<Shape, true><<<dim3(T, Shape::HKV, S), 32 * ATTN_WARPS, smem, stream>>>(
+        attn_kernel<Shape, true><<<dim3(T, Shape::HKV, S), 32 * ATTN_WARPS, smem_split, stream>>>(
             q, gate, kc, blocks, n_blocks, pos0, out, per, part);
         combine_kernel<Shape><<<dim3(T, Shape::HKV, Shape::H / Shape::HKV), 256, 0, stream>>>(part, S, gate, out);
     } else {
-        attn_kernel<Shape, false><<<dim3(T, Shape::HKV), 32 * ATTN_WARPS, smem, stream>>>(
+        attn_kernel<Shape, false><<<dim3(T, Shape::HKV), 32 * ATTN_WARPS, smem_full, stream>>>(
             q, gate, kc, blocks, n_blocks, pos0, out, 0, nullptr);
     }
     TRUSS_CUDA(cudaGetLastError());
