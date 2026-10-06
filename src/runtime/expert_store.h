@@ -13,7 +13,9 @@
 //
 // Protocol (compute = the caller's stream; copies run on the store's own stream):
 //   prompt chunk:  begin_stream(compute); prefetch(0), prefetch(1); per layer acquire(l) -> kernel -> release(l) ->
-//                  prefetch(l + 2). spare() is valid until the next fetch().
+//                  prefetch(l + 2). spare() is valid until the next fetch(). When a chunk has a streaming successor,
+//                  warm_next_chunk() queues the successor's layers 0 and 1 behind this chunk's release(46)/(47);
+//                  begin_stream() then returns true and the caller skips those two prefetches.
 //   decode step / verify window: per layer, routing to the host -> fetch(l, ids, n, compute) -> acquire(l) -> kernel.
 // Switching mode waits for all compute queued so far (the ring and the slots share memory), and a switch to stream
 // mode drops the ring's contents. Why a ring: on held-out routing a FIFO of recently fetched experts halves the misses
@@ -67,7 +69,9 @@ public:
     ExpertStore & operator=(const ExpertStore &) = delete;
 
     moe::Weights weights(int layer) const;                        // meta table of the current mode
-    void begin_stream(cudaStream_t compute);                       // prompt chunk starts: stream mode
+    // prompt chunk starts: stream mode. true: a warm_next_chunk() handoff already queued this chunk's layers 0 and
+    // 1 into the slots (skip their prefetch); false: the chunk starts copying here.
+    bool begin_stream(cudaStream_t compute);
     // decode starts: ring mode (the ring starts empty over the slots). Called by the thread that enqueues kernels
     // before weights(): with a doorbell driver, fetch() runs on another thread later (TRACKER #61)
     void begin_ring();
@@ -91,6 +95,10 @@ public:
     void upload(void * dst, const void * src, size_t bytes);         // a small copy (pinned src) on the copy stream
     void acquire(int layer, cudaStream_t compute);                 // compute waits for layer l's copies
     void release(int layer, cudaStream_t compute);                 // compute is done with slot l % 2 (stream mode)
+    // Warm handoff across a prompt chunk boundary (call after a chunk whose successor will stream): queue the
+    // successor's layers 0 and 1 into slots 0 and 1 behind this chunk's release(46)/(47) - the slot's last reader
+    // finishes there. Same bytes, same placement as the chunk-start prefetch, only earlier. No-op outside stream mode.
+    void warm_next_chunk();
     // TRUSS_STREAM_PROFILE=1: stream-mode measurements, harvested at every mode switch. busy_ms = PCIe transfer
     // time of the layer prefetches; wait_ms = compute-stream time spent waiting at acquire() (exposed stream).
     void stream_stats(double & busy_ms, double & wait_ms, bool reset = false) const;
@@ -243,6 +251,7 @@ private:
     cudaStream_t copy_ = nullptr;
     cudaEvent_t copied_[2] = {}, released_[2] = {}, compute_mark_ = nullptr;
     bool released_recorded_[2] = {};
+    bool handoff_pending_ = false;      // warm_next_chunk() copies are queued; consumed by begin_stream()
     size_t device_bytes_ = 0, cold_total_ = 0;
     Stats stats_;
     // pinned ring of the words signal() copies: a queued copy reads its source when it runs, so each call gets its

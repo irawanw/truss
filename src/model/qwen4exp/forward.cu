@@ -250,6 +250,7 @@ struct Forward::Impl {
     const int split_rows, split_t;                       // Options::split_rows / split_t (E7)
     const double split_ms_row;                           // Options::split_ms_row
     bool split_chunk = false;                            // this prompt chunk runs E7's split (run_chunk)
+    bool chunk_streamed_ = false;                        // the last run_chunk() ran in stream mode
     long long split_host_bytes = 0, split_cpu_experts = 0, split_gpu_experts = 0;   // E7 stats, since construction
     dense::Q8Matrix draft_head{};                        // the output matrix's draft_vocab rows (Options::draft_vocab)
     int * draft_map = nullptr;                           // device [draft_head.out]: row -> token id
@@ -1578,15 +1579,17 @@ struct Forward::Impl {
         check_driver();
         kv_reserve(pos0 + T, false);
         const bool stream = !fetch_mode(T);
+        chunk_streamed_ = stream;
         if (stream)
             require(T <= prefill_rows, "prompt chunk of " + std::to_string(T) + " tokens over prefill_rows (" +
                                             std::to_string(prefill_rows) + "); raise Options::prefill_rows");
+        bool handed = false;                             // begin_stream(): a warm handoff already queued layers 0/1
         if (!stream) {
             use(small);
             experts->begin_ring();
             if (adapt_every > 0 && ++decode_passes % adapt_every == 0) adapt();
         } else {   // the ring becomes the stream slots and this chunk's buffers
-            experts->begin_stream(s);
+            handed = experts->begin_stream(s);
             use(big);
         }
         split_chunk = stream && cpu_tier && T <= split_rows;   // E7: per-layer copies after the routing, no prefetch
@@ -1597,7 +1600,7 @@ struct Forward::Impl {
         TRUSS_CUDA(cudaMemcpyAsync(ids, tokens, (size_t) T * 4, cudaMemcpyHostToDevice, s));
         dense::q8_rows(q8.at(w.token_embd), ids, T, emb, s);
         hc::expand(emb, T, c.hc, c.d_model, res, s);
-        if (stream && !split_chunk)
+        if (stream && !split_chunk && !handed)
             for (int l = 0; l < std::min(2, n_store); ++l) experts->prefetch(l);
         const size_t base = sc->mark();
         for (int l = 0; l < c.n_layer; ++l) {
@@ -1632,6 +1635,13 @@ struct Forward::Impl {
         }
         commit_tail(tokens, T);
         if (mtp) mtp_commit(tokens, pos0, T, stream);
+    }
+    // A chunk followed by another streaming chunk (Forward::run calls this after run_chunk): the successor's first
+    // two layers go into the slots behind this chunk's last releases, so its first kernels wait less at acquire().
+    void warm_stream_next(int next_T)
+    {
+        if (!chunk_streamed_ || next_T <= 0 || fetch_mode(next_T) || (cpu_tier && next_T <= split_rows)) return;
+        experts->warm_next_chunk();
     }
 
     // Strata's adapt() (generate.cpp): the most-routed missing experts (decayed count >= 2) of every store layer,
@@ -2061,6 +2071,7 @@ void Forward::run(const int32_t * tokens, int T, const LayerHook & hook, const i
     if (next) require(next == tokens + T && next_T > 0, "PLE lookahead must follow the chunk");
     m_->ple_next = next; m_->ple_next_T = next_T;
     m_->run_chunk(tokens, pos_, T, hook, false);
+    m_->warm_stream_next(next_T);   // warm handoff across the chunk boundary when a successor chunk follows
     pos_ += T;
 }
 

@@ -80,7 +80,10 @@ void eval(truss_model & m, const int32_t * tokens, int n)
     int last = 0;
     for (int s = 0; s < n; s += step) {
         last = std::min(step, n - s);
-        m.fwd->run(tokens + s, last);
+        // PLE lookahead: the next chunk's trigram rows are read while this chunk computes; it also enables the
+        // stream warm handoff over the chunk boundary (Forward::run -> warm_stream_next).
+        const int nxt = std::max(0, std::min(step, n - s - last));
+        m.fwd->run(tokens + s, last, nullptr, nxt > 0 ? tokens + s + last : nullptr, nxt);
     }
     m.fwd->head(last - 1, 1, m.logits);
 }

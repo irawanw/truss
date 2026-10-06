@@ -342,7 +342,7 @@ void ExpertStore::wait_compute(cudaStream_t compute)
     TRUSS_CUDA(cudaStreamWaitEvent(copy_, compute_mark_, 0));
 }
 
-void ExpertStore::begin_stream(cudaStream_t compute)
+bool ExpertStore::begin_stream(cudaStream_t compute)
 {
     prof_harvest();
     std::lock_guard<std::mutex> g(adm_mu_);
@@ -359,6 +359,9 @@ void ExpertStore::begin_stream(cudaStream_t compute)
     claims_.clear(), adm_backlog_ = 0;   // landing_ events stay: their claims are gone from the ring (checked by offset)
     released_recorded_[0] = released_recorded_[1] = false;
     mode_ = Mode::STREAM;
+    const bool handed = handoff_pending_;   // warm_next_chunk() already queued layers 0/1 behind the last chunk
+    handoff_pending_ = false;
+    return handed;
 }
 
 void ExpertStore::prefetch(int l)
@@ -372,6 +375,28 @@ void ExpertStore::prefetch(int l)
     if (Y.cold) TRUSS_CUDA(cudaMemcpyAsync(base_ + s * slot_, Y.host, Y.cold, cudaMemcpyHostToDevice, copy_));
     TRUSS_CUDA(cudaEventRecord(copied_[s], copy_));
     if (pb1) { TRUSS_CUDA(cudaEventRecord(pb1, copy_)); busy_ev_.push_back({pb0, pb1}); }
+}
+
+// Warm handoff across a prompt chunk boundary: the successor's layers 0 and 1 go into the slots as soon as this
+// chunk's last readers release them (release(46) is slot 0's, release(47) slot 1's). cudaStreamWaitEvent captures
+// the latest record of released_[s] at enqueue time - called after the chunk's layer loop, that is exactly those
+// releases. Identical bytes and placement as the chunk-start prefetch, issued one chunk-tail earlier so the
+// successor's first kernels wait less.
+void ExpertStore::warm_next_chunk()
+{
+    if (mode_ != Mode::STREAM || handoff_pending_) return;
+    const int nl = std::min<int>(2, (int) layers_.size());
+    for (int l = 0; l < nl; ++l) {
+        const Layer & Y = layers_[l];
+        const int s = l % 2;
+        cudaEvent_t pb0 = nullptr, pb1 = nullptr;
+        if (stream_prof_) { pb0 = prof_take(); pb1 = prof_take(); TRUSS_CUDA(cudaEventRecord(pb0, copy_)); }
+        TRUSS_CUDA(cudaStreamWaitEvent(copy_, released_[s], 0));
+        if (Y.cold) TRUSS_CUDA(cudaMemcpyAsync(base_ + s * slot_, Y.host, Y.cold, cudaMemcpyHostToDevice, copy_));
+        TRUSS_CUDA(cudaEventRecord(copied_[s], copy_));
+        if (pb1) { TRUSS_CUDA(cudaEventRecord(pb1, copy_)); busy_ev_.push_back({pb0, pb1}); }
+    }
+    handoff_pending_ = true;
 }
 
 size_t ExpertStore::prefetch_some(int l, const int * ids, int n)
@@ -591,6 +616,8 @@ void ExpertStore::begin_ring()
     prof_harvest();
     std::lock_guard<std::mutex> g(adm_mu_);
     if (mode_ != Mode::RING) mode_ = Mode::RING;   // decode after a prompt: the stream area is empty, the rest kept
+    handoff_pending_ = false;   // the caller's gate prevents a handoff here; defensive: in-flight copies land in the
+                                // slots, which ring mode never places entries into (head_ stays past stream_end_)
 }
 
 bool ExpertStore::fetch(int l, const int * ids, int n, cudaStream_t compute)
