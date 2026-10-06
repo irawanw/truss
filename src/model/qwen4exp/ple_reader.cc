@@ -92,7 +92,8 @@ void PleReader::worker()
         size_t done = 0;
         int err = 0;
         for (size_t i; (i = next_.fetch_add(1)) < n_pages_;) {
-            const Page & p = pages_[i];
+            Page p;
+            { std::lock_guard<std::mutex> g(mu_); p = pages_[i]; }   // append() may grow pages_ concurrently (1.B)
             const ssize_t got = ::pread(p.fd, p.buf, PAGE, (off_t) p.off);
             if (got < 0) err = errno;   // a short read is the file's end: the rows never reach it
             ++done;
@@ -104,27 +105,42 @@ void PleReader::worker()
     }
 }
 
-int PleReader::issue(const int32_t * rows, size_t n, bool cache_misses)
+int PleReader::begin(bool cache_misses)
 {
     {   // one ticket in flight: the previous one's reads write into buffers this one reuses
         std::unique_lock<std::mutex> lk(mu_);
         done_cv_.wait(lk, [&] { return finished_ == n_pages_; });
+        rows_.clear();
+        slot_.clear();
+        pages_.clear();
+        page_at_.clear();
+        n_pages_ = 0;
+        finished_ = 0;
+        next_ = 0;
+        buf_used_ = 0;
+        io_errno_ = 0;
+        cache_misses_ = cache_misses;
     }
-    rows_.assign(rows, rows + n);
-    slot_.assign(n, -1);
-    pages_.clear();
-    page_at_.clear();
-    size_t nb = 0;
+    return ++ticket_;
+}
+
+void PleReader::append(int ticket, const int32_t * rows, size_t n)
+{
+    if (ticket != ticket_) throw std::logic_error("PleReader::append: not the ticket in flight");
+    std::unique_lock<std::mutex> lk(mu_);   // pages_ grows here; workers copy pages_[i] under the same lock
+    const size_t old_pages = pages_.size();
+    rows_.insert(rows_.end(), rows, rows + n);
+    slot_.resize(rows_.size(), -1);
     auto need = [&](int fd, uint64_t off) {
         const uint64_t pg = off / PAGE;
         auto [it, fresh] = page_at_.try_emplace(key(fd, pg), nullptr);
         if (!fresh) return;
-        if (nb == bufs_.size()) {
+        if (buf_used_ == bufs_.size()) {
             void * b = nullptr;
             if (posix_memalign(&b, PAGE, PAGE)) throw std::bad_alloc();
             bufs_.push_back(static_cast<uint8_t *>(b));
         }
-        it->second = bufs_[nb++];
+        it->second = bufs_[buf_used_++];
         pages_.push_back({ fd, pg * PAGE, it->second });
     };
     for (size_t i = 0; i < n; ++i) {
@@ -132,7 +148,7 @@ int PleReader::issue(const int32_t * rows, size_t n, bool cache_misses)
         if (cap_) {
             auto it = where_.find(r);
             if (it != where_.end()) {
-                slot_[i] = it->second;
+                slot_[rows_.size() - n + i] = it->second;
                 ref_[it->second] = 1;
                 ++stats_.cache_hits;
                 continue;
@@ -144,18 +160,19 @@ int PleReader::issue(const int32_t * rows, size_t n, bool cache_misses)
         need(fd_scale_, scale_off_ + (uint64_t) r * sizeof(half));
     }
     stats_.rows += n;
-    stats_.pages += pages_.size();
-    {
-        std::lock_guard<std::mutex> g(mu_);
-        n_pages_ = pages_.size();
-        finished_ = 0;
-        next_ = 0;
-        io_errno_ = 0;
-        cache_misses_ = cache_misses;
-        ++gen_;
-    }
-    if (n_pages_) cv_.notify_all();
-    return ++ticket_;
+    stats_.pages += pages_.size() - old_pages;
+    const bool more = pages_.size() > n_pages_;
+    n_pages_ = pages_.size();
+    ++gen_;
+    lk.unlock();
+    if (more) cv_.notify_all();
+}
+
+int PleReader::issue(const int32_t * rows, size_t n, bool cache_misses)
+{
+    const int t = begin(cache_misses);
+    append(t, rows, n);
+    return t;
 }
 
 const uint8_t * PleReader::page_of(int fd, uint64_t off) const

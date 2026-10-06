@@ -39,6 +39,13 @@ public:
     // cache_misses=false: read the rows but do not populate the cache — a prefill chunk's trigram rows are read
     // once; caching them grows the map/cache working set for no reuse and slows every later lookup.
     int issue(const int32_t * rows, size_t n, bool cache_misses = true);
+    // Incremental ticket (TRACKER 130, 1.B): begin() opens an empty ticket (waits for the previous one's
+    // reads first), append() adds rows and starts the new pages' reads at once; collect() waits for the
+    // ticket's pages and assembles every row appended so far. The decode spec loop keeps one ticket open
+    // across the draft chain: win[0]'s rows are read while the chain runs, each step's token's rows while
+    // the next step runs, so only the last token's rows are still exposed at the layer-1 collect().
+    int begin(bool cache_misses);
+    void append(int ticket, const int32_t * rows, size_t n);
     void collect(int ticket, half * emb);   // emb [n][row_bytes]
 
     struct Stats {
@@ -73,6 +80,7 @@ private:
     std::vector<Page> pages_;
     std::unordered_map<uint64_t, uint8_t *> page_at_;   // (fd << 48 | page index) -> buffer
     std::vector<uint8_t *> bufs_;                 // aligned page buffers (grown, reused)
+    size_t buf_used_ = 0;                         // buffers owned by the current ticket (1.B: appends continue here)
     int ticket_ = 0;
     bool cache_misses_ = true;   // per ticket: misses populate the cache
     // pool

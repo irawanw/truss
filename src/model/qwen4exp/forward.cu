@@ -163,6 +163,12 @@ struct Forward::Impl {
     // from disk while the current chunk computes, so the next layer-1 gather does not stall the host (E8).
     const int32_t * ple_next = nullptr; int ple_next_T = 0;
     bool ple_tk_valid = false; int ple_tk = -1, ple_tk_pos0 = -1;   // the prefetched ticket and its chunk's pos0
+    // 1.B (TRACKER 130): the decode PLE ticket opens with win[0] at draft() entry and grows by one token per
+    // draft step; its reads run under the chain so ple() at layer 1 only waits for the last token's rows.
+    int ple_inc_tk = -1, ple_inc_pos = -1;
+    size_t ple_inc_ntok = 0;
+    std::vector<int32_t> ple_inc_seq;                              // tail + tokens whose rows the open ticket holds
+    cudaEvent_t draft_ev[moe::MAX_ROWS] = {};                      // per draft step: its token is host-visible
     long drv_n = 0;
     std::atomic<long> jobs_pushed{ 0 };   // the driver spins on this before it sleeps on dq_cv (Strata's host spins)
     bool driver_stop = false;
@@ -298,6 +304,7 @@ struct Forward::Impl {
             TRUSS_CUDA(cudaMallocHost(&draft_host, sizeof(int32_t) * (moe::MAX_ROWS + 1)));
             draft_prob = alloc<float>(moe::MAX_ROWS + 1);
             TRUSS_CUDA(cudaMallocHost(&draft_prob_host, sizeof(float) * (moe::MAX_ROWS + 1)));
+            for (cudaEvent_t & e : draft_ev) TRUSS_CUDA(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
             if (!o.draft_vocab.empty()) {   // gather the subset's output rows once
                 const dense::Q8Matrix & O = q8.at(w.output);
                 const int n = (int) o.draft_vocab.size();
@@ -480,6 +487,7 @@ struct Forward::Impl {
         if (ids_host) cudaFreeHost(ids_host);
         if (draft_host) cudaFreeHost(draft_host);
         if (draft_prob_host) cudaFreeHost(draft_prob_host);
+        for (cudaEvent_t & e : draft_ev) if (e) cudaEventDestroy(e);
         if (embd_q) cudaFreeHost(embd_q);
         if (cpu_tier)
             for (void * p : { (void *) cpu_tier->x, (void *) cpu_tier->w, (void *) cpu_tier->y, (void *) cpu_tier->ids })
@@ -1182,6 +1190,30 @@ struct Forward::Impl {
         sc->release(m);
     }
 
+    // 1.B (TRACKER 130): open/extend the PLE ticket as soon as each token of the next verify window is known
+    // (win[0] at draft() entry, each draft step's token after its event): the row reads run while the chain
+    // runs, and ple() at layer 1 collects a ticket whose last token's rows are the only ones still exposed.
+    void ple_prefetch(int32_t tok, int pos)
+    {
+        if (!ple_reader) return;
+        const int H = c.ple_heads(), NG = c.ple_ngram;
+        if (ple_inc_tk < 0)
+        {
+            ple_inc_tk = ple_reader->begin(false);   // decode rows are not cached (as today's T > 1 tickets)
+            ple_inc_pos = pos;
+            ple_inc_seq = tail;
+            ple_inc_ntok = 0;
+        }
+        const size_t keep = std::min(ple_inc_seq.size(), (size_t) (NG - 1));
+        std::vector<int32_t> seq(ple_inc_seq.end() - keep, ple_inc_seq.end());
+        seq.push_back(tok);
+        std::vector<int32_t> rows((size_t) seq.size() * H);
+        ple_rows(c, seq.data(), (int) seq.size(), rows.data());
+        ple_reader->append(ple_inc_tk, rows.data() + (seq.size() - 1) * H, H);   // the token's own H rows
+        ple_inc_seq.push_back(tok);
+        ++ple_inc_ntok;
+    }
+
     void ple(const Ple & p, LayerState & L, const int32_t * tokens, int T, int pos0, bool tentative)
     {
         // n-gram window across chunks: hash [tail | chunk] and keep the chunk's rows
@@ -1196,8 +1228,12 @@ struct Forward::Impl {
         if (ple_reader) {   // O_DIRECT reads into the pinned stage (the previous copy out of it has been read)
             require((size_t) T * E <= ple_stage_n, "PLE stage too small for the chunk");
             int tk;
-            if (ple_tk_valid && ple_tk_pos0 == pos0) { tk = ple_tk; ple_tk_valid = false; }   // already in flight
-            else { ple_tk_valid = false; tk = ple_reader->issue(rows.data() + (size_t) n_prev * H, (size_t) T * H,
+            if (ple_tk_valid && ple_tk_pos0 == pos0) { tk = ple_tk; ple_tk_valid = false; }   // prefill: in flight
+            else if (ple_inc_tk >= 0 && ple_inc_pos == pos0 && ple_inc_ntok == (size_t) T)
+            {   // 1.B: the draft chain's ticket: every row but the last token's has had the chain's whole runtime
+                tk = ple_inc_tk; ple_inc_tk = -1; ple_inc_ntok = 0;
+            }
+            else { ple_tk_valid = false; ple_inc_tk = -1; tk = ple_reader->issue(rows.data() + (size_t) n_prev * H, (size_t) T * H,
                                                                  T <= 1); }   // a chunk's rows are used once: only
                                                                                 // decode tickets populate the cache
             TRUSS_CUDA(cudaEventSynchronize(ple_copied));
@@ -1563,6 +1599,7 @@ struct Forward::Impl {
         }
         tail.clear();
         ple_next = nullptr; ple_next_T = 0; ple_tk_valid = false;   // a dangling ticket is replaced by the next issue
+        ple_inc_tk = -1; ple_inc_ntok = 0;                          // 1.B: ditto for the decode ticket
         last_T = 0;
         has_pending = false;
         vw.open = false;
@@ -1897,21 +1934,27 @@ struct Forward::Impl {
         copy(cur.mh, pending_h, row);
         const int nv = draft_head.q ? draft_head.out : c.n_vocab;
         int made = 0;
-        for (int i = 0; i < n; ++i) {
+        ple_prefetch(next, pos);   // 1.B: win[0]'s PLE rows read while the chain runs
+        for (int i = 0; i < n; ++i)
+        {   // the whole chain goes down the stream at once (no device gaps); each step's token, and its
+            // probability when the min-p gate is on, come back behind an event the host waits on in order
             mtp_rows(cur.mh, draft_ids + i, pos + i, 1, false, true);
             sampling::argmax_prob(mtp_logits, nv, draft_map, draft_ids + i + 1, draft_prob + i, s);
-            if (draft_min_p > 0.f) {   // an unsure guess does not enter the window, and ends the chain
+            TRUSS_CUDA(cudaMemcpyAsync(draft_host + i + 1, draft_ids + i + 1, sizeof(int32_t), cudaMemcpyDeviceToHost, s));
+            if (draft_min_p > 0.f)
                 TRUSS_CUDA(cudaMemcpyAsync(draft_prob_host + i, draft_prob + i, sizeof(float), cudaMemcpyDeviceToHost, s));
-                TRUSS_CUDA(cudaStreamSynchronize(s));
-                if (draft_prob_host[i] < draft_min_p) break;
-            }
-            ++made;
+            TRUSS_CUDA(cudaEventRecord(draft_ev[i], s));
             if (i + 1 < n) copy(cur.mh, cur.mres, row);
         }
+        for (int i = 0; i < n; ++i)
+        {
+            TRUSS_CUDA(cudaEventSynchronize(draft_ev[i]));
+            if (draft_min_p > 0.f && draft_prob_host[i] < draft_min_p) break;   // an unsure guess ends the chain
+            ++made;
+            ple_prefetch(draft_host[i + 1], pos);   // this step's token: its rows read while the next steps run
+        }
         copy(mst.idx_partial, mtp_partial_snap, (size_t) (DsaShape::RATIO - 1) * c.idx_head_dim);
-        if (made) TRUSS_CUDA(cudaMemcpyAsync(draft_host, draft_ids + 1, sizeof(int32_t) * made, cudaMemcpyDeviceToHost, s));
-        TRUSS_CUDA(cudaStreamSynchronize(s));
-        std::copy(draft_host, draft_host + made, out);
+        std::copy(draft_host + 1, draft_host + 1 + made, out);   // the tokens are already on the host per step
         return made;
     }
 };
