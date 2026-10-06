@@ -117,3 +117,23 @@ identically in plan() and ctor; compute slot_ from layers_ FIRST; all `%2` -> `%
 - Next targets by size (nsys): dense gemm_kernel Q8 6.5 s (14%), gate_up 4.4 s, decode waits (spin+plan ~9.8 s),
   hc small-kernel chains decode-side. Per-layer fp16/int8 KV split knob = +45 pp on fp16 layers but costs expert
   budget (tg) -> DECISION + lead G-Q territory.
+
+## 2026-10-06 evening: D0 decode-pipeline simulator - calibrated PASS (tools/sim/decode_pipeline.py)
+- Discrete-event model {GPU serial chain, driver serial, copy-engine FIFO, CPU pool serial-at-DRAM-floor}.
+  Gate on six GPU1 rows: max |err| 1.4% on wall AND tg, tg order MATCH on all six
+  (probe 68.4 > K2 62.4 > final 61.5 > admit2 61.2 > f0.35 61.1 > K4 59.1).
+- Key mechanisms (each traceable to code, no fudge): dem_pressure 0.032 ms per demand expert above
+  1.6/layer (expert_store.cu ring_put/wait_compute slot contention - this is what lands f0.35 and makes
+  the ORDER match); host_gap = 3.7 + 0.02*copy_busy (driver publishes + issues copies on same host);
+  per-row cpu_slow in [0.95, 1.22] = pool wall band (DRAM floor 0.056 ms/slot .. engine charge 0.085).
+- Lever verdicts at served point (base sim 61.3, row 61.7): a_hint2ahead -0.0 DEAD while CPU binds (link
+  FIFO total unchanged; freed go-wait absorbed by CPU wait); d_speccpu -0.8 DEAD (0.06 ms/layer early
+  start < 12% mispredict DRAM waste); c_frac005 -5.1 => frac 0.2 IS the engine balance point (both
+  directions worse; consistent with measured f0.35 -1.2); b_ringslots +1.4; g_graphs +0.2
+  (launch_gap 0.005->0.002); combo_bg +1.6 = best attainable with weights/placement untouched (~63 tg).
+- Model verdict: CPU tier is the binding wait at the served point (~0.29 ms/layer = 14 ms/pass); link is
+  secondary (3.7 ms/pass); the 3.3 ms/pass "wait for host plan" is host-side slack absorbed by both.
+  tg gains must remove CPU-tier bytes (placement = D1, or DECISION line) or cold volume; plan D0(e)
+  answer: ~63 tg combo b+g, i.e. +1.6 - the plan's 75-85 needs D1 placement + D2, not scheduling.
+- Next per plan section 4: D2 nsys 20 decode passes (top-10 kernels to TRACKER + measured launch-gap
+  total = true graphs value), P2 SASS attn int8-vs-fp16 per tile, P4 inter-kernel gap sum (drop P4 <1 s).
