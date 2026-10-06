@@ -48,3 +48,55 @@ GPU-reach 14.4-15 ms, CPU 3 ms, hit rate 89.5-93.4%, 89-106 tok/s (4K prompts; n
    **est. ~3,500-4,000 tok/s**. Cost: GPU 2 is no longer rentable.
 3. Faster CPU tier (engine 0.068 ms/slot vs PAW's pool microbench 0.045): **est.** -4 to -5 ms/pass on one card.
 4. Strata itself is not an option at our quality: it needs 2-bit experts (1.38 MB) for its hit rate.
+
+## 5. The pass formula and its floors (one RTX 3090, X3.1, 150K, served config)
+
+Clean measurement (PAW's MTP A/B run A1, no section timers, served env): **77.7 tok/s, 2.89 tokens/pass, pass 37.3 ms**,
+CPU wait 14.65 ms, 193 distinct CPU experts (229 slots), 47 demand + 63 hinted copies, 61 admitted/pass.
+(kbench rows set TRUSS_PROFILE_SECTIONS=1: that turns admission off in practice and slows decode; the "~60 tok/s"
+rows are biased low. Fix kbench before more decode A/Bs.)
+
+Layers are sequential, and inside a layer the CPU's misses run in parallel with the GPU's resident experts only:
+
+  T_pass = sum over 48 layers [ t_mix(l) + t_hc(l) + t_route(l) + max( t_gpu_exp(l), t_cpu(l), t_copy(l) ) + t_comb(l) ]
+           + t_head + t_draft + t_host
+
+Floors = bytes / bandwidth (3090: 936 GB/s HBM-class GDDR6X, PCIe x16 ~21 GB/s measured, host DRAM ~40-57 GB/s shared):
+
+| term (per pass) | bytes | floor | measured | x floor |
+|---|---:|---:|---:|---:|
+| dense weights (Q8: GDN/DSA projections, hc, shared, router) | ~4.1 GB | ~4.4 ms | | |
+| mixer state + KV at 150K (GDN states r+w, DSA indexer keys, 2,048 selected K/V) | ~0.5 GB | ~0.5 ms | | |
+| **GPU non-expert total (mix + hc + route + combine)** | ~4.6 GB | **~5 ms** | **~13 ms** | **~2.6x** |
+| GPU resident experts (~880 distinct x 1.95 MB) | ~1.7 GB | ~1.9 ms | ~5.3 ms | ~2.8x |
+| CPU misses (193 x 1.85 MB, read in place) | ~0.36 GB | ~7 ms at 50 GB/s | 14.65 ms wait | ~2x |
+| head (output 0.675 GB) + MTP drafts | ~1.2 GB | ~1.3 ms | ~2.7 ms | ~2x |
+
+Per layer today: GPU non-expert ~0.27 ms, then max(GPU experts 0.11, CPU 0.30) -> the CPU binds every layer.
+If the GPU non-expert part reached ~80% of bandwidth (0.12 ms/layer) AND the CPU tier reached its DRAM floor
+(~0.15-0.2 ms/layer): pass ~0.32 x 48 + ~3.5 = **~19 ms -> ~150 tok/s at 2.9 tokens/pass** (upper bound).
+Neither alone is enough: GPU-only work stops at ~0.27->0.12 but the CPU still binds (pass ~31 ms, ~93 tok/s);
+CPU-only work stops when the GPU non-expert time binds.
+
+**Why the GPU is slow at decode:** not FLOPs or bytes, but latency: ~2,200 launches per pass (46 per layer), small
+grids (4 rows), each kernel's ramp-up/tail and the dependency chain between them. The mixer moves ~0.5 GB yet takes
+7.2 ms (14x its byte floor). This is exactly the regime of the Hazy Research "no bubbles" megakernel (batch-1 Llama-1B:
+existing engines <= 50% of bandwidth on H100, one persistent kernel 78%).
+
+**Why the CPU is used for misses (and is right to be):** a cold expert lives in host RAM; the GPU can only read it at
+PCIe speed (21 GB/s) while the CPU reads it in place at DRAM speed (~2x). This is Fiddler's result (ICLR 2025).
+The CPU tier runs at ~half its DRAM floor today (engine 0.068 ms/slot vs PAW's pool microbench 0.045).
+
+## 6. Workstreams after the MTP A/B (each measured before building)
+
+G1. **Decode megakernel / persistent layer kernel for sm_86** (GPU non-expert 13 -> ~6 ms est.): one persistent
+    kernel per pass (or per layer) running the hc -> norm -> GDN/DSA -> hc -> router -> shared chain from a device-side
+    instruction queue, CTAs pinned per SM, weights streamed with cp.async, doorbell to the CPU tier unchanged.
+    Step 0: nsys of 20 clean decode passes (no section timers): per-kernel bytes/time = achieved GB/s, and the
+    idle gaps between kernels; the megakernel's gain is bounded by (sum of gaps + per-kernel ramp losses).
+G2. **CPU tier to its floor** (14.65 -> ~8-9 ms est.): find the engine-vs-microbench 1.5x (perf needs the matching
+    linux-tools package; else in-process rdtsc timers per phase): candidates are the 4K-page TLB walks on the 38 GB
+    pinned arena (1.85 MB expert = 452 pages), the 3-phase barriers (gate/up -> h-quant -> down), and thread wakeups.
+G3. **Trellis GPU expert kernel** (5.3 -> ~2.5 ms est.): window kernel at ~320 GB/s; QTIP's bitshift-trellis kernels
+    run near the byte bound at batch 1. Profile occupancy/stalls first.
+G4. Admission policy as replayed (every CPU miss, link budget permitting): replay -31% misses vs today's capped 61/pass.
