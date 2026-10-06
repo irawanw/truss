@@ -266,6 +266,26 @@ identically in plan() and ctor; compute slot_ from layers_ FIRST; all `%2` -> `%
   Kernel only reads meta for plan slots; protect_layer_/protect_ blocks evicting in-use experts.
   (3) demand+hint MERGE into one copy: BLOCKED by layout - ALIGN=256 but K3.5 bytes 2,150,000 not div by 256
   -> padding between adjacent ring slots -> host runs not device-contiguous. Skip, note in TRACKER.
-- 1.B/1.C NOT STARTED. 1.B = 7 MoE-boundary host stalls 7.45ms/pass (after hc::combine, before router quantize;
-  PLE gather wait 7.85ms/pass + D2H syncs prime suspects). 1.C = split wait_plan 11.01 vs spin 10.52 by driver
-  timestamps (Phase1 vs Phase2 split). Phase 5.0 (cudaHostAlloc arena) after 1.C.
+- 1.B root cause CONFIRMED (decode-window sqlite, ledger04_204049): 19 gaps >5 ms avg 8.18 ms ALL
+  hc::combine_kernel -> dense::quantize_kernel with ZERO overlap = pass boundary; host accept + verify-enqueue
+  then layer-1 ple() blocks on contended SSD PLE preads (7.85 ms/pass @275W, 1.69 at baseline instant - varies
+  with tenant I/O). FIX = early-issue ticket across the draft chain (implemented; see postmortem below).
+- 1.C NOT STARTED: split wait_plan 11.01 vs spin 10.52 by driver timestamps (Phase1 vs Phase2 split).
+  Phase 5.0 (cudaHostAlloc arena) after 1.C.
+- 1.A committed 852c5df; quick EXACT row 1006_222356. 1.B committed 0712b86 -> kbench RUN_FAIL (1006_225433):
+  exact run HUNG (timeout kill; exact.log mtime = last stderr line = mid-load; no OOM in syslog, no coredumpctl,
+  no dmesg access on this box). Repro under lock+trap (/tmp/repro_1b.sh, prompts at 20260930_truss_tg/data/
+  profile_prompts, kbench D=): rc=124 hang confirmed.
+- 1.B CRASH POST-MORTEM (two bugs, fixed a077865, repro tokens IDENTICAL-TO-GOLDEN, 0 PLE-MISMATCH):
+  (1) HANG: 1.B's incremental ticket let workers read plain `n_pages_` while append() grew it -> a worker
+  early-exits the fetch loop on the stale value -> finished_ never reaches n_pages_ -> begin/collect wait
+  forever. FIX: pages handed out UNDER mu_ (worker: cv_.wait(next_ < n_pages_) then p = pages_[next_++];
+  gen_/seen protocol deleted; n_pages_/next_/finished_ all mu_-protected; ntok >= T consumption).
+  (2) TOKEN DIFF at token 55: prefill lookahead ticket (ple_tk_pos0 == first decode pos0) is consumed by the
+  FIRST decode ple() (branch order) leaving the draft ticket OPEN; next pass's ple_prefetch appended its
+  window's rows to that stale ticket (same ticket_ id) -> ple() later consumed a cross-window rows_.
+  FIX: ple_prefetch opens a fresh ticket when ple_inc_pos != pos. Debug kept env-gated: TRUSS_PLE_DEBUG=1
+  compares ticket rows vs recomputed at every consumption; TRUSS_PLE_NOINC=1 kill switch (forces fresh issue).
+  NOTE: first decode pass still uses the prefill lookahead ticket (E8 design); the incremental ticket covers
+  passes >= 2.
+- kbench on fixed stack (1.A+1.B) running -> /tmp/kbench_1ab2.log.
