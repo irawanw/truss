@@ -96,3 +96,30 @@ Gate: kmicro checksums unchanged + G-X + G-S.
 ## 4. Stop/escalate
 Three failed attempts -> STUCK + TRACKER why. A kernel at eta >= 0.65 is done: move on. If Phase 0 ledgers show the
 floors above are wrong, PAW writes the corrected numbers and the lead re-budgets before more building.
+
+## 5. Lead review of the Phase 0 ledgers (2026-10-06 ~21:45) -> Phase 1 re-ordered
+
+Ledgers (`work/agent/docs/ledger-{decode,prefill}-20261006.md`, TRACKER 124-127) accepted, with one correction:
+**the PCIe "peak 13.4 GB/s" in the prefill ledger is not the peak.** Lead's test on GPU 1 (scratch `bw.cu`, 64 MB,
+brain idle, H2D, pieces 4 KB .. 64 MB): `cudaMallocHost` 21.7 GB/s at 256 KB, **24-25 GB/s at >= 1 MB**;
+malloc + `cudaHostRegister` (= the engine's cold arena) **18-20 GB/s**; 64 KB pieces 13-15; 4 KB pieces 1.9.
+IOMMU runs in translated mode (dmesg) - registered 4 KB pages cost ~20%.
+So: prefill streams 38.5 GB/chunk at 13.4 GB/s = 2.87 s, while the arena could give ~19.5 (1.97 s) and pinned-alloc
+memory ~24.5 (1.57 s). Once kernels reach the 2.77 s/chunk target, **the link becomes the wall unless fixed**.
+Decode: 1,107 copies/pass, 217 MB in 26.2 ms busy = **8.3 GB/s effective** (avg ~196 KB per copy, plus 4 KB meta
+tables): the copy stream's per-copy overhead, not the link.
+
+**Phase 1 (decode) new order - the expert supply chain first (29 of 53 ms/pass is waiting for it):**
+1.A Copy path: histogram copies/pass by size and by source (demand / hint / admission pieces / meta tables / other);
+    then batch: meta tables updated on the device from mapped host words (or one copy per layer), admission pieces
+    256 KB -> >= 1 MB, demand+hint of one layer in as few copies as the ring layout allows. Target: copy busy
+    <= 12 ms/pass at >= 18 GB/s effective. Gate G-X.
+1.B The 7 host stalls/pass at the MoE boundary (7.45 ms): instrument what the host thread blocks on (rdtsc around
+    every CUDA call/sync/event query in the enqueue path, per layer); fix the cause. Gate G-X.
+1.C wait_plan (11 ms) vs spin (10.5 ms): show with driver timestamps how much of wait_plan is the driver still
+    inside the previous layer's ct->pool->wait() (CPU tier) vs its own plan work. That splits Phase 1 from Phase 2.
+1.D Then window_kernel eta 0.33 -> >= 0.6 (2.6 ms), then glue fusion (~4.5 ms), as before.
+**Phase 5 (prefill) addition:** 5.0 cold arena in `cudaHostAlloc`'d chunks (e.g. 1 GiB each) instead of
+malloc+register: measure link GB/s and startup time and host RAM (must stay within the renter budget); if startup
+regresses, allocate in the background as today. Do before kernel work so the link stops hiding behind compute.
+Router fp32 -> Q8 is a DECISION (precision): not now.
