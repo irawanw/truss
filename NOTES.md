@@ -204,3 +204,11 @@ identically in plan() and ctor; compute slot_ from layers_ FIRST; all `%2` -> `%
   footprint small, stream capture to disk, NO big mlocks; check free -g available >= 20 GB before starting.
 - PAW step 2 (later, after lead posts packed MTP GGUF): bench new MTP vs mtp_x3k3 same prompt set -
   tokens/pass, tok/s, VRAM/resident experts, EXACT greedy tokens; interleaved A/B, 2 pairs.
+- STEP 1 DONE 10-06 19:2x: capture rc=0, mtp_calib.f32 = 245,520 rows (2,514,124,800 B = 240x1023x2560x4),
+  main build 5798d3c, served env replicated, brain down ~3 min, lock held, START/END notified; prompts
+  kept in data/prompts/; README written (data/README.md). cpu_quant.cc already committed (b3e97cb).
+  IDLE on Order 3 until lead posts the packed MTP GGUF -> then step 2 A/B bench.
+- LESSON (10-06): pm2 stop brain kills MY OWN serving connection - every GPU run must be ONE backgrounded
+  script that takes the lock, notifies, stops the brain, runs, and RESTARTS the brain via an EXIT trap
+  (scripts/capture_calib.sh pattern); then wait for the script/user notice - NEVER poll the model while
+  the brain is down.
