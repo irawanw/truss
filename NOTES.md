@@ -212,3 +212,22 @@ identically in plan() and ctor; compute slot_ from layers_ FIRST; all `%2` -> `%
   script that takes the lock, notifies, stops the brain, runs, and RESTARTS the brain via an EXIT trap
   (scripts/capture_calib.sh pattern); then wait for the script/user notice - NEVER poll the model while
   the brain is down.
+
+## 2026-10-06 ~20:30: ORDER 4 = Plan v3 (docs/PLAN-20261006-x31-bandwidth.md), Phase 0 instruments
+- Order 3 CLOSED: lead verdict keep A (served MTP); my phase-1 A/B/C numbers -> TRACKER #123; phase 2 skipped.
+- Plan v3 KPI = SERVED brain log (scripts/served_stats.py), not the greedy bench: served p50 55.4 tok/s,
+  accept 0.50/draft (greedy bench 77.7 overstates ~40%). Targets: eta_k = bytes_k/(t_k x 936 GB/s) >= 0.65
+  for every kernel moving >1 MB; floors GPU non-expert 4.6 GB -> 7.6 ms (now ~13), resident experts 1.7 GB
+  -> 2.8 ms (now ~5.3), CPU misses 8 ms (now 14.65), head ~2 ms; pass ~20 ms -> ~115 served. G-N gate NEW:
+  kernel changes numerics => must pass tk-parity-kl <= 0.002 + top-1 >= 99% + PPL +-0.3% with placement fixed.
+- PHASE 0 DONE so far: 0.1 golden re-dumped (md5 a7ae0e42, kbench_1006_201716, exactness WITHOUT admission) +
+  baseline row 1006_202143 decode 66.6 / pp 2,136 / EXACT (determinism holds admission-off). 0.2 served_stats.py
+  written (scripts/, committed) reproduces plan §0 table. TRACKER #124.
+- TODO 0.3 served-pattern bench (port e7_steps.py GPU2/X3 -> GPU1/X3.1, T0.8 top_p0.95 top_k40 min_p0.05
+  draft-min-p 0.5 fixed seeds, 8 agent steps 150K; must reproduce served p50 +-10%). 0.4 decode bandwidth ledger
+  (nsys 20 clean passes @150K, per-kernel count/t/bytes/eta/Recoverable + idle gaps -> docs/ledger-decode-20261006.md).
+  0.5 prefill ledger (one 8K chunk @150K, TFLOPS/GB/s vs 3090 limits). STOP after Phase 0 for lead review.
+- tell_lead.sh DONE|STUCK|DECISION "one line" = two-way channel (also logs notify.txt); use ONLY phase DONE /
+  brick wall / needs-lead. First use: DONE at end of Phase 0. Never while brain down mid-run unless the wall itself.
+- kbench fixed by lead (hash c438f387 in data/ledger/scripts.sha256): served env, --sections opt-in ONLY,
+  exactness admission-off. Never compare --sections rows with plain rows.
