@@ -47,6 +47,7 @@ public:
     int begin(bool cache_misses);
     void append(int ticket, const int32_t * rows, size_t n);
     void collect(int ticket, half * emb);   // emb [n][row_bytes]
+    const std::vector<int32_t> & ticket_rows() const { return rows_; }   // debug: the ticket's row ids in order
 
     struct Stats {
         uint64_t rows = 0, cache_hits = 0, pages = 0;   // rows asked for, served by the cache, 4 KiB pages read
@@ -87,9 +88,8 @@ private:
     std::vector<std::thread> pool_;
     mutable std::mutex mu_;
     std::condition_variable cv_, done_cv_;
-    std::atomic<size_t> next_{ 0 };
-    size_t n_pages_ = 0, finished_ = 0;
-    uint64_t gen_ = 0;
+    size_t next_ = 0;                     // fetched under mu_ (1.B: appends grow the ticket while workers run)
+    size_t n_pages_ = 0, finished_ = 0;   // both touched only under mu_ (workers and begin/collect)
     bool stop_ = false;
     int io_errno_ = 0;
     // row cache

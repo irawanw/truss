@@ -81,26 +81,19 @@ PleReader::~PleReader()
 
 void PleReader::worker()
 {
-    uint64_t seen = 0;
     for (;;) {
-        {
+        Page p;
+        {   // one page handed out per lock section: append() grows pages_/n_pages_ concurrently (1.B), and
+            // a Page copied under the lock cannot dangle when a later append reallocs pages_
             std::unique_lock<std::mutex> lk(mu_);
-            cv_.wait(lk, [&] { return stop_ || gen_ != seen; });
+            cv_.wait(lk, [&] { return stop_ || next_ < n_pages_; });
             if (stop_) return;
-            seen = gen_;
+            p = pages_[next_++];
         }
-        size_t done = 0;
-        int err = 0;
-        for (size_t i; (i = next_.fetch_add(1)) < n_pages_;) {
-            Page p;
-            { std::lock_guard<std::mutex> g(mu_); p = pages_[i]; }   // append() may grow pages_ concurrently (1.B)
-            const ssize_t got = ::pread(p.fd, p.buf, PAGE, (off_t) p.off);
-            if (got < 0) err = errno;   // a short read is the file's end: the rows never reach it
-            ++done;
-        }
+        const ssize_t got = ::pread(p.fd, p.buf, PAGE, (off_t) p.off);
         std::lock_guard<std::mutex> g(mu_);
-        if (err) io_errno_ = err;
-        finished_ += done;
+        if (got < 0) io_errno_ = errno;   // a short read is the file's end: the rows never reach it
+        ++finished_;
         if (finished_ == n_pages_) done_cv_.notify_all();
     }
 }
@@ -163,7 +156,6 @@ void PleReader::append(int ticket, const int32_t * rows, size_t n)
     stats_.pages += pages_.size() - old_pages;
     const bool more = pages_.size() > n_pages_;
     n_pages_ = pages_.size();
-    ++gen_;
     lk.unlock();
     if (more) cv_.notify_all();
 }

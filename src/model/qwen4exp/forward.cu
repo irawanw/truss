@@ -1197,6 +1197,7 @@ struct Forward::Impl {
     {
         if (!ple_reader) return;
         const int H = c.ple_heads(), NG = c.ple_ngram;
+        if (ple_inc_tk >= 0 && ple_inc_pos != pos) ple_inc_tk = -1;   // a stale window opens a fresh ticket
         if (ple_inc_tk < 0)
         {
             ple_inc_tk = ple_reader->begin(false);   // decode rows are not cached (as today's T > 1 tickets)
@@ -1214,6 +1215,9 @@ struct Forward::Impl {
         ++ple_inc_ntok;
     }
 
+    static bool ple_dbg() { static const bool on = getenv("TRUSS_PLE_DEBUG") != nullptr; return on; }
+    static bool ple_no_inc() { static const bool on = getenv("TRUSS_PLE_NOINC") != nullptr; return on; }
+
     void ple(const Ple & p, LayerState & L, const int32_t * tokens, int T, int pos0, bool tentative)
     {
         // n-gram window across chunks: hash [tail | chunk] and keep the chunk's rows
@@ -1229,9 +1233,20 @@ struct Forward::Impl {
             require((size_t) T * E <= ple_stage_n, "PLE stage too small for the chunk");
             int tk;
             if (ple_tk_valid && ple_tk_pos0 == pos0) { tk = ple_tk; ple_tk_valid = false; }   // prefill: in flight
-            else if (ple_inc_tk >= 0 && ple_inc_pos == pos0 && ple_inc_ntok == (size_t) T)
-            {   // 1.B: the draft chain's ticket: every row but the last token's has had the chain's whole runtime
+            else if (ple_inc_tk >= 0 && ple_inc_pos == pos0 && ple_inc_ntok >= (size_t) T && !ple_no_inc())
+            {   // 1.B: the draft chain's ticket covers the window (its rows are in window order; rows of
+                // rejected drafts trail and are ignored by the kernel); only the last row had no slack
                 tk = ple_inc_tk; ple_inc_tk = -1; ple_inc_ntok = 0;
+                if (ple_dbg()) {
+                    const auto & tr = ple_reader->ticket_rows();
+                    const int32_t * want = rows.data() + (size_t) n_prev * H;
+                    for (size_t i = 0; i < (size_t) T * H; ++i)
+                        if (i >= tr.size() || tr[i] != want[i]) {
+                            std::fprintf(stderr, "PLE-MISMATCH i=%zu got=%d want=%d pos0=%d T=%d ntok=%zu\n", i,
+                                         i < tr.size() ? tr[i] : -999, want[i], pos0, T, tr.size() / (size_t) H);
+                            break;
+                        }
+                }
             }
             else { ple_tk_valid = false; ple_inc_tk = -1; tk = ple_reader->issue(rows.data() + (size_t) n_prev * H, (size_t) T * H,
                                                                  T <= 1); }   // a chunk's rows are used once: only
