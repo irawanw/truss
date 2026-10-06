@@ -223,10 +223,18 @@ identically in plan() and ctor; compute slot_ from layers_ FIRST; all `%2` -> `%
 - PHASE 0 DONE so far: 0.1 golden re-dumped (md5 a7ae0e42, kbench_1006_201716, exactness WITHOUT admission) +
   baseline row 1006_202143 decode 66.6 / pp 2,136 / EXACT (determinism holds admission-off). 0.2 served_stats.py
   written (scripts/, committed) reproduces plan §0 table. TRACKER #124.
-- TODO 0.3 served-pattern bench (port e7_steps.py GPU2/X3 -> GPU1/X3.1, T0.8 top_p0.95 top_k40 min_p0.05
-  draft-min-p 0.5 fixed seeds, 8 agent steps 150K; must reproduce served p50 +-10%). 0.4 decode bandwidth ledger
-  (nsys 20 clean passes @150K, per-kernel count/t/bytes/eta/Recoverable + idle gaps -> docs/ledger-decode-20261006.md).
-  0.5 prefill ledger (one 8K chunk @150K, TFLOPS/GB/s vs 3090 limits). STOP after Phase 0 for lead review.
+- 0.3 DONE (e7_03_203346, TRACKER #125): dedicated :8193 server brain-exact config + 8-step 150K replay seed=1.
+  Decode p50 63.7 vs served 55.4 (+15%, outside plan 10% band - warm single session; e7 = relative A/B harness
+  only), accept 0.570, step-0 prefill 2,130, reuse confirmed. Ports scripts/e7_serve_x31.sh + e7_steps_x31.py.
+- 0.4 DONE (TRACKER #126): docs/ledger-decode-20261006.md (worktree) from ledger04_204049 nsys (20 passes,
+  53.0 ms/pass, gaps 11.20). Headline ~29 ms/pass = expert-supply-chain WAIT (spin 10.5 + wait_plan 11.0 +
+  7.45 in 7 MoE-boundary host stalls after hc::combine before router quantize). Recoverable: window 2.60
+  (eta 0.33), DSA glue 1.71 (0.10), hc glue 1.10 (0.08), fusion class 2.54, router-f32 0.40 (Q8 = DECISION);
+  dense gemv eta 0.63 (GDN qkv 0.83 / DSA qkv 0.86 / heads ~0.9 AT target, do not touch). Bytes method: GGUF
+  tensor table /tmp/gguf_infos.pkl + grid decode per=4x32/lpo (lpo16 -> x8!). Evidence in data/logs/ledger04_204049.
+- TODO 0.5 prefill ledger: nsys WITHOUT -c cudaProfilerApi (PROFRANGE brackets decode only), whole-process,
+  filter ONE 8K prefill chunk by timestamps; capture nvidia-smi clocks+power alongside; TFLOPS (int8 IMMA
+  113.6 / fp16 HMMA 142 dense) or GB/s vs 936; -> docs/ledger-prefill-20261006.md. STOP after 0.5 for lead review.
 - tell_lead.sh DONE|STUCK|DECISION "one line" = two-way channel (also logs notify.txt); use ONLY phase DONE /
   brick wall / needs-lead. First use: DONE at end of Phase 0. Never while brain down mid-run unless the wall itself.
 - kbench fixed by lead (hash c438f387 in data/ledger/scripts.sha256): served env, --sections opt-in ONLY,
