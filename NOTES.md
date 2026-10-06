@@ -270,22 +270,20 @@ identically in plan() and ctor; compute slot_ from layers_ FIRST; all `%2` -> `%
   hc::combine_kernel -> dense::quantize_kernel with ZERO overlap = pass boundary; host accept + verify-enqueue
   then layer-1 ple() blocks on contended SSD PLE preads (7.85 ms/pass @275W, 1.69 at baseline instant - varies
   with tenant I/O). FIX = early-issue ticket across the draft chain (implemented; see postmortem below).
-- 1.C NOT STARTED: split wait_plan 11.01 vs spin 10.52 by driver timestamps (Phase1 vs Phase2 split).
-  Phase 5.0 (cudaHostAlloc arena) after 1.C.
-- 1.A committed 852c5df; quick EXACT row 1006_222356. 1.B committed 0712b86 -> kbench RUN_FAIL (1006_225433):
-  exact run HUNG (timeout kill; exact.log mtime = last stderr line = mid-load; no OOM in syslog, no coredumpctl,
-  no dmesg access on this box). Repro under lock+trap (/tmp/repro_1b.sh, prompts at 20260930_truss_tg/data/
-  profile_prompts, kbench D=): rc=124 hang confirmed.
-- 1.B CRASH POST-MORTEM (two bugs, fixed a077865, repro tokens IDENTICAL-TO-GOLDEN, 0 PLE-MISMATCH):
-  (1) HANG: 1.B's incremental ticket let workers read plain `n_pages_` while append() grew it -> a worker
-  early-exits the fetch loop on the stale value -> finished_ never reaches n_pages_ -> begin/collect wait
-  forever. FIX: pages handed out UNDER mu_ (worker: cv_.wait(next_ < n_pages_) then p = pages_[next_++];
-  gen_/seen protocol deleted; n_pages_/next_/finished_ all mu_-protected; ntok >= T consumption).
-  (2) TOKEN DIFF at token 55: prefill lookahead ticket (ple_tk_pos0 == first decode pos0) is consumed by the
-  FIRST decode ple() (branch order) leaving the draft ticket OPEN; next pass's ple_prefetch appended its
-  window's rows to that stale ticket (same ticket_ id) -> ple() later consumed a cross-window rows_.
-  FIX: ple_prefetch opens a fresh ticket when ple_inc_pos != pos. Debug kept env-gated: TRUSS_PLE_DEBUG=1
-  compares ticket rows vs recomputed at every consumption; TRUSS_PLE_NOINC=1 kill switch (forces fresh issue).
-  NOTE: first decode pass still uses the prefill lookahead ticket (E8 design); the incremental ticket covers
-  passes >= 2.
-- kbench on fixed stack (1.A+1.B) running -> /tmp/kbench_1ab2.log.
+- ORDER 6/7 VERDICT (10-07): 1.A KEPT, 1.B REVERTED IN FULL (revert 4775617 = a077865+0712b86).
+  Interleaved A/B (2 rounds x 4 arms, 250W, order B0 B1 B2 B3 B3 B2 B1 B0, worktrees ab_b0/ab_b1 +
+  --env TRUSS_PLE_NOINC=1): means B0 base 71.0, B1 1.A 71.9, B2 1.B-NOINC 63.3, B3 1.B 62.6.
+  1.B costs 8.6 tok/s EVEN WITH TICKETS OFF -> the upfront draft-chain enqueue itself (draft window
+  1.7 -> 5 ms, verify ~+2 ms; driver can't pipeline it). Confirm row 1007_064447: 72.8/1974/EXACT,
+  draft-window 1.65, PLE wait 0.51, driver 0.18/1.03. TRACKER 129/130.
+- 1.B postmortem (lessons): (1) HANG: workers read plain n_pages_ while append() grew it -> early-exit ->
+  finished_ never reached n_pages_; fixed by handing pages out under mu_. (2) TOKEN DIFF token 55: prefill
+  lookahead ticket consumed by FIRST decode ple() left the draft ticket open; next ple_prefetch appended
+  across windows; fixed by fresh-ticket guard (repro then IDENTICAL-TO-GOLDEN). (3) 2-slot variant
+  instrumentation: begin_wait 0.1 ms vs append 1431 ms/run (~2.5 ms/pass) = mu_ convoy from per-page lock
+  handoffs, NOT SSD tail. (4) Baseline PLE wait was only ~1.24 ms/pass -> 1.B ceiling ~1 ms, the 7.45 ms
+  MoE-boundary stall is NOT mostly PLE. All tweaks saved UNMEASURED on branch agent/1b-experiments (c5c5b08).
+- NOW: 1.C ATTRIBUTION-FIRST (Order 6 step 4): nsys -t cuda,osrt,nvtx PROFRANGE capture on the KEPT build
+  (4775617 = 1.A only) -> top 3 host causes of the 7.45 ms MoE-boundary stall + wait_plan 11.0/spin 10.5
+  split IN MS. Script /tmp/run_order6_1c.sh (lock+trap). No fix before the attribution table. Then
+  tell_lead DONE with the table. Phase 5.0 (cudaHostAlloc arena) after 1.C. 1.D only after lead go.
