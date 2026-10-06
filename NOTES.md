@@ -232,9 +232,13 @@ identically in plan() and ctor; compute slot_ from layers_ FIRST; all `%2` -> `%
   (eta 0.33), DSA glue 1.71 (0.10), hc glue 1.10 (0.08), fusion class 2.54, router-f32 0.40 (Q8 = DECISION);
   dense gemv eta 0.63 (GDN qkv 0.83 / DSA qkv 0.86 / heads ~0.9 AT target, do not touch). Bytes method: GGUF
   tensor table /tmp/gguf_infos.pkl + grid decode per=4x32/lpo (lpo16 -> x8!). Evidence in data/logs/ledger04_204049.
-- TODO 0.5 prefill ledger: nsys WITHOUT -c cudaProfilerApi (PROFRANGE brackets decode only), whole-process,
-  filter ONE 8K prefill chunk by timestamps; capture nvidia-smi clocks+power alongside; TFLOPS (int8 IMMA
-  113.6 / fp16 HMMA 142 dense) or GB/s vs 936; -> docs/ledger-prefill-20261006.md. STOP after 0.5 for lead review.
+- 0.5 DONE (TRACKER #127): docs/ledger-prefill-20261006.md from ledger05_211615 (whole-proc nsys + clock logger;
+  2,052 tok/s; SM 1,440 MHz @ 277 W TDP -> peaks at 1440: int8 120.2 TOPS / fp16-HMMA-fp32acc 60.1 TF / fp32 30.2).
+  Chunk9 T=8192: 3,847.7 ms, kernels 98.5% busy, expert H2D 38.5 GB overlapped (75% link) = COMPUTE-BOUND, 25%
+  PCIe headroom. moe trellis eta 0.69 AT TARGET (decode window 0.33 = batch-4 occupancy, not codec); dsa attn
+  Rec 412-641 (biggest); delta_rule 220; int8 gemm 185; quantize 75; hc glue 70. Rec sum ~1,075 -> ~2,950 tok/s:
+  3,000 reachable by efficiency alone. **PHASE 0 COMPLETE 10-06 21:31 — sent tell_lead DONE; awaiting lead review
+  of the two ledgers before ANY Phase 1+ work. Do not start Phases 1-5 without lead go.**
 - tell_lead.sh DONE|STUCK|DECISION "one line" = two-way channel (also logs notify.txt); use ONLY phase DONE /
   brick wall / needs-lead. First use: DONE at end of Phase 0. Never while brain down mid-run unless the wall itself.
 - kbench fixed by lead (hash c438f387 in data/ledger/scripts.sha256): served env, --sections opt-in ONLY,
