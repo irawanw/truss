@@ -106,3 +106,14 @@ identically in plan() and ctor; compute slot_ from layers_ FIRST; all `%2` -> `%
 - Decode attn_kernel<,1> also pays it: 37.0 us int8 vs 18.8 us fp16 per launch - tg gains too if the fix works.
 - If fast dequant doesn't close the gap: next candidate is cp.async staging of codes+scales (smem 42->58.5 KB,
   2 CTAs/SM) - measure before building; and per-layer fp16/int8 KV split knob (allocation is already per-layer).
+
+## Row 1006_153824 (commit 53b59b9): fast dequant + staged decode = EXACT, pp 1975/1968 @load 27.2 (kept 113004: 1944/1930 @21.3)
+- attn<,0> 44.7 -> 39.7 ms; attn<,1> 37.0 -> 25.7 us; tg 57.7/60.6 vs 61.7/60.8 (load-unmatched: 27 vs 21).
+- Staged cp.async for PREFILL int8 FAILED (attn 61 ms: 2 CTAs/SM occupancy loss > async gain) -> staged only in SPLIT
+  (decode) instantiation: AttnSmem<Shape, STAGED>; prefill keeps direct fast dequant at 3 CTAs/SM.
+- Matched-load tg confirmation row pending (box flaps 27-35 all day; poller pattern in prior sections).
+- MoE scout map partly stale: silu+mul ALREADY fused in gate_up epilogue (moe_prefill.cu:319-321); prep->A_gu round
+  trip is justified by measured TRACKER #42 (23 vs 36 TFLOPS). Do not re-litigate.
+- Next targets by size (nsys): dense gemm_kernel Q8 6.5 s (14%), gate_up 4.4 s, decode waits (spin+plan ~9.8 s),
+  hc small-kernel chains decode-side. Per-layer fp16/int8 KV split knob = +45 pp on fp16 layers but costs expert
+  budget (tg) -> DECISION + lead G-Q territory.
