@@ -72,6 +72,19 @@
 3. Final ladder report to lead: software within ~3% of x8-link wall; remaining gains = x16 hardware, KL gate,
    VRAM ring, sampling gate. NOTES + notify per row.
 
+## Main repo status (10-06, read-only check)
+- main = cc53231: 49b2fee MERGED agent/x31-speed (row D parallel collect + bench instrumentation + stream profiler)
+  -> the brain (main build) already serves my kept work; 1c585aa fast startup 8.3 s (TRACKER #120); 1d38be9
+  tk-parity-kl decode-step mode (lead's KL tooling); cc53231 server console prints live pp/tg to pm2 logs.
+  Lead's master plan: main docs/PLAN-20261005-x31-decode100.md (W0 A/B bench + G-Q quality gate vs Q8 teacher,
+  W1 residency replay, W2 device-ms, W3 MTP re-encode = user decision, W4 prefill). My lane W4.1 = the handoff,
+  done pending verdict; W1-W3 are the lead's ("B handled by lead", 10-05 notify).
+- Main HEAD is DIFF vs the old golden (startup/decode-step changes) -> keep the handoff verdict on the clean
+  d9b6c0b base (85d791a); lead rebases/merges and moves the golden.
+- W4.2 16K chunks halves total prefill stream bytes (9.1 vs 18.2 chunk passes over the cold set) but needs
+  ~+2.6-5 GB VRAM (scratch 285 KB/row doubles; moe::prefill ws scales with pairs 839->1678 MB A_gu etc.) vs the
+  0.75 GB margin -> VRAM/human decision, not an exact-safe code step. Same wall as Slots-depth below.
+
 ## Slots-depth idea: BLOCKED on VRAM (from failed run 1004_224142; keep for later)
 Real sizes: chunk buffers `big_bytes()` = **4.06 GiB** (scratch ~2.48 = 8192x285KB/row + 268MB dsa select ws;
 moe::prefill workspace ~1.36 GiB (A_gu 839 MB [pairs=81920][2*2560] half + A_d 105 + C_d 419); residual 3x336 MB);
