@@ -525,9 +525,9 @@ struct Forward::Impl {
             b.go = alloc<int>(1);
             b.d_mids = alloc<int>((size_t) R * K);
         }
+        drv_ts = std::getenv("TRUSS_DRIVER_TS") && std::atoi(std::getenv("TRUSS_DRIVER_TS"));
         driver = std::thread([this] { drive(); });
         dbg_on = std::getenv("TRUSS_DRIVER_DEBUG") && std::atoi(std::getenv("TRUSS_DRIVER_DEBUG"));
-        drv_ts = std::getenv("TRUSS_DRIVER_TS") && std::atoi(std::getenv("TRUSS_DRIVER_TS"));
         if (dbg_on)
             watchdog = std::thread([this] {
                 long last = -1;
