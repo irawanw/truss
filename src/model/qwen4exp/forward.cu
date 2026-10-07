@@ -980,7 +980,9 @@ struct Forward::Impl {
     // bytes of the prompt path's buffers (scratch, moe::prefill workspace, residual) at prefill_rows rows
     size_t big_bytes() const
     {
-        return align(scratch_bytes(c, prefill_rows, n_ctx)) + align(moe::prefill_workspace_bytes<MoeShape>(prefill_rows)) +
+        // the same scratch size the carve uses (with the MTP join when the block is present): sized without it, the
+        // carve ran ~T x 83 KB past the stream area, over the ring's tail and the hot experts after it (lead 10-07)
+        return align(scratch_bytes(c, prefill_rows, n_ctx, mtp != nullptr)) + align(moe::prefill_workspace_bytes<MoeShape>(prefill_rows)) +
                (mtp ? 3 : 1) * align(sizeof(float) * prefill_rows * c.hc_dim());
     }
 
