@@ -287,3 +287,17 @@ identically in plan() and ctor; compute slot_ from layers_ FIRST; all `%2` -> `%
   (4775617 = 1.A only) -> top 3 host causes of the 7.45 ms MoE-boundary stall + wait_plan 11.0/spin 10.5
   split IN MS. Script /tmp/run_order6_1c.sh (lock+trap). No fix before the attribution table. Then
   tell_lead DONE with the table. Phase 5.0 (cudaHostAlloc arena) after 1.C. 1.D only after lead go.
+
+## 2026-10-07 ~07:20: ORDER 7 1.C ATTRIBUTION TABLE (TRACKER 131) - DONE, told lead
+- Method (analyze_stall.py): engine-thread gating overlap only (worker/pool overlap = concurrent, NOT causal);
+  wait_plan split by 4B plan-signal memcpy (pre = prep + signal queued before EXECUTING, post = PCIe visibility).
+- MoE-boundary stall (combine->quantize >5ms): 7.26 ms/pass @275W (7x20.7) / 3.69 @250W-traced (6x13.5).
+  Top-3 gating (275W -> 250W ms/pass): (1) engine PLE-collect cond_wait+mu_ 4.4 -> 1.6; (2) engine accept+
+  verify-enqueue CPU (no event covers it) 2.9 -> 2.1; (3) PLE pread busy in gaps 0.67 -> 0.85 (SSD NOT the wall).
+- wait_plan 11.01 -> 12.03 = ~94% PRE-SIGNAL: driver API prep 2.25/2.63 + copy-backlog drain ~8.2/8.6 before
+  the 4B signal executes; post-signal 0.08. spin 10.52 -> 23.81 (osrt tax inflates CPU tier).
+- 1.A inventory CONFIRMED: 1,107 -> 652 copies/pass, 435 -> 415 MB, busy 26.2 -> 22.5 ms, eff 16.6 -> 18.4 GB/s
+  -> wait_plan NOT copy-busy-bound. LEVER: early/separate-stream plan write (~9-10 ms device wait); boundary
+  stall = PLE collect + accept/enqueue CPU.
+- CAVEAT: osrt trace tax - ledger07 decode 42.4 tok/s vs 72.8 clean (ledger04 56.4 vs ~66): absolutes upper bounds.
+- NEXT per lead: tell_lead DONE (done 07:2x) -> await; Phase 5.0 arena after ack; 1.D only on go.
