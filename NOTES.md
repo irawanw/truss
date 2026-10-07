@@ -335,3 +335,21 @@ identically in plan() and ctor; compute slot_ from layers_ FIRST; all `%2` -> `%
 - kmicro baseline 10-07: K35 R1 197.9 us (checksum = ref 4a32754e93e35f86). Build: g++ -O2 -g -mavx2 -mfma
   -mf16c -std=c++20 -Isrc /tmp/callshape.cc build/libtruss_cpu.a -lpthread -o build/callshape.
 - NEXT: lead go -> kmicro ALU experiments on gemv_i16f (src/cpu/expert_trellis.cc), checksums frozen.
+
+## 2026-10-07 ~10:10: ORDER 10 STEP 1 DONE - driver segments measured (TRACKER 134)
+- Patch 26a33d7 + fix 9331d33 (getenv RACED driver-thread spawn -> first ON run printed nothing; init now
+  BEFORE `driver = std::thread`). TRUSS_DRIVER_TS=1, prints to stderr every 480 calls; kbench routes bench
+  stderr to $LOG/bench_1.log (NOT the /tmp wrapper log - that is why the first extraction came up empty).
+- Rows (250W): ON#1 1007_094329 71.5/1956 EXACT; ON#2 1007_095636 70.3/1952 EXACT (OFF ref 72.8/1974).
+  ON overhead -1.8..-3.4% - diagnostic only, gated OFF by default, kept on branch.
+- SEGMENTS steady state (ms/call -> x48 ms/pass): pre 0.39 -> 18.6 (job+doorbell spin, device-paced;
+  admit_step already copies during it); split 0.004 -> 0.2; start 0.004 -> 0.2; copies 0.022 -> 1.1
+  (all three cross-check the engine line 0.21/0.18/1.03); hint_admit 0.019 -> 0.9 (ALREADY overlaps the
+  pool - runs before wait); wait 0.25 -> 12.0 (pool->wait + cpu_done publish); post 0.000; pool_done
+  0.28 -> 13.4. Accounting closes 0.64-0.67 busy+waits ~ 0.75 = 35.9/48.
+- ANSWER to lead: NOTHING >=4 ms/pass after wait() is reorderable; post-wait ~0, hint/admit already in
+  the pool window; big terms are WAITS (pre = device-paced dead time, wait = pool-paced). Lever = pool
+  wall 12-13.4 ms/pass inside the device chain -> step 2 ALU program (running now: variants A/B/C swap
+  the two vpmaddubsw byte-sums for and/srli/add; mul-pipe 6->5/4 ops per 16w @R1; checksums frozen).
+- Runner /tmp/run_alu.sh (base,A,B,C x2 reps, restores base). DO NOT run kmicro during a kbench row (same
+  build dir + CPU contention corrupts CPU-tier-bound rows).
