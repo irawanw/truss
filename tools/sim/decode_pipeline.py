@@ -227,7 +227,7 @@ if __name__ == "__main__":
     ap.add_argument("--calibrate", action="store_true")
     ap.add_argument("--base", action="store_true")
     ap.add_argument("--lever", action="store_true")
-    args = ap.parse_args()
+    args, _un = ap.parse_known_args()
     if args.base or not (args.calibrate or args.lever):
         q = row_params(ROWS[2])
         pm, st = simulate(q, random.Random(5))
@@ -238,3 +238,139 @@ if __name__ == "__main__":
         calibrate()
     if args.lever:
         levers()
+
+
+# =====================================================================================
+# X3.1 recalibration (Order 8): clean row 1007_064447 (kept build 4775617, 250 W).
+# Engine structure READ FROM CODE (forward.cu serve(), 595-717):
+#   serve(l): split -> pool->start -> fetch(demand copies) -> signal(go, copy stream, BEHIND this
+#   layer's demand, BEFORE hints) -> PLAN WRITTEN DIRECT TO MAPPED HOST FLAG (b.plan, immediate,
+#   NOT behind the copy queue) -> prefetch_hint -> claim(admission) -> pool->wait()  <-- INSIDE
+#   serve: the driver thread is serialized per layer by the CPU tier.
+# Device stream per layer: tinies(mix/hc/PLE/glue) -> wait_plan (mapped flag: ~0 clean) ->
+#   window kernel { spin on go = demand-landing, resident scan } -> gemv -> spin (CPU done) -> combine.
+# Consistent clean-row model (ALL bench.log/lead numbers close):
+#   wall 35.85 = verify 32.43 (48 x 0.675) + draft 1.65 + head 0.93 + accept 0.85;
+#   GPU busy 20.5 = tinies 7.5 + resident 0.3 + gemv 7.7 + go-spin 5.0 (INSIDE window kernel 5.3);
+#   waits: wait_plan ~0.2 (mapped), spin 11.7 = pool wall/call 0.514 (bench: 0.136 ms/expert x 3.68
+#   experts/call = 0.50) minus window+gemv end 0.27; pool serial (pool->wait), util 76%;
+#   link: dem 42.6x1.99MB @18.4 GB/s = 0.096 ms/layer + API 0.008 -> go visible serve+0.104;
+#   hint 56.6, admission 58.6 queue behind go (link 17.1 ms busy/pass, ahead of the device).
+# KEY CONSEQUENCE (the lead's absorption risk, quantified): pool_done(l) = serve(l)+wall/call is
+# INDEPENDENT of GPU-side durations -> every GPU-side saving up to the spin (11.7 ms/pass, floor
+# driver pace serve-interval 0.544 = wall/call + API 0.030) is ABSORBED by a longer spin.
+PX = dict(
+    n_layer=48, tokens_per_pass=2.61,
+    tinies_ms=7.5/48,          # mixer+hc+PLE+glue+combine GPU serial, incl tiny-kernel gaps
+    resident_ms=0.3/48,        # window-kernel resident scan/compute AFTER go arrives
+    gemv_ms=7.7/48,            # GPU expert gemv (after window)
+    poll_ms=0.004, driver_api_ms=1.42/48,   # split+pool start+copy APIs+hint+claim (drv_ms sum)
+    pool_wall_ms=0.514,        # pool wall per layer call (measured 0.136 ms/expert x 3.68)
+    link_bytes_ms=18.4e6, expert_bytes=1.99e6,
+    demand=42.6/48, prefetch=56.6/48, admission=58.6/48,
+    host_gap_ms=3.42,          # draft 1.65 + head 0.93 + accept 0.85
+    plan_mapped=True,          # ENGINE FACT today; False = plan rides at the copy-batch tail
+    spec_cap_ms=float("inf"),  # L1: hold speculative copies back to <= cap ms in front of demand
+    link_upgrade_ms=0.0,       # Phase 5.0 stand-in: extra link bytes/ms
+    window_overlap_ms=0.0,     # L2: useful window work done DURING the go spin (eta up)
+    tinies_cut_ms=0.0,         # L3 glue fusion
+    cpu_slow=1.0,              # L4 multiplier on pool wall/call
+)
+ROW_X = dict(wall=35.85, tg=72.8, tpp=2.61)
+
+def simulate_x(p):
+    link = p["link_bytes_ms"] + p["link_upgrade_ms"]
+    dem_ms = p["demand"] * p["expert_bytes"] / link
+    hint_ms = p["prefetch"] * p["expert_bytes"] / link
+    adm_ms = p["admission"] * p["expert_bytes"] / link
+    tinies = p["tinies_ms"] - p["tinies_cut_ms"]
+    gpu_t = drv_free = link_free = 0.0
+    st = dict(tinies=0.0, plan=0.0, go=0.0, resident=0.0, gemv=0.0, cpu=0.0,
+              copy_busy=0.0, link_idle=0.0, driver_idle=0.0)
+    for l in range(p["n_layer"]):
+        mix_end = gpu_t + tinies
+        serve = max(drv_free, mix_end + p["poll_ms"])
+        st["driver_idle"] += serve - drv_free
+        # copies: demand issued right after pool->start; hints+admission behind go
+        issue = serve + p["driver_api_ms"] * 0.3
+        dem_start = max(link_free, issue)     # demand is FIRST in the FIFO (engine order 670-671)
+        dem_end = dem_start + dem_ms
+        hint_end = dem_end + hint_ms          # go signal rides at dem_end; hints after
+        adm_end = hint_end + adm_ms
+        if p["spec_cap_ms"] != float("inf"):
+            # L1: driver holds speculative issue back so queued speculative bytes never exceed
+            # cap ms in front of the next demand (no-op when hint+admission < cap, true today).
+            adm_end = min(adm_end, dem_end + p["spec_cap_ms"])
+            hint_end = min(hint_end, adm_end)
+        if dem_start > link_free: st["link_idle"] += dem_start - link_free
+        link_free = adm_end
+        st["copy_busy"] += dem_ms + hint_ms + adm_ms
+        # pool: serial across layers (pool->wait inside serve); starts at serve
+        pool_done = max(drv_free, serve) + p["pool_wall_ms"] * p["cpu_slow"]
+        # device stream: tinies -> wait_plan -> window{go-spin + resident} -> gemv -> spin
+        t = max(mix_end, serve + p["poll_ms"])          # mapped plan visible ~serve+poll
+        if not p["plan_mapped"]:
+            t = max(t, adm_end)                        # plan behind the whole batch
+        st["tinies"] += tinies; st["plan"] += t - mix_end
+        win_start = t
+        go_vis = max(dem_end, win_start)
+        go_spin = go_vis - win_start
+        overlap = min(go_spin, p["window_overlap_ms"])  # L2: resident work overlaps the spin
+        st["go"] += go_spin - overlap
+        st["resident"] += p["resident_ms"] + overlap   # overlap = GPU work that WAS idle
+        win_end = max(go_vis, win_start) + p["resident_ms"] - overlap
+        gemv_end = win_end + p["gemv_ms"]
+        st["gemv"] += p["gemv_ms"]
+        cpu_done = max(pool_done, gemv_end)            # spin: CPU results joined at window tail
+        st["cpu"] += cpu_done - gemv_end
+        gpu_t = cpu_done
+        drv_free = pool_done + p["driver_api_ms"] * 0.7  # driver free after pool->wait + tail APIs
+    wall = gpu_t + p["host_gap_ms"]
+    return wall, st
+
+def x31():
+    p = dict(PX)
+    wall, st = simulate_x(p)
+    err = 100*(wall-ROW_X["wall"])/ROW_X["wall"]
+    print(f"X3.1 base wall {wall:.2f} ms vs measured {ROW_X['wall']:.2f} ({err:+.1f}%) -> "
+          f"{1000*p['tokens_per_pass']/wall:.1f} tok/s vs 72.8")
+    print(f"  busy = tinies {st['tinies']:.1f} + resident {st['resident']:.1f} + gemv {st['gemv']:.1f} "
+          f"+ go-spin {st['go']:.1f} (in window) = {st['tinies']+st['resident']+st['gemv']+st['go']:.1f} (meas 20.5)")
+    for k in ("plan","cpu","copy_busy","link_idle","driver_idle"):
+        print(f"  {k:12s} {st[k]:6.2f}")
+    print(f"  verify {wall-p['host_gap_ms']:.2f} (meas 32.43); spin {st['cpu']:.2f} (lead 14.5*)")
+    return wall, st
+
+def x31_levers():
+    base, stb = x31()
+    tg0 = 1000*PX["tokens_per_pass"]/base
+    print()
+    def run(name, **kw):
+        p = dict(PX); p.update(kw)
+        w, st = simulate_x(p)
+        tg = 1000*p["tokens_per_pass"]/w
+        print(f"  {name:26s} wall {w:6.2f} {tg:5.1f} tok/s ({tg-tg0:+5.1f})  "
+              f"go-spin {st['go']:5.2f} spin {st['cpu']:5.2f} plan {st['plan']:5.2f} "
+              f"link_idle {st['link_idle']:5.2f} drv_idle {st['driver_idle']:5.2f}")
+        return w
+    L1  = dict(spec_cap_ms=1.0)
+    L1n = dict(spec_cap_ms=1.0, plan_mapped=False)   # cap + plan-behind-batch = worst case
+    L2  = dict(window_overlap_ms=(5.3-2.7)/48)       # eta 0.33->0.65: 2.6 ms of window time made useful
+    L3  = dict(tinies_cut_ms=3.0/48)                 # glue fusion mid-point
+    L4  = dict(cpu_slow=0.70)
+    A50 = dict(link_upgrade_ms=(24.0-18.4)*1e6)      # Phase 5.0 arena stand-in (24 GB/s)
+    run("L1 spec-cap 1ms", **L1)
+    run("L1' cap + plan-behind", **L1n)
+    run("L2 window eta 0.65", **L2)
+    run("L3 glue -3ms", **L3)
+    run("L4 CPU -30%", **L4)
+    run("5.0 arena 24GB/s", **A50)
+    run("L1+L4", **L1, **L4)
+    run("L2+L3+L4", **L2, **L3, **L4)
+    run("ALL L1..L4", **L1, **L2, **L3, **L4)
+    run("ALL + 5.0", **L1, **L2, **L3, **L4, **A50)
+
+if __name__ == "__main__":
+    import sys
+    if "--x31" in sys.argv: x31()
+    if "--x31-levers" in sys.argv: x31_levers()
