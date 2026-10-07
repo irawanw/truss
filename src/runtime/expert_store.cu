@@ -368,6 +368,9 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
                             fill += Y.bytes[e];
                         }
                         flush();
+                        // the last copy may still read its stage buffer, and the next job restarts at stage[0]: without
+                        // this wait it overwrote an in-flight batch (random hot experts corrupt at load, lead 10-07)
+                        TRUSS_CUDA(cudaStreamSynchronize(st));
                     }
                     if (layer_left[l].fetch_sub(1) == 1)
                         for (int p = 0; p < 3; ++p) release_pages(layers[l][p]->trellis);
