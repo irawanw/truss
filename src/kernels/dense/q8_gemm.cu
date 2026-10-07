@@ -69,12 +69,21 @@ __device__ __forceinline__ void mma_s8(const uint32_t (&a)[4], const uint32_t (&
 }
 
 __global__ __launch_bounds__(THREADS) void gemm_kernel(Q8Matrix W, const int8_t * __restrict__ xq,
-                                                       const half * __restrict__ xd, int rows, float * __restrict__ y)
+                                                       const half * __restrict__ xd, int rows, float * __restrict__ y,
+                                                       int sw)
 {
+    // grouped raster (sw > 0): sw token tiles run each weight tile back to back while it is in L2 (a weight matrix of
+    // 26-31 MB was re-read from DRAM by every one of the 64 token tiles at 8K rows). Tile order only: bit-identical.
+    int bx = blockIdx.x, by = blockIdx.y;
+    if (sw > 0) {
+        const int pid = blockIdx.y * gridDim.x + blockIdx.x, per = sw * gridDim.x;
+        const int first = pid / per * sw, gs = min((int) gridDim.y - first, sw);
+        by = first + (pid % per) % gs, bx = (pid % per) / gs;
+    }
     __shared__ __align__(16) int8_t sq[2][STAGE];            // [stage][W rows | x rows][SK]
     __shared__ float sd[2][BM + BN][KC / 32];                 // scales of the stage's two blocks
 
-    const int o0 = blockIdx.x * BM, t0 = blockIdx.y * BN;
+    const int o0 = bx * BM, t0 = by * BN;
     const int K = W.in, KB = K / 32;
     const int wid = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int wm = (wid / (BN / WN)) * WM, wn = (wid % (BN / WN)) * WN;
@@ -420,7 +429,10 @@ void q8_gemm(const Q8Matrix & W, const int8_t * xq, const half * xd, int rows, f
 {
     if (W.in % KC) throw std::runtime_error("q8_gemm: in must be a multiple of 64, got " + std::to_string(W.in));
     const dim3 grid((W.out + BM - 1) / BM, (rows + BN - 1) / BN);
-    gemm_kernel<<<grid, THREADS, 0, stream>>>(W, xq, xd, rows, y);
+    // measured on the 8K-row shapes (tools/tk-bench/g128_gemm_bench): 10-12K outputs x1.25 at 8, 6K x1.06 at 16, a
+    // 2.5K output with a 6K input slower grouped
+    const int sw = W.out >= 8192 ? 8 : W.out >= 4096 ? 16 : 0;
+    gemm_kernel<<<grid, THREADS, 0, stream>>>(W, xq, xd, rows, y, (int) grid.y > sw ? sw : 0);
     TRUSS_CUDA(cudaGetLastError());
 }
 
