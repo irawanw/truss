@@ -143,6 +143,12 @@ struct Forward::Impl {
     std::deque<Job> jobs;
     std::chrono::steady_clock::time_point drv_t[3];   // driver thread only: doorbell seen, split done, CPU started
     double drv_ms[3] = { 0, 0, 0 };                    // summed: split, CPU start, copies + plan (driver_ms)
+    // TRUSS_DRIVER_TS=1: fine-grained driver segments (steady_clock only, no syncs; driver thread only).
+    // [0] pre (exit -> next doorbell: job spin + admit_step), [1] split, [2] pool start, [3] copies + plan,
+    // [4] hint + admit, [5] pool->wait() + publish, [6] exit tail. pool_done = pool's own start->last item.
+    bool drv_ts = false;
+    double ts_ms[7] = {}, ts_pool = 0; long ts_n = 0;
+    std::chrono::steady_clock::time_point ts_prev{}, ts_t3{}, ts_t3b{}, ts_t4{};
     double ple_host_ms = 0;                            // host time of the PLE row hash + gather + fp16 convert
     // TRUSS_ROUTE_TRACE=<file>: every decode layer's routing (driver thread), for offline cache-policy replays.
     // Header: int32 n_store, n_expert, K, then per (layer, expert) int32 bytes and uint8 hot. Records: int32 layer, T,
@@ -521,6 +527,7 @@ struct Forward::Impl {
         }
         driver = std::thread([this] { drive(); });
         dbg_on = std::getenv("TRUSS_DRIVER_DEBUG") && std::atoi(std::getenv("TRUSS_DRIVER_DEBUG"));
+        drv_ts = std::getenv("TRUSS_DRIVER_TS") && std::atoi(std::getenv("TRUSS_DRIVER_TS"));
         if (dbg_on)
             watchdog = std::thread([this] {
                 long last = -1;
@@ -576,6 +583,8 @@ struct Forward::Impl {
             }
             std::atomic_thread_fence(std::memory_order_acquire);
             drv_t[0] = std::chrono::steady_clock::now();
+            if (drv_ts && ts_prev.time_since_epoch().count())
+                ts_ms[0] += std::chrono::duration<double, std::milli>(drv_t[0] - ts_prev).count();
             try {
                 dbg_phase = 4;
                 serve(j, b);
@@ -677,6 +686,11 @@ struct Forward::Impl {
             auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
             drv_ms[0] += ms(drv_t[0], drv_t[1]), drv_ms[1] += ms(drv_t[1], drv_t[2]), drv_ms[2] += ms(drv_t[2], t3);
             ++drv_n;
+            if (drv_ts)
+            {
+                ts_ms[1] += ms(drv_t[0], drv_t[1]), ts_ms[2] += ms(drv_t[1], drv_t[2]), ts_ms[3] += ms(drv_t[2], t3);
+                ts_t3 = t3;
+            }
         }
         if (j.hint) {
             std::vector<int> h;
@@ -706,6 +720,7 @@ struct Forward::Impl {
             for (size_t i = 0; i < cand.size() && i < 2 && admit_pass < admit_idle; ++i)
                 admit_pass += experts->claim(l, cand[i].second);
         }
+        if (drv_ts) ts_t3b = std::chrono::steady_clock::now();
         if (ct) {
             dbg_phase = 7;
             ct->pool->wait();
@@ -713,6 +728,28 @@ struct Forward::Impl {
                 fit_cpu_cost(n_cpu, ct->pool->last_call_ms());
             std::atomic_thread_fence(std::memory_order_release);
             *(volatile int *) b.cpu_done = j.seq;
+            if (drv_ts)
+            {
+                ts_t4 = std::chrono::steady_clock::now();
+                ts_pool += ct->pool->last_call_ms();
+            }
+        }
+        if (drv_ts)
+        {
+            const auto dms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+            if (!ct) ts_t4 = ts_t3b;
+            const auto t5 = std::chrono::steady_clock::now();
+            ts_ms[4] += dms(ts_t3, ts_t3b), ts_ms[5] += dms(ts_t3b, ts_t4), ts_ms[6] += dms(ts_t4, t5);
+            ts_prev = t5;
+            if (++ts_n % 480 == 0)   // ~10 decode passes
+            {
+                std::fprintf(stderr, "DRIVER_TS n=%ld pre %.3f split %.3f start %.3f copies %.3f hint_admit %.3f wait %.3f post %.3f pool_done %.3f ms/call\n",
+                             ts_n, ts_ms[0] / 480, ts_ms[1] / 480, ts_ms[2] / 480,
+                             ts_ms[3] / 480, ts_ms[4] / 480, ts_ms[5] / 480,
+                             ts_ms[6] / 480, ts_pool / 480);
+                for (double & v : ts_ms) v = 0;
+                ts_pool = 0;
+            }
         }
     }
 
