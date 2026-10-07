@@ -301,3 +301,37 @@ identically in plan() and ctor; compute slot_ from layers_ FIRST; all `%2` -> `%
   stall = PLE collect + accept/enqueue CPU.
 - CAVEAT: osrt trace tax - ledger07 decode 42.4 tok/s vs 72.8 clean (ledger04 56.4 vs ~66): absolutes upper bounds.
 - NEXT per lead: tell_lead DONE (done 07:2x) -> await; Phase 5.0 arena after ack; 1.D only on go.
+
+## 2026-10-07 ~08:45: ORDER 8 = SIM FIRST (done, TRACKER 132, told lead) -> await lever choice
+- Sim recalibrated on clean 1007_064447 (-0.2%) WITH ENGINE-CODE STRUCTURE (forward.cu serve 595-717):
+  plan = MAPPED HOST FLAG already (1.C traced wait_plan 12 ms = osrt tax on driver; clean ~0.4);
+  go = copy-stream behind THIS demand, BEFORE hints; **pool->wait INSIDE serve -> driver serialized
+  by CPU tier**. Model A closes: wall 35.78/35.85, verify 32.36/32.43, busy 20.3/20.5 (go-spin 4.8
+  INSIDE window kernel 5.3), spin 11.64 (pool wall/call 0.514 = 0.136 ms/expert x 3.68), copy 17.1.
+- LEVERS (tok/s vs 72.9): L1 spec-cap +0.0 (ALREADY IMPLEMENTED: mapped plan + demand-first FIFO);
+  L2 window-eta +0.0 (window time IS go-spin -> freed time extends spin; lead's absorption risk CONFIRMED);
+  5.0 arena +0.0 (absorbed); L3 glue -3ms +6.7 (pre-doorbell work converts); L4 CPU -30% +19.0;
+  L2+L3+L4 +29.9 (L2 still absorbed); all +29.9. RANKING L4 >> L3 >> L1=L2=5.0=0. Model-B sens: L4 tops both.
+- Phase 2.0 memory floor (/tmp/memfloor.cc, 22 pins = TRUSS_CPU_PIN scheme, no SMT overlap, renters
+  load 43.6): 57.4 GB/s vs in-situ 16.7 (412 MB/pool-busy 24.7ms; lead basis 34.5) -> CPU tier NOT
+  DRAM-bound; -30% = kernel ALU work (Zen2 int-mul pipe), Phase 2/3 program.
+- DONE msg sent asking: build L4-first-attempt (gemv_i16f instruction-mix, kmicro CPU-only) vs L3
+  (ready single build, +6.7 converts). A/B 2 rounds vs 4775617 after choice.
+- Files: tools/sim/decode_pipeline.py --x31/--x31-levers (commit ba0136b); /tmp/memfloor.cc.
+
+## 2026-10-07 ~09:30: ORDER 9 L4 ATTRIBUTION (TRACKER 133, told lead) -> await go on kmicro ALU program
+- Harness tools/cpu/callshape.cc (commit 7beac17) on the REAL pool; CPU-only. TRAP FOUND: pthread_create
+  inherits creator affinity -> pinning caller to core 0 BEFORE pool creation collapses all 22 workers onto
+  core 0 (their setaffinity EINVAL unchecked). Engine never pins caller -> in-situ clean. Create pool FIRST.
+- Reproduced: wall 0.286 (p50 0.263 p95 0.342) = engine fit 0.334; paced 0.675/1.5 unchanged (workers hot).
+- DECOMP (sums exact): compute 0.213 (74%) + fork/join 0.073 (26%); 1x1 = 0.076 = lead 0.075 EXACT;
+  overhead constant per call (60 vs 167 items) = phase flips + wake; knob grid GU_INxDN_COLS: default best.
+- Suspects: (a) small+constant; (b) DOMINATES: ALL 48 CPUs 100% tenant-busy (no free core, siblings of all
+  22 worker pins busy; brain nice 0 SCHED_OTHER = no priority edge) -> lost 0.142/call = 6.8 ms/pass;
+  (c) clock 3.8-4.0 GHz clear; TLB clear (TLB-hot = random, 7.3MB/call fits L2 TLB); BW clear (57.9 vs 34.4).
+- Lead's 3x reconciles: compute-only 34.5 GB/s (= 445/12.9 basis); per-thread 1.5 vs kmicro 2.3-3.6 = SMT+cold.
+- FIX PROPOSED: (d) kmicro ALU-mix program (kernel vpmulld-free already; ~5-6 mul-pipe ops/16w). Sim:
+  compute -30% -> wall x0.875 -> +6.9 tok/s (79.8); -40% -> +9.5; (a) per-group phase deps +2-3 second priority.
+- kmicro baseline 10-07: K35 R1 197.9 us (checksum = ref 4a32754e93e35f86). Build: g++ -O2 -g -mavx2 -mfma
+  -mf16c -std=c++20 -Isrc /tmp/callshape.cc build/libtruss_cpu.a -lpthread -o build/callshape.
+- NEXT: lead go -> kmicro ALU experiments on gemv_i16f (src/cpu/expert_trellis.cc), checksums frozen.
