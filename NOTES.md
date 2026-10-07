@@ -353,3 +353,14 @@ identically in plan() and ctor; compute slot_ from layers_ FIRST; all `%2` -> `%
   the two vpmaddubsw byte-sums for and/srli/add; mul-pipe 6->5/4 ops per 16w @R1; checksums frozen).
 - Runner /tmp/run_alu.sh (base,A,B,C x2 reps, restores base). DO NOT run kmicro during a kbench row (same
   build dir + CPU contention corrupts CPU-tier-bound rows).
+
+## 2026-10-07 ~10:35: ORDER 10 STEP 2 RESULT NEGATIVE - byte-sum ALU rebalance fails (kmicro)
+- Variants on gemv_i16f bs line (A all-ALU, B lo-maddubs+hi-ALU, C lo-ALU+hi-maddubs; runner /tmp/run_alu.sh,
+  interleaved base A B C base A, 2 reps, checksums identical to ref on ALL runs - arithmetic untouched).
+- K35 R1 min-of-reps: base 196.5, B 200.0 (+1.8%), C 197.2 (+0.4%), A 211.0 (+7.4%). K25 R1: base 192.5,
+  A 210.2 (+9.2%), B/C ~= base. R2/R4 same direction. truss_cpu already -O3 (CMakeLists:57) -> no compiler lever.
+- WHY: the single-multiply-pipe contention model was WRONG for byte-sums; the file comment (both maddubs =
+  measured best) holds even with the SMT sibling busy. Kernel is at a local optimum; in-situ compute penalty
+  is SMT/cold (Order-9 suspect b), not instruction mix. L4-via-kmicro = DEAD (+6.9 sim lever unreachable here).
+- NEXT: step 3 = L3 glue fusion (+6.7 sim, tinies BEFORE the doorbell convert while spin>0; dsa glue 1.71 +
+  hc glue 1.10 ms classes, ~1,130 tiny launches/pass). Then fork/join (a) per-group phase deps (+2-3 est).
