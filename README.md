@@ -1,19 +1,23 @@
 # TRUSS (trellis-kernel)
 
 Our own inference engine for **trellis-quantized MoE models on one RTX 3090** (Ampere, sm_86). First model:
-**Qwen3.8 Flash-Next PAW X3.1** (qwen4exp, 48 layers, 512 experts, 37 GiB of 2.63-bpw trellis experts + Q8_0 dense),
-served on GPU 2 of this box through an OpenAI-compatible API. Next models: PAW X3.1 27B, PAW 35B.
+**Qwen3.8 Flash-Next PAW X3.1** (qwen4exp, 48 layers, 512 experts), served through an OpenAI-compatible API.
 
-## Status (2026-09-30, measured on GPU 2)
+## Status (2026-10-07)
 
-| | TRUSS | Strata (same box) |
-|---|---|---|
-| prefill, bench tool, 4K / 8K / 16K / 32K prompt | 2,263 / 2,499 / 2,548 / 2,321 tok/s | 960–1,330 |
-| prefill, server + code-agent bench, ~4K / ~32K | 938–1,403 / 1,508–1,778 tok/s | 960–1,330 |
-| decode (serving bring-up) | 13–15 tok/s | 84–107 |
-| quality: full-model KL vs llama-paw Q8 logits | 0.0131 (= llama's own run-to-run floor 0.0115) | expert error 2× ours |
+PAW-125B-FLASH-NEXT-X3.1 (Qwen3.8-Flash-Next, 125B MoE, 24,576 experts at 3.5 / 2.5 bit, Q8_0 dense, 47.7 GiB n-gram
+table read from NVMe) on one RTX 3090 at 250 W, Threadripper 3960X:
 
-Every number has a row in TRACKER.md (kept locally, internal-only — not in this repo) with the command that produced it.
+| | |
+|---|---|
+| decode, short prompt | peak 80+ tok/s |
+| decode, 150K-token context | 57-60 tok/s |
+| prefill, fresh 150K-token prompt | 2,170-2,270 tok/s |
+| context | 262,144 tokens |
+| memory | GPU 23.6 GiB, RAM 43 GB, NVMe 97 GB |
+
+Decode varies by about 10% on a shared machine. Model card: [PAW-125B-FLASH-NEXT-X3.1](https://huggingface.co/lackonendes/PAW-125B-FLASH-NEXT-X3.1).
+Every number has a row in TRACKER.md (kept locally, internal-only, not in this repo) with the command that produced it.
 
 ## Start here
 
@@ -27,13 +31,15 @@ Every number has a row in TRACKER.md (kept locally, internal-only — not in thi
 
 ## Quickstart
 
+Serve **PAW-125B-FLASH-NEXT-X3.1** ([model on Hugging Face](https://huggingface.co/lackonendes/PAW-125B-FLASH-NEXT-X3.1))
+on one 24 GB GPU plus CPU: **[docs/SERVING-FLASHNEXT-X31.md](docs/SERVING-FLASHNEXT-X31.md)** (install, download, the
+best settings, memory, expected speed). Short version:
+
 ```bash
 cmake -S . -B build -G Ninja && cmake --build build
-M=~/ML_projects/flashnext/20260918_ngram_q8/data/qwen38-flash-next-paw-x3-q8_0-00001-of-00002.gguf
-TOK=/data/www/Qwen3.8-27B-DFlash2-EXL3-5.0bpw/models/Qwen3.8-27B-EXL3-3.5bpw/tokenizer.json
-CUDA_VISIBLE_DEVICES=2 python3 -m server.app --model $M --tokenizer $TOK --port 8090 --n-ctx 65536 --chunk 8192
-curl localhost:8090/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":64,"temperature":0}'
+MODEL_DIR=/nvme/flashnext TOKENIZER=/nvme/flashnext/tokenizer.json GPU=0 tools/serve/serve_flashnext_x31.sh
+curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":64}'
 ```
 
 Tests and benchmarks: [docs/reference/tests-tools.md](docs/reference/tests-tools.md).
