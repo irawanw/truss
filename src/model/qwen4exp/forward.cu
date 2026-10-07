@@ -17,6 +17,7 @@
 #include "kernels/mtp/mtp_ops.cuh"
 #include "kernels/ple/ple_prefill.cuh"
 #include "kernels/sampling/argmax.cuh"
+#include "kernels/sampling/spec.cuh"
 #include "kernels/spec/rollback.cuh"
 #include "model/qwen4exp/ple.h"
 #include "model/qwen4exp/ple_reader.h"
@@ -153,6 +154,12 @@ struct Forward::Impl {
     std::deque<Job> jobs;
     std::chrono::steady_clock::time_point drv_t[3];   // driver thread only: doorbell seen, split done, CPU started
     double drv_ms[3] = { 0, 0, 0 };                    // summed: split, CPU start, copies + plan (driver_ms)
+    // TRUSS_DRIVER_TS=1: fine-grained driver segments (steady_clock only, no syncs; driver thread only).
+    // [0] pre (exit -> next doorbell: job spin + admit_step), [1] split, [2] pool start, [3] copies + plan,
+    // [4] hint + admit, [5] pool->wait() + publish, [6] exit tail. pool_done = pool's own start->last item.
+    bool drv_ts = false;
+    double ts_ms[7] = {}, ts_pool = 0; long ts_n = 0;
+    std::chrono::steady_clock::time_point ts_prev{}, ts_t3{}, ts_t3b{}, ts_t4{};
     double ple_host_ms = 0;                            // host time of the PLE row hash + gather + fp16 convert
     // TRUSS_ROUTE_TRACE=<file>: every decode layer's routing (driver thread), for offline cache-policy replays.
     // Header: int32 n_store, n_expert, K, then per (layer, expert) int32 bytes and uint8 hot. Records: int32 layer, T,
@@ -264,6 +271,9 @@ struct Forward::Impl {
     dense::Q8Matrix draft_head{};                        // the output matrix's draft_vocab rows (Options::draft_vocab)
     int * draft_map = nullptr;                           // device [draft_head.out]: row -> token id
     float draft_min_p = 0.f;
+    const sampling::SampleParams * ds_p = nullptr;        // set_draft_sampling(): sampled guesses (spec. sampling)
+    uint64_t ds_counter = 0;
+    float * ds_q = nullptr;                              // device [draft][n_vocab]
     float * draft_prob = nullptr;                        // device [spec_rows], pinned mirror below
     float * draft_prob_host = nullptr;
     int n_store = 0;                                     // ExpertStore layers: n_layer (+ 1 with the MTP block)
@@ -537,6 +547,7 @@ struct Forward::Impl {
             b.go = alloc<int>(1);
             b.d_mids = alloc<int>((size_t) R * K);
         }
+        drv_ts = std::getenv("TRUSS_DRIVER_TS") && std::atoi(std::getenv("TRUSS_DRIVER_TS"));
         driver = std::thread([this] { drive(); });
         dbg_on = std::getenv("TRUSS_DRIVER_DEBUG") && std::atoi(std::getenv("TRUSS_DRIVER_DEBUG"));
         if (dbg_on)
@@ -594,6 +605,8 @@ struct Forward::Impl {
             }
             std::atomic_thread_fence(std::memory_order_acquire);
             drv_t[0] = std::chrono::steady_clock::now();
+            if (drv_ts && ts_prev.time_since_epoch().count())
+                ts_ms[0] += std::chrono::duration<double, std::milli>(drv_t[0] - ts_prev).count();
             try {
                 dbg_phase = 4;
                 serve(j, b);
@@ -695,6 +708,11 @@ struct Forward::Impl {
             auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
             drv_ms[0] += ms(drv_t[0], drv_t[1]), drv_ms[1] += ms(drv_t[1], drv_t[2]), drv_ms[2] += ms(drv_t[2], t3);
             ++drv_n;
+            if (drv_ts)
+            {
+                ts_ms[1] += ms(drv_t[0], drv_t[1]), ts_ms[2] += ms(drv_t[1], drv_t[2]), ts_ms[3] += ms(drv_t[2], t3);
+                ts_t3 = t3;
+            }
         }
         if (j.hint) {
             std::vector<int> h;
@@ -724,6 +742,7 @@ struct Forward::Impl {
             for (size_t i = 0; i < cand.size() && i < 2 && admit_pass < admit_idle; ++i)
                 admit_pass += experts->claim(l, cand[i].second);
         }
+        if (drv_ts) ts_t3b = std::chrono::steady_clock::now();
         if (ct) {
             dbg_phase = 7;
             ct->pool->wait();
@@ -731,6 +750,28 @@ struct Forward::Impl {
                 fit_cpu_cost(n_cpu, ct->pool->last_call_ms());
             std::atomic_thread_fence(std::memory_order_release);
             *(volatile int *) b.cpu_done = j.seq;
+            if (drv_ts)
+            {
+                ts_t4 = std::chrono::steady_clock::now();
+                ts_pool += ct->pool->last_call_ms();
+            }
+        }
+        if (drv_ts)
+        {
+            const auto dms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+            if (!ct) ts_t4 = ts_t3b;
+            const auto t5 = std::chrono::steady_clock::now();
+            ts_ms[4] += dms(ts_t3, ts_t3b), ts_ms[5] += dms(ts_t3b, ts_t4), ts_ms[6] += dms(ts_t4, t5);
+            ts_prev = t5;
+            if (++ts_n % 480 == 0)   // ~10 decode passes
+            {
+                std::fprintf(stderr, "DRIVER_TS n=%ld pre %.3f split %.3f start %.3f copies %.3f hint_admit %.3f wait %.3f post %.3f pool_done %.3f ms/call\n",
+                             ts_n, ts_ms[0] / 480, ts_ms[1] / 480, ts_ms[2] / 480,
+                             ts_ms[3] / 480, ts_ms[4] / 480, ts_ms[5] / 480,
+                             ts_ms[6] / 480, ts_pool / 480);
+                for (double & v : ts_ms) v = 0;
+                ts_pool = 0;
+            }
         }
     }
 
@@ -1211,17 +1252,32 @@ struct Forward::Impl {
         for (const Proj & p : ps) lin32(p.first, x, rows, p.second);
     }
 
-    // hyper-connection mix: mixed [T][d] (fp32 and fp16), inject [T][hc] when h.inject
-    void hc_mix(const HyperConnection & h, const float * res, int T, float * mixed, half * mixed16, float * inject)
+    // hyper-connection mix: mixed [T][d] (fp32 and fp16), inject [T][hc] when h.inject.
+    // L3 (Order 11): with Q8_1 activations the norm fuses the activation quantize (and, when cout/cinj are
+    // given, the preceding hc::combine) into one launch; bit-identical arithmetic, see hc_prefill.cuh.
+    void hc_mix(const HyperConnection & h, const float * res, int T, float * mixed, half * mixed16, float * inject,
+                const float * cout = nullptr, const float * cinj = nullptr)
     {
         const size_t m = sc->mark();
-        half * xn16 = sc->alloc<half>((size_t) T * c.hc_dim());
         float * rstd = sc->alloc((size_t) T * c.hc);
         float * lo = sc->alloc((size_t) T * c.hc_rank);
         half * lo16 = sc->alloc<half>((size_t) T * c.hc_rank);
         float * gate = sc->alloc((size_t) T * c.hc_dim());
-        hc::norm(res, f32(h.norm), T, c.hc, c.d_model, c.rms_eps, xn16, rstd, s);
-        const Act xa = quant(xn16, T, c.hc_dim());
+        Act xa;
+        if (act == Activations::Q8_1)
+        {
+            xa.q = sc->alloc<int8_t>((size_t) T * c.hc_dim());
+            xa.d = sc->alloc<half>((size_t) T * c.hc_dim() / 32);
+            if (cout) hc::combine_norm_q8(const_cast<float *>(res), cout, cinj, f32(h.norm), T, c.hc, c.d_model, c.rms_eps, rstd, xa.q, xa.d, s);
+            else      hc::norm_q8(res, f32(h.norm), T, c.hc, c.d_model, c.rms_eps, rstd, xa.q, xa.d, s);
+        }
+        else
+        {
+            half * xn16 = sc->alloc<half>((size_t) T * c.hc_dim());
+            if (cout) hc::combine(const_cast<float *>(res), cout, cinj, T, c.hc, c.d_model, s);
+            hc::norm(res, f32(h.norm), T, c.hc, c.d_model, c.rms_eps, xn16, rstd, s);
+            xa = quant(xn16, T, c.hc_dim());
+        }
         if (h.inject) lin_multi({ { h.down, lo }, { h.inject, inject } }, xa, T);   // inject reads the same xa
         else lin(h.down, xa, T, lo);
         hc::silu(lo, T * c.hc_rank, 1.f / c.hc, lo16, s);
@@ -1661,8 +1717,7 @@ struct Forward::Impl {
             if (L.mixer == Mixer::GDN) gdn(L.gdn, st[l], mixed16, T, out, tentative);
             else dsa(L.dsa, st[l], mixed16, pos0, T, out, tentative);
             sect_record(l, 2);
-            hc::combine(res, out, inject, T, c.hc, c.d_model, s);
-            hc_mix(L.hc_ffn, res, T, mixed, mixed16, inject);
+            hc_mix(L.hc_ffn, res, T, mixed, mixed16, inject, out, inject);   // combine #1 fused into the norm (L3)
             ffn(l, L.moe, mixed, mixed16, T, out, stream);   // records 3 (routed MoE), 4 (shared), 5 (cpu join)
             sect_record(l, 6);
             hc::combine(res, out, inject, T, c.hc, c.d_model, s);
@@ -1948,6 +2003,9 @@ struct Forward::Impl {
         for (int i = 0; i < n; ++i) {
             mtp_rows(cur.mh, draft_ids + i, pos + i, 1, false, true);
             sampling::argmax_prob(mtp_logits, nv, draft_map, draft_ids + i + 1, draft_prob + i, s);
+            if (ds_p)   // the guess becomes a sample of q (the argmax probability above still decides the stop)
+                sampling::draft_sample(mtp_logits, nv, draft_map, c.n_vocab, *ds_p, ds_counter + i,
+                                       ds_q + (size_t) i * c.n_vocab, draft_ids + i + 1, s);
             if (draft_min_p > 0.f) {   // an unsure guess does not enter the window, and ends the chain
                 TRUSS_CUDA(cudaMemcpyAsync(draft_prob_host + i, draft_prob + i, sizeof(float), cudaMemcpyDeviceToHost, s));
                 TRUSS_CUDA(cudaStreamSynchronize(s));
@@ -2132,6 +2190,11 @@ void Forward::accept(int n)
 }
 
 int Forward::draft(int32_t next, int n, int32_t * out) { return m_->draft(next, pos_, n, out); }
+
+void Forward::set_draft_sampling(const sampling::SampleParams * p, uint64_t counter, float * q_full)
+{
+    m_->ds_p = p, m_->ds_counter = counter, m_->ds_q = q_full;
+}
 
 void Forward::checkpoint() { m_->checkpoint(pos_); }
 

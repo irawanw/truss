@@ -89,6 +89,7 @@ add_library(truss_kernels STATIC
   src/kernels/sampling/argmax.cu
   src/kernels/sampling/sample.cu
   src/kernels/sampling/penalty.cu
+  src/kernels/sampling/spec.cu
   src/kernels/spec/rollback.cu
   src/kernels/mtp/mtp_ops.cu)
 target_include_directories(truss_kernels PUBLIC src)
@@ -114,6 +115,8 @@ add_executable(q8_gemm_test tests/unit/q8_gemm_test.cu)
 target_link_libraries(q8_gemm_test PRIVATE truss_kernels truss_reference)
 add_executable(sample_test tests/unit/sample_test.cu)
 target_link_libraries(sample_test PRIVATE truss_kernels)
+add_executable(spec_test tests/unit/spec_test.cu)
+target_link_libraries(spec_test PRIVATE truss_kernels)
 add_executable(penalty_rows_test tests/unit/penalty_rows_test.cc)
 target_link_libraries(penalty_rows_test PRIVATE truss_kernels)
 add_executable(ple_reader_test tests/unit/ple_reader_test.cc)
@@ -144,6 +147,14 @@ add_executable(tk-bench-ceiling tools/tk-bench/ceiling.cu)
 target_include_directories(tk-bench-ceiling PRIVATE src)
 add_executable(tk-bench-moe-trace tools/tk-bench/moe_trace.cu)
 target_link_libraries(tk-bench-moe-trace PRIVATE truss_kernels)
+
+# Lead Order-2 microbench: trellis K2.5/K3.5 (truss_cpu) vs ggml Q3_K/Q4_K/Q8_0 vec_dot (llama-paw's AVX2 build).
+add_executable(tk-bench-cpu-quant tools/tk-bench/cpu_quant.cc)
+target_include_directories(tk-bench-cpu-quant PRIVATE src ${LLAMA_PAW_DIR}/ggml/src)
+target_link_directories(tk-bench-cpu-quant PRIVATE ${LLAMA_PAW_DIR}/build/bin)
+target_link_libraries(tk-bench-cpu-quant PRIVATE truss_cpu ggml-cpu ggml-base Threads::Threads)
+set_target_properties(tk-bench-cpu-quant PROPERTIES BUILD_RPATH ${LLAMA_PAW_DIR}/build/bin)
+target_compile_options(tk-bench-cpu-quant PRIVATE -O3 -mavx2 -mfma -mf16c)
 
 # ---- tools/tk-pack: model file catalog, pack converter
 add_executable(tk-pack-inspect tools/tk-pack/inspect.cc)

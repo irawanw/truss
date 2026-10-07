@@ -126,9 +126,11 @@ public:
     // without copying it, never evicting an expert the last fetch() needs (its kernel may be running); the expert is
     // not on the device until its copy lands. admit_step() copies the claimed experts in PIECE-byte pieces, one piece
     // in flight at a time and only while no demand copy is in flight, so a demand fetch queues behind at most one
-    // piece; a claim's meta table goes up behind its last piece. A fetch() that needs a claimed expert copies the rest
-    // of it at once. Returns whether admit_step() issued a copy.
-    static constexpr size_t PIECE = 256 << 10;
+    // piece. A fetch() that needs a claimed expert copies the rest of it at once. The meta table is no longer copied
+    // per mutation: ring_put() marks the layer dirty and fetch()/prefetch_hint()/acquire() upload it once, behind all
+    // copies queued so far on copy_ and before the event/flag the compute side waits on (TRACKER 129, 1.A).
+    // Returns whether admit_step() issued a copy.
+    static constexpr size_t PIECE = 1 << 20;
     bool claim(int l, int e);
     bool admit_step();
     size_t admit_backlog() const { return adm_backlog_; }       // claimed bytes not issued yet
@@ -177,6 +179,7 @@ private:
         std::array<std::vector<size_t>, 3> part;                    // [p][expert] offset of projection p in the expert
         int32_t * stream_meta[3] = {}, * ring_meta[3] = {};         // device (K, offset in 32-byte units)
         int32_t * ring_meta_host = nullptr;                         // pinned mirror of ring_meta, [3][n_expert][2]
+        bool meta_dirty = false;                                    // ring_meta_host changed; uploaded by the next fetch/hint/acquire (1.A)
         std::vector<int64_t> ring_at;                               // [expert] byte offset in the ring, -1: absent
         std::vector<uint8_t> pend;                                  // [expert] admitted, copy not known to have landed
         std::vector<uint8_t> ref;                                   // [expert] ring entry used since it was copied in

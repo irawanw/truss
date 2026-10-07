@@ -7,6 +7,7 @@
 #include "kernels/sampling/argmax.cuh"
 #include "kernels/sampling/penalty.cuh"
 #include "kernels/sampling/sample.cuh"
+#include "kernels/sampling/spec.cuh"
 #include "model/qwen4exp/config.h"
 #include "model/qwen4exp/forward.h"
 #include "model/qwen4exp/weights.h"
@@ -30,6 +31,9 @@ struct truss_model {
     std::unique_ptr<q::Mtp> mtp;
     int drafts = 0;
     int * spec_next = nullptr, * spec_host = nullptr;   // device / pinned argmax of each verify row
+    bool spec_sample = false;                // TRUSS_SPEC_SAMPLE=1: sampled drafts + min(1, p/q) acceptance
+    float * q_full = nullptr;                // device [drafts][n_vocab]: the sampled drafts' q
+    int * spec_drafts = nullptr;             // device [drafts]: the window's guesses
     q::Config config;
     q::Weights weights;
     float * logits = nullptr;                // device [n_vocab]
@@ -47,6 +51,8 @@ struct truss_model {
         cudaFree(logits);
         cudaFree(next);
         cudaFree(spec_next);
+        cudaFree(q_full);
+        cudaFree(spec_drafts);
         if (spec_host) cudaFreeHost(spec_host);
         cudaFree(pen_cnt);
         cudaFree(pen_hist);
@@ -161,6 +167,11 @@ truss_model * truss_open_params(const char * gguf_path, const truss_params * p)
             TRUSS_CUDA(cudaMalloc(&m->next, sizeof(int)));
             TRUSS_CUDA(cudaMalloc(&m->spec_next, sizeof(int) * (m->drafts + 1)));
             TRUSS_CUDA(cudaMallocHost(&m->spec_host, sizeof(int) * (m->drafts + 1)));
+            if (const char * e = std::getenv("TRUSS_SPEC_SAMPLE")) m->spec_sample = std::atoi(e) != 0 && m->drafts > 0;
+            if (m->spec_sample) {   // 3 MB at 3 drafts
+                TRUSS_CUDA(cudaMalloc(&m->q_full, sizeof(float) * m->config.n_vocab * m->drafts));
+                TRUSS_CUDA(cudaMalloc(&m->spec_drafts, sizeof(int) * m->drafts));
+            }
             const size_t rows = m->drafts + 1;   // penalties: 4 MB of counts at 3 drafts
             TRUSS_CUDA(cudaMalloc(&m->pen_cnt, sizeof(int) * rows * m->config.n_vocab));
             TRUSS_CUDA(cudaMemset(m->pen_cnt, 0, sizeof(int) * rows * m->config.n_vocab));
@@ -317,6 +328,30 @@ int truss_spec_step_sampled(truss_model * m, int32_t next, const truss_sampling 
             }
             int32_t win[8];
             win[0] = next;
+            if (m->spec_sample) {   // speculative sampling: lossless, accepts sum min(p, q) instead of p(argmax q)
+                m->fwd->set_draft_sampling(&p, m->sample_counter, m->q_full);
+                const int nw = m->fwd->draft(next, nd, win + 1);
+                m->fwd->set_draft_sampling(nullptr, 0, nullptr);
+                m->sample_counter += nd;
+                m->fwd->verify(win, nw + 1);
+                m->fwd->head(0, nw + 1, m->logits);
+                penalize_rows(*m, *sp, win, nw + 1, nw + 1);
+                sampling::probs_inplace(m->logits, V, nw + 1, p, m->fwd->stream());
+                if (nw) TRUSS_CUDA(cudaMemcpyAsync(m->spec_drafts, win + 1, sizeof(int) * nw, cudaMemcpyHostToDevice,
+                                                   m->fwd->stream()));
+                sampling::spec_accept(m->logits, m->q_full, m->spec_drafts, nw, V, p.seed, m->sample_counter,
+                                      m->spec_next, m->fwd->stream());
+                m->sample_counter += nw + 1;
+                TRUSS_CUDA(cudaMemcpyAsync(m->spec_host, m->spec_next, sizeof(int) * 2, cudaMemcpyDeviceToHost,
+                                           m->fwd->stream()));
+                TRUSS_CUDA(cudaStreamSynchronize(m->fwd->stream()));
+                const int j = m->spec_host[0];
+                m->fwd->accept(j + 1);
+                for (int i = 0; i <= j; ++i) emitted[i] = win[i];
+                *n_emitted = j + 1;
+                *new_next = m->spec_host[1];
+                return 0;
+            }
             const int nw = m->fwd->draft(next, nd, win + 1);
             m->fwd->verify(win, nw + 1);
             m->fwd->head(0, nw + 1, m->logits);
