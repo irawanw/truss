@@ -17,6 +17,7 @@
 #include "kernels/mtp/mtp_ops.cuh"
 #include "kernels/ple/ple_prefill.cuh"
 #include "kernels/sampling/argmax.cuh"
+#include "kernels/sampling/spec.cuh"
 #include "kernels/spec/rollback.cuh"
 #include "model/qwen4exp/ple.h"
 #include "model/qwen4exp/ple_reader.h"
@@ -260,6 +261,9 @@ struct Forward::Impl {
     dense::Q8Matrix draft_head{};                        // the output matrix's draft_vocab rows (Options::draft_vocab)
     int * draft_map = nullptr;                           // device [draft_head.out]: row -> token id
     float draft_min_p = 0.f;
+    const sampling::SampleParams * ds_p = nullptr;        // set_draft_sampling(): sampled guesses (spec. sampling)
+    uint64_t ds_counter = 0;
+    float * ds_q = nullptr;                              // device [draft][n_vocab]
     float * draft_prob = nullptr;                        // device [spec_rows], pinned mirror below
     float * draft_prob_host = nullptr;
     int n_store = 0;                                     // ExpertStore layers: n_layer (+ 1 with the MTP block)
@@ -1951,6 +1955,9 @@ struct Forward::Impl {
         for (int i = 0; i < n; ++i) {
             mtp_rows(cur.mh, draft_ids + i, pos + i, 1, false, true);
             sampling::argmax_prob(mtp_logits, nv, draft_map, draft_ids + i + 1, draft_prob + i, s);
+            if (ds_p)   // the guess becomes a sample of q (the argmax probability above still decides the stop)
+                sampling::draft_sample(mtp_logits, nv, draft_map, c.n_vocab, *ds_p, ds_counter + i,
+                                       ds_q + (size_t) i * c.n_vocab, draft_ids + i + 1, s);
             if (draft_min_p > 0.f) {   // an unsure guess does not enter the window, and ends the chain
                 TRUSS_CUDA(cudaMemcpyAsync(draft_prob_host + i, draft_prob + i, sizeof(float), cudaMemcpyDeviceToHost, s));
                 TRUSS_CUDA(cudaStreamSynchronize(s));
@@ -2130,6 +2137,11 @@ void Forward::accept(int n)
 }
 
 int Forward::draft(int32_t next, int n, int32_t * out) { return m_->draft(next, pos_, n, out); }
+
+void Forward::set_draft_sampling(const sampling::SampleParams * p, uint64_t counter, float * q_full)
+{
+    m_->ds_p = p, m_->ds_counter = counter, m_->ds_q = q_full;
+}
 
 void Forward::checkpoint() { m_->checkpoint(pos_); }
 

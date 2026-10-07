@@ -12,6 +12,7 @@
 #pragma once
 #include "model/qwen4exp/config.h"
 #include "model/qwen4exp/weights.h"
+#include "kernels/sampling/sample.cuh"
 #include "runtime/expert_store.h"
 
 #include <cuda_runtime.h>
@@ -158,6 +159,11 @@ public:
     // how many (0 .. n: the chain stops before a guess whose probability < Options::draft_min_p). The MTP block reads the last
     // committed row's hidden state; every run() / accept() keeps the MTP layer's own cache in step.
     int draft(int32_t next, int n, int32_t * out);
+
+    // speculative sampling: while set, draft() SAMPLES each guess from the draft head's distribution under p (stream
+    // counter + i; the stop rule still reads the argmax probability) and writes its kept probabilities to
+    // q_full[i][n_vocab] (device); nullptr: greedy guesses
+    void set_draft_sampling(const sampling::SampleParams * p, uint64_t counter, float * q_full);
 
     // logits [n][n_vocab] (device, fp32) of rows first .. first + n - 1 of the last chunk: the head hc mix, then
     // the output projection
