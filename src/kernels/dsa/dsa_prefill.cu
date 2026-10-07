@@ -22,6 +22,7 @@
 #include <cub/block/block_scan.cuh>
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -519,6 +520,266 @@ __global__ void __launch_bounds__(32 * ATTN_WARPS) attn_kernel(const half * q, c
     }
 }
 
+// ---- multi-query prefill attention (lead 10-07, TRUSS_DSA_MQ=1): MQ consecutive queries share one gather.
+// Neighbouring queries select mostly the same blocks (real 150K selections: the union of 4 queries' 512 blocks is
+// ~1.95x one query's), so each KV tile is gathered and dequantized once for 4 queries (48 query-head rows = 3 m16
+// tiles, all rows used) instead of 4 times. Each row masks the union's cells to its own query's set: its selected
+// blocks plus its tail (cells after its last complete block, up to its position). Cells stay in ascending position
+// order per query; tile boundaries differ from attn_kernel's, so results match to fp32 reassociation only.
+constexpr int MQ = 4, MQ_WARPS = 6, MQ_THREADS = 32 * MQ_WARPS;
+constexpr int MQ_BM_WORDS = 2048;                       // bitmap words per query: n_ctx / RATIO <= 65536 blocks
+
+template <class Shape> struct MqSmem {
+    static constexpr int STRIDE = Shape::D + 8, G = Shape::H / Shape::HKV, ROWS = MQ * G;
+    static constexpr int MAXU = MQ * Shape::TOP_BLOCKS + 4;
+    half q[ROWS][STRIDE];
+    union U {
+        struct { half k[TILE][STRIDE]; half v[TILE][STRIDE]; } kv;
+        uint32_t bm[MQ][MQ_BM_WORDS];                    // union build
+        float merge[16 * Shape::D + 32];                 // warp-pair merge of one row tile
+    } u;
+    int ublk[MAXU];
+    uint8_t umask[MAXU];
+    int scan[MQ_WARPS + 1];
+    // int8 cache: the NEXT tile's codes and scales arrive here by cp.async while this tile computes
+    __align__(16) int8_t kq8[TILE][Shape::D];
+    __align__(16) int8_t vq8[TILE][Shape::D];
+    __align__(16) half ks8[TILE][Shape::D / KV_GROUP];
+    __align__(16) half vs8[TILE][Shape::D / KV_GROUP];
+};
+
+template <class Shape>
+__global__ void __launch_bounds__(MQ_THREADS) attn_mq_kernel(const half * q, const float * gate, KvCache kc,
+                                                             const int * blocks, const int * n_blocks, int pos0,
+                                                             int T, half * out)
+{
+    const half * k16 = kc.k16, * v16 = kc.v16;
+    constexpr int H = Shape::H, HKV = Shape::HKV, D = Shape::D, R = Shape::RATIO, G = H / HKV, NT = D / 8;
+    constexpr int ROWS = MqSmem<Shape>::ROWS;
+    static_assert(ROWS % 16 == 0 && ROWS / 16 == MQ_WARPS / 2, "row tiles x 2 cell halves = warps");
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    auto & sm = *reinterpret_cast<MqSmem<Shape> *>(smem_raw);
+    const int t0 = blockIdx.x * MQ, kv = blockIdx.y, tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
+    const int nq = min(MQ, T - t0);
+    const int g = lane / 4, qd = lane % 4;
+    const float scale_log2 = 1.44269504f / sqrtf((float) D);
+    const int pos_max = pos0 + t0 + nq - 1, seen_min = (pos0 + t0 + 1) / R, last_blk = pos_max / R;
+    const int nw = last_blk / 32 + 1;
+
+    // union of the queries' blocks: per-query bitmaps, then compaction in ascending block order
+    for (int i = tid; i < MQ * nw; i += MQ_THREADS) sm.u.bm[i / nw][i % nw] = 0u;
+    __syncthreads();
+    for (int j = 0; j < nq; ++j) {
+        const int * sel = blocks + (size_t) (t0 + j) * Shape::TOP_BLOCKS;
+        for (int i = tid; i < n_blocks[t0 + j]; i += MQ_THREADS) atomicOr(&sm.u.bm[j][sel[i] >> 5], 1u << (sel[i] & 31));
+    }
+    __syncthreads();
+    auto comb = [&](int w) {
+        uint32_t x = sm.u.bm[0][w] | sm.u.bm[1][w] | sm.u.bm[2][w] | sm.u.bm[3][w];
+        const int lo = max(seen_min, 32 * w), hi = min(last_blk, 32 * w + 31);   // tail blocks
+        for (int b = lo; b <= hi; ++b) x |= 1u << (b & 31);
+        return x;
+    };
+    const int per = (nw + MQ_THREADS - 1) / MQ_THREADS, w0 = min(nw, tid * per), w1 = min(nw, w0 + per);
+    int cnt = 0;
+    for (int w = w0; w < w1; ++w) cnt += __popc(comb(w));
+    int inc = cnt;
+    for (int o = 1; o < 32; o *= 2) {
+        const int y = __shfl_up_sync(0xffffffffu, inc, o);
+        if (lane >= o) inc += y;
+    }
+    if (lane == 31) sm.scan[warp] = inc;
+    __syncthreads();
+    if (tid == 0) {
+        int a = 0;
+        for (int w = 0; w < MQ_WARPS; ++w) { const int c = sm.scan[w]; sm.scan[w] = a; a += c; }
+        sm.scan[MQ_WARPS] = a;
+    }
+    __syncthreads();
+    int idx = sm.scan[warp] + inc - cnt;
+    for (int w = w0; w < w1; ++w) {
+        uint32_t x = comb(w);
+        while (x) {
+            const int bit = __ffs(x) - 1;
+            x &= x - 1;
+            sm.ublk[idx] = 32 * w + bit;
+            sm.umask[idx] = (uint8_t) (((sm.u.bm[0][w] >> bit) & 1) | (((sm.u.bm[1][w] >> bit) & 1) << 1) |
+                                       (((sm.u.bm[2][w] >> bit) & 1) << 2) | (((sm.u.bm[3][w] >> bit) & 1) << 3));
+            ++idx;
+        }
+    }
+    const int n_cells = R * sm.scan[MQ_WARPS];
+
+    // q rows: row r = query r / G, head kv G + r % G (rows of missing queries are zero)
+    for (int i = tid; i < ROWS * D / 8; i += MQ_THREADS) {
+        const int r = i / (D / 8), c = 8 * (i % (D / 8)), j = r / G;
+        uint4 val = make_uint4(0, 0, 0, 0);
+        if (j < nq) val = *reinterpret_cast<const uint4 *>(q + ((size_t) (t0 + j) * H + kv * G + r % G) * D + c);
+        *reinterpret_cast<uint4 *>(&sm.q[r][c]) = val;
+    }
+
+    const int mt = warp / 2, hf = warp % 2;   // row tile, cell half
+    int jr[2], posr[2], seenr[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        jr[i] = (16 * mt + g + 8 * i) / G;
+        posr[i] = pos0 + t0 + jr[i];
+        seenr[i] = (posr[i] + 1) / R;
+    }
+    float o[NT][4] = {};
+    float m[2] = { -INFINITY, -INFINITY }, l[2] = { 0.f, 0.f };
+    const bool staged = kc.kq != nullptr;
+    // int8: async copy of a tile's codes (16 B pieces) and scale rows (8 B) into the stage
+    auto issue = [&](int c0) {
+        for (int i = tid; i < TILE * D / 16; i += MQ_THREADS) {
+            const int r = i / (D / 16), c = 16 * (i % (D / 16)), cell = c0 + r;
+            const int p = cell < n_cells ? R * sm.ublk[cell / R] + cell % R : pos_max + 1;
+            if (p <= pos_max) {
+                const size_t off = ((size_t) p * HKV + kv) * D + c;
+                cp16(&sm.kq8[r][c], kc.kq + off);
+                cp16(&sm.vq8[r][c], kc.vq + off);
+            } else {
+                *reinterpret_cast<uint4 *>(&sm.kq8[r][c]) = make_uint4(0, 0, 0, 0);
+                *reinterpret_cast<uint4 *>(&sm.vq8[r][c]) = make_uint4(0, 0, 0, 0);
+            }
+        }
+        for (int i = tid; i < TILE * 2; i += MQ_THREADS) {
+            const int r = i / 2, cell = c0 + r;
+            half * dst = (i & 1 ? sm.vs8 : sm.ks8)[r];
+            const int p = cell < n_cells ? R * sm.ublk[cell / R] + cell % R : pos_max + 1;
+            if (p <= pos_max) cp8(dst, (i & 1 ? kc.vs : kc.ks) + (size_t) (p * HKV + kv) * (D / KV_GROUP));
+            else *reinterpret_cast<uint2 *>(dst) = make_uint2(0, 0);
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+    if (staged) {
+        __syncthreads();   // ublk / umask complete
+        issue(0);
+    }
+    for (int c0 = 0; c0 < n_cells; c0 += TILE) {
+        __syncthreads();   // previous tile consumed; bitmaps, ublk/umask and q ready (first time)
+        if (staged) {   // stage -> fp16 tiles, then the next tile's copies fly while this one computes
+            asm volatile("cp.async.wait_all;\n" ::);
+            __syncthreads();
+            for (int i = tid; i < TILE * D / 8; i += MQ_THREADS) {
+                const int r = i / (D / 8), c = 8 * (i % (D / 8));
+                *reinterpret_cast<uint4 *>(&sm.u.kv.k[r][c]) = dequant8(&sm.kq8[r][c], sm.ks8[r][c / KV_GROUP]);
+                *reinterpret_cast<uint4 *>(&sm.u.kv.v[r][c]) = dequant8(&sm.vq8[r][c], sm.vs8[r][c / KV_GROUP]);
+            }
+            __syncthreads();
+            if (c0 + TILE < n_cells) issue(c0 + TILE);
+        } else for (int i = tid; i < TILE * D / 8; i += MQ_THREADS) {
+            const int r = i / (D / 8), c = 8 * (i % (D / 8)), cell = c0 + r;
+            const int p = cell < n_cells ? R * sm.ublk[cell / R] + cell % R : pos_max + 1;
+            if (p <= pos_max) {
+                const size_t off = ((size_t) p * HKV + kv) * D + c;
+                cp16(&sm.u.kv.k[r][c], k16 + off);
+                cp16(&sm.u.kv.v[r][c], v16 + off);
+            } else {
+                *reinterpret_cast<uint4 *>(&sm.u.kv.k[r][c]) = make_uint4(0, 0, 0, 0);
+                *reinterpret_cast<uint4 *>(&sm.u.kv.v[r][c]) = make_uint4(0, 0, 0, 0);
+            }
+        }
+        if (!staged) {
+            asm volatile("cp.async.wait_all;\n" ::);
+            __syncthreads();
+        }
+
+        float s[2][4] = {};
+        const int r0 = 16 * hf;
+#pragma unroll
+        for (int kk = 0; kk < D / 16; ++kk) {
+            uint32_t a[4], b[4];
+            ldsm_x4(a, &sm.q[16 * mt + lane % 8 + 8 * ((lane / 8) % 2)][16 * kk + 8 * (lane / 16)]);
+            ldsm_x4(b, &sm.u.kv.k[r0 + lane % 8 + 8 * (lane / 16)][16 * kk + 8 * ((lane / 8) % 2)]);
+            mma_f32(a, b[0], b[1], s[0]);
+            mma_f32(a, b[2], b[3], s[1]);
+        }
+        float mx[2] = { -INFINITY, -INFINITY };
+#pragma unroll
+        for (int j = 0; j < 2; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int cell = c0 + r0 + 8 * j + 2 * qd + (e & 1), i = e / 2, jq = jr[i];
+                bool ok = cell < n_cells && jq < nq;
+                if (ok) {
+                    const int u = cell / R, blk = sm.ublk[u], p = R * blk + cell % R;
+                    ok = p <= posr[i] && (((sm.umask[u] >> jq) & 1) || blk >= seenr[i]);
+                }
+                s[j][e] = ok ? s[j][e] * scale_log2 : -INFINITY;
+                mx[i] = fmaxf(mx[i], s[j][e]);
+            }
+        float corr[2], base[2];
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            mx[i] = fmaxf(mx[i], __shfl_xor_sync(0xffffffffu, mx[i], 1));
+            mx[i] = fmaxf(mx[i], __shfl_xor_sync(0xffffffffu, mx[i], 2));
+            const float mn = fmaxf(m[i], mx[i]);
+            base[i] = mn == -INFINITY ? 0.f : mn;
+            corr[i] = exp2f(m[i] - base[i]);
+            m[i] = mn;
+            l[i] *= corr[i];
+        }
+        uint32_t pa[4];
+#pragma unroll
+        for (int j = 0; j < 2; ++j)
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const half2 pp = __floats2half2_rn(exp2f(s[j][2 * i] - base[i]), exp2f(s[j][2 * i + 1] - base[i]));
+                const float2 pf = __half22float2(pp);
+                l[i] += pf.x + pf.y;
+                pa[2 * j + i] = *reinterpret_cast<const uint32_t *>(&pp);
+            }
+#pragma unroll
+        for (int n = 0; n < NT; ++n) o[n][0] *= corr[0], o[n][1] *= corr[0], o[n][2] *= corr[1], o[n][3] *= corr[1];
+#pragma unroll
+        for (int n2 = 0; n2 < NT / 2; ++n2) {
+            uint32_t b[4];
+            ldsm_x4_t(b, &sm.u.kv.v[r0 + lane % 8 + 8 * ((lane / 8) % 2)][16 * n2 + 8 * (lane / 16)]);
+            mma_f32(pa, b[0], b[1], o[2 * n2]);
+            mma_f32(pa, b[2], b[3], o[2 * n2 + 1]);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        l[i] += __shfl_xor_sync(0xffffffffu, l[i], 1);
+        l[i] += __shfl_xor_sync(0xffffffffu, l[i], 2);
+    }
+    // merge the two cell halves of each row tile, one tile at a time through shared memory
+    float * mo = sm.u.merge, * ml = mo + 16 * D;
+    for (int t = 0; t < MQ_WARPS / 2; ++t) {
+        __syncthreads();
+        if (warp == 2 * t + 1) {
+#pragma unroll
+            for (int n = 0; n < NT; ++n)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) mo[(g + 8 * (e / 2)) * D + 8 * n + 2 * qd + (e & 1)] = o[n][e];
+            if (qd == 0)
+                for (int i = 0; i < 2; ++i) ml[g + 8 * i] = m[i], ml[16 + g + 8 * i] = l[i];
+        }
+        __syncthreads();
+        if (warp != 2 * t) continue;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int r = 16 * mt + g + 8 * i, j = r / G;
+            if (j >= nq) continue;
+            const float m1 = ml[g + 8 * i], l1 = ml[16 + g + 8 * i], mm = fmaxf(m[i], m1);
+            const float f0 = m[i] == -INFINITY ? 0.f : exp2f(m[i] - mm), f1 = m1 == -INFINITY ? 0.f : exp2f(m1 - mm);
+            const float inv = 1.f / (l[i] * f0 + l1 * f1);
+            const size_t row = (size_t) (t0 + j) * H + kv * G + r % G;
+#pragma unroll
+            for (int n = 0; n < NT; ++n) {
+                const int d = 8 * n + 2 * qd;
+                const float2 gt = *reinterpret_cast<const float2 *>(gate + row * D + d);
+                const float a0 = (o[n][2 * i] * f0 + mo[(g + 8 * i) * D + d] * f1) * inv;
+                const float a1 = (o[n][2 * i + 1] * f0 + mo[(g + 8 * i) * D + d + 1] * f1) * inv;
+                *reinterpret_cast<half2 *>(out + row * D + d) =
+                    __floats2half2_rn(a0 / (1.f + __expf(-gt.x)), a1 / (1.f + __expf(-gt.y)));
+            }
+        }
+    }
+}
+
 // out [t][kv G + r][d] = gated merge of the splits' states, in split order. One CTA per (query, KV head, head of
 // the group): a decode window had only T x HKV CTAs (34 us per call, TRACKER #111)
 template <class Shape>
@@ -548,6 +809,12 @@ __global__ void __launch_bounds__(256) combine_kernel(const float * part, int sp
 
 // splits per query: ranges of >= 2 tiles, at most MAX_SPLITS
 constexpr int MAX_SPLITS = 32;
+
+bool mq_on()   // the multi-query prefill kernel; TRUSS_DSA_MQ=0 restores attn_kernel (A/B switch, read once)
+{
+    static const bool v = [] { const char * e = std::getenv("TRUSS_DSA_MQ"); return !e || std::atoi(e); }();
+    return v;
+}
 
 template <class Shape> int max_query_cells(int pos0, int T)   // the most cells any query of the chunk attends to
 {
@@ -625,6 +892,16 @@ void attention(const half * q, const float * gate, const KvCache & kc, const int
         attn_kernel<Shape, true><<<dim3(T, Shape::HKV, S), 32 * ATTN_WARPS, smem_split, stream>>>(
             q, gate, kc, blocks, n_blocks, pos0, out, per, part);
         combine_kernel<Shape><<<dim3(T, Shape::HKV, Shape::H / Shape::HKV), 256, 0, stream>>>(part, S, gate, out);
+    } else if (mq_on()) {
+        static bool mq_attr = [] {
+            TRUSS_CUDA(cudaFuncSetAttribute(attn_mq_kernel<Shape>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            (int) sizeof(MqSmem<Shape>)));
+            return true;
+        }();
+        (void) mq_attr;
+        if ((pos0 + T) / Shape::RATIO > 32 * MQ_BM_WORDS) throw std::invalid_argument("dsa::attention: context over the MQ bitmap");
+        attn_mq_kernel<Shape><<<dim3((T + MQ - 1) / MQ, Shape::HKV), MQ_THREADS, sizeof(MqSmem<Shape>), stream>>>(
+            q, gate, kc, blocks, n_blocks, pos0, T, out);
     } else {
         attn_kernel<Shape, false><<<dim3(T, Shape::HKV), 32 * ATTN_WARPS, smem_full, stream>>>(
             q, gate, kc, blocks, n_blocks, pos0, out, 0, nullptr);
