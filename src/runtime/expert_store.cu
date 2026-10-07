@@ -3,6 +3,8 @@
 #include "core/cuda_check.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <climits>
@@ -12,18 +14,24 @@
 #include <unistd.h>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace truss::runtime {
 namespace {
 
-// MADV_DONTNEED over the whole pages of a mapped tensor (file pages only: the tensor is read-only and shared)
-void release_pages(const gguf::Tensor * t)
+// MADV_DONTNEED over the whole pages of a mapped range (file pages only: read-only and shared, a later read re-faults)
+void release_range(const void * p, size_t bytes)
 {
     const long ps = sysconf(_SC_PAGESIZE);
-    if (!t || !t->data || !t->bytes || ps <= 0) return;
-    const uintptr_t a = (uintptr_t) t->data, m = (uintptr_t) ps - 1;
-    const uintptr_t lo = (a + m) & ~m, hi = (a + (uintptr_t) t->bytes) & ~m;   // pages wholly inside the tensor
+    if (!p || !bytes || ps <= 0) return;
+    const uintptr_t a = (uintptr_t) p, m = (uintptr_t) ps - 1;
+    const uintptr_t lo = (a + m) & ~m, hi = (a + (uintptr_t) bytes) & ~m;   // pages wholly inside the range
     if (hi > lo) madvise((void *) lo, (size_t) (hi - lo), MADV_DONTNEED);
+}
+
+void release_pages(const gguf::Tensor * t)
+{
+    if (t) release_range(t->data, t->bytes);
 }
 
 constexpr int SHIFT = 4;                 // meta offsets in 16-word (32-byte) units
@@ -237,21 +245,39 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
     stream_end_ = (int64_t) align_up(2 * slot_ + z.stream_extra);
     device_bytes_ = hot_lo + ring_ + hot_hi;
 
+    // Every layer's cold copy lives in one anonymous mapping, filled from the file (pread) by TRUSS_LOAD_THREADS
+    // workers (16) and page-locked afterwards by start_pinning(): cudaHostAlloc per layer cost ~0.6 s/GB on this box,
+    // an anonymous fill ~0.1 s/GB and cudaHostRegister ~0.08 s/GB. Hot experts go to the device through per-worker
+    // pinned staging buffers in 32 MB batches (was one pageable cudaMemcpy per expert projection, ~14K of them).
+    // X3.1: this constructor 39.6 -> 3.6 s, the Forward 43 -> 6.7 s, the server ready ~2 min -> 8.3 s.
+    std::vector<size_t> region_at(L, 0);
+    for (int l = 0; l < L; ++l) {
+        region_at[l] = host_region_bytes_;
+        host_region_bytes_ += align_up(layers_[l].cold, 4096);
+        cold_total_ += layers_[l].cold;
+    }
+    if (host_region_bytes_) {
+        void * m = mmap(nullptr, host_region_bytes_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (m == MAP_FAILED) throw std::runtime_error("ExpertStore: mmap of the cold copy failed");
+        madvise(m, host_region_bytes_, MADV_NOHUGEPAGE);   // THP faults compact this fragmented box: 8 GB took 31 s
+        host_region_ = static_cast<uint8_t *>(m);
+    }
+    struct Hot {   // a layer's hot experts: one contiguous device run in expert order
+        uint8_t * dev = nullptr;
+        std::vector<int> experts;
+    };
+    std::vector<Hot> hot_run(L);
+    std::vector<std::vector<int32_t>> smeta_all(L);
     uint8_t * next_hot[2] = { arena, arena + hot_lo + ring_ };
     for (int l = 0; l < L; ++l) {
         Layer & Y = layers_[l];
         const int E = Y.n_expert;
-        if (Y.cold) {
-            uint8_t * pinned;
-            TRUSS_CUDA(cudaHostAlloc(reinterpret_cast<void **>(&pinned), Y.cold, cudaHostAllocDefault));
-            pinned_.push_back(pinned);
-            Y.host = pinned;
-            cold_total_ += Y.cold;
-        }
+        if (Y.cold) Y.host = host_region_ + region_at[l];
         TRUSS_CUDA(cudaHostAlloc(reinterpret_cast<void **>(&Y.ring_meta_host), sizeof(int32_t) * 3 * 2 * E,
                                  cudaHostAllocDefault));
         pinned_.push_back(Y.ring_meta_host);
-        std::vector<int32_t> smeta(3 * 2 * E);
+        std::vector<int32_t> & smeta = smeta_all[l];
+        smeta.assign(3 * 2 * E, 0);
         Y.cold_off.assign(E, -1);
         Y.ring_at.assign(E, -1);
         Y.pend.assign(E, 0);
@@ -262,6 +288,8 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
             uint8_t * at;
             if (hot[l][e]) {
                 uint8_t *& h = next_hot[l < half_l ? 0 : 1];
+                if (hot_run[l].experts.empty()) hot_run[l].dev = h;
+                hot_run[l].experts.push_back(e);
                 at = h;
                 h += Y.bytes[e];
             } else {
@@ -271,20 +299,111 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
             }
             for (int p = 0; p < 3; ++p) {
                 const formats::ExpertTable & t = *layers[l][p];
-                const auto * from = reinterpret_cast<const uint8_t *>(t.trellis->data) + t.offset[e] * 2;
-                const size_t pb = proj_bytes(t, e);
-                if (hot[l][e]) TRUSS_CUDA(cudaMemcpy(at + Y.part[p][e], from, pb, cudaMemcpyHostToDevice));
-                else std::memcpy(const_cast<uint8_t *>(Y.host) + Y.cold_off[e] + Y.part[p][e], from, pb);
                 int32_t * sm = smeta.data() + (size_t) p * 2 * E, * rm = Y.ring_meta_host + (size_t) p * 2 * E;
                 sm[2 * e] = rm[2 * e] = t.k[e];
                 sm[2 * e + 1] = unit_offset(at + Y.part[p][e], base_, l);
                 rm[2 * e + 1] = hot[l][e] ? sm[2 * e + 1] : 0;   // cold: set when fetched
             }
         }
-        // The layer's tiles now live in the pinned copy or on the device: drop the file pages they were read from.
-        // The mapping stays valid (read-only, shared; a later read re-faults), but without this the load's resident
-        // peak counts the pack twice (pinned + page cache, ~69 GB measured) beside renters holding 58-77 GB.
-        for (int p = 0; p < 3; ++p) release_pages(layers[l][p]->trellis);
+    }
+    {
+        // jobs: (layer, 0) its cold experts -> the host copy, (layer, 1) its hot run -> the device. A layer's file
+        // pages are dropped by whichever of its two jobs finishes last (the load's resident peak otherwise counts the
+        // pack twice, pinned + page cache, ~69 GB measured, beside renters holding 58-77 GB).
+        constexpr size_t STAGE = 32u << 20;
+        const int n_jobs = 2 * L;
+        const unsigned hw = std::thread::hardware_concurrency();
+        const int T = std::max(1, std::min<int>(std::getenv("TRUSS_LOAD_THREADS") ? std::atoi(std::getenv("TRUSS_LOAD_THREADS")) : 16,
+                                                 hw ? (int) hw : 16));
+        std::atomic<int> next{ 0 };
+        std::vector<std::atomic<int>> layer_left(L);
+        for (auto & a : layer_left) a = 2;
+        std::vector<std::string> errs(T);
+        auto copy_part = [&](int l, int e, uint8_t * dst) {   // expert e of layer l as [gate | up | down]
+            for (int p = 0; p < 3; ++p) {
+                const formats::ExpertTable & t = *layers[l][p];
+                const uint8_t * from = reinterpret_cast<const uint8_t *>(t.trellis->data) + t.offset[e] * 2;
+                // pread from the shard: no faults, no file pages mapped (through the mapping, 16 workers had ~16
+                // layers of file pages resident at once)
+                if (!gguf::read_mapped(from, proj_bytes(t, e), dst + layers_[l].part[p][e])) {
+                    std::memcpy(dst + layers_[l].part[p][e], from, proj_bytes(t, e));
+                    release_range(from, proj_bytes(t, e));
+                }
+            }
+        };
+        auto worker = [&](int w) {
+            cudaStream_t st = nullptr;
+            uint8_t * stage[2] = {};
+            cudaEvent_t done[2] = {};
+            try {
+                for (;;) {
+                    const int j = next.fetch_add(1);
+                    if (j >= n_jobs) break;
+                    const int l = j / 2;
+                    const Layer & Y = layers_[l];
+                    if (j % 2 == 0) {
+                        for (int e = 0; e < Y.n_expert; ++e)
+                            if (Y.cold_off[e] >= 0) copy_part(l, e, host_region_ + region_at[l] + Y.cold_off[e]);
+                    } else if (!hot_run[l].experts.empty()) {
+                        if (!st) {
+                            TRUSS_CUDA(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
+                            for (int b = 0; b < 2; ++b) {
+                                TRUSS_CUDA(cudaHostAlloc(reinterpret_cast<void **>(&stage[b]), STAGE, cudaHostAllocDefault));
+                                TRUSS_CUDA(cudaEventCreateWithFlags(&done[b], cudaEventDisableTiming | cudaEventBlockingSync));
+                            }
+                        }
+                        int b = 0;
+                        size_t fill = 0, dev_off = 0;
+                        auto flush = [&] {
+                            if (!fill) return;
+                            TRUSS_CUDA(cudaMemcpyAsync(hot_run[l].dev + dev_off, stage[b], fill, cudaMemcpyHostToDevice, st));
+                            TRUSS_CUDA(cudaEventRecord(done[b], st));
+                            dev_off += fill, fill = 0, b ^= 1;
+                            TRUSS_CUDA(cudaEventSynchronize(done[b]));   // the other buffer's last copy has left it
+                        };
+                        for (int e : hot_run[l].experts) {
+                            if (Y.bytes[e] > STAGE) throw std::runtime_error("ExpertStore: expert larger than the load stage");
+                            if (fill + Y.bytes[e] > STAGE) flush();
+                            copy_part(l, e, stage[b] + fill);
+                            fill += Y.bytes[e];
+                        }
+                        flush();
+                    }
+                    if (layer_left[l].fetch_sub(1) == 1)
+                        for (int p = 0; p < 3; ++p) release_pages(layers[l][p]->trellis);
+                }
+                if (st) TRUSS_CUDA(cudaStreamSynchronize(st));
+            } catch (const std::exception & ex) {
+                errs[w] = ex.what();
+                next = n_jobs;
+                if (st) cudaStreamSynchronize(st);
+            }
+            for (int b = 0; b < 2; ++b) {
+                if (stage[b]) cudaFreeHost(stage[b]);
+                if (done[b]) cudaEventDestroy(done[b]);
+            }
+            if (st) cudaStreamDestroy(st);
+        };
+        const auto t0 = std::chrono::steady_clock::now();
+        int dev = 0;
+        TRUSS_CUDA(cudaGetDevice(&dev));
+        std::vector<std::thread> pool;
+        for (int w = 0; w < T; ++w)
+            pool.emplace_back([&, w] {
+                cudaSetDevice(dev);
+                worker(w);
+            });
+        for (auto & th : pool) th.join();
+        for (const std::string & m : errs)
+            if (!m.empty()) throw std::runtime_error("ExpertStore load: " + m);
+        if (std::getenv("TRUSS_LOAD_TIMES"))
+            std::fprintf(stderr, "load ExpertStore: %d workers copied %.2f GB cold + uploaded the hot set in %.2f s\n", T,
+                         cold_total_ / 1e9, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
+    for (int l = 0; l < L; ++l) {
+        Layer & Y = layers_[l];
+        const int E = Y.n_expert;
+        const std::vector<int32_t> & smeta = smeta_all[l];
         for (int p = 0; p < 3; ++p) {
             const formats::ExpertTable & t = *layers[l][p];
             Y.stream_meta[p] = static_cast<int32_t *>(device_alloc(sizeof(int32_t) * 2 * E, device_));
@@ -300,15 +419,54 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
             Y.suh[p] = suh, Y.svh[p] = svh;
             device_bytes_ += 2 * sizeof(int32_t) * 2 * E + t.suh->bytes + t.svh->bytes;
         }
-    }
+    }}
+
+void ExpertStore::start_pinning()
+{
+    // Page-locking the cold copy (~0.08 s/GB, serialized in the driver: ~3 s here) runs in the background, layer by
+    // layer; the owner starts it after its own setup, since it holds the driver lock that cudaMalloc / cudaMemcpy /
+    // cudaHostAlloc also take. Until a layer is registered its copies are pageable (synchronous on the issuing
+    // thread, slower), never wrong; wait_pinned() blocks until all are done (the benches call it before timing).
+    if (reg_thread_.joinable() || reg_ok_) return;
+    const int L = (int) layers_.size();
+    reg_ok_.reset(new std::atomic<uint8_t>[L]);
+    for (int l = 0; l < L; ++l) reg_ok_[l] = 0;
+    int dev = 0;
+    TRUSS_CUDA(cudaGetDevice(&dev));
+    reg_thread_ = std::thread([this, dev, L] {
+        cudaSetDevice(dev);
+        const auto r0 = std::chrono::steady_clock::now();
+        for (int l = 0; l < L && !reg_stop_; ++l) {
+            const Layer & Y = layers_[l];
+            if (!Y.cold) continue;
+            const cudaError_t e = cudaHostRegister(const_cast<uint8_t *>(Y.host), align_up(Y.cold, 4096),
+                                                   cudaHostRegisterDefault);
+            if (e != cudaSuccess) {   // the copies stay pageable: slower, still right
+                std::fprintf(stderr, "ExpertStore: cudaHostRegister of layer %d failed (%s); its copies stay pageable\n", l,
+                             cudaGetErrorString(e));
+                continue;
+            }
+            reg_ok_[l] = 1;
+        }
+        if (std::getenv("TRUSS_LOAD_TIMES"))
+            std::fprintf(stderr, "load ExpertStore: cold copy page-locked in the background in %.2f s\n",
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - r0).count());
+    });
 }
 
 ExpertStore::~ExpertStore()
 {
+    reg_stop_ = true;
+    if (reg_thread_.joinable()) reg_thread_.join();
     for (cudaEvent_t & e : prof_pool_) cudaEventDestroy(e);
     if (copy_) cudaStreamSynchronize(copy_);
     for (void * p : device_) cudaFree(p);
     for (void * p : pinned_) cudaFreeHost(p);
+    if (host_region_) {
+        for (size_t l = 0; l < layers_.size(); ++l)
+            if (reg_ok_ && reg_ok_[l]) cudaHostUnregister(const_cast<uint8_t *>(layers_[l].host));
+        munmap(host_region_, host_region_bytes_);
+    }
     for (int s = 0; s < 2; ++s) {
         if (copied_[s]) cudaEventDestroy(copied_[s]);
         if (released_[s]) cudaEventDestroy(released_[s]);
@@ -834,6 +992,12 @@ void ExpertStore::release(int l, cudaStream_t compute)
 {
     TRUSS_CUDA(cudaEventRecord(released_[l % 2], compute));
     released_recorded_[l % 2] = true;
+}
+
+void ExpertStore::wait_pinned()
+{
+    start_pinning();
+    if (reg_thread_.joinable()) reg_thread_.join();
 }
 
 }  // namespace truss::runtime

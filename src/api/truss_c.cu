@@ -13,6 +13,7 @@
 #include "model/qwen4exp/weights.h"
 #include "runtime/expert_store.h"
 
+#include <atomic>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -39,6 +40,7 @@ struct truss_model {
     int * next = nullptr;                    // device, argmax
     int n_ctx = 0, max_chunk = 0;
     uint64_t sample_counter = 0;             // random stream of the next sampled row
+    std::atomic<int> prog_done{ 0 }, prog_total{ 0 };   // the running eval(): tokens run / tokens asked (truss_progress)
     int * pen_cnt = nullptr;                 // device [drafts + 1][n_vocab] penalty counts, zero between calls
     int * pen_hist = nullptr, * pen_host = nullptr;   // device / pinned [drafts + 1][TRUSS_PENALTY_CAP] row histories
     std::unique_ptr<q::Forward> fwd;         // last: its expert budget takes the memory left
@@ -84,12 +86,14 @@ void eval(truss_model & m, const int32_t * tokens, int n)
     const int fetch_max = std::getenv("TRUSS_FETCH_PROMPT") ? std::atoi(std::getenv("TRUSS_FETCH_PROMPT")) : 0;
     const int step = n <= fetch_max ? std::min(m.max_chunk, q::Forward::fetch_rows()) : m.max_chunk;
     int last = 0;
+    m.prog_done = 0, m.prog_total = n;
     for (int s = 0; s < n; s += step) {
         last = std::min(step, n - s);
         // PLE lookahead: the next chunk's trigram rows are read while this chunk computes (Forward::run ->
         // ple_next, the pipelined gather kept in row D 216d52a).
         const int nxt = std::max(0, std::min(step, n - s - last));
         m.fwd->run(tokens + s, last, nullptr, nxt > 0 ? tokens + s + last : nullptr, nxt);
+        m.prog_done = s + last;
     }
     m.fwd->head(last - 1, 1, m.logits);
 }
@@ -219,6 +223,11 @@ int truss_reset(truss_model * m)
             return 0;
         },
         -1);
+}
+
+void truss_progress(const truss_model * m, int * done, int * total)
+{
+    *done = m->prog_done.load(std::memory_order_relaxed), *total = m->prog_total.load(std::memory_order_relaxed);
 }
 
 int truss_eval(truss_model * m, const int32_t * tokens, int n, float * logits)

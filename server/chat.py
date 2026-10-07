@@ -4,11 +4,11 @@ The tokenizer is the model family's HF tokenizer.json (NFC-normalizing, as the m
 normalization). The chat template is the one stored in the GGUF, rendered by transformers exactly as HF would.
 """
 import numpy as np
-from transformers import PreTrainedTokenizerFast
 
 
 class Chat:
     def __init__(self, tokenizer_json: str, template: str):
+        from transformers import PreTrainedTokenizerFast   # ~1.7 s (torch): Engine loads it beside the model load
         self.tok = PreTrainedTokenizerFast(tokenizer_file=tokenizer_json)
         self.template = template
 
