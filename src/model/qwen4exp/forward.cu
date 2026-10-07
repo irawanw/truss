@@ -1200,17 +1200,32 @@ struct Forward::Impl {
         for (const Proj & p : ps) lin32(p.first, x, rows, p.second);
     }
 
-    // hyper-connection mix: mixed [T][d] (fp32 and fp16), inject [T][hc] when h.inject
-    void hc_mix(const HyperConnection & h, const float * res, int T, float * mixed, half * mixed16, float * inject)
+    // hyper-connection mix: mixed [T][d] (fp32 and fp16), inject [T][hc] when h.inject.
+    // L3 (Order 11): with Q8_1 activations the norm fuses the activation quantize (and, when cout/cinj are
+    // given, the preceding hc::combine) into one launch; bit-identical arithmetic, see hc_prefill.cuh.
+    void hc_mix(const HyperConnection & h, const float * res, int T, float * mixed, half * mixed16, float * inject,
+                const float * cout = nullptr, const float * cinj = nullptr)
     {
         const size_t m = sc->mark();
-        half * xn16 = sc->alloc<half>((size_t) T * c.hc_dim());
         float * rstd = sc->alloc((size_t) T * c.hc);
         float * lo = sc->alloc((size_t) T * c.hc_rank);
         half * lo16 = sc->alloc<half>((size_t) T * c.hc_rank);
         float * gate = sc->alloc((size_t) T * c.hc_dim());
-        hc::norm(res, f32(h.norm), T, c.hc, c.d_model, c.rms_eps, xn16, rstd, s);
-        const Act xa = quant(xn16, T, c.hc_dim());
+        Act xa;
+        if (act == Activations::Q8_1)
+        {
+            xa.q = sc->alloc<int8_t>((size_t) T * c.hc_dim());
+            xa.d = sc->alloc<half>((size_t) T * c.hc_dim() / 32);
+            if (cout) hc::combine_norm_q8(const_cast<float *>(res), cout, cinj, f32(h.norm), T, c.hc, c.d_model, c.rms_eps, rstd, xa.q, xa.d, s);
+            else      hc::norm_q8(res, f32(h.norm), T, c.hc, c.d_model, c.rms_eps, rstd, xa.q, xa.d, s);
+        }
+        else
+        {
+            half * xn16 = sc->alloc<half>((size_t) T * c.hc_dim());
+            if (cout) hc::combine(const_cast<float *>(res), cout, cinj, T, c.hc, c.d_model, s);
+            hc::norm(res, f32(h.norm), T, c.hc, c.d_model, c.rms_eps, xn16, rstd, s);
+            xa = quant(xn16, T, c.hc_dim());
+        }
         if (h.inject) lin_multi({ { h.down, lo }, { h.inject, inject } }, xa, T);   // inject reads the same xa
         else lin(h.down, xa, T, lo);
         hc::silu(lo, T * c.hc_rank, 1.f / c.hc, lo16, s);
@@ -1650,8 +1665,7 @@ struct Forward::Impl {
             if (L.mixer == Mixer::GDN) gdn(L.gdn, st[l], mixed16, T, out, tentative);
             else dsa(L.dsa, st[l], mixed16, pos0, T, out, tentative);
             sect_record(l, 2);
-            hc::combine(res, out, inject, T, c.hc, c.d_model, s);
-            hc_mix(L.hc_ffn, res, T, mixed, mixed16, inject);
+            hc_mix(L.hc_ffn, res, T, mixed, mixed16, inject, out, inject);   // combine #1 fused into the norm (L3)
             ffn(l, L.moe, mixed, mixed16, T, out, stream);   // records 3 (routed MoE), 4 (shared), 5 (cpu join)
             sect_record(l, 6);
             hc::combine(res, out, inject, T, c.hc, c.d_model, s);

@@ -7,6 +7,7 @@
 // All memory-bound; rows are processed by one block each so the norm reduction order is fixed.
 #pragma once
 #include <cuda_fp16.h>
+#include <cstdint>
 #include <cuda_runtime.h>
 
 namespace truss::hc {
@@ -27,5 +28,13 @@ void collapse(const float * res, const float * rstd, const float * gamma, const 
 
 // res [T][hc][d] += out [T][d] * 2 sigmoid(inject [T][hc] / hc)
 void combine(float * res, const float * out, const float * inject, int T, int hc, int d, cudaStream_t stream);
+
+// Q8_1 fused variants (L3, Order 11): norm (+ optional combine) with the activation quantization the caller
+// would run on xn16 next. Bit-identical to the separate kernels (q8_gemm quantize_kernel<__half> tree/scale/
+// rounding reproduced per warp); xn16 is never materialized.
+void norm_q8(const float * res, const float * gamma, int T, int hc, int d, float eps, float * rstd,
+             int8_t * q, half * dsc, cudaStream_t stream);
+void combine_norm_q8(float * res, const float * out, const float * inject, const float * gamma, int T, int hc, int d,
+                     float eps, float * rstd, int8_t * q, half * dsc, cudaStream_t stream);
 
 }  // namespace truss::hc

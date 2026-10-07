@@ -43,6 +43,59 @@ __global__ void silu_kernel(const float * lo, int n, float inv_hc, half * lo16)
     const float a = lo[i] * inv_hc;
     lo16[i] = __float2half(a * sigmoid(a));
 }
+// One warp quantizes its 32 consecutive values exactly as dense::quantize_kernel<__half> does: same shfl_xor
+// amax tree (16..1), same scale and rounding, same lane -> element map. g is the FLAT element index.
+__device__ __forceinline__ void q8_warp(float v, size_t g, int8_t * q, half * dsc)
+{
+    float amax = fabsf(v);
+    for (int m = 16; m; m >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, m));
+    const float s = amax / 127.f;
+    q[g] = (int8_t) (amax == 0.f ? 0 : (int) roundf(v / s));
+    if (threadIdx.x % 32 == 0) dsc[g / 32] = __float2half(s);
+}
+
+// The second norm loop gives warp w, stride iteration k the elements w*32 + k*THREADS + lane: 32 consecutive,
+// so the Q8_1 quantization below is bit-identical to quantize_kernel<__half> over xn16. xn16 itself is dead
+// (only the quantized form feeds the GEMMs), so it is not written.
+__global__ void __launch_bounds__(THREADS) norm_q8_kernel(const float * res, const float * gamma, int hc, int d,
+                                                          float eps, float * rstd, int8_t * q, half * dsc)
+{
+    __shared__ float part[THREADS / 32];
+    const size_t r = blockIdx.x;
+    const float * x = res + r * d;
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < d; i += THREADS) acc += x[i] * x[i];
+    const float inv = rsqrtf(block_sum(acc, part) / d + eps);
+    if (threadIdx.x == 0) rstd[r] = inv;
+    const float * g = gamma + (size_t) (r % hc) * d;
+    for (int i = threadIdx.x; i < d; i += THREADS)
+        q8_warp(__half2float(__float2half(x[i] * inv * g[i])), r * (size_t) d + i, q, dsc);
+}
+
+// combine + norm + quant in one launch: res is updated first (the expression matches combine_kernel exactly,
+// (o * 2.f) * sig), then the norm reduction runs on the updated values, exactly as the two-kernel sequence does.
+__global__ void __launch_bounds__(THREADS) combine_norm_q8_kernel(float * res, const float * out, const float * inject,
+                                                                  const float * gamma, int hc, int d, float eps,
+                                                                  float * rstd, int8_t * q, half * dsc)
+{
+    __shared__ float part[THREADS / 32];
+    const size_t r = blockIdx.x;
+    const size_t t = r / hc;
+    const float sig = sigmoid(inject[t * hc + (r % hc)] / hc);
+    float * xr = res + r * d;
+    const float * o = out + t * d;
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < d; i += THREADS) {
+        const float v = xr[i] + (o[i] * 2.f) * sig;
+        xr[i] = v;
+        acc += v * v;
+    }
+    const float inv = rsqrtf(block_sum(acc, part) / d + eps);
+    if (threadIdx.x == 0) rstd[r] = inv;
+    const float * g = gamma + (size_t) (r % hc) * d;
+    for (int i = threadIdx.x; i < d; i += THREADS)
+        q8_warp(__half2float(__float2half(xr[i] * inv * g[i])), r * (size_t) d + i, q, dsc);
+}
 
 __global__ void collapse_kernel(const float * res, const float * rstd, const float * gamma, const float * gate, int T,
                                 int hc, int d, float * mixed, half * mixed16)
@@ -107,6 +160,19 @@ void collapse(const float * res, const float * rstd, const float * gamma, const 
 void combine(float * res, const float * out, const float * inject, int T, int hc, int d, cudaStream_t stream)
 {
     combine_kernel<<<grid((int64_t) T * hc * d), THREADS, 0, stream>>>(res, out, inject, T, hc, d);
+    TRUSS_CUDA(cudaGetLastError());
+}
+void norm_q8(const float * res, const float * gamma, int T, int hc, int d, float eps, float * rstd,
+             int8_t * q, half * dsc, cudaStream_t stream)
+{
+    norm_q8_kernel<<<T * hc, THREADS, 0, stream>>>(res, gamma, hc, d, eps, rstd, q, dsc);
+    TRUSS_CUDA(cudaGetLastError());
+}
+
+void combine_norm_q8(float * res, const float * out, const float * inject, const float * gamma, int T, int hc, int d,
+                     float eps, float * rstd, int8_t * q, half * dsc, cudaStream_t stream)
+{
+    combine_norm_q8_kernel<<<T * hc, THREADS, 0, stream>>>(res, out, inject, gamma, hc, d, eps, rstd, q, dsc);
     TRUSS_CUDA(cudaGetLastError());
 }
 
