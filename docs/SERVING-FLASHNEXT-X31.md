@@ -20,7 +20,7 @@ git clone https://github.com/irawanw/truss && cd truss
 cmake -S . -B build -G Ninja && cmake --build build
 pip install fastapi uvicorn anyio numpy transformers torch huggingface_hub
 
-hf download lackonendes/PAW-125B-FLASH-NEXT-X3.1 flashnext-x31.gguf flashnext-mtp-x3k3.gguf --local-dir /nvme/flashnext
+hf download lackonendes/PAW-125B-FLASH-NEXT-X3.1 flashnext-x31-00001-of-00002.gguf flashnext-x31-00002-of-00002.gguf flashnext-mtp-x3k3.gguf --local-dir /nvme/flashnext
 hf download Qwen/Qwen3.8-Flash-Next tokenizer.json --local-dir /nvme/flashnext
 ```
 
@@ -40,7 +40,7 @@ export TRUSS_CPU_THREADS=22 TRUSS_CPU_PIN=1          # your physical cores minus
 export TRUSS_KV_INT8=1 TRUSS_KV_LEND=1 TRUSS_ADMIT_IDLE=64 TRUSS_FETCH_PROMPT=96 TRUSS_SPLIT_ROWS=2048
 
 python3 -m server.app \
-  --model /nvme/flashnext/flashnext-x31.gguf --tokenizer /nvme/flashnext/tokenizer.json \
+  --model /nvme/flashnext/flashnext-x31-00001-of-00002.gguf --tokenizer /nvme/flashnext/tokenizer.json \
   --n-ctx 262144 --chunk 8192 \
   --expert-usage data/usage_strata_rank.f32 \
   --mtp /nvme/flashnext/flashnext-mtp-x3k3.gguf --drafts 3 \

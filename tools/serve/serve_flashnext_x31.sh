@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-: "${MODEL_DIR:?directory holding flashnext-x31.gguf and flashnext-mtp-x3k3.gguf (put it on NVMe)}"
+: "${MODEL_DIR:?directory holding flashnext-x31-0000{1,2}-of-00002.gguf and flashnext-mtp-x3k3.gguf (put it on NVMe)}"
 : "${TOKENIZER:?path to tokenizer.json (the one in Qwen/Qwen3.8-Flash-Next)}"
 GPU=${GPU:-0}
 PORT=${PORT:-8080}
@@ -14,7 +14,8 @@ NCTX=${NCTX:-262144}
 PHYS=$(lscpu -p=CORE,SOCKET | grep -v '^#' | sort -u | wc -l)
 THREADS=${THREADS:-$(( PHYS > 6 ? PHYS - 2 : 4 ))}
 
-[ -f "$MODEL_DIR/flashnext-x31.gguf" ] || { echo "missing $MODEL_DIR/flashnext-x31.gguf" >&2; exit 1; }
+[ -f "$MODEL_DIR/flashnext-x31-00002-of-00002.gguf" ] || { echo "missing the n-gram shard $MODEL_DIR/flashnext-x31-00002-of-00002.gguf" >&2; exit 1; }
+[ -f "$MODEL_DIR/flashnext-x31-00001-of-00002.gguf" ] || { echo "missing $MODEL_DIR/flashnext-x31-00001-of-00002.gguf" >&2; exit 1; }
 [ -f build/libtruss.so ] || { echo "build first: cmake -S . -B build -G Ninja && cmake --build build" >&2; exit 1; }
 case "$MODEL_DIR" in /mnt/*|/media/*) echo "warning: $MODEL_DIR looks like removable/slow storage; the n-gram table is read from disk while decoding" >&2;; esac
 
@@ -24,7 +25,7 @@ export TRUSS_CPU_THREADS=$THREADS TRUSS_CPU_PIN=1
 export TRUSS_KV_INT8=1 TRUSS_KV_LEND=1 TRUSS_ADMIT_IDLE=64 TRUSS_FETCH_PROMPT=96 TRUSS_SPLIT_ROWS=2048
 
 CMD=(python3 -m server.app
-  --model "$MODEL_DIR/flashnext-x31.gguf" --tokenizer "$TOKENIZER"
+  --model "$MODEL_DIR/flashnext-x31-00001-of-00002.gguf" --tokenizer "$TOKENIZER"
   --n-ctx "$NCTX" --chunk 8192
   --expert-usage data/usage_strata_rank.f32
   --mtp "$MODEL_DIR/flashnext-mtp-x3k3.gguf" --drafts 3
