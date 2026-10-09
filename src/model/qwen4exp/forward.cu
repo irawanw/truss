@@ -2229,6 +2229,8 @@ void apply_env(ForwardOptions & o)
     f("TRUSS_ADMIT_DECAY", o.admit_decay);
     f("TRUSS_PREFILL_ROWS", o.prefill_rows);
     f("TRUSS_KV_INT8", o.kv_int8);             // Strata's int8 KV
+    if (const char * e = std::getenv("TRUSS_ACT"))   // dense activations: fp16 (W8A16, KL 0.040) or q8_1 (default, 0.065)
+        o.act = std::string(e) == "fp16" ? Activations::FP16 : Activations::Q8_1;
     f("TRUSS_PLAN_ALPHA", o.plan_alpha);       // hot-set ranking: usage / bytes^alpha
     f("TRUSS_SPLIT_ROWS", o.split_rows);       // E7: short prompt chunks split cold experts CPU / PCIe
     f("TRUSS_SPLIT_T", o.split_t);
