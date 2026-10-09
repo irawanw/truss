@@ -57,6 +57,10 @@ void f32_gemv(const float * W, int in, int out, const float * x, int rows, float
 constexpr int MULTI_MAX = 8;
 void q8_gemv_multi(const Q8Matrix * const * W, float * const * y, int n, const int8_t * xq, const half * xd, int rows,
                    cudaStream_t stream);
+// W8A16 for decode rows (rows <= GEMV_ROWS): the same mapping as q8_gemv(_multi), fp16 activations, int8 weights
+// converted in registers (no dequantized copy, so the same weight traffic as the Q8_1 path), fp32 accumulation.
+void q8_gemv_multi_a16(const Q8Matrix * const * W, float * const * y, int n, const half * x, int rows, cudaStream_t stream);
+void q8_gemv_a16(const Q8Matrix & W, const half * x, int rows, float * y, cudaStream_t stream);
 void f32_gemv_multi(const float * const * W, const int * out, float * const * y, int n, int in, const float * x,
                     int rows, cudaStream_t stream);
 

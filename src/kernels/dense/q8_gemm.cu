@@ -220,7 +220,27 @@ struct MultiQ8 {
     int n;
 };
 
-template <int ROWS, int LPO, int WPO>
+// A16: the activations are fp16 (xq is the half array [rows][in], xd unused): W8A16 without dequantizing the weights,
+// each int8 weight is converted in registers and multiplied in fp32, one scale multiply per 32-block.
+__device__ __forceinline__ float dot32_a16(const int4 w0, const int4 w1, const half * __restrict__ x)
+{
+    const int4 * xp = reinterpret_cast<const int4 *>(x);
+    const int4 xv[4] = { __ldg(xp), __ldg(xp + 1), __ldg(xp + 2), __ldg(xp + 3) };
+    const int wv[8] = { w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w };
+    float s = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const half2 * h = reinterpret_cast<const half2 *>(&xv[i >> 1]) + 2 * (i & 1);
+        const float2 a = __half22float2(h[0]), b = __half22float2(h[1]);
+        s = fmaf((float) (int8_t) (wv[i]), a.x, s);
+        s = fmaf((float) (int8_t) (wv[i] >> 8), a.y, s);
+        s = fmaf((float) (int8_t) (wv[i] >> 16), b.x, s);
+        s = fmaf((float) (int8_t) (wv[i] >> 24), b.y, s);
+    }
+    return s;
+}
+
+template <int ROWS, int LPO, int WPO, bool A16 = false>
 __global__ void __launch_bounds__(128) gemv_multi_kernel(MultiQ8 m, int in, const int8_t * __restrict__ xq,
                                                          const half * __restrict__ xd)
 {
@@ -243,6 +263,10 @@ __global__ void __launch_bounds__(128) gemv_multi_kernel(MultiQ8 m, int in, cons
             const float dw = __half2float(d[b]);
 #pragma unroll
             for (int r = 0; r < ROWS; ++r) {
+                if (A16) {
+                    acc[r] += dot32_a16(w0, w1, reinterpret_cast<const half *>(xq) + (size_t) r * in + b * 32) * dw;
+                    continue;
+                }
                 const int4 * xp = reinterpret_cast<const int4 *>(xq + (size_t) r * in + b * 32);
                 const int4 x0 = __ldg(xp), x1 = __ldg(xp + 1);
                 int s = 0;
@@ -275,7 +299,7 @@ __global__ void __launch_bounds__(128) gemv_multi_kernel(MultiQ8 m, int in, cons
         }
 }
 
-template <int ROWS>
+template <int ROWS, bool A16 = false>
 void gemv_multi_rows(const MultiQ8 & m, int in, const int8_t * xq, const half * xd, cudaStream_t stream)
 {
     const int nb = in / 32, outs = m.start[m.n];
@@ -285,12 +309,12 @@ void gemv_multi_rows(const MultiQ8 & m, int in, const int8_t * xq, const half * 
     const int lpo = nb >= 32 ? 32 : nb > 8 ? 16 : nb > 4 ? 8 : 4;
     if (lpo < 32) {
         const int per = 4 * 32 / lpo, grid = (outs + per - 1) / per;
-        if (lpo == 16) gemv_multi_kernel<ROWS, 16, 1><<<grid, 128, 0, stream>>>(m, in, xq, xd);
-        else if (lpo == 8) gemv_multi_kernel<ROWS, 8, 1><<<grid, 128, 0, stream>>>(m, in, xq, xd);
-        else gemv_multi_kernel<ROWS, 4, 1><<<grid, 128, 0, stream>>>(m, in, xq, xd);
-    } else if (wpo == 1) gemv_multi_kernel<ROWS, 32, 1><<<(outs + 3) / 4, 128, 0, stream>>>(m, in, xq, xd);
-    else if (wpo == 2) gemv_multi_kernel<ROWS, 32, 2><<<(outs + 1) / 2, 128, 0, stream>>>(m, in, xq, xd);
-    else gemv_multi_kernel<ROWS, 32, 4><<<outs, 128, 0, stream>>>(m, in, xq, xd);
+        if (lpo == 16) gemv_multi_kernel<ROWS, 16, 1, A16><<<grid, 128, 0, stream>>>(m, in, xq, xd);
+        else if (lpo == 8) gemv_multi_kernel<ROWS, 8, 1, A16><<<grid, 128, 0, stream>>>(m, in, xq, xd);
+        else gemv_multi_kernel<ROWS, 4, 1, A16><<<grid, 128, 0, stream>>>(m, in, xq, xd);
+    } else if (wpo == 1) gemv_multi_kernel<ROWS, 32, 1, A16><<<(outs + 3) / 4, 128, 0, stream>>>(m, in, xq, xd);
+    else if (wpo == 2) gemv_multi_kernel<ROWS, 32, 2, A16><<<(outs + 1) / 2, 128, 0, stream>>>(m, in, xq, xd);
+    else gemv_multi_kernel<ROWS, 32, 4, A16><<<outs, 128, 0, stream>>>(m, in, xq, xd);
 }
 
 // fp32 weights: lane l reads float4 l, l + 32, ... (+ 32 * 32 wi with WPO warps per output); rows in groups of 8
@@ -459,6 +483,37 @@ void q8_gemv_multi(const Q8Matrix * const * W, float * const * y, int n, const i
     default: throw std::runtime_error("q8_gemv_multi: rows must be 1.." + std::to_string(GEMV_ROWS));
     }
     TRUSS_CUDA(cudaGetLastError());
+}
+
+void q8_gemv_multi_a16(const Q8Matrix * const * W, float * const * y, int n, const half * x, int rows, cudaStream_t stream)
+{
+    if (n < 1 || n > MULTI_MAX) throw std::runtime_error("q8_gemv_multi_a16: 1.." + std::to_string(MULTI_MAX) + " matrices");
+    MultiQ8 m{};
+    m.n = n, m.start[0] = 0;
+    for (int i = 0; i < n; ++i) {
+        if (W[i]->in != W[0]->in || W[i]->in % 32) throw std::runtime_error("q8_gemv_multi_a16: same in, multiple of 32");
+        m.q[i] = W[i]->q, m.d[i] = W[i]->d, m.y[i] = y[i], m.start[i + 1] = m.start[i] + W[i]->out;
+    }
+    const int in = W[0]->in;
+    const int8_t * xq = reinterpret_cast<const int8_t *>(x);
+    switch (rows) {
+    case 1: gemv_multi_rows<1, true>(m, in, xq, nullptr, stream); break;
+    case 2: gemv_multi_rows<2, true>(m, in, xq, nullptr, stream); break;
+    case 3: gemv_multi_rows<3, true>(m, in, xq, nullptr, stream); break;
+    case 4: gemv_multi_rows<4, true>(m, in, xq, nullptr, stream); break;
+    case 5: gemv_multi_rows<5, true>(m, in, xq, nullptr, stream); break;
+    case 6: gemv_multi_rows<6, true>(m, in, xq, nullptr, stream); break;
+    case 7: gemv_multi_rows<7, true>(m, in, xq, nullptr, stream); break;
+    case 8: gemv_multi_rows<8, true>(m, in, xq, nullptr, stream); break;
+    default: throw std::runtime_error("q8_gemv_multi_a16: rows must be 1.." + std::to_string(GEMV_ROWS));
+    }
+    TRUSS_CUDA(cudaGetLastError());
+}
+
+void q8_gemv_a16(const Q8Matrix & W, const half * x, int rows, float * y, cudaStream_t stream)
+{
+    const Q8Matrix * w = &W;
+    q8_gemv_multi_a16(&w, &y, 1, x, rows, stream);
 }
 
 void f32_gemv_multi(const float * const * W, const int * out, float * const * y, int n, int in, const float * x,

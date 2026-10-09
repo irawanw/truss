@@ -1201,7 +1201,8 @@ struct Forward::Impl {
     void lin(T t, const Act & a, int rows, float * y)
     {
         const dense::Q8Matrix & W = q8.at(t);
-        if (act == Activations::FP16) dense::q8_gemm_a16(W, a.x, rows, y, w16, blas, s);
+        if (act == Activations::FP16 && rows <= dense::GEMV_ROWS) dense::q8_gemv_a16(W, a.x, rows, y, s);
+        else if (act == Activations::FP16) dense::q8_gemm_a16(W, a.x, rows, y, w16, blas, s);
         else if (rows <= dense::GEMV_ROWS) dense::q8_gemv(W, a.q, a.d, rows, y, s);
         else dense::q8_gemm(W, a.q, a.d, rows, y, s);
     }
@@ -1227,11 +1228,12 @@ struct Forward::Impl {
     using Proj = std::pair<T, float *>;
     void lin_multi(const std::vector<Proj> & ps, const Act & a, int rows)
     {
-        if (act == Activations::Q8_1 && rows <= dense::GEMV_ROWS && ps.size() > 1 && ps.size() <= (size_t) dense::MULTI_MAX) {
+        if (rows <= dense::GEMV_ROWS && ps.size() > 1 && ps.size() <= (size_t) dense::MULTI_MAX) {
             const dense::Q8Matrix * W[dense::MULTI_MAX];
             float * y[dense::MULTI_MAX];
             for (size_t i = 0; i < ps.size(); ++i) W[i] = &q8.at(ps[i].first), y[i] = ps[i].second;
-            dense::q8_gemv_multi(W, y, (int) ps.size(), a.q, a.d, rows, s);
+            if (act == Activations::FP16) dense::q8_gemv_multi_a16(W, y, (int) ps.size(), a.x, rows, s);
+            else dense::q8_gemv_multi(W, y, (int) ps.size(), a.q, a.d, rows, s);
             return;
         }
         for (const Proj & p : ps) lin(p.first, a, rows, p.second);
@@ -1641,6 +1643,11 @@ struct Forward::Impl {
                 return;
             }
             lin(w.output, mixed16, n, logits);
+            sc->release(m);
+            return;
+        }
+        if (n <= dense::GEMV_ROWS) {   // FP16 decode: the fused gemv reads the int8 output matrix once (no dequantized copy)
+            dense::q8_gemv_a16(draft && draft_head.q ? draft_head : q8.at(w.output), mixed16, n, logits, s);
             sc->release(m);
             return;
         }
