@@ -156,6 +156,7 @@ truss_model * truss_open_params(const char * gguf_path, const truss_params * p)
                 o.cpu_threads = p->cpu_threads;
             }
             o.ple_file = m->file.get();   // PLE rows by O_DIRECT reads (TRUSS_PLE_DIRECT=0: the mapping)
+            o.act = q::Activations::FP16;   // served default: 16-bit dense activations (KL 0.040 vs 0.065); TRUSS_ACT=q8 for the old 8-bit path
             q::apply_env(o);   // the bench's decode-tier knobs (TRUSS_CPU_TRELLIS, TRUSS_PCIE_FRAC, TRUSS_HINT_K, ...)
             // drop the shards' file pages once the weights are on the device (a ~47 GB resident peak otherwise, TRACKER #72)
             o.after_upload = [&] {

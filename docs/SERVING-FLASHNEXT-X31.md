@@ -68,6 +68,7 @@ top_p 0.8, top_k 20`. Requests are handled one at a time.
 | `--mtp ... --drafts 3`, `--draft-vocab`, `--draft-min-p 0.5` | speculative decoding with the MTP head: about 2.7 tokens per step instead of 1 |
 | `TRUSS_CPU_TRELLIS=1`, `TRUSS_CPU_DYNAMIC=1` | experts that are not on the GPU run on the CPU or are copied over PCIe, whichever finishes first |
 | `TRUSS_CPU_THREADS`, `TRUSS_CPU_PIN=1` | CPU threads for those experts, pinned to cores. Use your physical core count minus 2 |
+| `TRUSS_ACT` (default `fp16`) | 16-bit activations in the dense layers: KL 0.040 against BF16 instead of 0.065 with the 8-bit path, at the same decode speed (a fused kernel reads the int8 weights once). `TRUSS_ACT=q8` selects the 8-bit path: prefill about 4% faster |
 | `TRUSS_KV_INT8=1` | int8 KV cache: what makes 262,144 tokens fit in 24 GB |
 | `TRUSS_KV_LEND=1` | lends unused KV memory to the expert cache while the context is short |
 | `TRUSS_ADMIT_IDLE=64`, `TRUSS_PCIE_FRAC=0.2`, `TRUSS_HINT_K=3` | expert-cache and PCIe tuning for decode |
