@@ -32,4 +32,12 @@ void wait_plan(const volatile int * plan, const volatile int * need_copy, const 
 // y [n] += x [n], x in mapped host memory
 void add_mapped(float * y, const float * x, int n, cudaStream_t stream);
 
+// y [n] += x [n] from mapped host memory, but only if the host driver said this layer has rows there: need == seq
+// (the peer GPU computed rows) adds them and first waits for done >= seq, anything else returns without waiting. The
+// driver writes need BEFORE the plan word the layer's wait_plan already waited for, so by the time this runs the
+// decision for this seq is in place; no wait on need itself. That is why a layer with no peer rows costs one empty
+// kernel launch and no PCIe read, and one with them costs the wait and the read.
+void join_mapped(float * y, const float * x, const volatile int * need, const volatile int * done, int seq, int n,
+                 cudaStream_t stream);
+
 }  // namespace truss::runtime

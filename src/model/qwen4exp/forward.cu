@@ -184,6 +184,10 @@ struct Forward::Impl {
         int * doorbell = nullptr, * cpu_done = nullptr;             // mapped words
         int * plan = nullptr, * need_copy = nullptr;                // mapped words the driver writes (wait_plan)
         int * go = nullptr, * d_mids = nullptr;                       // device
+        // Phase 2 (helper compute): the peer GPU's work for this layer. hmids [8][k] holds ONLY the slots the peer
+        // holds (-1 elsewhere), hy [8][d] its rows, and hneed/hdone are the words runtime::join_mapped reads.
+        int * hmids = nullptr, * hneed = nullptr, * hdone = nullptr;
+        float * hy = nullptr;
         int seq = 0;                                                  // host: the last seq enqueued
     };
     std::vector<Bell> bells;
@@ -348,6 +352,32 @@ struct Forward::Impl {
     std::unique_ptr<runtime::HelperStore> helper;
     size_t helper_bytes = 0;
     long helper_count = 0;
+    // Phase 2: this GPU's helper stream, serving the PEER stage's routed layers out of `helper` (which holds them).
+    // The peer's driver pushes one job per layer it routed; hdrive() copies the peer's published rows in, runs
+    // moe::window over the static set and writes the rows back, then raises the peer's hdone. Nothing here spins on
+    // the GPU, so this device's own persistent moe::window never waits behind a resident waiter.
+    bool helper_compute = false;
+    Impl * peer_stage = nullptr;                 // the other stage, whose helper holds what this one gave away
+    struct HJob {
+        int layer, hl, T, seq;                                 // layer: the peer's model layer (its Bell); hl: ours
+        std::chrono::steady_clock::time_point t0;               // when the peer's driver handed the work over
+    };
+    std::deque<HJob> hjobs;
+    std::mutex h_mu;
+    std::condition_variable h_cv;
+    std::thread hdriver;
+    bool h_stop = false;
+    std::atomic<long> h_pushed{ 0 };
+    long h_served = 0;
+    // What a helper job costs the peer's decode, measured on the host (all three threads share this machine's
+    // monotonic clock): h_lat_us from the hand-off to hdone, of which h_pre_us is this stage still issuing its own
+    // copies and plan word, and h_srv_us is the peer's own service (queue wait + copies + window + write-back).
+    double h_lat_us = 0, h_srv_us = 0, h_pre_us = 0;
+    std::exception_ptr h_error;
+    cudaStream_t h_stream = nullptr;
+    int * h_ids = nullptr;                       // device: the peer's masked ids, [8][k]
+    float * h_w = nullptr, * h_x = nullptr, * h_y = nullptr;   // device: slot weights, rows in, rows out
+    void * h_ws = nullptr;                       // moe::window's own workspace (two windows share no queue counters)
     std::vector<int32_t> tail;                           // the last ple_ngram - 1 tokens seen (PLE window)
 
     const Activations act;
@@ -625,6 +655,7 @@ struct Forward::Impl {
         else if (o.cpu_trellis) load_cpu_tier_trellis(o, owner_hot, sg);
         load_mark("CPU tier");
         use_doorbell = o.doorbell;
+        helper_compute = o.helper_compute && use_doorbell;   // the peer's compute rides the doorbell path's publishes
         cpu_dynamic = o.cpu_dynamic && cpu_tier && use_doorbell;
         pcie_ms_byte = 1.0 / (o.pcie_gbps * 1e6);
         pcie_frac = o.pcie_frac;
@@ -705,6 +736,16 @@ struct Forward::Impl {
                      helper->trellis_bytes() / gb, helper->fixed_bytes_used() / gb, peer_give_bytes / gb,
                      (double) used / gb, dropped, peer.split.give_count, n_hot + helper_count,
                      experts->device_bytes() / gb, helper->trellis_bytes() / gb);
+        // Phase 2: this GPU now holds the peer's experts, so it can compute them. The worker is started here, not in
+        // finish(), because it needs the HelperStore to exist - and Forward builds those only once both stages have
+        // planned and uploaded.
+        helper_compute = helper_compute && peer.helper_on;
+        if (helper_compute) {
+            setup_helper_worker();
+            std::fprintf(stderr, "helper: device %d computes the peer's layers %d-%d%s for it: %ld resident experts, "
+                                 "its own stream, the rows over PCIe\n",
+                         device, peer.lb, peer.le - 1, peer.mtp ? "+MTP" : "", helper_count);
+        }
         return items;
     }
 
@@ -744,9 +785,29 @@ struct Forward::Impl {
             driver.join();
             if (watchdog.joinable()) watchdog.join();
         }
+        if (hdriver.joinable()) {   // the peer stops pushing jobs before this stage goes away
+            {
+                std::lock_guard<std::mutex> g(h_mu);
+                h_stop = true;
+            }
+            h_cv.notify_all();
+            hdriver.join();
+            if (h_stream) cudaStreamDestroy(h_stream);
+            if (h_error) {   // a destructor cannot throw; the run is over, the log is what is left
+                try { std::rethrow_exception(h_error); }
+                catch (const std::exception & e) { std::fprintf(stderr, "helper stream: %s\n", e.what()); }
+                catch (...) { std::fprintf(stderr, "helper stream: unknown failure\n"); }
+            }
+            if (h_served > 0)
+                std::fprintf(stderr,
+                             "helper: device %d served %ld peer layers: %.0f us from the owner's hand-off to hdone, "
+                             "of which %.0f us is the owner still issuing its plan and %.0f us this GPU's service\n",
+                             device, h_served, h_lat_us / h_served, h_pre_us / h_served, h_srv_us / h_served);
+        }
         for (Bell & b : bells)
             for (void * p : { (void *) b.ids, (void *) b.pred, (void *) b.mids, (void *) b.w, (void *) b.x, (void *) b.y,
-                              (void *) b.doorbell, (void *) b.cpu_done, (void *) b.plan, (void *) b.need_copy })
+                              (void *) b.doorbell, (void *) b.cpu_done, (void *) b.plan, (void *) b.need_copy,
+                              (void *) b.hmids, (void *) b.hy, (void *) b.hneed, (void *) b.hdone })
                 if (p) cudaFreeHost(p);
         for (void * p : owned) cudaFree(p);
         if (ids_host) cudaFreeHost(ids_host);
@@ -809,6 +870,12 @@ struct Forward::Impl {
             mapped((void **) &b.need_copy, sizeof(int));
             b.go = alloc<int>(1);
             b.d_mids = alloc<int>((size_t) R * K);
+            if (helper_on) {   // Phase 2: this stage's routed rows go to the peer; its Bell is what the peer reads
+                mapped((void **) &b.hmids, sizeof(int) * R * K);
+                mapped((void **) &b.hy, sizeof(float) * R * c.d_model);
+                mapped((void **) &b.hneed, sizeof(int));
+                mapped((void **) &b.hdone, sizeof(int));
+            }
         }
         drv_ts = std::getenv("TRUSS_DRIVER_TS") && std::atoi(std::getenv("TRUSS_DRIVER_TS"));
         driver = std::thread([this] { drive(); });
@@ -836,6 +903,82 @@ struct Forward::Impl {
                     }
                 }
             });
+    }
+
+    // The layers whose given-away experts sit in the peer's static set: exactly this stage's own store layers, since
+    // the peer built its HelperStore from this stage's tables (and when the peer is the last stage, its helper ends
+    // with the MTP block, which this stage's store also has). Everything else is this stage's own business.
+    bool helper_layer(int l) const
+    {
+        return helper_compute && peer_stage && peer_stage->helper && sl(l) < peer_stage->helper->layers();
+    }
+
+    void push_helper_job(int layer, int hl, int T, int seq)
+    {
+        {
+            std::lock_guard<std::mutex> g(h_mu);
+            hjobs.push_back({ layer, hl, T, seq, std::chrono::steady_clock::now() });
+        }
+        h_pushed.fetch_add(1, std::memory_order_release);
+        h_cv.notify_one();
+    }
+
+    // Called by Forward once this stage's HelperStore exists (load_helper), on this stage's device.
+    void setup_helper_worker()
+    {
+        const int R = cpu::MAX_ROWS, K = c.n_expert_used;
+        TRUSS_CUDA(cudaStreamCreateWithFlags(&h_stream, cudaStreamNonBlocking));
+        h_ids = alloc<int>((size_t) R * K);
+        h_w = alloc<float>((size_t) R * K);
+        h_x = alloc<float>((size_t) R * c.d_model);
+        h_y = alloc<float>((size_t) R * c.d_model);
+        h_ws = alloc<unsigned char>(moe::workspace_bytes<MoeShape>());
+        moe::workspace_init<MoeShape>(h_ws, h_stream);
+        hdriver = std::thread([this] { hdrive(); });
+    }
+
+    // One job is one layer of the peer's decode: its published routing and rows in, our static expert set, its rows
+    // back into its pinned Bell, then its hdone. The stream belongs to this thread alone, so the peer's own copies
+    // and kernels are never ordered behind it - and no kernel here waits for anything, which is what keeps THIS
+    // device's own persistent moe::window from queueing behind a resident spinner.
+    void hdrive()
+    {
+        if (device >= 0) cudaSetDevice(device);
+        long taken = 0;
+        for (;;) {
+            HJob j;
+            for (int i = 0; i < 200000 && h_pushed.load(std::memory_order_acquire) <= taken; ++i) _mm_pause();
+            {
+                std::unique_lock<std::mutex> g(h_mu);
+                h_cv.wait(g, [&] { return h_stop || !hjobs.empty(); });
+                ++taken;
+                if (h_stop && hjobs.empty()) return;
+                j = hjobs.front();
+                hjobs.pop_front();
+            }
+            const auto t_take = std::chrono::steady_clock::now();
+            const Bell & b = peer_stage->bells[j.layer];
+            const int n = j.T * c.n_expert_used;
+            const size_t rows = sizeof(float) * (size_t) j.T * c.d_model;
+            try {
+                TRUSS_CUDA(cudaMemcpyAsync(h_ids, b.hmids, sizeof(int) * n, cudaMemcpyHostToDevice, h_stream));
+                TRUSS_CUDA(cudaMemcpyAsync(h_w, b.w, sizeof(float) * n, cudaMemcpyHostToDevice, h_stream));
+                TRUSS_CUDA(cudaMemcpyAsync(h_x, b.x, rows, cudaMemcpyHostToDevice, h_stream));
+                TRUSS_CUDA(cudaMemsetAsync(h_y, 0, rows, h_stream));
+                moe::window<MoeShape>(helper->weights(j.hl), h_x, h_ids, h_w, j.T, h_y, h_ws, h_stream);
+                TRUSS_CUDA(cudaMemcpyAsync(b.hy, h_y, rows, cudaMemcpyDeviceToHost, h_stream));
+                TRUSS_CUDA(cudaStreamSynchronize(h_stream));
+            } catch (...) {   // the owner waits on hdone: raise it anyway; the error surfaces at teardown
+                if (!h_error) h_error = std::current_exception();
+                cudaStreamSynchronize(h_stream);
+            }
+            std::atomic_thread_fence(std::memory_order_release);
+            *(volatile int *) b.hdone = j.seq;
+            const auto t_done = std::chrono::steady_clock::now();
+            h_lat_us += std::chrono::duration<double, std::micro>(t_done - j.t0).count();
+            h_srv_us += std::chrono::duration<double, std::micro>(t_done - t_take).count();
+            ++h_served;
+        }
     }
 
     // The driver: for each queued decode FFN, wait for its doorbell, split the routed experts (CPU tier / GPU),
@@ -885,6 +1028,10 @@ struct Forward::Impl {
                 *(volatile int *) b.plan = j.seq;
                 std::atomic_thread_fence(std::memory_order_release);
                 *(volatile int *) b.cpu_done = j.seq;
+                if (helper_on) {   // b.hneed only exists with a helper (as cpu_done does with a CPU tier)
+                    std::atomic_thread_fence(std::memory_order_release);
+                    *(volatile int *) b.hneed = 0;   // no peer rows for this layer: its join leaves routed untouched
+                }
             }
         }
     }
@@ -895,11 +1042,14 @@ struct Forward::Impl {
         CpuTier * ct = j.cpu ? cpu_tier.get() : nullptr;
         if (!route_usage.empty())
             for (int i = 0; i < n; ++i) route_usage[(size_t) sl(l) * c.n_expert + b.ids[i]] += 1.f;
-        // What the peer's compute would take off this stage: distinct routed experts of this layer the peer holds
-        // (Phase 2 masks exactly these), a hit and not a miss - see Forward::helper_hits(). The helper holds the
-        // PEER's layers, so this stage's own MTP block (store layer past helper->layers()) is out of scope: reading
-        // set_ there segfaulted the first draft pass.
-        if (helper && sl(l) < helper->layers()) {
+        // Phase 2: the experts this stage gave away are resident in the PEER's static set, so the slots routing to
+        // them are masked out here, never copied over PCIe, and joined back as the peer's rows - the CPU tier's path
+        // with a GPU as the worker. Counted distinct, as ExpertStore counts asked/misses (Forward::helper_hits).
+        uint8_t to_helper[8 * 16] = {};
+        int n_help = 0;
+        if (helper_layer(l)) {
+            const runtime::HelperStore & hs = *peer_stage->helper;
+            const int hl = sl(l);
             int dist[8 * 16], nd = 0;
             for (int i = 0; i < n; ++i) {
                 const int e = b.ids[i];
@@ -907,7 +1057,10 @@ struct Forward::Impl {
                 for (int q = 0; q < nd; ++q) seen |= dist[q] == e;
                 if (seen) continue;
                 dist[nd++] = e;
-                helper_hits += helper->has(sl(l), e);
+                if (!hs.has(hl, e)) continue;
+                for (int q = 0; q < n; ++q)
+                    if (b.ids[q] == e) to_helper[q] = 1;
+                ++n_help, ++helper_hits;
             }
         }
         if (admit_idle > 0 && l < c.n_layer) {
@@ -915,7 +1068,8 @@ struct Forward::Impl {
                 for (float & u : admit_u) u *= admit_decay;
                 admit_pass = 0;
             }
-            for (int i = 0; i < n; ++i) admit_u[(size_t) l * c.n_expert + b.ids[i]] += 1.f;
+            for (int i = 0; i < n; ++i)
+                if (!to_helper[i]) admit_u[(size_t) l * c.n_expert + b.ids[i]] += 1.f;   // the peer's share is not ours
         }
         if (route_trace) {
             const int32_t h[2] = { l, j.T };
@@ -939,6 +1093,7 @@ struct Forward::Impl {
                 for (int q = 0; q < nd; ++q) seen |= b.ids[dist[q]] == e;
                 if (seen) continue;
                 dist[nd] = i;
+                if (to_helper[i]) { ++nd; continue; }   // the peer computes it: neither the CPU's nor a copy's business
                 if (!experts->on_device(sl(l), e)) {
                     if (ct->is_cpu[l][e]) elig.push_back(nd);
                     else pcie_bytes += (double) experts->bytes_of(sl(l), e);
@@ -964,7 +1119,7 @@ struct Forward::Impl {
             dyn_cpu += n_cpu;
             dyn_pcie += best_m;
         } else if (ct) {
-            for (int i = 0; i < n; ++i) to_cpu[i] = ct->is_cpu[l][b.ids[i]];
+            for (int i = 0; i < n; ++i) to_cpu[i] = !to_helper[i] && ct->is_cpu[l][b.ids[i]];
         }
         // TRUSS_ABL_HALF=1 (Phase 0b, timing only: the output is wrong): every second distinct GPU-side expert of
         // this layer, in routing order, is computed nowhere — mids -1, no CPU slot, no copy. The gap to the base run
@@ -974,22 +1129,35 @@ struct Forward::Impl {
         if (abl_half) {
             int drop[8 * 16], nd = 0;                       // distinct GPU-side experts, routing order
             for (int i = 0; i < n; ++i) {
-                if (to_cpu[i]) continue;
+                if (to_cpu[i] || to_helper[i]) continue;
                 const int e = b.ids[i];
                 bool seen = false;
                 for (int q = 0; q < nd; ++q) seen |= drop[q] == e;
                 if (seen) continue;
                 if (nd % 2 == 1)
                     for (int q = 0; q < n; ++q)
-                        if (!to_cpu[q] && b.ids[q] == e) abl[q] = 1;
+                        if (!to_cpu[q] && !to_helper[q] && b.ids[q] == e) abl[q] = 1;
                 drop[nd++] = e;
             }
         }
         for (int i = 0; i < n; ++i) {
             const int e = b.ids[i];
-            b.mids[i] = (to_cpu[i] || abl[i]) ? -1 : e;
+            b.mids[i] = (to_cpu[i] || to_helper[i] || abl[i]) ? -1 : e;
             if (to_cpu[i]) slots.push_back(ct->slot(i / K, l, e, b.w[i]));
-            else if (!abl[i]) gpu_ids.push_back(e);
+            else if (!abl[i] && !to_helper[i]) gpu_ids.push_back(e);   // not copied: the peer has it resident
+        }
+        // Hand the peer the slots it can serve from VRAM: hmids carries them, its rows come back through b.hy.
+        // Pushed before fetch() so the peer computes while this device copies, and before the plan word below -
+        // which is what this layer's stream waits for before it reads the decision (runtime::join_mapped).
+        std::chrono::steady_clock::time_point h_t0;   // when the peer learned of this layer (h_pre_us: to its plan)
+        if (helper_layer(l)) {
+            if (n_help > 0) {
+                for (int i = 0; i < n; ++i) b.hmids[i] = to_helper[i] ? b.ids[i] : -1;
+                h_t0 = std::chrono::steady_clock::now();   // the instant the peer's job is stamped
+                peer_stage->push_helper_job(l, sl(l), j.T, j.seq);
+            }
+            std::atomic_thread_fence(std::memory_order_release);
+            *(volatile int *) b.hneed = n_help > 0 ? j.seq : 0;
         }
         drv_t[1] = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> pool_lock;   // a split's stages share the pool (pipelined windows overlap)
@@ -1005,6 +1173,8 @@ struct Forward::Impl {
         *(volatile int *) b.need_copy = copied ? j.seq : 0;
         std::atomic_thread_fence(std::memory_order_release);
         *(volatile int *) b.plan = j.seq;
+        if (n_help > 0)   // the peer's round trip began at the hand-off; its owner raises the plan this much later
+            h_pre_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - h_t0).count();
         {   // driver timing (Forward::driver_ms): split, CPU start, copies + plan
             const auto t3 = std::chrono::steady_clock::now();
             auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
@@ -1021,10 +1191,19 @@ struct Forward::Impl {
             // static: the next layer's CPU set never goes to the GPU, so it is not hinted; dynamic: a hinted expert
             // that arrives in time is simply a GPU hit
             const CpuTier * nt = l + 1 < c.n_layer && !cpu_dynamic ? cpu_tier.get() : nullptr;
+            // And never a hint for an expert the peer holds: prefetch_hint() copies over PCIe what the peer's window
+            // is about to read from its own VRAM, behind this layer's demand copies. Without this the hint traffic
+            // alone was 225 MB/pass against the plain split's 47 (smoke2), because the owners no longer hold the
+            // experts they gave away and so miss on nearly every hint.
+            const runtime::HelperStore * hh =
+                (l + 1 < le || l + 1 == c.n_layer) && helper_layer(l + 1) ? peer_stage->helper.get() : nullptr;
+            const int hhl = hh ? sl(l + 1) : 0;
             for (int t = 0; t < j.T; ++t)
                 for (int i = 0; i < std::min(K, hint_k); ++i) {
                     const int e = b.pred[t * K + i];
-                    if (!nt || !nt->is_cpu[l + 1][e]) h.push_back(e);
+                    if (nt && nt->is_cpu[l + 1][e]) continue;
+                    if (hh && hh->has(hhl, e)) continue;
+                    h.push_back(e);
                 }
             experts->prefetch_hint(sl(l), h.data(), (int) h.size());
         }
@@ -1796,6 +1975,7 @@ struct Forward::Impl {
             if (sect) sect_record(l, 8);
             moe::window<MoeShape>(experts->weights(sl(l)), in, b.d_mids, wts, T, routed, window_ws, s);
             if (cpu_on) cpu_rows = -T;            // the CPU rows join after the shared expert (mapped)
+            if (helper_layer(l)) help_rows = -T;   // the peer may have rows for this layer (its slots are masked out)
         } else if (!stream) {   // fetch the few cold experts this chunk routes to
             // pre-gating: the next layer's router on this layer's input predicts 72% of its experts (TRACKER #58);
             // their copies start behind this layer's, one sync for both id sets
@@ -1920,6 +2100,10 @@ struct Forward::Impl {
             runtime::add_mapped(routed, bells[l].y, -cpu_rows * dm, s);
             cpu_rows = 0;
         }
+        if (help_rows < 0) {   // the peer's rows for the experts this stage gave away, if it had any for this layer
+            runtime::join_mapped(routed, bells[l].hy, bells[l].hneed, bells[l].hdone, bells[l].seq, -help_rows * dm, s);
+            help_rows = 0;
+        }
         if (cpu_rows) {   // the CPU experts' sum joins the routed output
             CpuTier & ct = *cpu_tier;
             float * yc = sc->alloc((size_t) cpu_rows * dm);
@@ -1935,6 +2119,7 @@ struct Forward::Impl {
     int last_T = 0;                                      // rows of res from the last run()
     float * route_counts = nullptr;                      // [layer][expert] while profiling (Forward::profile_routes)
     int cpu_rows = 0;                                    // rows of the CPU tier call in flight (ffn)
+    int help_rows = 0;                                   // rows the peer GPU is computing for this layer (ffn)
 
     void head(int first, int n, float * logits)
     {
@@ -2452,6 +2637,9 @@ Forward::Forward(const Config & c, const Weights & w, int n_ctx, int max_chunk, 
     StageSpec b{ S, c.n_layer, cur, 1.0, f.done && f.cpu_tier ? f.cpu_tier->pool : nullptr, a.pool_mu };
     m_ = std::make_unique<Impl>(c, w, n_ctx, max_chunk, o, b);
     m_->prev = &f, f.next = m_.get();
+    // Each stage's helper holds the PEER's layers, so serving the peer's routed slots is this stage's job: a stage
+    // needs to know the other's Bells (its pinned publish buffers) to hand the work over at all.
+    f.peer_stage = m_.get(), m_->peer_stage = &f;
     if (f.helper_on) f.peer_give_bytes = m_->split.give_bytes, m_->peer_give_bytes = f.split.give_bytes;
     if (!f.done) {   // Phase 2: carve the region, plan the owner share inside it, build the store and all of it
         DeviceGuard g(d0);
@@ -2871,6 +3059,7 @@ void apply_env(ForwardOptions & o)
     f("TRUSS_LAYER_SPLIT_FRAC", o.layer_split_frac);
     f("TRUSS_HELPER", o.helper);               // helper experts: each GPU holds half of the other stage's hot set
     f("TRUSS_HELPER_FRAC", o.helper_frac);     // ... the share of every layer's hot routed mass that side takes
+    f("TRUSS_HELPER_COMPUTE", o.helper_compute);   // ... and the peer computes them, instead of being copied to
     f("TRUSS_SPLIT_ROWS", o.split_rows);       // E7: short prompt chunks split cold experts CPU / PCIe
     f("TRUSS_SPLIT_T", o.split_t);
     f("TRUSS_SPLIT_MS_ROW", o.split_ms_row);

@@ -133,6 +133,12 @@ struct ForwardOptions {
     // output is unchanged. helper_frac is the share of every layer's hot routed mass the helper side takes.
     bool helper = false;
     double helper_frac = 0.5;
+    // Phase 2 (TRUSS_HELPER_COMPUTE, on with the helper): the peer's COMPUTE serves the experts this stage gave away
+    // instead of a PCIe copy of them. The owner's driver publishes the routed rows (they are already in pinned host
+    // memory for the CPU tier), the peer's helper stream runs moe::window over its static set and writes the rows
+    // back, and the owner adds them after the shared expert - the CPU tier's path with a GPU as the worker. Off:
+    // Phase 1's placement only, where the owner fetches and computes everything itself.
+    bool helper_compute = true;
     // Called once upload() has the weights on the device but before the constructor does anything else expensive
     // (the expert plan, the CPU tier). The owner releases the model's file-backed pages there — the shards fault to a
     // ~47 GB resident peak during upload, and the CPU tier's anonymous vector then allocates on top of it and the

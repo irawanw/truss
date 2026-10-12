@@ -44,9 +44,8 @@ __global__ void wait_plan_kernel(const volatile int * plan, const volatile int *
 }
 
 // x is mapped host memory: 16-byte reads (a quarter of the PCIe read requests of 4-byte ones)
-__global__ void add_mapped_kernel(float * y, const float * x, int n)
+__device__ __forceinline__ void add_mapped_body(float * y, const float * x, int n, int i)
 {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (4 * i + 3 < n) {
         const float4 v = reinterpret_cast<const float4 *>(x)[i];
         float4 w = reinterpret_cast<float4 *>(y)[i];
@@ -55,6 +54,30 @@ __global__ void add_mapped_kernel(float * y, const float * x, int n)
     } else {
         for (int j = 4 * i; j < n; ++j) y[j] += x[j];
     }
+}
+
+__global__ void add_mapped_kernel(float * y, const float * x, int n)
+{
+    add_mapped_body(y, x, n, blockIdx.x * blockDim.x + threadIdx.x);
+}
+
+// The peer GPU computed rows for this layer (its helper experts): wait for them, then add. `need` was written before
+// the plan word this stream already waited on, so the decision for this seq is in place when this runs; a layer with
+// no peer rows leaves without waiting and without reading a byte of host memory. done is raised by the peer's host
+// thread behind its own stream sync, so the rows are in pinned memory by then.
+__global__ void join_mapped_kernel(float * y, const float * x, const volatile int * need, const volatile int * done,
+                                   int seq, int n)
+{
+    __shared__ int add;
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+        add = *need == seq;
+        if (add)
+            while (*done < seq) __nanosleep(128);
+        __threadfence();
+    }
+    __syncthreads();
+    if (add) add_mapped_body(y, x, n, blockIdx.x * blockDim.x + threadIdx.x);
 }
 
 }  // namespace
@@ -83,6 +106,13 @@ void wait_plan(const volatile int * plan, const volatile int * need_copy, const 
 void add_mapped(float * y, const float * x, int n, cudaStream_t stream)
 {
     add_mapped_kernel<<<((n + 3) / 4 + 255) / 256, 256, 0, stream>>>(y, x, n);
+    TRUSS_CUDA(cudaGetLastError());
+}
+
+void join_mapped(float * y, const float * x, const volatile int * need, const volatile int * done, int seq, int n,
+                 cudaStream_t stream)
+{
+    join_mapped_kernel<<<((n + 3) / 4 + 255) / 256, 256, 0, stream>>>(y, x, need, done, seq, n);
     TRUSS_CUDA(cudaGetLastError());
 }
 
