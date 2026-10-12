@@ -97,6 +97,30 @@ __global__ void __launch_bounds__(THREADS) combine_norm_q8_kernel(float * res, c
         q8_warp(__half2float(__float2half(xr[i] * inv * g[i])), r * (size_t) d + i, q, dsc);
 }
 
+// combine + norm, fp16 output (the decode path's W8A16 activations): res updated exactly as combine_kernel, then the
+// norm of norm_kernel on the updated values: bit-identical to the two launches
+__global__ void __launch_bounds__(THREADS) combine_norm_kernel(float * res, const float * out, const float * inject,
+                                                               const float * gamma, int hc, int d, float eps,
+                                                               half * xn16, float * rstd)
+{
+    __shared__ float part[THREADS / 32];
+    const size_t r = blockIdx.x;
+    const size_t t = r / hc;
+    const float sig = sigmoid(inject[t * hc + (r % hc)] / hc);
+    float * xr = res + r * d;
+    const float * o = out + t * d;
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < d; i += THREADS) {
+        const float v = xr[i] + (o[i] * 2.f) * sig;
+        xr[i] = v;
+        acc += v * v;
+    }
+    const float inv = rsqrtf(block_sum(acc, part) / d + eps);
+    const float * g = gamma + (size_t) (r % hc) * d;
+    for (int i = threadIdx.x; i < d; i += THREADS) xn16[r * d + i] = __float2half(xr[i] * inv * g[i]);
+    if (threadIdx.x == 0) rstd[r] = inv;
+}
+
 __global__ void collapse_kernel(const float * res, const float * rstd, const float * gamma, const float * gate, int T,
                                 int hc, int d, float * mixed, half * mixed16)
 {
@@ -173,6 +197,13 @@ void combine_norm_q8(float * res, const float * out, const float * inject, const
                      float eps, float * rstd, int8_t * q, half * dsc, cudaStream_t stream)
 {
     combine_norm_q8_kernel<<<T * hc, THREADS, 0, stream>>>(res, out, inject, gamma, hc, d, eps, rstd, q, dsc);
+    TRUSS_CUDA(cudaGetLastError());
+}
+
+void combine_norm(float * res, const float * out, const float * inject, const float * gamma, int T, int hc, int d,
+                  float eps, half * xn16, float * rstd, cudaStream_t stream)
+{
+    combine_norm_kernel<<<T * hc, THREADS, 0, stream>>>(res, out, inject, gamma, hc, d, eps, xn16, rstd);
     TRUSS_CUDA(cudaGetLastError());
 }
 

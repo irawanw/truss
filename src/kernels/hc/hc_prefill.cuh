@@ -34,6 +34,9 @@ void combine(float * res, const float * out, const float * inject, int T, int hc
 // rounding reproduced per warp); xn16 is never materialized.
 void norm_q8(const float * res, const float * gamma, int T, int hc, int d, float eps, float * rstd,
              int8_t * q, half * dsc, cudaStream_t stream);
+// combine then norm in one launch, fp16 output: bit-identical to combine() followed by norm()
+void combine_norm(float * res, const float * out, const float * inject, const float * gamma, int T, int hc, int d,
+                  float eps, half * xn16, float * rstd, cudaStream_t stream);
 void combine_norm_q8(float * res, const float * out, const float * inject, const float * gamma, int T, int hc, int d,
                      float eps, float * rstd, int8_t * q, half * dsc, cudaStream_t stream);
 

@@ -1384,8 +1384,8 @@ struct Forward::Impl {
         else
         {
             half * xn16 = sc->alloc<half>((size_t) T * c.hc_dim());
-            if (cout) hc::combine(const_cast<float *>(res), cout, cinj, T, c.hc, c.d_model, s);
-            hc::norm(res, f32(h.norm), T, c.hc, c.d_model, c.rms_eps, xn16, rstd, s);
+            if (cout) hc::combine_norm(const_cast<float *>(res), cout, cinj, f32(h.norm), T, c.hc, c.d_model, c.rms_eps, xn16, rstd, s);
+            else hc::norm(res, f32(h.norm), T, c.hc, c.d_model, c.rms_eps, xn16, rstd, s);
             xa = quant(xn16, T, c.hc_dim());
         }
         if (h.inject) lin_multi({ { h.down, lo }, { h.inject, inject } }, xa, T);   // inject reads the same xa
@@ -1840,6 +1840,10 @@ struct Forward::Impl {
         if (stream && !split_chunk)
             for (int l = 0; l < std::min(2, n_store); ++l) experts->prefetch(l);
         const size_t base = sc->mark();
+        // a layer's closing combine is folded into the next layer's first norm (one launch fewer per layer): out and
+        // inject sit at the same scratch offsets every layer and are read by that first kernel before anything
+        // rewrites them. Not before a PLE layer (ple() reads res), with a hook, or at the stage's end.
+        bool pend_combine = false;
         for (int l = lb; l < le; ++l) {
             sc->release(base);
             const Layer & L = w.layers[l];
@@ -1848,7 +1852,8 @@ struct Forward::Impl {
             half * mixed16 = sc->alloc<half>((size_t) T * c.d_model);
             sect_record(l, 0);
             if (c.is_ple(l)) ple(L.ple, st[l], tokens, T, pos0, tentative);
-            hc_mix(L.hc_attn, res, T, mixed, mixed16, inject);
+            hc_mix(L.hc_attn, res, T, mixed, mixed16, inject, pend_combine ? out : nullptr, pend_combine ? inject : nullptr);
+            pend_combine = false;
             sect_record(l, 1);
             if (L.mixer == Mixer::GDN) gdn(L.gdn, st[l], mixed16, T, out, tentative);
             else dsa(L.dsa, st[l], mixed16, pos0, T, out, tentative);
@@ -1856,7 +1861,8 @@ struct Forward::Impl {
             hc_mix(L.hc_ffn, res, T, mixed, mixed16, inject, out, inject);   // combine #1 fused into the norm (L3)
             ffn(l, L.moe, mixed, mixed16, T, out, stream);   // records 3 (routed MoE), 4 (shared), 5 (cpu join)
             sect_record(l, 6);
-            hc::combine(res, out, inject, T, c.hc, c.d_model, s);
+            if (!hook && l + 1 < le && !c.is_ple(l + 1)) pend_combine = true;
+            else hc::combine(res, out, inject, T, c.hc, c.d_model, s);
             if (hook) {
                 TRUSS_CUDA(cudaStreamSynchronize(s));
                 hook(l, res, T);
