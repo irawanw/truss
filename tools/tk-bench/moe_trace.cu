@@ -1,10 +1,13 @@
 // Timeline of one MoE window launch from the kernel's own trace (truss::moe::TraceEvent): where the time goes
 // between dependency waits, the three item kinds, and the tail. Random trellis weights; correctness is the unit
 // test's job (tests/unit/moe_window_test).
-// usage: tk-bench-moe-trace [n_rows] [K: 0 = mixed 1..4]
+// usage: tk-bench-moe-trace [n_rows] [K: 0 = mixed 1..4] [mask_frac]
+// mask_frac: fraction of the window's DISTINCT routed experts set to id -1 (the kernel skips them), spread evenly
+// over distinct experts in order of first appearance — Phase 0a: how the launch time scales with live slots.
 #include "kernels/moe/moe_window.cuh"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
@@ -34,6 +37,7 @@ __global__ void fill_scale(half * p, size_t n)
 int main(int argc, char ** argv)
 {
     const int n_rows = argc > 1 ? atoi(argv[1]) : 4, kfix = argc > 2 ? atoi(argv[2]) : 2;
+    const double maskf = argc > 3 ? atof(argv[3]) : 0.0;
     const int D = Shape::D_MODEL, F = Shape::D_FF, TOPK = Shape::TOPK, E = 512;
     truss::moe::Weights W;
     W.n_expert = E;
@@ -68,6 +72,19 @@ int main(int argc, char ** argv)
             while (std::find(ids.begin() + t * TOPK, ids.begin() + t * TOPK + s, e) != ids.begin() + t * TOPK + s);
             ids[t * TOPK + s] = e;
         }
+    // mask: set maskf of the DISTINCT experts (evenly spread over first appearance) to -1; the kernel skips those
+    // slots entirely, so the launch does the work of the rest only (a helper GPU would own the dropped ones).
+    std::vector<int> dist;
+    for (int e : ids)
+        if (std::find(dist.begin(), dist.end(), e) == dist.end()) dist.push_back(e);
+    const int nd = (int) dist.size(), n_mask = (int) std::lround(maskf * nd);
+    for (int q = 0; q < n_mask; ++q) {
+        const int e = dist[(size_t) ((q + 0.5) * nd / n_mask)];
+        for (int & v : ids)
+            if (v == e) v = -1;
+    }
+    int n_live = 0;
+    for (int v : ids) n_live += v >= 0;
     int * d_ids; float *d_w, *d_x, *d_out; void * ws; TraceEvent * d_tr;
     CK(cudaMalloc(&d_ids, ids.size() * 4));
     CK(cudaMemcpy(d_ids, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice));
@@ -99,8 +116,10 @@ int main(int argc, char ** argv)
 
     unsigned long long t0 = ~0ull, t1 = 0;
     for (auto & e : tr) { t0 = std::min(t0, e.t_start); t1 = std::max(t1, e.t_end); }
-    printf("rows %d K %s: %.1f us per launch (untraced, back to back); traced span first item start -> last end %.1f us\n",
-           n_rows, kfix ? std::to_string(kfix).c_str() : "mix", ms * 10.0, (t1 - t0) / 1e3);
+    printf("rows %d K %s mask %.2f (%d/%d experts dropped, %d/%d slots live): "
+           "%.1f us per launch (untraced, back to back); traced span first item start -> last end %.1f us\n",
+           n_rows, kfix ? std::to_string(kfix).c_str() : "mix", maskf, n_mask, nd, n_live, n_rows * TOPK,
+           ms * 10.0, (t1 - t0) / 1e3);
     const char * kname[3] = { "H", "gate/up", "down" };
     for (int k = 0; k < 3; ++k) {
         double busy = 0, wait = 0, first = 1e30, last = 0;
