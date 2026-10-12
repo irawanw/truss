@@ -240,6 +240,7 @@ struct Forward::Impl {
     bool dbg_on = false;
     std::exception_ptr driver_error;
     bool use_doorbell = true;
+    bool abl_nowait = false;                             // TRUSS_ABL_NOWAIT: the Phase 0b ceiling, timing only
     // Options::cpu_dynamic (Strata's split, TRACKER #73): per layer, missed experts with a host copy go to the CPU or
     // over PCIe so that both finish together. CPU time of a call with n experts = cpu_ms_call + cpu_ms_expert * n
     // (n > 0), a least-squares line through the pool's own call times (exponentially weighted sums dyn_s*; a flat
@@ -526,6 +527,9 @@ struct Forward::Impl {
         load_mark("CPU tier");
         use_doorbell = o.doorbell;
         cpu_dynamic = o.cpu_dynamic && cpu_tier && use_doorbell;
+        abl_nowait = std::getenv("TRUSS_ABL_NOWAIT") && std::atoi(std::getenv("TRUSS_ABL_NOWAIT"));
+        if (abl_nowait)
+            std::fprintf(stderr, "TRUSS_ABL_NOWAIT=1: the decode window runs before the plan (timing only, output wrong)\n");
         pcie_ms_byte = 1.0 / (o.pcie_gbps * 1e6);
         pcie_frac = o.pcie_frac;
         adapt_every = o.adapt_every, adapt_swaps = o.adapt_swaps;
@@ -1636,6 +1640,13 @@ struct Forward::Impl {
             // the shared expert does not need the plan or the copies: it runs while the driver splits and the
             // copies land (TRACKER #112; same math, so the same output)
             shared();
+            // TRUSS_ABL_NOWAIT=1 (Phase 0b ceiling; timing only, the output is wrong): the window runs on the raw
+            // ids here, before the plan and the copies are waited for. An expert that is not resident reads stale
+            // bytes - every meta entry points at a real past placement inside the arena, so the read is in bounds
+            // and only the numbers are wrong. wait_plan still runs below (the doorbell protocol, the copies and the
+            // go word all still happen) and so does the CPU join. With sect on the boundaries keep their stream
+            // order, so the early window shows up inside wait_plan (7 -> 9) and the window segment (8 -> 10) ~0.
+            if (abl_nowait) moe::window<MoeShape>(experts->weights(sl(l)), in, ids, wts, T, routed, window_ws, s);
             // the driver's plan (mapped), the layer's copies when it queued any, the masked ids into d_mids
             if (sect) {   // profiling: the plan and the copies waited for apart (two launches instead of one)
                 runtime::spin_until(b.plan, seq, s);
@@ -1643,7 +1654,8 @@ struct Forward::Impl {
             }
             runtime::wait_plan(b.plan, b.need_copy, b.go, seq, b.mids, b.d_mids, cpu_on ? T * K : 0, s);
             if (sect) sect_record(l, 8);
-            moe::window<MoeShape>(experts->weights(sl(l)), in, cpu_on ? b.d_mids : ids, wts, T, routed, window_ws, s);
+            if (!abl_nowait)
+                moe::window<MoeShape>(experts->weights(sl(l)), in, cpu_on ? b.d_mids : ids, wts, T, routed, window_ws, s);
             if (sect) sect_record(l, 10);   // the window kernel ends here; the joins below wait for other workers
             if (cpu_on) cpu_rows = -T;            // the CPU rows join after the shared expert (mapped)
         } else if (!stream) {   // fetch the few cold experts this chunk routes to
