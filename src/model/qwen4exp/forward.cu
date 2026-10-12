@@ -895,8 +895,11 @@ struct Forward::Impl {
         CpuTier * ct = j.cpu ? cpu_tier.get() : nullptr;
         if (!route_usage.empty())
             for (int i = 0; i < n; ++i) route_usage[(size_t) sl(l) * c.n_expert + b.ids[i]] += 1.f;
-        if (helper) {   // what the peer's compute would take off this stage: distinct routed experts of this layer it
-                        // holds (Phase 2 masks exactly these). A hit, not a miss — see Forward::helper_hits().
+        // What the peer's compute would take off this stage: distinct routed experts of this layer the peer holds
+        // (Phase 2 masks exactly these), a hit and not a miss - see Forward::helper_hits(). The helper holds the
+        // PEER's layers, so this stage's own MTP block (store layer past helper->layers()) is out of scope: reading
+        // set_ there segfaulted the first draft pass.
+        if (helper && sl(l) < helper->layers()) {
             int dist[8 * 16], nd = 0;
             for (int i = 0; i < n; ++i) {
                 const int e = b.ids[i];
