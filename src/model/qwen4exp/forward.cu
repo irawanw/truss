@@ -229,6 +229,7 @@ struct Forward::Impl {
     bool ple_tk_valid = false; int ple_tk = -1, ple_tk_pos0 = -1;   // the prefetched ticket and its chunk's pos0
     long drv_n = 0;
     std::atomic<long> jobs_pushed{ 0 };   // the driver spins on this before it sleeps on dq_cv (Strata's host spins)
+    std::atomic<long> jobs_done{ 0 };     // jobs the driver has finished (served or failed): see drain_jobs()
     bool driver_stop = false;
     // TRUSS_DRIVER_DEBUG=1: the driver's phase, and a watchdog that prints it with the stuck layer's doorbell words
     // when no job is served for 10 s (phases: 1 job spin, 2 job sleep, 3 doorbell spin, 4 serve, 5 fetch, 6 claim,
@@ -729,6 +730,13 @@ struct Forward::Impl {
                 serve(j, b);
                 ++dbg_served;
             } catch (...) {   // keep the GPU moving (its output is garbage now); the caller rethrows at its next sync
+                try {
+                    throw;
+                } catch (const std::exception & e) {
+                    std::fprintf(stderr, "driver: layer %d seq %d T %d threw: %s\n", j.layer, j.seq, j.T, e.what());
+                } catch (...) {
+                    std::fprintf(stderr, "driver: layer %d seq %d T %d threw a non-std exception\n", j.layer, j.seq, j.T);
+                }
                 if (!driver_error) driver_error = std::current_exception();
                 experts->signal(sl(j.layer), b.go, j.seq);
                 *(volatile int *) b.need_copy = j.seq;
@@ -737,6 +745,7 @@ struct Forward::Impl {
                 std::atomic_thread_fence(std::memory_order_release);
                 *(volatile int *) b.cpu_done = j.seq;
             }
+            jobs_done.fetch_add(1, std::memory_order_release);
         }
     }
 
@@ -905,6 +914,16 @@ struct Forward::Impl {
         if (dyn_s1 > 8 && var > 0.25 * dyn_s1 * dyn_s1)
             cpu_ms_expert = std::min(2.0, std::max(0.02, (dyn_snt * dyn_s1 - dyn_sn * dyn_st) / var));
         cpu_ms_call = std::max(0.0, (dyn_st - cpu_ms_expert * dyn_sn) / dyn_s1);
+    }
+
+    // Wait until the driver has finished every queued decode FFN. begin_stream() switches the store's mode on the host
+    // at once, while a decode job queued just before (run_chunk's flush_commit: the deferred MTP commit) may not have
+    // been served yet: its fetch() then threw "outside ring mode", and the failure path's go word queued on the copy
+    // stream behind a wait for the very compute that spins on it (the served hangs of 2026-10-12). The GPU reaches the
+    // doorbells on its own, so this wait ends.
+    void drain_jobs()
+    {
+        while (jobs_done.load(std::memory_order_acquire) < jobs_pushed.load(std::memory_order_acquire)) _mm_pause();
     }
 
     void check_driver()
@@ -1828,6 +1847,7 @@ struct Forward::Impl {
         if (stream)
             require(T <= prefill_rows, "prompt chunk of " + std::to_string(T) + " tokens over prefill_rows (" +
                                             std::to_string(prefill_rows) + "); raise Options::prefill_rows");
+        if (stream) drain_jobs();   // before begin_stream: a queued decode FFN (the flushed MTP commit) must fetch in ring mode
         if (!stream) {
             use(small);
             experts->begin_ring();
