@@ -562,12 +562,32 @@ struct Forward::Impl {
             std::vector<uint8_t> hb((size_t) n_store * E, 0);
             int n_hot_static = 0;
             for (int l = 0; l < n_store; ++l)
-                for (int e = 0; e < experts->experts(l); ++e)
-                    hb[(size_t) l * E + e] = (uint8_t) (n_hot_static += (int) experts->hot(l, e));
+                for (int e = 0; e < experts->experts(l); ++e) {
+                    const uint8_t h = experts->hot(l, e) ? 1 : 0;
+                    hb[(size_t) l * E + e] = h;
+                    n_hot_static += h;
+                }
             TRUSS_CUDA(cudaMalloc(&hot_dev, hb.size()));
             TRUSS_CUDA(cudaMemcpy(hot_dev, hb.data(), hb.size(), cudaMemcpyHostToDevice));
-            std::fprintf(stderr, "TRUSS_EARLY_WINDOW=%d: %d hot experts of %d, early window from %d rows\n",
-                         early_window, n_hot_static, n_store * E, early_window);
+            // This bitmap is the early window's whole idea of which experts are safe to read before the plan, and it
+            // is the only copy the GPU has: read it back and compare every entry against the store's own answer (the
+            // one serve() masks the plan with). A wrong 1 lets a window read an expert a copy may be overwriting; a
+            // wrong 0 computes one twice or drops it. Both would be silent.
+            std::vector<uint8_t> back(hb.size(), 0);
+            TRUSS_CUDA(cudaMemcpy(back.data(), hot_dev, back.size(), cudaMemcpyDeviceToHost));
+            int bad = 0, n_back = 0;
+            for (int l = 0; l < n_store; ++l)
+                for (int e = 0; e < experts->experts(l); ++e) {
+                    n_back += back[(size_t) l * E + e];
+                    bad += ((back[(size_t) l * E + e] != 0) != experts->hot(l, e)) ? 1 : 0;
+                }
+            require(!bad && n_back == n_hot_static,
+                    "TRUSS_EARLY_WINDOW: the device hot bitmap must match ExpertStore::hot (" + std::to_string(bad) +
+                        " entries differ, " + std::to_string(n_back) + " set against " + std::to_string(n_hot_static) +
+                        ")");
+            // n_hot is the plan's own count for this stage: a third, independent source for the same set.
+            std::fprintf(stderr, "TRUSS_EARLY_WINDOW=%d: %d hot experts of %d on the device (plan says %d), early"
+                         " window from %d rows\n", early_window, n_hot_static, n_store * E, n_hot, early_window);
         }
         pcie_ms_byte = 1.0 / (o.pcie_gbps * 1e6);
         pcie_frac = o.pcie_frac;
