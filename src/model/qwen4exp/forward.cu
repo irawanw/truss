@@ -568,13 +568,23 @@ struct Forward::Impl {
         }
         load_mark("Forward: done");
         if (mtp) mtp_calib_open(prefill_rows);
-        if (getenv("TRUSS_PROFILE_SECTIONS")) {
+        if (getenv("TRUSS_PROFILE_SECTIONS") || getenv("TRUSS_SECT_CSV")) {
             sect_on = true;
             sect_ev.resize(c.n_layer + 1);   // by model layer (MTP: n_layer)
             sect_rec.assign(c.n_layer + 1, 0);
             sect_bell.assign(c.n_layer + 1, 0);
             for (auto & a : sect_ev)
                 for (cudaEvent_t & e : a) TRUSS_CUDA(cudaEventCreate(&e));
+            if (const char * p = getenv("TRUSS_SECT_CSV")) {   // one line per layer per pass (the pass breakdown)
+                char path[1024];
+                // One FILE per stage: two stages appending to one path interleave their half-written lines.
+                std::snprintf(path, sizeof path, "%s.d%d", p, device);
+                sect_csv = std::fopen(path, "ab");
+                if (sect_csv)
+                    std::fprintf(sect_csv,
+                                 "# pass rows layer route_publish wait_plan wait_copies window cpu_join helper_join "
+                                 "tail ple_attn_mix mixer hc_mix moe_total shared combine\n");
+            }
         }
     }
 
@@ -596,6 +606,10 @@ struct Forward::Impl {
             driver.join();
             if (watchdog.joinable()) watchdog.join();
         }
+        if (sect_on)   // where the two threads that matter ran: the caller launches, the driver plans and copies
+            std::fprintf(stderr, "threads: caller %ld on cpu %d, driver %ld on cpu %d; aux %s\n",
+                         (long) cpu::this_tid(), caller_cpu, (long) driver_tid.load(), drv_cpu.load(),
+                         aux.on ? aux.text.c_str() : "off");
         for (Bell & b : bells)
             for (void * p : { (void *) b.ids, (void *) b.pred, (void *) b.mids, (void *) b.w, (void *) b.x, (void *) b.y,
                               (void *) b.doorbell, (void *) b.cpu_done, (void *) b.plan, (void *) b.need_copy })
@@ -616,6 +630,7 @@ struct Forward::Impl {
         for (auto & a : sect_ev)
             for (cudaEvent_t e : a)
                 if (e) cudaEventDestroy(e);
+        if (sect_csv) std::fclose(sect_csv);
         if (blas) cublasDestroy(blas);
         if (s) cudaStreamDestroy(s);
     }
@@ -705,6 +720,7 @@ struct Forward::Impl {
             for (int i = 0; i < 200000 && jobs_pushed.load(std::memory_order_acquire) <= taken; ++i) {
                 _mm_pause();
                 if (admit_idle > 0 && i % 64 == 0) dbg_phase = 8, experts->admit_step(), dbg_phase = 1;   // the link is ours while we wait
+                if (sect_on && i == 4096 && (dbg_served & 127) == 0) drv_cpu.store(last_cpu(driver_tid.load()));
             }
             {
                 std::unique_lock<std::mutex> g(dq_mu);
@@ -1628,6 +1644,7 @@ struct Forward::Impl {
             runtime::wait_plan(b.plan, b.need_copy, b.go, seq, b.mids, b.d_mids, cpu_on ? T * K : 0, s);
             if (sect) sect_record(l, 8);
             moe::window<MoeShape>(experts->weights(sl(l)), in, cpu_on ? b.d_mids : ids, wts, T, routed, window_ws, s);
+            if (sect) sect_record(l, 10);   // the window kernel ends here; the joins below wait for other workers
             if (cpu_on) cpu_rows = -T;            // the CPU rows join after the shared expert (mapped)
         } else if (!stream) {   // fetch the few cold experts this chunk routes to
             // pre-gating: the next layer's router on this layer's input predicts 72% of its experts (TRACKER #58);
@@ -1753,6 +1770,10 @@ struct Forward::Impl {
             runtime::add_mapped(routed, bells[l].y, -cpu_rows * dm, s);
             cpu_rows = 0;
         }
+        // The join boundary is recorded on every path: cudaEventElapsedTime between a recorded and a never-recorded
+        // event reads garbage, and the CSV is read per layer whether or not this layer had CPU rows to join.
+        if (sect) sect_record(l, 11);   // the CPU tier's rows are in, or this layer had none
+        if (sect) sect_record(l, 12);   // no peer join on this branch: the segment between 11 and 12 is empty
         if (cpu_rows) {   // the CPU experts' sum joins the routed output
             CpuTier & ct = *cpu_tier;
             float * yc = sc->alloc((size_t) cpu_rows * dm);
@@ -1919,7 +1940,7 @@ struct Forward::Impl {
             TRUSS_CUDA(cudaEventRecord(out_ready, s));
             handed.fetch_add(1, std::memory_order_release);
         }
-        sect_flush();
+        sect_flush(T);
         ple_next = nullptr; ple_next_T = 0;   // consumed by this chunk's ple(), or there was no lookahead
         last_T = T;
         if (tentative) {
@@ -2073,13 +2094,37 @@ struct Forward::Impl {
     // stream order, so elapsed(e[i-1], e[i]) is one section's device time including any host stall inside it.
     // Sums accumulate per run()/verify(); section_ms() reads them back.
     bool sect_on = false;
-    std::vector<std::array<cudaEvent_t, 10>> sect_ev;   // [layer][0..6] section bounds; 7, 9, 8: inside routed MoE (doorbell)
+    std::vector<std::array<cudaEvent_t, 13>> sect_ev;   // [layer][0..6] sections; 7, 9, 8, 10, 11, 12: inside the MoE
     mutable std::vector<uint8_t> sect_rec;             // layers recorded since the last flush
     mutable double sect_ms[6] = { 0, 0, 0, 0, 0, 0 };
     // routed MoE on the doorbell path split at events 7 (doorbell raised), 9 (plan received) and 8 (copies landed,
     // TRACKER #77): router + publish, wait for the host's plan, wait for the layer's copies, expert kernel
     mutable std::vector<uint8_t> sect_bell;
     mutable double sect_moe[4] = { 0, 0, 0, 0 };
+    // /proc/self/task/<tid>/stat field 39: the logical CPU the thread last ran on. Field 2 (comm) can hold spaces
+    // and parentheses, so parse from after the last ')'. -2: not readable.
+    static int last_cpu(pid_t tid)
+    {
+        char path[64], buf[2048];
+        std::snprintf(path, sizeof path, "/proc/self/task/%ld/stat", (long) tid);
+        FILE * f = std::fopen(path, "r");
+        if (!f) return -2;
+        const size_t n = std::fread(buf, 1, sizeof buf - 1, f);
+        std::fclose(f);
+        buf[n] = 0;
+        char * p = buf + n;
+        while (p > buf && *(p - 1) != ')') --p;   // just past the last ')'
+        for (int i = 0; i < 36; ++i) {            // fields 3..38 precede the processor field
+            while (p < buf + n && *p == ' ') ++p;
+            while (p < buf + n && *p != ' ') ++p;
+        }
+        while (p < buf + n && *p == ' ') ++p;
+        return p < buf + n ? (int) std::strtol(p, nullptr, 10) : -2;
+    }
+    int caller_cpu = -1;                                // sampled by sect_flush, on the thread that launches
+    std::atomic<int> drv_cpu{ -1 };                     // the driver's CPU, sampled by the driver itself
+    FILE * sect_csv = nullptr;                          // TRUSS_SECT_CSV: per layer per pass, the doorbell path
+    long sect_pass = 0;                                 // chunks flushed (one per verify pass)
     void sect_record(int layer, int i)
     {
         if (!sect_on) return;
@@ -2088,16 +2133,22 @@ struct Forward::Impl {
     }
     // Read the events back after the whole chunk (one sync, no per-layer stall) and add the five sections. Only
     // the layers that ran are read: draft()'s MTP steps record only some.
-    void sect_flush()
+    void sect_flush(int T = 0)
     {
         if (!sect_on) return;
-        for (int l = 0; l <= c.n_layer; ++l) {   // by model layer
+        ++sect_pass;
+        caller_cpu = last_cpu(cpu::this_tid());
+        // The events were recorded on THIS stage's device; the thread reading them runs both stages, so its current
+        // device is whichever one ran last - reading another device's event is "invalid resource handle".
+        DeviceGuard g(device);
+        for (int l = 0; l <= c.n_layer; ++l) {
             if (!sect_rec[l]) continue;
-            TRUSS_CUDA(cudaEventSynchronize(sect_ev[l][6]));
+            TRUSS_CUDA(cudaEventSynchronize(sect_ev[l][6]));   // the last one recorded for the layer, stream order
+            float sec[6];   // the layer chain around the MoE: see Forward::section_ms
             for (int i = 1; i <= 6; ++i) {
                 float ms = 0.f;
                 TRUSS_CUDA(cudaEventElapsedTime(&ms, sect_ev[l][i - 1], sect_ev[l][i]));
-                sect_ms[i - 1] += ms;
+                sect_ms[i - 1] += sec[i - 1] = ms;
             }
             if (sect_bell[l]) {
                 const int at[5] = { 3, 7, 9, 8, 4 };
@@ -2105,6 +2156,17 @@ struct Forward::Impl {
                     float ms = 0.f;
                     TRUSS_CUDA(cudaEventElapsedTime(&ms, sect_ev[l][at[i]], sect_ev[l][at[i + 1]]));
                     sect_moe[i] += ms;
+                }
+                if (sect_csv) {   // the doorbell FFN to its last boundary, plus the whole layer chain around it
+                    const int b[8] = { 3, 7, 9, 8, 10, 11, 12, 6 };
+                    std::fprintf(sect_csv, "%ld %d %d", sect_pass, T, l);
+                    for (int i = 0; i < 7; ++i) {
+                        float ms = 0.f;
+                        TRUSS_CUDA(cudaEventElapsedTime(&ms, sect_ev[l][b[i]], sect_ev[l][b[i + 1]]));
+                        std::fprintf(sect_csv, " %.3f", ms);
+                    }
+                    for (int i = 0; i < 6; ++i) std::fprintf(sect_csv, " %.3f", sec[i]);
+                    std::fprintf(sect_csv, "\n");
                 }
             }
             sect_rec[l] = 0, sect_bell[l] = 0;
