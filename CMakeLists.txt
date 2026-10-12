@@ -133,6 +133,8 @@ add_executable(frac_decode_test tests/unit/frac_decode_test.cu)
 target_link_libraries(frac_decode_test PRIVATE truss_kernels truss_reference)
 add_executable(codec_v2one_test tests/unit/codec_v2one_test.cu)
 target_link_libraries(codec_v2one_test PRIVATE truss_encode)
+add_executable(helper_plan_test tests/unit/helper_plan_test.cc)   # host only: the owner/helper placement (runtime/helper_plan.h)
+target_include_directories(helper_plan_test PRIVATE src)
 
 # ---- tests/layer: model blocks vs llama-paw activations
 add_executable(qwen4exp_parity tests/layer/qwen4exp_parity.cu)
