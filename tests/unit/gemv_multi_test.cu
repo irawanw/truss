@@ -215,6 +215,85 @@ bool f32_group(const char * name, int in, std::vector<int> outs, std::mt19937 & 
     return pass;
 }
 
+// W8A16 (fp16 activations): q8_gemv_multi_a16 against an fp64 reference, row- and fusion-invariance, 4-row time
+bool a16_group(const char * name, int in, std::vector<int> outs, std::mt19937 & g)
+{
+    const int n = (int) outs.size(), R = dense::GEMV_ROWS;
+    std::vector<Mat> ms;
+    for (int o : outs) ms.push_back(make(in, o, g));
+    std::vector<half> x((size_t) R * in);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    for (auto & v : x) v = __float2half(nd(g));
+    half * dx;
+    TRUSS_CUDA(cudaMalloc(&dx, x.size() * 2));
+    TRUSS_CUDA(cudaMemcpy(dx, x.data(), x.size() * 2, cudaMemcpyHostToDevice));
+    std::vector<float *> dy(n);
+    for (int i = 0; i < n; ++i) TRUSS_CUDA(cudaMalloc(&dy[i], (size_t) R * outs[i] * 4));
+    std::vector<const dense::Q8Matrix *> Ws(n);
+    for (int i = 0; i < n; ++i) Ws[i] = &ms[i].W;
+    double worst = 0;
+    bool invariant = true;
+    std::vector<std::vector<float>> row0(n);
+    for (int rows = 1; rows <= R; ++rows) {
+        dense::q8_gemv_multi_a16(Ws.data(), dy.data(), n, dx, rows, nullptr);
+        TRUSS_CUDA(cudaDeviceSynchronize());
+        for (int i = 0; i < n; ++i) {
+            std::vector<float> y((size_t) rows * outs[i]);
+            TRUSS_CUDA(cudaMemcpy(y.data(), dy[i], y.size() * 4, cudaMemcpyDeviceToHost));
+            if (rows == 1) row0[i].assign(y.begin(), y.begin() + outs[i]);
+            else invariant &= std::memcmp(row0[i].data(), y.data(), outs[i] * 4) == 0;
+            double e = 0, r = 0;
+            for (int t = 0; t < rows; ++t)
+                for (int o = 0; o < outs[i]; ++o) {
+                    double ref = 0;
+                    for (int b = 0; b < in / 32; ++b) {
+                        double s = 0;
+                        for (int j = 0; j < 32; ++j)
+                            s += (double) ms[i].q[(size_t) o * in + b * 32 + j] * __half2float(x[(size_t) t * in + b * 32 + j]);
+                        ref += s * __half2float(ms[i].d[(size_t) o * (in / 32) + b]);
+                    }
+                    const double v = y[(size_t) t * outs[i] + o];
+                    e += (v - ref) * (v - ref), r += ref * ref;
+                }
+            worst = std::max(worst, std::sqrt(e / r));
+        }
+    }
+    bool alone = true;
+    dense::q8_gemv_multi_a16(Ws.data(), dy.data(), n, dx, 3, nullptr);
+    std::vector<std::vector<float>> fusedv(n);
+    for (int i = 0; i < n; ++i) {
+        fusedv[i].resize((size_t) 3 * outs[i]);
+        TRUSS_CUDA(cudaMemcpy(fusedv[i].data(), dy[i], fusedv[i].size() * 4, cudaMemcpyDeviceToHost));
+    }
+    for (int i = 0; i < n; ++i) {
+        dense::q8_gemv_a16(ms[i].W, dx, 3, dy[i], nullptr);
+        std::vector<float> a(fusedv[i].size());
+        TRUSS_CUDA(cudaMemcpy(a.data(), dy[i], a.size() * 4, cudaMemcpyDeviceToHost));
+        alone &= std::memcmp(a.data(), fusedv[i].data(), a.size() * 4) == 0;
+    }
+    invariant &= alone;
+    cudaEvent_t e0, e1;
+    TRUSS_CUDA(cudaEventCreate(&e0));
+    TRUSS_CUDA(cudaEventCreate(&e1));
+    const int reps = 200;
+    TRUSS_CUDA(cudaEventRecord(e0));
+    for (int k = 0; k < reps; ++k) dense::q8_gemv_multi_a16(Ws.data(), dy.data(), n, dx, 4, nullptr);
+    TRUSS_CUDA(cudaEventRecord(e1));
+    TRUSS_CUDA(cudaEventSynchronize(e1));
+    double mb = 0;
+    for (int o : outs) mb += (double) in * o * (1 + 2.0 / 32) / 1e6;
+    const float t = elapsed(e0, e1) * 1e3f / reps;
+    const bool pass = worst < 1e-5 && invariant;
+    std::string shape;
+    for (int o : outs) shape += std::to_string(in) + "->" + std::to_string(o) + " ";
+    std::printf("a16 %-12s %-40s rel %.1e, row-invariant %s | 4 rows %.1f us (%.0f GB/s)  %s\n", name, shape.c_str(), worst,
+                invariant ? "yes" : "NO", t, mb / t * 1e3, pass ? "ok" : "FAIL");
+    for (auto & m : ms) cudaFree(m.dq), cudaFree(m.dd);
+    for (auto * p : dy) cudaFree(p);
+    cudaFree(dx);
+    return pass;
+}
+
 }  // namespace
 
 int main()
@@ -229,6 +308,14 @@ int main()
     ok &= q8_group("shexp g+u", 2560, { 640, 640 }, g);
     ok &= q8_group("shexp down", 640, { 2560 }, g);
     ok &= q8_group("out-proj", 6144, { 2560 }, g);
+    ok &= a16_group("hc down+inj", 10240, { 320, 4 }, g);
+    ok &= a16_group("hc up", 320, { 10240 }, g);
+    ok &= a16_group("gdn in", 2560, { 10240, 6144, 48, 48 }, g);
+    ok &= a16_group("dsa in", 2560, { 12288, 512, 512, 512, 128 }, g);
+    ok &= a16_group("shexp g+u", 2560, { 640, 640 }, g);
+    ok &= a16_group("shexp down", 640, { 2560 }, g);
+    ok &= a16_group("out-proj", 6144, { 2560 }, g);
+    ok &= a16_group("lm head", 2560, { 248320 }, g);
     ok &= f32_group("router+hint", 2560, { 512, 512, 1 }, g);
     ok &= f32_group("router", 2560, { 512, 1 }, g);
     std::printf("%s\n", ok ? "PASS" : "FAIL");

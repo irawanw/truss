@@ -4,6 +4,7 @@
 // buffered with cp.async. 8 warps as 2 (outputs) x 4 (tokens): a warp computes 64 outputs x 32 tokens = 4 x 4 mma
 // tiles, weights as the A operand (m16 x k32), activations as B (k32 x n8). Per Q8 block the int32 tile results are
 // scaled and folded into fp32 accumulators: acc += float(c) * d_w * d_x.
+#include <cstdlib>
 #include "q8_gemm.cuh"
 
 #include "core/cublas_check.h"
@@ -299,6 +300,124 @@ __global__ void __launch_bounds__(128) gemv_multi_kernel(MultiQ8 m, int in, cons
         }
 }
 
+// ---- W8A16 decode gemv on the tensor cores (mma.m16n8k16, fp16 x fp16 -> fp32) ----
+// The scalar A16 path above converts every int8 weight with a quarter-rate I2F per row and multiplies in fp32: ALU
+// bound at ~470-570 GB/s on the 3090 (2-GPU split trace 10-12). Here a warp computes a tile of 16 outputs x 8 rows
+// (rows >= the window's are zero): per 32-weight Q8 block two mmas, then the block's scale in fp32, as the scalar
+// path does. int8 -> fp16 is exact (byte_perm into 0x64xx = 1024 + (w + 128), minus 1152). Each thread loads 8
+// contiguous weights of its two output rows per block; the mma's logical k order is permuted identically for weights
+// and activations (thread q's k pairs {2q, 2q+1}, {2q+8, 2q+9} <-> physical 8q..8q+3, then 8q+4..8q+7), which leaves
+// every dot product's terms the same. A row's result does not depend on the row count (each C element is its own
+// dot product of fixed order) nor on the other matrices of the launch: the k split S comes from `in` only, partial
+// sums are added in warp order.
+__device__ __forceinline__ void i8x4_to_h2(uint32_t w, uint32_t & lo, uint32_t & hi)   // bytes 0,1 / 2,3, exact
+{
+    const uint32_t u = w ^ 0x80808080u;
+    lo = __byte_perm(u, 0x64646464u, 0x5140);
+    hi = __byte_perm(u, 0x64646464u, 0x7362);
+    const half2 bias = __halves2half2(__ushort_as_half(0x6480), __ushort_as_half(0x6480));   // 1152
+    half2 l = *reinterpret_cast<half2 *>(&lo), h = *reinterpret_cast<half2 *>(&hi);
+    l = __hsub2(l, bias), h = __hsub2(h, bias);
+    lo = *reinterpret_cast<uint32_t *>(&l), hi = *reinterpret_cast<uint32_t *>(&h);
+}
+
+__device__ __forceinline__ void mma16816(float c[4], const uint32_t a[4], const uint32_t b[2])
+{
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+template <int S>   // warps per tile (k split); a CTA has max(4, S) warps = max(4, S) / S tiles
+__global__ void __launch_bounds__(512) gemv_mma_a16_kernel(MultiQ8 m, int in, const half * __restrict__ x, int rows)
+{
+    constexpr int WARPS = S > 4 ? S : 4, TILES = WARPS / S;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane >> 2, q = lane & 3, nb = in / 32;
+    const int tile = blockIdx.x * TILES + warp / S, ks = warp % S;
+    const int outs = m.start[m.n];
+    // this thread's two output rows (g, g + 8 of the tile) and their matrices
+    const int o[2] = { tile * 16 + g, tile * 16 + g + 8 };
+    const int8_t * wq[2] = { nullptr, nullptr };
+    const half * wd[2] = { nullptr, nullptr };
+    float * wy[2] = { nullptr, nullptr };
+    int wout[2] = { 0, 0 }, woo[2] = { 0, 0 };
+#pragma unroll
+    for (int j = 0; j < 2; ++j)
+        if (o[j] < outs) {
+            int seg = 0;
+            while (o[j] >= m.start[seg + 1]) ++seg;
+            woo[j] = o[j] - m.start[seg], wout[j] = m.start[seg + 1] - m.start[seg];
+            wq[j] = m.q[seg] + (size_t) woo[j] * in + 8 * q, wd[j] = m.d[seg] + (size_t) woo[j] * nb, wy[j] = m.y[seg];
+        }
+    const bool xrow = g < rows;   // B column g = window row g
+    const half * xr = x + (size_t) (xrow ? g : 0) * in + 8 * q;
+    float acc[4] = { 0.f, 0.f, 0.f, 0.f };
+#pragma unroll 4
+    for (int b = ks; b < nb; b += S) {
+        const uint2 w0 = wq[0] ? __ldg(reinterpret_cast<const uint2 *>(wq[0] + b * 32)) : make_uint2(0, 0);
+        const uint2 w1 = wq[1] ? __ldg(reinterpret_cast<const uint2 *>(wq[1] + b * 32)) : make_uint2(0, 0);
+        const uint4 xv = xrow ? __ldg(reinterpret_cast<const uint4 *>(xr + b * 32)) : make_uint4(0, 0, 0, 0);
+        const float d0 = wq[0] ? __half2float(wd[0][b]) : 0.f, d1 = wq[1] ? __half2float(wd[1][b]) : 0.f;
+        uint32_t a[4], bb[2];
+        float c[4] = { 0.f, 0.f, 0.f, 0.f };
+        i8x4_to_h2(w0.x, a[0], a[2]);   // row g, k 8q..8q+3
+        i8x4_to_h2(w1.x, a[1], a[3]);   // row g + 8
+        bb[0] = xv.x, bb[1] = xv.y;
+        mma16816(c, a, bb);
+        i8x4_to_h2(w0.y, a[0], a[2]);   // k 8q+4..8q+7
+        i8x4_to_h2(w1.y, a[1], a[3]);
+        bb[0] = xv.z, bb[1] = xv.w;
+        mma16816(c, a, bb);
+        acc[0] += c[0] * d0, acc[1] += c[1] * d0, acc[2] += c[2] * d1, acc[3] += c[3] * d1;
+    }
+    if (S > 1) {   // k split: the S warps' partials added in warp order
+        __shared__ float part[WARPS][32][4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) part[warp][lane][i] = acc[i];
+        __syncthreads();
+        if (ks) return;
+#pragma unroll
+        for (int k = 1; k < S; ++k)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) acc[i] += part[warp + k][lane][i];
+    }
+    // C: (row g, cols 2q, 2q + 1), (row g + 8, same cols); col = window row
+#pragma unroll
+    for (int j = 0; j < 2; ++j)
+        if (wy[j])
+#pragma unroll
+            for (int t = 0; t < 2; ++t) {
+                const int r = 2 * q + t;
+                if (r < rows) wy[j][(size_t) r * wout[j] + woo[j]] = acc[2 * j + t];
+            }
+}
+
+int mma_split(int in)   // warps per tile, from the input width only: ~16-20 blocks per warp
+{
+    const int nb = in / 32, want = nb / 16;
+    return want >= 16 ? 16 : want >= 8 ? 8 : want >= 4 ? 4 : want >= 2 ? 2 : 1;
+}
+
+void gemv_mma_a16(const MultiQ8 & m, int in, const half * x, int rows, cudaStream_t stream)
+{
+    const int S = mma_split(in), warps = S > 4 ? S : 4, tiles = (m.start[m.n] + 15) / 16, per = warps / S;
+    const int grid = (tiles + per - 1) / per;
+    switch (S) {
+    case 1: gemv_mma_a16_kernel<1><<<grid, 32 * warps, 0, stream>>>(m, in, x, rows); break;
+    case 2: gemv_mma_a16_kernel<2><<<grid, 32 * warps, 0, stream>>>(m, in, x, rows); break;
+    case 4: gemv_mma_a16_kernel<4><<<grid, 32 * warps, 0, stream>>>(m, in, x, rows); break;
+    case 8: gemv_mma_a16_kernel<8><<<grid, 32 * warps, 0, stream>>>(m, in, x, rows); break;
+    default: gemv_mma_a16_kernel<16><<<grid, 32 * warps, 0, stream>>>(m, in, x, rows); break;
+    }
+}
+
+bool mma_on()   // TRUSS_GEMV_MMA=0: the scalar A16 kernel (A/B switch, read once)
+{
+    static const bool v = [] { const char * e = std::getenv("TRUSS_GEMV_MMA"); return !e || std::atoi(e); }();
+    return v;
+}
+
 template <int ROWS, bool A16 = false>
 void gemv_multi_rows(const MultiQ8 & m, int in, const int8_t * xq, const half * xd, cudaStream_t stream)
 {
@@ -495,6 +614,12 @@ void q8_gemv_multi_a16(const Q8Matrix * const * W, float * const * y, int n, con
         m.q[i] = W[i]->q, m.d[i] = W[i]->d, m.y[i] = y[i], m.start[i + 1] = m.start[i] + W[i]->out;
     }
     const int in = W[0]->in;
+    if (rows < 1 || rows > GEMV_ROWS) throw std::runtime_error("q8_gemv_multi_a16: rows must be 1.." + std::to_string(GEMV_ROWS));
+    if (mma_on()) {
+        gemv_mma_a16(m, in, x, rows, stream);
+        TRUSS_CUDA(cudaGetLastError());
+        return;
+    }
     const int8_t * xq = reinterpret_cast<const int8_t *>(x);
     switch (rows) {
     case 1: gemv_multi_rows<1, true>(m, in, xq, nullptr, stream); break;
