@@ -271,7 +271,7 @@ bool a16_group(const char * name, int in, std::vector<int> outs, std::mt19937 & 
         TRUSS_CUDA(cudaMemcpy(a.data(), dy[i], a.size() * 4, cudaMemcpyDeviceToHost));
         alone &= std::memcmp(a.data(), fusedv[i].data(), a.size() * 4) == 0;
     }
-    invariant &= alone;
+    // a16: the k split depends on the launch's total outputs (dense::mma_split), so fused may differ from alone
     cudaEvent_t e0, e1;
     TRUSS_CUDA(cudaEventCreate(&e0));
     TRUSS_CUDA(cudaEventCreate(&e1));
@@ -286,8 +286,8 @@ bool a16_group(const char * name, int in, std::vector<int> outs, std::mt19937 & 
     const bool pass = worst < 1e-5 && invariant;
     std::string shape;
     for (int o : outs) shape += std::to_string(in) + "->" + std::to_string(o) + " ";
-    std::printf("a16 %-12s %-40s rel %.1e, row-invariant %s | 4 rows %.1f us (%.0f GB/s)  %s\n", name, shape.c_str(), worst,
-                invariant ? "yes" : "NO", t, mb / t * 1e3, pass ? "ok" : "FAIL");
+    std::printf("a16 %-12s %-40s rel %.1e, row-invariant %s, alone = fused %s | 4 rows %.1f us (%.0f GB/s)  %s\n", name,
+                shape.c_str(), worst, invariant ? "yes" : "NO", alone ? "yes" : "no", t, mb / t * 1e3, pass ? "ok" : "FAIL");
     for (auto & m : ms) cudaFree(m.dq), cudaFree(m.dd);
     for (auto * p : dy) cudaFree(p);
     cudaFree(dx);

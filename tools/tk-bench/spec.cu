@@ -249,6 +249,7 @@ int main(int argc, char ** argv)
             float ms_draft = 0.f, ms_verify = 0.f, ms_head = 0.f;
             // TRUSS_BENCH_PROFRANGE=1: the decode loops are the only cudaProfilerApi range (nsys --capture-range)
             const bool prange = std::getenv("TRUSS_BENCH_PROFRANGE") && std::atoi(std::getenv("TRUSS_BENCH_PROFRANGE"));
+            static FILE * passlog = std::getenv("TRUSS_BENCH_PASSLOG") ? std::fopen(std::getenv("TRUSS_BENCH_PASSLOG"), "w") : nullptr;
             if (prange) TRUSS_CUDA(cudaProfilerStart());
             const auto t0 = std::chrono::steady_clock::now();
             while ((int) got.size() < N) {
@@ -279,6 +280,11 @@ int main(int argc, char ** argv)
                 for (int i = 0; i <= j; ++i) got.push_back(win[i]);
                 t = best[j];
                 ++passes, drafted += nw, accepted += j;
+                if (passlog) {   // TRUSS_BENCH_PASSLOG: one line per pass (A/B at equal window sizes)
+                    const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+                    std::fprintf(passlog, "%d %d %.3f %.3f %.3f %.3f\n", nw + 1, j, ms(tA, tB), ms(tB, tC), ms(tC, tD),
+                                 ms(tA, std::chrono::steady_clock::now()));
+                }
                 S.hw[0] += std::chrono::duration<double, std::milli>(tB - tA).count();
                 S.hw[1] += std::chrono::duration<double, std::milli>(tC - tB).count();
                 S.hw[2] += std::chrono::duration<double, std::milli>(tD - tC).count();

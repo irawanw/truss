@@ -300,6 +300,8 @@ struct Forward::Impl {
     float * mtp_logits = nullptr;                        // [n_vocab]
     int * draft_ids = nullptr;                           // device [spec_rows]
     int32_t * draft_host = nullptr;                      // pinned
+    int32_t * commit_host = nullptr;                     // pinned [2][MAX_ROWS + 1]: a decode commit's tokens (mtp_commit)
+    int commit_flip = 0;
     struct Verify {                                      // the window verify() left uncommitted
         bool open = false;
         int pos0 = 0, T = 0;
@@ -367,6 +369,7 @@ struct Forward::Impl {
             mtp_logits = alloc<float>(c.n_vocab);
             draft_ids = alloc<int>(moe::MAX_ROWS + 1);
             TRUSS_CUDA(cudaMallocHost(&draft_host, sizeof(int32_t) * (moe::MAX_ROWS + 1)));
+            TRUSS_CUDA(cudaMallocHost(&commit_host, sizeof(int32_t) * 2 * (moe::MAX_ROWS + 1)));
             draft_prob = alloc<float>(moe::MAX_ROWS + 1);
             TRUSS_CUDA(cudaMallocHost(&draft_prob_host, sizeof(float) * (moe::MAX_ROWS + 1)));
             if (!o.draft_vocab.empty()) {   // gather the subset's output rows once
@@ -582,6 +585,7 @@ struct Forward::Impl {
         for (void * p : owned) cudaFree(p);
         if (ids_host) cudaFreeHost(ids_host);
         if (draft_host) cudaFreeHost(draft_host);
+        if (commit_host) cudaFreeHost(commit_host);
         if (draft_prob_host) cudaFreeHost(draft_prob_host);
         if (embd_q) cudaFreeHost(embd_q);
         if (cpu_tier)
@@ -2116,9 +2120,20 @@ struct Forward::Impl {
             if (T > 1) copy(mh + (size_t) (1 - skip) * row, res, (size_t) (T - 1) * row);
             const size_t m = sc->mark();
             int * d_ids = sc->alloc<int>(n);
-            TRUSS_CUDA(cudaMemcpyAsync(d_ids, tokens + skip, sizeof(int32_t) * n, cudaMemcpyHostToDevice, s));
+            // a decode commit's tokens go through pinned staging (alternating halves: the previous commit's copy ran
+            // a pass ago), so accept() returns without waiting for the GPU; a prompt chunk's tokens may be a host
+            // temporary: that copy is waited for
+            const bool staged = n <= moe::MAX_ROWS + 1;
+            const int32_t * src = tokens + skip;
+            if (staged) {
+                int32_t * h = commit_host + (size_t) commit_flip * (moe::MAX_ROWS + 1);
+                commit_flip ^= 1;
+                std::copy(src, src + n, h);
+                src = h;
+            }
+            TRUSS_CUDA(cudaMemcpyAsync(d_ids, src, sizeof(int32_t) * n, cudaMemcpyHostToDevice, s));
             mtp_rows(mh, d_ids, pos0 + skip, n, stream, false, true);
-            TRUSS_CUDA(cudaStreamSynchronize(s));   // tokens may be a host temporary
+            if (!staged) TRUSS_CUDA(cudaStreamSynchronize(s));
             sc->release(m);
         }
         copy(pending_h, res + (size_t) (T - 1) * row, row);
@@ -2488,7 +2503,13 @@ void Forward::verify(const int32_t * tokens, int T)
 
 void Forward::accept(int n)
 {
-    each_stage([n](Impl & m) { m.accept(n); });
+    // the last stage first: its rollback and MTP commit are queued (no host wait) and run on its device while this
+    // thread launches the other stages' rollbacks (~100 small launches each), off the draft's critical path
+    m_->accept(n);
+    for (auto & p : front_) {
+        DeviceGuard g(p->device);
+        p->accept(n);
+    }
     pos_ += n;
 }
 

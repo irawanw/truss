@@ -61,6 +61,14 @@ void q8_gemv_multi(const Q8Matrix * const * W, float * const * y, int n, const i
 // converted in registers (no dequantized copy, so the same weight traffic as the Q8_1 path), fp32 accumulation.
 void q8_gemv_multi_a16(const Q8Matrix * const * W, float * const * y, int n, const half * x, int rows, cudaStream_t stream);
 void q8_gemv_a16(const Q8Matrix & W, const half * x, int rows, float * y, cudaStream_t stream);
+// Its k split: S warps per 16-output tile in a block, KB blocks per tile (KB > 1: the last block of a tile adds the
+// block partials in order). Chosen from the shape (in, total outputs of the launch) only, never from rows: a row's
+// result does not depend on the row count, but a matrix fused with others may differ from it alone in the last bits.
+struct MmaSplit { int S, KB; };
+MmaSplit mma_split(int in, int outs);
+// the same with a given split (tuning: tools/tk-bench/gemv_split_bench)
+void q8_gemv_multi_a16_cfg(const Q8Matrix * const * W, float * const * y, int n, const half * x, int rows, MmaSplit c,
+                           cudaStream_t stream);
 void f32_gemv_multi(const float * const * W, const int * out, float * const * y, int n, int in, const float * x,
                     int rows, cudaStream_t stream);
 

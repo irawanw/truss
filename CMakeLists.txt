@@ -145,6 +145,8 @@ target_link_libraries(qwen4exp_dsa_long PRIVATE truss_models truss_kernels)
 # ---- tools/tk-bench: microbenchmarks
 add_executable(tk-bench-ceiling tools/tk-bench/ceiling.cu)
 target_include_directories(tk-bench-ceiling PRIVATE src)
+add_executable(tk-bench-gemv-split tools/tk-bench/gemv_split_bench.cu)
+target_link_libraries(tk-bench-gemv-split PRIVATE truss_kernels)
 add_executable(tk-bench-moe-trace tools/tk-bench/moe_trace.cu)
 target_link_libraries(tk-bench-moe-trace PRIVATE truss_kernels)
 

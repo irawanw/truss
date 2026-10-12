@@ -12,10 +12,35 @@
 
 #include <cublas_v2.h>
 
+#include <algorithm>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 
 namespace truss::dense {
+
+// warps per tile S and blocks per tile KB of the W8A16 gemv, from the shape only (never from `rows`, so a row's
+// result does not depend on the window size). P = S * KB warps share a tile's k range: enough for ~1280 warps in
+// all (the small matrices fill the 82 SMs: hc down 10240 -> 324 has 21 tiles) and at most ~12 Q8 blocks per warp, at
+// least 2; S up to 16, the rest across KB blocks. Measured on the 3090 (tk-bench-gemv-split, 10-12): hc down 13.4 ->
+// 8.6 us, shexp down 10.7 -> 5.0, shexp gate+up 12.0 -> 7.2, dsa in 57.9 -> 49.2. TRUSS_GEMV_SPLIT=0: the earlier
+// rule (S from `in`, KB 1).
+MmaSplit mma_split(int in, int outs)
+{
+    const int nb = in / 32, tiles = (outs + 15) / 16;
+    static const bool on = [] { const char * e = std::getenv("TRUSS_GEMV_SPLIT"); return !e || std::atoi(e); }();
+    if (!on) {
+        const int want = nb / 16;
+        return { want >= 16 ? 16 : want >= 8 ? 8 : want >= 4 ? 4 : want >= 2 ? 2 : 1, 1 };
+    }
+    auto pow2_at_least = [](int v) { int p = 1; while (p < v) p *= 2; return p; };
+    int P = std::max(pow2_at_least((1280 + tiles - 1) / tiles), pow2_at_least((nb + 11) / 12));
+    while (P > 1 && P * 2 > nb) P /= 2;   // at least 2 blocks per warp
+    const int S = std::min(P, 16);
+    return { S, P / S };
+}
+
 namespace {
 
 constexpr int THREADS = 256;
@@ -330,11 +355,15 @@ __device__ __forceinline__ void mma16816(float c[4], const uint32_t a[4], const 
 }
 
 template <int S>   // warps per tile (k split); a CTA has max(4, S) warps = max(4, S) / S tiles
-__global__ void __launch_bounds__(512) gemv_mma_a16_kernel(MultiQ8 m, int in, const half * __restrict__ x, int rows)
+__global__ void __launch_bounds__(512) gemv_mma_a16_kernel(MultiQ8 m, int in, const half * __restrict__ x, int rows,
+                                                           float * __restrict__ ws, int * __restrict__ ctr)
 {
+    // gridDim.y = KB blocks split the k range of each tile group too (warp p = kb * S + ks of P = S * KB takes Q8
+    // blocks p, p + P, ...); each block sums its S warps, then the group's last block to arrive adds the KB partials
+    // in kb order (fixed order, no float atomics)
     constexpr int WARPS = S > 4 ? S : 4, TILES = WARPS / S;
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane >> 2, q = lane & 3, nb = in / 32;
-    const int tile = blockIdx.x * TILES + warp / S, ks = warp % S;
+    const int tile = blockIdx.x * TILES + warp / S, ks = warp % S, KB = gridDim.y, kb = blockIdx.y, P = S * KB;
     const int outs = m.start[m.n];
     // this thread's two output rows (g, g + 8 of the tile) and their matrices
     const int o[2] = { tile * 16 + g, tile * 16 + g + 8 };
@@ -354,7 +383,7 @@ __global__ void __launch_bounds__(512) gemv_mma_a16_kernel(MultiQ8 m, int in, co
     const half * xr = x + (size_t) (xrow ? g : 0) * in + 8 * q;
     float acc[4] = { 0.f, 0.f, 0.f, 0.f };
 #pragma unroll 4
-    for (int b = ks; b < nb; b += S) {
+    for (int b = kb * S + ks; b < nb; b += P) {
         const uint2 w0 = wq[0] ? __ldg(reinterpret_cast<const uint2 *>(wq[0] + b * 32)) : make_uint2(0, 0);
         const uint2 w1 = wq[1] ? __ldg(reinterpret_cast<const uint2 *>(wq[1] + b * 32)) : make_uint2(0, 0);
         const uint4 xv = xrow ? __ldg(reinterpret_cast<const uint4 *>(xr + b * 32)) : make_uint4(0, 0, 0, 0);
@@ -376,11 +405,32 @@ __global__ void __launch_bounds__(512) gemv_mma_a16_kernel(MultiQ8 m, int in, co
 #pragma unroll
         for (int i = 0; i < 4; ++i) part[warp][lane][i] = acc[i];
         __syncthreads();
-        if (ks) return;
+        if (ks) {
+            if (KB == 1) return;
+        } else {
 #pragma unroll
-        for (int k = 1; k < S; ++k)
+            for (int k = 1; k < S; ++k)
 #pragma unroll
-            for (int i = 0; i < 4; ++i) acc[i] += part[warp + k][lane][i];
+                for (int i = 0; i < 4; ++i) acc[i] += part[warp + k][lane][i];
+        }
+    }
+    if (KB > 1) {   // block partials to ws[tile][kb]; the last block of the group adds them in kb order
+        __shared__ int s_last;
+        float4 * wp = reinterpret_cast<float4 *>(ws) + ((size_t) tile * KB) * 32 + lane;
+        if (ks == 0) wp[(size_t) kb * 32] = make_float4(acc[0], acc[1], acc[2], acc[3]);
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) s_last = atomicAdd(&ctr[blockIdx.x], 1) == KB - 1;
+        __syncthreads();
+        if (!s_last || ks) return;
+        __threadfence();
+        float4 v = __ldcg(wp);
+        acc[0] = v.x, acc[1] = v.y, acc[2] = v.z, acc[3] = v.w;
+        for (int k = 1; k < KB; ++k) {
+            v = __ldcg(wp + (size_t) k * 32);
+            acc[0] += v.x, acc[1] += v.y, acc[2] += v.z, acc[3] += v.w;
+        }
+        if (warp == 0 && lane == 0) ctr[blockIdx.x] = 0;   // the next launch's
     }
     // C: (row g, cols 2q, 2q + 1), (row g + 8, same cols); col = window row
 #pragma unroll
@@ -393,23 +443,49 @@ __global__ void __launch_bounds__(512) gemv_mma_a16_kernel(MultiQ8 m, int in, co
             }
 }
 
-int mma_split(int in)   // warps per tile, from the input width only: ~16-20 blocks per warp
+// cross-block split workspace, one per (device, stream): launches on one stream run in order, so each finds the
+// counters zero (the last block of a group resets its own)
+constexpr size_t SPLIT_WS_FLOATS = (size_t) 1 << 20, SPLIT_CTRS = 8192;
+struct SplitWs { float * part = nullptr; int * ctr = nullptr; };
+SplitWs split_ws(cudaStream_t stream)
 {
-    const int nb = in / 32, want = nb / 16;
-    return want >= 16 ? 16 : want >= 8 ? 8 : want >= 4 ? 4 : want >= 2 ? 2 : 1;
+    static std::mutex mu;
+    static std::map<std::pair<int, cudaStream_t>, SplitWs> all;
+    int dev = 0;
+    TRUSS_CUDA(cudaGetDevice(&dev));
+    std::lock_guard<std::mutex> g(mu);
+    SplitWs & w = all[{ dev, stream }];
+    if (!w.part) {
+        TRUSS_CUDA(cudaMalloc(&w.part, sizeof(float) * SPLIT_WS_FLOATS));
+        TRUSS_CUDA(cudaMalloc(&w.ctr, sizeof(int) * SPLIT_CTRS));
+        TRUSS_CUDA(cudaMemset(w.ctr, 0, sizeof(int) * SPLIT_CTRS));
+    }
+    return w;
+}
+
+void gemv_mma_a16_cfg(const MultiQ8 & m, int in, const half * x, int rows, MmaSplit c, cudaStream_t stream)
+{
+    const int S = c.S, warps = S > 4 ? S : 4, tiles = (m.start[m.n] + 15) / 16, per = warps / S;
+    const int grid = (tiles + per - 1) / per;
+    int KB = c.KB < 1 ? 1 : c.KB;
+    SplitWs w;
+    if (KB > 1) {
+        if ((size_t) grid * per * KB * 128 > SPLIT_WS_FLOATS || grid > (int) SPLIT_CTRS) KB = 1;
+        else w = split_ws(stream);
+    }
+    const dim3 gd(grid, KB);
+    switch (S) {
+    case 1: gemv_mma_a16_kernel<1><<<gd, 32 * warps, 0, stream>>>(m, in, x, rows, w.part, w.ctr); break;
+    case 2: gemv_mma_a16_kernel<2><<<gd, 32 * warps, 0, stream>>>(m, in, x, rows, w.part, w.ctr); break;
+    case 4: gemv_mma_a16_kernel<4><<<gd, 32 * warps, 0, stream>>>(m, in, x, rows, w.part, w.ctr); break;
+    case 8: gemv_mma_a16_kernel<8><<<gd, 32 * warps, 0, stream>>>(m, in, x, rows, w.part, w.ctr); break;
+    default: gemv_mma_a16_kernel<16><<<gd, 32 * warps, 0, stream>>>(m, in, x, rows, w.part, w.ctr); break;
+    }
 }
 
 void gemv_mma_a16(const MultiQ8 & m, int in, const half * x, int rows, cudaStream_t stream)
 {
-    const int S = mma_split(in), warps = S > 4 ? S : 4, tiles = (m.start[m.n] + 15) / 16, per = warps / S;
-    const int grid = (tiles + per - 1) / per;
-    switch (S) {
-    case 1: gemv_mma_a16_kernel<1><<<grid, 32 * warps, 0, stream>>>(m, in, x, rows); break;
-    case 2: gemv_mma_a16_kernel<2><<<grid, 32 * warps, 0, stream>>>(m, in, x, rows); break;
-    case 4: gemv_mma_a16_kernel<4><<<grid, 32 * warps, 0, stream>>>(m, in, x, rows); break;
-    case 8: gemv_mma_a16_kernel<8><<<grid, 32 * warps, 0, stream>>>(m, in, x, rows); break;
-    default: gemv_mma_a16_kernel<16><<<grid, 32 * warps, 0, stream>>>(m, in, x, rows); break;
-    }
+    gemv_mma_a16_cfg(m, in, x, rows, mma_split(in, m.start[m.n]), stream);
 }
 
 bool mma_on()   // TRUSS_GEMV_MMA=0: the scalar A16 kernel (A/B switch, read once)
@@ -632,6 +708,16 @@ void q8_gemv_multi_a16(const Q8Matrix * const * W, float * const * y, int n, con
     case 8: gemv_multi_rows<8, true>(m, in, xq, nullptr, stream); break;
     default: throw std::runtime_error("q8_gemv_multi_a16: rows must be 1.." + std::to_string(GEMV_ROWS));
     }
+    TRUSS_CUDA(cudaGetLastError());
+}
+
+void q8_gemv_multi_a16_cfg(const Q8Matrix * const * W, float * const * y, int n, const half * x, int rows, MmaSplit c,
+                           cudaStream_t stream)
+{
+    MultiQ8 m{};
+    m.n = n, m.start[0] = 0;
+    for (int i = 0; i < n; ++i) m.q[i] = W[i]->q, m.d[i] = W[i]->d, m.y[i] = y[i], m.start[i + 1] = m.start[i] + W[i]->out;
+    gemv_mma_a16_cfg(m, W[0]->in, x, rows, c, stream);
     TRUSS_CUDA(cudaGetLastError());
 }
 
