@@ -183,6 +183,16 @@ struct Forward::Impl {
         int * plan = nullptr, * need_copy = nullptr;                // mapped words the driver writes (wait_plan)
         int * go = nullptr, * d_mids = nullptr;                       // device
         int seq = 0;                                                  // host: the last seq enqueued
+        // TRUSS_SECT_CSV: the host side of this layer's chain, microseconds after the driver saw the doorbell
+        // (drv_t[0]) - the same origin as the CSV's GPU columns, which start at the publish event a few us earlier.
+        // All of it is written before the release fence in front of cpu_done, and the GPU only reaches its last
+        // event after that, so sect_flush reads these without racing the driver.
+        double h_t[5] = {};      // split done, pool started, plan written, hint + admit done, pool wait returned
+        double h_pool = 0;       // the pool's own span for this call (start -> last item)
+        double h_wake = 0;       // ... its start -> first item started (-1: no item ran)
+        double h_item = 0;       // ... its sum of item time, over every thread that ran one
+        double h_longest = 0;    // ... its longest single item (the straggler the call ends with)
+        int h_ncpu = 0;          // slots the CPU tier took for this layer (0: no CPU tier)
     };
     std::vector<Bell> bells;
     struct Job {
@@ -587,7 +597,9 @@ struct Forward::Impl {
                 if (sect_csv)
                     std::fprintf(sect_csv,
                                  "# pass rows layer route_publish wait_plan wait_copies window cpu_join helper_join "
-                                 "tail ple_attn_mix mixer hc_mix moe_total shared combine\n");
+                                 "tail ple_attn_mix mixer hc_mix moe_total shared combine host_split host_pool_start "
+                                 "host_plan host_hint_admit host_publish pool_span pool_wake pool_compute "
+                                 "pool_longest ncpu\n");
             }
         }
     }
@@ -840,6 +852,7 @@ struct Forward::Impl {
         drv_t[1] = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> pool_lock;   // a split's stages share the pool (pipelined windows overlap)
         if (ct && ct->pool_mu) pool_lock = std::unique_lock<std::mutex>(*ct->pool_mu);
+        const long long item0 = sect_on && ct ? ct->pool->item_us() : 0;   // cumulative; the call's own is the diff
         if (ct) ct->pool->start(b.x, j.T, slots, b.y);   // CPU first: it runs while the copies are issued
         drv_t[2] = std::chrono::steady_clock::now();
         // the plan (masked ids in mapped b.mids) goes to the GPU through mapped words, as Strata's: a layer that needs
@@ -861,6 +874,14 @@ struct Forward::Impl {
                 ts_ms[1] += ms(drv_t[0], drv_t[1]), ts_ms[2] += ms(drv_t[1], drv_t[2]), ts_ms[3] += ms(drv_t[2], t3);
                 ts_t3 = t3;
             }
+        }
+        if (sect_on)   // this layer's host chain, us after the driver saw the doorbell (Bell::h_t -> the CSV)
+        {
+            auto us = [](auto a, auto t) { return std::chrono::duration<double, std::micro>(t - a).count(); };
+            b.h_t[0] = us(drv_t[0], drv_t[1]);
+            b.h_t[1] = us(drv_t[0], drv_t[2]);
+            b.h_t[2] = us(drv_t[0], std::chrono::steady_clock::now());
+            b.h_ncpu = n_cpu;
         }
         if (j.hint) {
             std::vector<int> h;
@@ -890,12 +911,21 @@ struct Forward::Impl {
             for (size_t i = 0; i < cand.size() && i < 2 && admit_pass < admit_idle; ++i)
                 admit_pass += experts->claim(sl(l), cand[i].second);
         }
-        if (drv_ts) ts_t3b = std::chrono::steady_clock::now();
+        if (drv_ts || sect_on) ts_t3b = std::chrono::steady_clock::now();
+        if (sect_on) b.h_t[3] = std::chrono::duration<double, std::micro>(ts_t3b - drv_t[0]).count();   // hint + admit
         if (ct) {
             dbg_phase = 7;
             ct->pool->wait();
             if (cpu_dynamic && n_cpu > 0)   // the pool's own time (start to last item), not this thread's
                 fit_cpu_cost(n_cpu, ct->pool->last_call_ms());
+            if (sect_on)   // the pool's own split, and the instant cpu_done is about to be raised (the GPU sees it
+            {              // a round trip later: see the residuals sect.py prints)
+                b.h_t[4] = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - drv_t[0]).count();
+                b.h_pool = 1000.0 * ct->pool->last_call_ms();
+                b.h_wake = (double) ct->pool->last_wake_us();
+                b.h_item = (double) (ct->pool->item_us() - item0);   // item_us_ is cumulative over the run
+                b.h_longest = (double) ct->pool->last_longest_us();
+            }
             std::atomic_thread_fence(std::memory_order_release);
             *(volatile int *) b.cpu_done = j.seq;
             if (drv_ts)
@@ -2178,7 +2208,12 @@ struct Forward::Impl {
                         std::fprintf(sect_csv, " %.3f", ms);
                     }
                     for (int i = 0; i < 6; ++i) std::fprintf(sect_csv, " %.3f", sec[i]);
-                    std::fprintf(sect_csv, "\n");
+                    // the host chain of this layer, us after the driver saw the doorbell (see Bell::h_t). The GPU
+                    // waits for the plan and the copies, so the driver had served this seq when its last event
+                    // completed: no race with the writer.
+                    const Bell & hb = bells[l];
+                    for (int i = 0; i < 5; ++i) std::fprintf(sect_csv, " %.1f", hb.h_t[i]);
+                    std::fprintf(sect_csv, " %.1f %.1f %.1f %.1f %d\n", hb.h_pool, hb.h_wake, hb.h_item, hb.h_longest, hb.h_ncpu);
                 }
             }
             sect_rec[l] = 0, sect_bell[l] = 0;
