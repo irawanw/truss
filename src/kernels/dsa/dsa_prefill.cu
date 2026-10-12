@@ -39,15 +39,18 @@ __device__ __forceinline__ uint32_t ld32(const half * p) { return __ldg(reinterp
 
 // scores [n_q][ld] for queries q0 .. q0 + n_q - 1 of the chunk (positions pos0 + q0 + i); only blocks a query sees
 // are written
-template <class Shape>
+// FEW (<= 16 queries: decode steps, verify windows): every warp takes the same 16 queries and its own 32 blocks, so a
+// CTA covers 8 x 32 blocks with all 8 warps busy (the 64-query tiling leaves 6 of them idle); same per-(query, block)
+// arithmetic, so the same scores
+template <class Shape, bool FEW = false>
 __global__ void __launch_bounds__(256) score_kernel(const half * idx_q, const half * idx_k, int pos0, int q0, int n_q,
                                                     float * scores, int ld)
 {
     constexpr int IH = Shape::IH, ID = Shape::ID, R = Shape::RATIO;
     static_assert(ID % 16 == 0, "indexer head dim in k16 steps");
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane / 4, qd = lane % 4;
-    const int tq0 = blockIdx.x * SQ + (warp % 4) * 16;         // local query of fragment row 0
-    const int b0 = blockIdx.y * SB + (warp / 4) * 32;          // block of fragment column 0
+    const int tq0 = FEW ? 0 : blockIdx.x * SQ + (warp % 4) * 16;              // local query of fragment row 0
+    const int b0 = FEW ? blockIdx.y * 256 + warp * 32 : blockIdx.y * SB + (warp / 4) * 32;   // block of column 0
     const int last_pos = pos0 + q0 + min(n_q, tq0 + 16) - 1;   // warp's last query
     if (tq0 >= n_q || R * b0 + R - 1 > last_pos) return;       // no visible block in this warp's tile
     const int nb_seen = (last_pos + 1) / R;
@@ -259,6 +262,162 @@ __global__ void __launch_bounds__(FEW_THREADS) select_few_kernel(const float * s
         if (take) out[TOP - 1 - pos++] = b;
     }
     if (tid == 0) n_blocks[t] = TOP;
+}
+
+// Multi-CTA form of select_few (decode, verify windows at long context): SEL_NB CTAs per query each histogram a
+// strided share of the keys into a global histogram per radix pass, wait at a grid barrier, and all derive the same
+// prefix from it; the final pass gives each CTA a contiguous range and the counts of the later CTAs. Same kth, same
+// tie rule (the latest equal keys), same ascending output as select_few. The CTAs of a launch must be co-resident:
+// n_q * SEL_NB <= the SM count (one 1024-thread CTA per SM). The sync state is per device and is left zero by the last
+// CTA out.
+constexpr int SEL_NB = 8, SEL_MAXQ = 8;
+struct SelSync {
+    unsigned hist[4][256];
+    int gt[SEL_NB], eq[SEL_NB];
+    unsigned bar, out;
+};
+__device__ SelSync g_sel[SEL_MAXQ];
+
+__device__ __forceinline__ void sel_barrier(unsigned * bar, unsigned target)
+{
+    __threadfence();   // every thread's global atomics and stores before the arrival
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        atomicAdd(bar, 1u);
+        while (*(volatile unsigned *) bar < target) __nanosleep(32);
+        __threadfence();
+    }
+    __syncthreads();
+}
+
+template <class Shape>
+__global__ void __launch_bounds__(FEW_THREADS) select_multi_kernel(const float * scores, int ld, int pos0, int q0,
+                                                                   int * blocks, int * n_blocks)
+{
+    constexpr int R = Shape::RATIO, TOP = Shape::TOP_BLOCKS;
+    using Scan = cub::BlockScan<int, FEW_THREADS>;
+    __shared__ typename Scan::TempStorage scan;
+    __shared__ unsigned hist[256];
+    __shared__ int after[FEW_THREADS];
+    __shared__ unsigned s_prefix, s_mask, s_need;
+    __shared__ int s_gt, s_eq;
+    const int tq = blockIdx.y, t = q0 + tq, tid = threadIdx.x, cb = blockIdx.x;
+    SelSync & G = g_sel[tq];
+    const int seen = (pos0 + t + 1) / R;
+    int * out = blocks + (size_t) t * TOP;
+    if (seen <= TOP) {   // the launcher only sends long rows here, but stay correct
+        if (cb == 0) {
+            for (int b = tid; b < seen; b += FEW_THREADS) out[b] = b;
+            if (tid == 0) n_blocks[t] = seen;
+        }
+        return;
+    }
+    const float * row = scores + (size_t) tq * ld;
+    auto key = [&](int b) { return __float_as_uint(row[b]); };
+    unsigned prefix = 0, mask = 0, need = TOP, phase = 0;
+    for (int p = 0, shift = 24; shift >= 0; ++p, shift -= 8) {
+        for (int i = tid; i < 256; i += FEW_THREADS) hist[i] = 0;
+        __syncthreads();
+        for (int b = cb * FEW_THREADS + tid; b < seen; b += SEL_NB * FEW_THREADS) {
+            const unsigned k = key(b);
+            if ((k & mask) == prefix) atomicAdd(&hist[(k >> shift) & 255], 1u);
+        }
+        __syncthreads();
+        for (int i = tid; i < 256; i += FEW_THREADS)
+            if (hist[i]) atomicAdd(&G.hist[p][i], hist[i]);
+        sel_barrier(&G.bar, SEL_NB * ++phase);
+        if (tid < 32) {   // as select_few, on the global histogram (every CTA derives the same bin)
+            const int lane = tid;
+            unsigned c[8], sum = 0;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) c[i] = __ldcg(&G.hist[p][255 - 8 * lane - i]), sum += c[i];
+            unsigned incl = sum;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const unsigned v = __shfl_up_sync(0xffffffffu, incl, o);
+                if (lane >= o) incl += v;
+            }
+            const unsigned above0 = incl - sum;
+            if (above0 < need && incl >= need) {
+                unsigned above = above0;
+                for (int i = 0; i < 8; ++i) {
+                    if (above + c[i] >= need) {
+                        const unsigned bin = 255 - 8 * lane - i;
+                        s_prefix = prefix | bin << shift;
+                        s_mask = mask | 255u << shift;
+                        s_need = need - above;
+                        break;
+                    }
+                    above += c[i];
+                }
+            }
+        }
+        __syncthreads();
+        prefix = s_prefix, mask = s_mask, need = s_need;
+    }
+    const unsigned kth = prefix;
+    const int need_eq = (int) need;
+
+    // final pass: CTA cb owns blocks [clo, chi), thread i a contiguous piece of it
+    const int cper = (seen + SEL_NB - 1) / SEL_NB, clo = min(seen, cb * cper), chi = min(seen, clo + cper);
+    const int per = (chi - clo + FEW_THREADS - 1) / FEW_THREADS;
+    const int lo = min(chi, clo + tid * per), hi = min(chi, lo + per);
+    int gt = 0, eq = 0;
+    for (int b = lo; b < hi; ++b) {
+        const unsigned k = key(b);
+        gt += k > kth, eq += k == kth;
+    }
+    // later threads' counts within the CTA (reversed exclusive scans, as select_few)
+    auto later = [&](int v, int & total) {
+        after[FEW_THREADS - 1 - tid] = v;
+        __syncthreads();
+        int x = after[tid], ex;
+        __syncthreads();
+        Scan(scan).ExclusiveSum(x, ex, total);
+        __syncthreads();
+        after[FEW_THREADS - 1 - tid] = ex;
+        __syncthreads();
+        const int r = after[tid];
+        __syncthreads();
+        return r;
+    };
+    int gt_cta, eq_cta;
+    const int gt_after = later(gt, gt_cta), eq_after = later(eq, eq_cta);
+    if (tid == 0) G.gt[cb] = gt_cta, G.eq[cb] = eq_cta;
+    sel_barrier(&G.bar, SEL_NB * ++phase);
+    if (tid == 0) {   // the later CTAs' counts
+        int g2 = 0, e2 = 0;
+        for (int j = cb + 1; j < SEL_NB; ++j) g2 += __ldcg(&G.gt[j]), e2 += __ldcg(&G.eq[j]);
+        s_gt = g2, s_eq = e2;
+    }
+    __syncthreads();
+    const int eq_later = eq_after + s_eq;                          // equal keys after this thread's range
+    const int eq_keep = max(0, min(eq, need_eq - eq_later));       // this range's latest equal keys
+    const int kept_cta_after = s_gt + min(s_eq, need_eq);          // kept in the later CTAs
+    int dummy;
+    int pos = kept_cta_after + later(gt + eq_keep, dummy);         // kept blocks after this range
+    int eq_seen = 0;
+    for (int b = hi - 1; b >= lo; --b) {
+        const unsigned k = key(b);
+        bool take = k > kth;
+        if (k == kth) take = eq_seen++ < eq_keep;
+        if (take) out[TOP - 1 - pos++] = b;
+    }
+    if (cb == 0 && tid == 0) n_blocks[t] = TOP;
+    // the last CTA out leaves the sync state zero for the next launch
+    __syncthreads();
+    if (tid == 0) {
+        __threadfence();
+        if (atomicAdd(&G.out, 1u) == SEL_NB - 1) {
+            for (int p = 0; p < 4; ++p)
+                for (int i = 0; i < 256; ++i) G.hist[p][i] = 0;
+            for (int j = 0; j < SEL_NB; ++j) G.gt[j] = 0, G.eq[j] = 0;
+            G.bar = 0;
+            __threadfence();
+            G.out = 0;
+        }
+    }
 }
 
 // ---- sparse attention
@@ -824,6 +983,18 @@ template <class Shape> int max_query_cells(int pos0, int T)   // the most cells 
 
 int split_count(int max_cells) { return std::max(1, std::min(MAX_SPLITS, (max_cells + 2 * TILE - 1) / (2 * TILE))); }
 
+// select_multi_kernel's CTAs must all be resident at once (they wait for each other): one 1024-thread CTA per SM
+bool sel_multi_ok(int n_q)
+{
+    static const bool off = std::getenv("TRUSS_DSA_SELECT_MULTI") && !std::atoi(std::getenv("TRUSS_DSA_SELECT_MULTI"));
+    if (off) return false;
+    int dev = 0, sms = 0;
+    TRUSS_CUDA(cudaGetDevice(&dev));
+    TRUSS_CUDA(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+    return n_q * SEL_NB <= sms;
+}
+
+
 }  // namespace
 
 template <class Shape> size_t attention_workspace_bytes(int max_queries)
@@ -852,10 +1023,15 @@ void select(const half * idx_q, const half * idx_k, int pos0, int T, int * block
     for (int q0 = 0; q0 < T; q0 += rows) {
         const int n_q = std::min(rows, T - q0);
         const int last_seen = (pos0 + q0 + n_q) / Shape::RATIO;
-        if (last_seen > Shape::TOP_BLOCKS)   // some query needs scores
+        if (last_seen > Shape::TOP_BLOCKS && n_q <= 16)   // some query needs scores
+            score_kernel<Shape, true><<<dim3(1, (last_seen + 255) / 256), 256, 0, stream>>>(idx_q, idx_k, pos0, q0, n_q,
+                                                                                          scores, ld);
+        else if (last_seen > Shape::TOP_BLOCKS)
             score_kernel<Shape><<<dim3((n_q + SQ - 1) / SQ, (last_seen + SB - 1) / SB), 256, 0, stream>>>(
                 idx_q, idx_k, pos0, q0, n_q, scores, ld);
-        if (n_q <= SELECT_FEW_ROWS && !rowwise)
+        if (n_q <= SEL_MAXQ && !rowwise && sel_multi_ok(n_q) && (pos0 + q0 + 1) / Shape::RATIO > 8 * Shape::TOP_BLOCKS)
+            select_multi_kernel<Shape><<<dim3(SEL_NB, n_q), FEW_THREADS, 0, stream>>>(scores, ld, pos0, q0, blocks, n_blocks);
+        else if (n_q <= SELECT_FEW_ROWS && !rowwise)
             select_few_kernel<Shape><<<n_q, FEW_THREADS, 0, stream>>>(scores, ld, pos0, q0, blocks, n_blocks);
         else
             select_kernel<Shape><<<n_q, SELECT_THREADS, 0, stream>>>(scores, ld, pos0, q0, blocks, n_blocks);
