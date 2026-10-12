@@ -86,6 +86,12 @@ public:
     // the last call's own duration, start() to its last item (not to wait()'s return): what the CPU took, without
     // whatever the caller did before calling wait(). 0 for an empty call.
     double last_call_ms() const { return last_ms_; }   // sum of item() compute time (all threads, caller included)
+    // TRUSS_DRIVER_TS=1: split last_call_ms() into the three parts the host chain is made of - the wake-up (start()
+    // to the first item actually started: a sleeping worker's futex + cache cost), the compute (item_us(), summed
+    // over the threads that ran) and the straggler (the longest single item: the call cannot end before it). Read
+    // them after wait() returns, holding the pool's lock (a split's stages share one pool).
+    long long last_wake_us() const { return first_us_.load(std::memory_order_relaxed); }   // -1: no item ran
+    long long last_longest_us() const { return longest_us_.load(std::memory_order_relaxed); }
     // phase breakdown of item_us_ (same clock): gate/up gemv, silu, h-quantize, down gemv. Trellis: gate = phase 0
     // items, down = phase 1 items (incl. their h block), hq = phase 2 items (down reduced, weighted into y; not in item_us_)
     long long gate_us() const { return gate_us_; }
@@ -160,6 +166,9 @@ private:
     std::vector<int> slot_g_, slot_k_;      // each slot's group and its row index within the group
     std::chrono::steady_clock::time_point t_start_;
     double last_ms_ = 0;
+    bool ts_ = false;                            // TRUSS_DRIVER_TS: grab() and item() take the two stamps below
+    std::atomic<long long> first_us_{ -1 }, longest_us_{ 0 };   // the current call: start -> first item started, and
+                                                 // its longest single item (microseconds; see last_wake_us)
     std::atomic<long long> wait_us_{ 0 };   // benchmark stats (see wait_us())
     std::atomic<long> waits_{ 0 };
     std::atomic<long long> item_us_{ 0 };

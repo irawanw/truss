@@ -179,6 +179,7 @@ ExpertPool::ExpertPool(int threads)
     // does. Off by default: the renters' threads float over every core, and pinning measured ~40% slower at loadavg
     // 28 with the q4s kernel (TRACKER #27); TRACKER #76 re-measures it with the int16 trellis kernel.
     spin_ = getenv("TRUSS_CPU_SPIN_US") ? atoi(getenv("TRUSS_CPU_SPIN_US")) : SPIN_US_DEF;
+    ts_ = getenv("TRUSS_DRIVER_TS") && atoi(getenv("TRUSS_DRIVER_TS"));   // the two stamps above (see last_wake_us)
     const bool pin = getenv("TRUSS_CPU_PIN") && atoi(getenv("TRUSS_CPU_PIN"));
     const std::vector<int> cores = pin ? physical_cores() : std::vector<int>{};
     tids_.assign(threads, 0);
@@ -279,6 +280,7 @@ void ExpertPool::start(const float * x, int T, const std::vector<Slot> & slots, 
     for (const Group & gr : groups_) rows_sum_ += (long long) gr.rows.size();
     t_start_ = std::chrono::steady_clock::now();
     last_ms_ = 0;
+    first_us_.store(-1, std::memory_order_relaxed), longest_us_.store(0, std::memory_order_relaxed);   // see last_wake_us
     busy_ = G > 0;   // seq_cst: the item fields above are visible to any worker that sees busy_
     if (G) wake();
 }
@@ -358,7 +360,10 @@ void ExpertPool::item_trellis(int i, int phase)
         trellis_gemv_raw(W, P.data(), R, c0, c0 + tr_dn_cols(), &pd_[((size_t) gi * nbd + b) * MAX_ROWS * D_MODEL + c0], D_MODEL);
         down_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
     }
-    item_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    const long long ius = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    item_us_ += ius;
+    if (ts_ && ius > longest_us_.load(std::memory_order_relaxed))
+        longest_us_.store(ius, std::memory_order_relaxed);   // the straggler: a call ends with its longest item
 }
 
 // phase 0: gate and up rows of one chunk, then h = silu(gate) * up; phase 1: h quantized, down rows of one chunk
@@ -401,7 +406,10 @@ void ExpertPool::item(int i, int ph)
         gemv(gr.e->down, r0, r1, xq, xd, R, &out_[(size_t) gi * MAX_ROWS * D_MODEL], D_MODEL);
         down_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
     }
-    item_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    const long long ius = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    item_us_ += ius;
+    if (ts_ && ius > longest_us_.load(std::memory_order_relaxed))
+        longest_us_.store(ius, std::memory_order_relaxed);   // the straggler: a call ends with its longest item
 }
 
 // every group's h rows quantized once, at the phase 0 -> 1 flip (under lock: no phase-1 item has started).
@@ -431,6 +439,9 @@ bool ExpertPool::grab(int & i, int & phase)
     if (!open()) return false;
     const int t = ticket_.fetch_add(1, std::memory_order_acq_rel);   // phase and index from the same value
     phase = t >> TICKET_SHIFT, i = t & ((1 << TICKET_SHIFT) - 1);
+    if (ts_ && i < phase_items_[phase] && first_us_.load(std::memory_order_relaxed) < 0)
+        first_us_.store(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_start_).count(),
+                        std::memory_order_relaxed);   // the call's wake-up: start() to the first item taken
     return i < phase_items_[phase];
 }
 
