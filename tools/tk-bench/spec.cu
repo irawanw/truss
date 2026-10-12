@@ -190,7 +190,7 @@ int main(int argc, char ** argv)
             long pre_tok = 0;
             long passes = 0, tokens = 0, drafted = 0, accepted = 0, dn = 0, ple_calls = 0, ple_rows = 0, cpu_waits = 0;
             long long item_us = 0, ph[4] = {}, sh[4] = {};
-            long asked = 0, misses = 0, hinted = 0;
+            long asked = 0, misses = 0, hinted = 0, helper = 0;
             double bytes = 0, hint_bytes = 0, adm_bytes = 0;
             long adm_n = 0;
             int identical = 0, compared = 0;
@@ -241,7 +241,8 @@ int main(int argc, char ** argv)
             long long ph0[4];
             f.cpu_phase_us(ph0);
             std::vector<int32_t> got;
-            const runtime::ExpertStore::Stats st0 = f.experts().stats();
+            const runtime::ExpertStore::Stats st0 = f.stats_all();   // every stage of a split, not just the last
+            const long helper0 = f.helper_hits();
             int passes = 0;
             long drafted = 0, accepted = 0;
             // device-side time per section (events bracket device work; host waits excluded): splits GPU compute from
@@ -335,10 +336,11 @@ int main(int argc, char ** argv)
             f.cpu_phase_us(ph);
             f.cpu_shape(sh);
             for (int k = 0; k < 4; ++k) S.ph[k] += ph[k] - ph0[k], S.sh[k] += sh[k];
-            const runtime::ExpertStore::Stats & st = f.experts().stats();
+            const runtime::ExpertStore::Stats st = f.stats_all();
             S.asked += st.experts_asked - st0.experts_asked, S.misses += st.misses - st0.misses;
             S.hinted += st.hinted - st0.hinted;
             S.bytes += st.bytes - st0.bytes, S.hint_bytes += st.hint_bytes - st0.hint_bytes;
+            S.helper += f.helper_hits() - helper0;
             S.adm_bytes += (double) (st.admit_bytes - st0.admit_bytes), S.adm_n += st.admitted_claims - st0.admitted_claims;
         }
         TRUSS_CUDA(cudaEventDestroy(e0));
@@ -352,8 +354,9 @@ int main(int argc, char ** argv)
                     S.pre_phase[2]);
         std::printf("spec : %ld tokens in %.2f s = %.1f tok/s, %ld passes (%.2f tokens/pass), drafts accepted %ld of %ld\n",
                     S.tokens, S.spec_s, S.tokens / S.spec_s, S.passes, S.tokens / passes, S.accepted, S.drafted);
-        std::printf("       per pass: %.1f cold experts routed, %.1f fetched on demand (%.1f MB), %.1f prefetched (%.1f MB)\n",
-                    S.asked / passes, S.misses / passes, S.bytes / 1e6 / passes, S.hinted / passes,
+        std::printf("       per pass: %.1f cold experts routed (%.1f held by the peer GPU), %.1f fetched on demand "
+                    "(%.1f MB), %.1f prefetched (%.1f MB)\n",
+                    S.asked / passes, S.helper / passes, S.misses / passes, S.bytes / 1e6 / passes, S.hinted / passes,
                     S.hint_bytes / 1e6 / passes);
         if (f.kv_lent()) std::printf("       KV lent to the expert ring at the end: %.2f GB\n", f.kv_lent() / 1e9);
         {
@@ -379,8 +382,9 @@ int main(int argc, char ** argv)
             double ce = 0, cc = 0;
             f.dyn_stats(dc, dp, ce, cc);
             if (dc + dp)
-                std::printf("       dynamic split (whole run): %ld misses to the CPU, %ld over PCIe; CPU call %.3f + %.3f ms/expert\n",
-                            dc, dp, cc, ce);
+                std::printf("       dynamic split per pass: %.1f misses to the CPU, %.1f over PCIe (whole run %ld, "
+                            "%ld); CPU call %.3f + %.3f ms/expert\n",
+                            dc / passes, dp / passes, dc, dp, cc, ce);
         }
         std::printf("       device ms/pass: draft %.2f + verify %.2f + head %.2f = %.2f (rest: host stalls/gaps)\n",
                     S.ms_draft / passes, S.ms_verify / passes, S.ms_head / passes,

@@ -220,6 +220,11 @@ public:
     // Options::cpu_dynamic: eligible misses sent to the CPU / over PCIe since construction, and the CPU's current
     // cost model of one CPU call, cpu_ms_call + cpu_ms_expert * n (ms, fitted to the pool's call times)
     void dyn_stats(long & cpu, long & pcie, double & cpu_ms_expert, double & cpu_ms_call) const;
+    // Summed over every stage of a layer split (experts() is one stage of it): a decode run's fetch statistics, and
+    // the routed experts the peer GPU holds for us (Options::helper). Those are hits, not misses: they are what the
+    // helper's compute takes off this stage. Divide by the number of decode passes for a per-pass figure.
+    runtime::ExpertStore::Stats stats_all() const;
+    long helper_hits() const;
     // Per-section device time of the layer chain, in ms, accumulated over every run()/verify() since the last
     // reset: [0] PLE + attn hyper-connection mix, [1] GDN/DSA mixer, [2] hc combine + ffn-side mix,
     // [3] router + routed MoE (PCIe copies and the CPU tier's start inside), [4] shared expert,
