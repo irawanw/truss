@@ -91,6 +91,17 @@ __global__ void count_kernel(const int * ids, int n, float * counts)
     if (i < n) atomicAdd(counts + ids[i], 1.f);
 }
 
+// the decode window's ids are at most MAX_ROWS * TOPK = 128, so this is one block
+__global__ void mask_split_kernel(const int * ids, const uint8_t * hot, int n, int * hot_ids, int * late_ids)
+{
+    for (int i = blockIdx.x * THREADS + threadIdx.x; i < n; i += gridDim.x * THREADS) {
+        const int e = ids[i];
+        const bool h = hot[e] != 0;
+        hot_ids[i] = h ? e : -1;
+        late_ids[i] = h ? -1 : e;
+    }
+}
+
 }  // namespace
 
 void add(float * y, const float * x, int n, cudaStream_t stream)
@@ -102,6 +113,12 @@ void add(float * y, const float * x, int n, cudaStream_t stream)
 void count(const int * ids, int n, float * counts, cudaStream_t stream)
 {
     count_kernel<<<grid(n), THREADS, 0, stream>>>(ids, n, counts);
+    TRUSS_CUDA(cudaGetLastError());
+}
+
+void mask_split(const int * ids, const uint8_t * hot, int n, int * hot_ids, int * late_ids, cudaStream_t stream)
+{
+    mask_split_kernel<<<grid(n), THREADS, 0, stream>>>(ids, hot, n, hot_ids, late_ids);
     TRUSS_CUDA(cudaGetLastError());
 }
 

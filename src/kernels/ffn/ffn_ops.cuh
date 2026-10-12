@@ -5,6 +5,7 @@
 //   swiglu      silu(g) * u -> fp16 (the down projection's input)
 //   shared_add  out = routed + y * sigmoid(gate)
 //   count       counts[ids[i]] += 1 (routing profile for the expert hot set)
+//   mask_split  ids -> the hot subset and the rest (-1 elsewhere), from a per-layer hot bitmap (the early window)
 #pragma once
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -28,5 +29,9 @@ void add(float * y, const float * x, int n, cudaStream_t stream);
 
 // counts [E] += how often each id appears in ids [n] (float: a profile of many tokens stays exact up to 2^24 per id)
 void count(const int * ids, int n, float * counts, cudaStream_t stream);
+
+// hot_ids / late_ids [n] = ids [n] split by hot[ids[i]] (a [E] bitmap), the other set getting -1: the early window
+// runs on hot_ids before the host's plan arrives, the late one on late_ids after it. One launch, both outputs.
+void mask_split(const int * ids, const uint8_t * hot, int n, int * hot_ids, int * late_ids, cudaStream_t stream);
 
 }  // namespace truss::ffn

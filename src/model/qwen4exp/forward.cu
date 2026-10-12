@@ -251,6 +251,14 @@ struct Forward::Impl {
     std::exception_ptr driver_error;
     bool use_doorbell = true;
     bool abl_nowait = false;                             // TRUSS_ABL_NOWAIT: the Phase 0b ceiling, timing only
+    // TRUSS_EARLY_WINDOW=N (Phase 1): the decode window splits in two. The static hot experts of a layer need neither
+    // the host's plan nor a copy, so their half of the MoE launches right after routing (over the ids masked to the
+    // hot set) and runs while the driver splits, the CPU tier starts and the copies land; the late window adds the
+    // rest to the same output. N is the row floor: 0 = off, N = on for windows of N rows and up (the small windows
+    // are latency-bound and a second launch only costs them). hot_dev is the [store layer][expert] hot bitmap on the
+    // device; the set is static after load, so the early launch can never read an expert a copy is overwriting.
+    int early_window = 0;
+    uint8_t * hot_dev = nullptr;
     // Options::cpu_dynamic (Strata's split, TRACKER #73): per layer, missed experts with a host copy go to the CPU or
     // over PCIe so that both finish together. CPU time of a call with n experts = cpu_ms_call + cpu_ms_expert * n
     // (n > 0), a least-squares line through the pool's own call times (exponentially weighted sums dyn_s*; a flat
@@ -540,6 +548,27 @@ struct Forward::Impl {
         abl_nowait = std::getenv("TRUSS_ABL_NOWAIT") && std::atoi(std::getenv("TRUSS_ABL_NOWAIT"));
         if (abl_nowait)
             std::fprintf(stderr, "TRUSS_ABL_NOWAIT=1: the decode window runs before the plan (timing only, output wrong)\n");
+        early_window = std::getenv("TRUSS_EARLY_WINDOW") ? std::atoi(std::getenv("TRUSS_EARLY_WINDOW")) : 0;
+        if (early_window > 0 && abl_nowait) {   // the ablation runs the whole window early; the two are exclusive
+            std::fprintf(stderr, "TRUSS_EARLY_WINDOW ignored: TRUSS_ABL_NOWAIT is on\n");
+            early_window = 0;
+        }
+        if (early_window > 0 && !use_doorbell) {   // no doorbell: the FFN already waits for the plan on this thread
+            std::fprintf(stderr, "TRUSS_EARLY_WINDOW ignored: the doorbell driver is off\n");
+            early_window = 0;
+        }
+        if (early_window > 0) {
+            const int E = c.n_expert;
+            std::vector<uint8_t> hb((size_t) n_store * E, 0);
+            int n_hot_static = 0;
+            for (int l = 0; l < n_store; ++l)
+                for (int e = 0; e < experts->experts(l); ++e)
+                    hb[(size_t) l * E + e] = (uint8_t) (n_hot_static += (int) experts->hot(l, e));
+            TRUSS_CUDA(cudaMalloc(&hot_dev, hb.size()));
+            TRUSS_CUDA(cudaMemcpy(hot_dev, hb.data(), hb.size(), cudaMemcpyHostToDevice));
+            std::fprintf(stderr, "TRUSS_EARLY_WINDOW=%d: %d hot experts of %d, early window from %d rows\n",
+                         early_window, n_hot_static, n_store * E, early_window);
+        }
         pcie_ms_byte = 1.0 / (o.pcie_gbps * 1e6);
         pcie_frac = o.pcie_frac;
         adapt_every = o.adapt_every, adapt_swaps = o.adapt_swaps;
@@ -599,7 +628,7 @@ struct Forward::Impl {
                                  "# pass rows layer route_publish wait_plan wait_copies window cpu_join helper_join "
                                  "tail ple_attn_mix mixer hc_mix moe_total shared combine host_split host_pool_start "
                                  "host_plan host_hint_admit host_publish pool_span pool_wake pool_compute "
-                                 "pool_longest ncpu\n");
+                                 "pool_longest ncpu early_window\n");
             }
         }
     }
@@ -631,6 +660,7 @@ struct Forward::Impl {
                               (void *) b.doorbell, (void *) b.cpu_done, (void *) b.plan, (void *) b.need_copy })
                 if (p) cudaFreeHost(p);
         for (void * p : owned) cudaFree(p);
+        if (hot_dev) cudaFree(hot_dev);
         if (ids_host) cudaFreeHost(ids_host);
         if (draft_host) cudaFreeHost(draft_host);
         if (commit_host) cudaFreeHost(commit_host);
@@ -843,11 +873,15 @@ struct Forward::Impl {
         } else if (ct) {
             for (int i = 0; i < n; ++i) to_cpu[i] = ct->is_cpu[l][b.ids[i]];
         }
+        const bool early = early_window > 0 && j.T >= early_window;   // the same predicate ffn() launched on
         for (int i = 0; i < n; ++i) {
             const int e = b.ids[i];
-            b.mids[i] = to_cpu[i] ? -1 : e;
+            // An expert the early window already computed needs no place in the plan and no copy. to_cpu and hot
+            // never overlap: a hot expert has no host copy, so the CPU tier cannot have taken one.
+            const bool done_early = early && experts->hot(sl(l), e);
+            b.mids[i] = to_cpu[i] || done_early ? -1 : e;
             if (to_cpu[i]) slots.push_back(ct->slot(i / K, l, e, b.w[i]));
-            else gpu_ids.push_back(e);
+            else if (!done_early) gpu_ids.push_back(e);
         }
         drv_t[1] = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> pool_lock;   // a split's stages share the pool (pipelined windows overlap)
@@ -1670,6 +1704,20 @@ struct Forward::Impl {
             // the shared expert does not need the plan or the copies: it runs while the driver splits and the
             // copies land (TRACKER #112; same math, so the same output)
             shared();
+            // TRUSS_EARLY_WINDOW (Phase 1): the hot experts of this layer need neither the plan nor a copy, so their
+            // half of the MoE runs now - while the driver splits, starts the CPU tier and issues the copies.
+            // mask_split writes both halves' ids in one launch; the late half comes from the plan when a CPU tier
+            // exists (serve() masks the same entries out of it) and from nids when it does not, so no expert is
+            // computed twice and none is dropped. The hot set is static: these reads never race a copy.
+            int * hids = nullptr, * nids = nullptr;
+            const bool early = early_window > 0 && T >= early_window;
+            if (early) {
+                hids = sc->alloc<int>((size_t) T * K);
+                nids = sc->alloc<int>((size_t) T * K);
+                ffn::mask_split(ids, hot_dev + (size_t) sl(l) * E, T * K, hids, nids, s);
+                moe::window<MoeShape>(experts->weights(sl(l)), in, hids, wts, T, routed, window_ws, s);
+            }
+            if (sect) sect_record(l, 13);   // the early half is done; waiting for the plan starts here
             // TRUSS_ABL_NOWAIT=1 (Phase 0b ceiling; timing only, the output is wrong): the window runs on the raw
             // ids here, before the plan and the copies are waited for. An expert that is not resident reads stale
             // bytes - every meta entry points at a real past placement inside the arena, so the read is in bounds
@@ -1685,7 +1733,8 @@ struct Forward::Impl {
             runtime::wait_plan(b.plan, b.need_copy, b.go, seq, b.mids, b.d_mids, cpu_on ? T * K : 0, s);
             if (sect) sect_record(l, 8);
             if (!abl_nowait)
-                moe::window<MoeShape>(experts->weights(sl(l)), in, cpu_on ? b.d_mids : ids, wts, T, routed, window_ws, s);
+                moe::window<MoeShape>(experts->weights(sl(l)), in, cpu_on ? b.d_mids : (early ? nids : ids), wts, T,
+                                      routed, window_ws, s, nullptr, early);
             if (sect) sect_record(l, 10);   // the window kernel ends here; the joins below wait for other workers
             if (cpu_on) cpu_rows = -T;            // the CPU rows join after the shared expert (mapped)
         } else if (!stream) {   // fetch the few cold experts this chunk routes to
@@ -2136,7 +2185,7 @@ struct Forward::Impl {
     // stream order, so elapsed(e[i-1], e[i]) is one section's device time including any host stall inside it.
     // Sums accumulate per run()/verify(); section_ms() reads them back.
     bool sect_on = false;
-    std::vector<std::array<cudaEvent_t, 13>> sect_ev;   // [layer][0..6] sections; 7, 9, 8, 10, 11, 12: inside the MoE
+    std::vector<std::array<cudaEvent_t, 14>> sect_ev;   // [layer][0..6] sections; 7, 13, 9, 8, 10, 11, 12: the MoE
     mutable std::vector<uint8_t> sect_rec;             // layers recorded since the last flush
     mutable double sect_ms[6] = { 0, 0, 0, 0, 0, 0 };
     // routed MoE on the doorbell path split at events 7 (doorbell raised), 9 (plan received) and 8 (copies landed,
@@ -2213,7 +2262,10 @@ struct Forward::Impl {
                     // completed: no race with the writer.
                     const Bell & hb = bells[l];
                     for (int i = 0; i < 5; ++i) std::fprintf(sect_csv, " %.1f", hb.h_t[i]);
-                    std::fprintf(sect_csv, " %.1f %.1f %.1f %.1f %d\n", hb.h_pool, hb.h_wake, hb.h_item, hb.h_longest, hb.h_ncpu);
+                    float early_ms = 0.f;   // 7 -> 13: the early window (0 with TRUSS_EARLY_WINDOW off)
+                    TRUSS_CUDA(cudaEventElapsedTime(&early_ms, sect_ev[l][7], sect_ev[l][13]));
+                    std::fprintf(sect_csv, " %.1f %.1f %.1f %.1f %d %.3f\n", hb.h_pool, hb.h_wake, hb.h_item,
+                                 hb.h_longest, hb.h_ncpu, early_ms);
                 }
             }
             sect_rec[l] = 0, sect_bell[l] = 0;

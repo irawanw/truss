@@ -140,6 +140,43 @@ static int run_case(ggml_backend_t backend, int64_t n_tokens, std::mt19937 & rng
     };
     const bool ok_first = check();
 
+    // The split window (TRUSS_EARLY_WINDOW): one routing as two launches - the first over half the experts, the
+    // second over the rest with accumulate - must give the reference output. Even/odd ids so both halves are
+    // non-empty and neither keeps the row's routing order (the sum order differs from the reference by design; the
+    // tolerance below is what a reassociated fp32 sum of this size actually costs).
+    std::vector<int32_t> hids(ids.size()), lids(ids.size());
+    for (size_t i = 0; i < ids.size(); ++i) {
+        const bool hot = (ids[i] & 1) == 0;
+        hids[i] = hot ? ids[i] : -1;
+        lids[i] = hot ? -1 : ids[i];
+    }
+    int32_t * d_h = nullptr, * d_l = nullptr;
+    CK(cudaMalloc(&d_h, sizeof(int32_t) * hids.size()));
+    CK(cudaMalloc(&d_l, sizeof(int32_t) * lids.size()));
+    CK(cudaMemcpy(d_h, hids.data(), sizeof(int32_t) * hids.size(), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_l, lids.data(), sizeof(int32_t) * lids.size(), cudaMemcpyHostToDevice));
+    CK(cudaMemset(d_out, 0xff, sizeof(float) * n_tokens * n_embd));
+    truss::moe::window<Shape>(W, (const float *) t_x->data, d_h, (const float *) t_w->data, (int) n_tokens, d_out, ws,
+                              st);
+    truss::moe::window<Shape>(W, (const float *) t_x->data, d_l, (const float *) t_w->data, (int) n_tokens, d_out, ws,
+                              st, nullptr, true);
+    CK(cudaStreamSynchronize(st));
+    CK(cudaGetLastError());
+    const bool ok_split = check();
+
+    // ... and the half-empty case every CPU-tier layer hits: an accumulating launch with nothing to add must leave
+    // the first half's output alone, not zero the row (the kernel's n == 0 path is what guards that).
+    CK(cudaMemset(d_out, 0xff, sizeof(float) * n_tokens * n_embd));
+    truss::moe::window<Shape>(W, (const float *) t_x->data, (const int *) t_ids->data, (const float *) t_w->data,
+                              (int) n_tokens, d_out, ws, st);
+    std::fill(lids.begin(), lids.end(), -1);
+    CK(cudaMemcpy(d_l, lids.data(), sizeof(int32_t) * lids.size(), cudaMemcpyHostToDevice));
+    truss::moe::window<Shape>(W, (const float *) t_x->data, d_l, (const float *) t_w->data, (int) n_tokens, d_out, ws,
+                              st, nullptr, true);
+    CK(cudaStreamSynchronize(st));
+    CK(cudaGetLastError());
+    const bool ok_empty_late = check();
+
     // bytes the window must read: each distinct routed expert once, all three projections, at its rate
     std::vector<char> seen(n_expert, 0);
     int64_t uniq = 0, tbytes = 0;
@@ -172,12 +209,16 @@ static int run_case(ggml_backend_t backend, int64_t n_tokens, std::mt19937 & rng
     CK(cudaGraphLaunch(ge, st));
     CK(cudaStreamSynchronize(st));
     const bool ok_replay = check();
-    const bool ok = ok_first && ok_replay;
+    const bool ok = ok_first && ok_replay && ok_split && ok_empty_late;
     printf("rows=%-2lld K=%s uniq=%-3lld %.1f MB | rel_rms %.5f cos %.8f %s | %.1f us/layer, %.0f GB/s (%.0f%% of 936)\n",
            (long long) n_tokens, kfix ? std::to_string(kfix).c_str() : "mix1-4", (long long) uniq, tbytes / 1e6,
-           worst_rel, worst_cos, ok ? "PASS" : ok_first ? "FAIL(replay)" : "FAIL", ms * 1e3, tbytes / (ms * 1e-3) / 1e9,
+           worst_rel, worst_cos,
+           ok ? "PASS" : !ok_first ? "FAIL" : !ok_split ? "FAIL(split)" : !ok_empty_late ? "FAIL(empty-late)"
+                                                                                  : "FAIL(replay)",
+           ms * 1e3, tbytes / (ms * 1e-3) / 1e9,
            100.0 * tbytes / (ms * 1e-3) / 936e9);
 
+    cudaFree(d_h); cudaFree(d_l);
     cudaGraphExecDestroy(ge); cudaGraphDestroy(g); cudaStreamDestroy(st); cudaFree(d_out);
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);

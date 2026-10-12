@@ -29,8 +29,11 @@ template <class Shape> void workspace_init(void * ws, cudaStream_t stream);
 // out[r] = sum_s w[r][s] * FFN_{ids[r][s]}(x[r]); x, out fp32 [n_rows][D_MODEL]; ids int32 / wts fp32
 // [n_rows][TOPK]. n_rows <= MAX_ROWS. Device work only: capturable into a CUDA graph.
 // trace: nullptr (normal use) or a device array of MAX_TRACE_EVENTS.
+// accumulate: out already holds an earlier window()'s sum (same stream), and this call adds to it rather than
+// writing it - the split window of the early-window path (hot experts first, the rest after the host's plan). A row
+// with no pair to compute leaves out untouched, so the two halves always cover every row exactly once.
 template <class Shape>
 void window(const Weights & W, const float * x, const int * ids, const float * wts, int n_rows, float * out, void * ws,
-            cudaStream_t stream, TraceEvent * trace = nullptr);
+            cudaStream_t stream, TraceEvent * trace = nullptr, bool accumulate = false);
 
 }  // namespace truss::moe

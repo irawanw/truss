@@ -114,6 +114,12 @@ public:
         const Layer & Y = layers_[l];
         return Y.cold_off[e] < 0 || (Y.ring_at[e] >= 0 && !Y.pend[e]);
     }
+    // The static hot set: `cold_off[e] < 0` is exactly HotSet[l][e] = 1. A hot expert lives in its own arena region,
+    // is never evicted and never overwritten by a copy, so a kernel may read one without ordering behind the copy
+    // stream - which is what the early window (TRUSS_EARLY_WINDOW) relies on. The CPU tier never has one: host_part()
+    // returns nullptr for a hot expert, so hot and the CPU set are disjoint by construction.
+    bool hot(int l, int e) const { return layers_[l].cold_off[e] < 0; }
+    int experts(int l) const { return layers_[l].n_expert; }
 
     // Strata's adaptive tier (TRACKER #78), between decode passes: copy the cold experts `le` (layer, expert) into the
     // ring (FIFO eviction) on the copy stream, after the compute queued on `compute` so far (no kernel can read a

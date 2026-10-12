@@ -435,17 +435,18 @@ __device__ __noinline__ void run_mid(const Slot & S, const float * __restrict__ 
     }
 }
 
-// out[row][cols of group] = sum over the row's routing choices, in order, of w * H128(C_d) * svh_d
+// out[row][cols of group] = sum over the row's routing choices, in order, of w * H128(C_d) * svh_d; with accum the
+// sum is added to what out already holds (the second half of a split window) instead of replacing it.
 template <class Shape>
 __device__ __noinline__ void run_combine(const Route<Shape> & R, int n_rows, int grp, const float * __restrict__ C_d,
-                                         const half * __restrict__ svh_d, float * __restrict__ out)
+                                         const half * __restrict__ svh_d, float * __restrict__ out, bool accum)
 {
     using P = Plan<Shape>;
     constexpr int D = P::D, HB = P::DN::BLOCK_COLS / 128;
     const int lane = threadIdx.x % 32;
     for (int t = threadIdx.x / 32; t < n_rows * HB; t += WARPS) {
         const int row = t / HB, c0 = grp * P::DN::BLOCK_COLS + (t % HB) * 128 + lane * 4;
-        float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+        float4 acc = accum ? *(const float4 *) (out + (size_t) row * D + c0) : make_float4(0.f, 0.f, 0.f, 0.f);
         for (int s = 0; s < P::TOPK; ++s) {
             const int j = row * P::TOPK + s, sl = R.pair_slot[j], i = R.pair_idx[j];
             if (sl == SKIP) continue;
@@ -493,7 +494,7 @@ __global__ __launch_bounds__(THREADS, Tune<Shape>::BLOCKS_PER_SM) void window_ke
                                                             const int * __restrict__ ids,
                                                             const float * __restrict__ wts, int n_rows,
                                                             float * __restrict__ out, Workspace<Shape> ws,
-                                                            TraceEvent * __restrict__ trace)
+                                                            TraceEvent * __restrict__ trace, bool accum)
 {
     using P = Plan<Shape>;
     constexpr int D = P::D, F = P::F, SLOTS = P::SLOTS;
@@ -511,7 +512,7 @@ __global__ __launch_bounds__(THREADS, Tune<Shape>::BLOCKS_PER_SM) void window_ke
     if (threadIdx.x == 0) first_item = atomicAdd(&ctr.next_item, 1);
     build_route<Shape>(ids, wts, n_rows, W, R);
     const int n = R.n;
-    if (n == 0)   // every pair skipped (all on the CPU tier): no combine will run, so the output is zero here
+    if (n == 0 && !accum)   // every pair skipped (all on the CPU tier): no combine will run, so the output is zero
         for (int i = blockIdx.x * THREADS + threadIdx.x; i < n_rows * D; i += gridDim.x * THREADS) out[i] = 0.f;
 
     for (bool first = true; n > 0; first = false) {
@@ -548,7 +549,7 @@ __global__ __launch_bounds__(THREADS, Tune<Shape>::BLOCKS_PER_SM) void window_ke
                                           ws.C_d + (size_t) sl * MAX_ROWS * D, 0, F / 16, D, it.group, red,
                                           [&] { wait_at_least(&ctr.mid_done[sl], 1); mark_ready(); });
             if (block_signal(&ctr.d_done[it.group]) == n - 1)          // last slot of the column group: combine
-                run_combine<Shape>(R, n_rows, it.group, ws.C_d, W.proj[2].svh, out);
+                run_combine<Shape>(R, n_rows, it.group, ws.C_d, W.proj[2].svh, out, accum);
         }
         if (trace && threadIdx.x == 0 && item < MAX_TRACE_EVENTS)
             trace[item] = { (int) blockIdx.x, it.kind, sl, it.group, t_enter, s_t0, s_ready, now_ns() };
@@ -593,7 +594,7 @@ void workspace_init(void * ws, cudaStream_t stream)
 
 template <class Shape>
 void window(const Weights & W, const float * x, const int * ids, const float * wts, int n_rows, float * out, void * ws,
-            cudaStream_t stream, TraceEvent * trace)
+            cudaStream_t stream, TraceEvent * trace, bool accumulate)
 {
     if (n_rows < 1 || n_rows > MAX_ROWS || W.n_expert > MAX_EXPERTS) {
         fprintf(stderr, "truss::moe::window: n_rows %d (max %d), n_expert %d (max %d)\n", n_rows, MAX_ROWS, W.n_expert,
@@ -601,12 +602,12 @@ void window(const Weights & W, const float * x, const int * ids, const float * w
         abort();
     }
     window_kernel<Shape><<<persistent_grid<Shape>(), THREADS, 0, stream>>>(W, x, ids, wts, n_rows, out,
-                                                                          Workspace<Shape>(ws), trace);
+                                                                          Workspace<Shape>(ws), trace, accumulate);
 }
 
 template size_t workspace_bytes<FlashNext>();
 template void workspace_init<FlashNext>(void *, cudaStream_t);
 template void window<FlashNext>(const Weights &, const float *, const int *, const float *, int, float *, void *,
-                                cudaStream_t, TraceEvent *);
+                                cudaStream_t, TraceEvent *, bool);
 
 }  // namespace truss::moe
