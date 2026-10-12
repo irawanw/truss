@@ -14,6 +14,7 @@
 //                     query's cells into contiguous ranges; each CTA writes its unnormalized state (o, m, l) and
 //                     combine_kernel merges the ranges in order and applies the gate. One query has only HKV = 2
 //                     CTAs otherwise: 227 us per decode layer at 3.4K context (TRACKER #57).
+#include <atomic>
 #include "dsa_prefill.cuh"
 
 #include "core/cuda_check.h"
@@ -877,12 +878,16 @@ void attention(const half * q, const float * gate, const KvCache & kc, const int
 {
     if (T <= 0 || pos0 < 0) throw std::invalid_argument("dsa::attention: bad chunk");
     const size_t smem_split = sizeof(AttnSmem<Shape, true>), smem_full = sizeof(AttnSmem<Shape, false>);
-    static bool attr = [&] {
+    // the shared-memory attribute is per device: once on each (a layer split runs layers on two devices)
+    int dev = 0;
+    TRUSS_CUDA(cudaGetDevice(&dev));
+    static std::atomic<uint64_t> attr_done{ 0 }, mq_done{ 0 };
+    const uint64_t bit = 1ull << (dev & 63);
+    if (!(attr_done.load() & bit)) {
         TRUSS_CUDA(cudaFuncSetAttribute(attn_kernel<Shape, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_full));
         TRUSS_CUDA(cudaFuncSetAttribute(attn_kernel<Shape, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_split));
-        return true;
-    }();
-    (void) attr;
+        attr_done.fetch_or(bit);
+    }
     if (T <= SPLIT_ROWS) {
         if (ws_bytes < attention_workspace_bytes<Shape>(T))
             throw std::invalid_argument("dsa::attention: split workspace too small");
@@ -893,12 +898,11 @@ void attention(const half * q, const float * gate, const KvCache & kc, const int
             q, gate, kc, blocks, n_blocks, pos0, out, per, part);
         combine_kernel<Shape><<<dim3(T, Shape::HKV, Shape::H / Shape::HKV), 256, 0, stream>>>(part, S, gate, out);
     } else if (mq_on()) {
-        static bool mq_attr = [] {
+        if (!(mq_done.load() & bit)) {
             TRUSS_CUDA(cudaFuncSetAttribute(attn_mq_kernel<Shape>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                             (int) sizeof(MqSmem<Shape>)));
-            return true;
-        }();
-        (void) mq_attr;
+            mq_done.fetch_or(bit);
+        }
         if ((pos0 + T) / Shape::RATIO > 32 * MQ_BM_WORDS) throw std::invalid_argument("dsa::attention: context over the MQ bitmap");
         attn_mq_kernel<Shape><<<dim3((T + MQ - 1) / MQ, Shape::HKV), MQ_THREADS, sizeof(MqSmem<Shape>), stream>>>(
             q, gate, kc, blocks, n_blocks, pos0, T, out);

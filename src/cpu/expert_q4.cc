@@ -1,4 +1,5 @@
 #include "cpu/expert_q4.h"
+#include "cpu/placement.h"
 
 #include <immintrin.h>
 
@@ -156,40 +157,19 @@ void preconvert_scales(const Q4Expert & e, float * out)
 }
 
 // one logical CPU per physical core this process may run on (the first allowed SMT sibling), from sysfs, as Strata's
-// pool (kernels/cpu/pool.cpp physical_cores): two workers on SMT siblings share one core's pipes. The siblings follow.
+// pool (kernels/cpu/pool.cpp physical_cores): two workers on SMT siblings share one core's pipes. The siblings follow,
+// in CPU order, without core 0's (the driver thread's core): pool sizes above the physical core count pin their extra
+// workers there (TRACKER #93). The topology is core_cpus()'s, read once before any thread is moved (TRUSS_AUX_CPUS).
 static std::vector<int> physical_cores()
 {
-    std::vector<int> out;
-    std::vector<std::pair<long, long>> seen;
-    std::vector<std::pair<std::pair<long, long>, int>> siblings;
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    if (sched_getaffinity(0, sizeof set, &set) != 0) return out;
-    for (int c = 0; c < CPU_SETSIZE; ++c) {
-        if (!CPU_ISSET(c, &set)) continue;
-        auto topo = [c](const char * what) {
-            char path[96];
-            std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/%s", c, what);
-            long v = -1;
-            if (FILE * f = std::fopen(path, "r")) {
-                if (std::fscanf(f, "%ld", &v) != 1) v = -1;
-                std::fclose(f);
-            }
-            return v;
-        };
-        const std::pair<long, long> key{ topo("physical_package_id"), topo("core_id") };
-        if (std::find(seen.begin(), seen.end(), key) != seen.end()) {
-            siblings.push_back({ key, c });
-            continue;
-        }
-        seen.push_back(key);
-        out.push_back(c);
+    std::vector<int> out, sib;
+    const auto & cores = core_cpus();
+    for (size_t i = 0; i < cores.size(); ++i) {
+        out.push_back(cores[i][0]);
+        if (i > 0) sib.insert(sib.end(), cores[i].begin() + 1, cores[i].end());
     }
-    // then the SMT siblings, in core order, without core 0's (the driver thread's core): pool sizes above the
-    // physical core count pin their extra workers there (TRACKER #93)
-    const auto core0 = seen.empty() ? std::pair<long, long>{ -1, -1 } : seen[0];
-    for (const auto & [key, c] : siblings)
-        if (key != core0) out.push_back(c);
+    std::sort(sib.begin(), sib.end());
+    out.insert(out.end(), sib.begin(), sib.end());
     return out;
 }
 
@@ -201,18 +181,23 @@ ExpertPool::ExpertPool(int threads)
     spin_ = getenv("TRUSS_CPU_SPIN_US") ? atoi(getenv("TRUSS_CPU_SPIN_US")) : SPIN_US_DEF;
     const bool pin = getenv("TRUSS_CPU_PIN") && atoi(getenv("TRUSS_CPU_PIN"));
     const std::vector<int> cores = pin ? physical_cores() : std::vector<int>{};
+    tids_.assign(threads, 0);
     for (int i = 0; i < threads; ++i) {
         const int core = i + 1 < (int) cores.size() ? cores[i + 1] : -1;
-        workers_.emplace_back([this, core] {
+        if (core >= 0) cpus_.push_back(core);
+        workers_.emplace_back([this, core, i] {
             if (core >= 0) {
                 cpu_set_t set;
                 CPU_ZERO(&set);
                 CPU_SET(core, &set);
                 pthread_setaffinity_np(pthread_self(), sizeof set, &set);
             }
+            tids_[i] = this_tid();
+            started_.fetch_add(1, std::memory_order_release);
             worker();
         });
     }
+    while (started_.load(std::memory_order_acquire) < threads) std::this_thread::yield();   // tids_ complete
 }
 
 ExpertPool::~ExpertPool()

@@ -25,6 +25,8 @@
 #include <thread>
 #include <vector>
 
+#include <sys/types.h>
+
 namespace truss::cpu {
 
 struct Q4Matrix {
@@ -72,6 +74,9 @@ public:
     void wait();
     void run(const float * x, int T, const std::vector<Slot> & slots, float * y) { start(x, T, slots, y), wait(); }
     int threads() const { return (int) workers_.size(); }
+    // the workers' logical CPUs when pinned (TRUSS_CPU_PIN=1; empty otherwise) and thread ids (TRUSS_AUX_CPUS)
+    const std::vector<int> & worker_cpus() const { return cpus_; }
+    const std::vector<pid_t> & worker_tids() const { return tids_; }
     // benchmark stats: total microseconds inside wait() and its calls (wait = pool latency + work the caller
     // did not itself compute; TRACKER #61 measures the CPU tier against DRAM peak through these).
     void reset_stats();
@@ -110,6 +115,9 @@ private:
     void finish();
 
     std::vector<std::thread> workers_;
+    std::vector<int> cpus_;
+    std::vector<pid_t> tids_;
+    std::atomic<int> started_{ 0 };
     // The workers take items without the mutex and spin (TRUSS_CPU_SPIN_US, default 20 ms as Strata's) before
     // blocking: a layer's call is a burst of ~1 ms, and condvar wake latency was 43% of it (cpu_expert_test: 903 us
     // wall, 515 us of parallel compute). The caller spins in wait(). The mutex only guards blocking (see sleepers_).

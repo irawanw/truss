@@ -52,7 +52,7 @@ target_compile_options(truss_models PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wex
 # ---- engine: model steps on the fast kernels
 # ---- src/cpu: host-side expert tier (AVX2 + FMA + F16C; the build machine is the run machine)
 find_package(Threads REQUIRED)
-add_library(truss_cpu STATIC src/cpu/expert_q4.cc src/cpu/expert_trellis.cc)
+add_library(truss_cpu STATIC src/cpu/expert_q4.cc src/cpu/expert_trellis.cc src/cpu/placement.cc)
 target_include_directories(truss_cpu PUBLIC src)
 target_compile_options(truss_cpu PRIVATE -O3 -mavx2 -mfma -mf16c)
 target_link_libraries(truss_cpu PUBLIC Threads::Threads)

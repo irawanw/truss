@@ -114,6 +114,16 @@ struct ForwardOptions {
     const gguf::File * ple_file = nullptr;
     int hint_k = 4;                           // pre-gated prefetch: per row, the next layer's top hint_k predicted
                                               // experts start copying early (0: off; 3-6 measured equal, TRACKER #59)
+    // Layer split over two devices (TRUSS_LAYER_SPLIT, TRUSS_LAYER_SPLIT_DEVICE): layers [0, layer_split) run on
+    // layer_split_device, the rest, the head and the MTP block on the current device (so the logits, stream() and
+    // the caller's buffers stay there). Each stage has its own expert store, K/V, recurrent state and driver; the
+    // CPU pool is shared; the residual rows go from one to the other through pinned host memory. Every row is
+    // computed as unsplit, so the output is the same up to which experts each device holds. 0: one device.
+    // layer_split_device -1: both stages on the current device (a test of the split), the first taking
+    // layer_split_frac of the free VRAM for its experts.
+    int layer_split = 0;
+    int layer_split_device = -1;
+    float layer_split_frac = 0.5f;
     // Called once upload() has the weights on the device but before the constructor does anything else expensive
     // (the expert plan, the CPU tier). The owner releases the model's file-backed pages there — the shards fault to a
     // ~47 GB resident peak during upload, and the CPU tier's anonymous vector then allocates on top of it and the
@@ -149,6 +159,11 @@ public:
     // chunk's layer-1 gather does not stall the host. Without the hint the gather still blocks its own chunk.
     void run(const int32_t * tokens, int T, const LayerHook & hook = nullptr,
              const int32_t * next = nullptr, int next_T = 0);
+
+    // A prompt of n tokens in chunks of step, as run() per chunk with the PLE lookahead; done(tokens so far) after
+    // each chunk. With a layer split the stages run on two threads, a chunk apart, so both devices compute at once
+    // (the same output as run()).
+    void run_prompt(const int32_t * tokens, int n, int step, const std::function<void(int)> & done = nullptr);
 
     // Speculative decoding (Options::spec_rows > 0). verify() runs a window of T <= spec_rows tokens (the next token
     // and the drafts after it) without committing it: head() then gives every row's logits. accept(n) keeps the
@@ -230,7 +245,9 @@ public:
 
 private:
     struct Impl;
-    std::unique_ptr<Impl> m_;
+    std::vector<std::unique_ptr<Impl>> front_;   // a layer split's stages before the last (destroyed after m_)
+    std::unique_ptr<Impl> m_;                    // the last stage (the whole model without a split)
+    template <class F> void each_stage(F && f);  // every stage in layer order, its device current
     int pos_ = 0;
 };
 

@@ -64,12 +64,9 @@ struct Greedy {   // argmax of logit rows on the device, copied back
 
 void prompt(q::Forward & f, const std::vector<int32_t> & tok, int chunk)
 {
-    for (size_t s = 0; s < tok.size(); s += chunk) {
-        const size_t n = std::min<size_t>(chunk, tok.size() - s);
-        const bool next = s + n < tok.size();   // describe the following chunk: its PLE reads start during this one
-        f.run(tok.data() + s, (int) n, nullptr, next ? tok.data() + s + chunk : nullptr,
-              next ? (int) std::min<size_t>(chunk, tok.size() - s - chunk) : 0);
-    }
+    // chunks with the PLE lookahead (the following chunk's reads start during this one); a layer split runs its
+    // stages a chunk apart
+    f.run_prompt(tok.data(), (int) tok.size(), chunk);
 }
 
 }  // namespace
