@@ -126,6 +126,13 @@ struct ForwardOptions {
     int layer_split = 0;
     int layer_split_device = -1;
     float layer_split_frac = 0.5f;
+    // Helper experts (PLAN Phase 1/2, TRUSS_HELPER / TRUSS_HELPER_FRAC): with a layer split, each stage plans its hot
+    // set inside the budget left by a region it hands to the other GPU, which keeps that share of its hot experts
+    // resident as a static, read-only set (runtime::HelperStore, no ring, uploaded once). Phase 1 only places them:
+    // the owner still computes every expert, fetching the given-away ones over PCIe as any other cold expert, so the
+    // output is unchanged. helper_frac is the share of every layer's hot routed mass the helper side takes.
+    bool helper = false;
+    double helper_frac = 0.5;
     // Called once upload() has the weights on the device but before the constructor does anything else expensive
     // (the expert plan, the CPU tier). The owner releases the model's file-backed pages there — the shards fault to a
     // ~47 GB resident peak during upload, and the CPU tier's anonymous vector then allocates on top of it and the
@@ -135,8 +142,8 @@ struct ForwardOptions {
 
 // The decode-tier sweep knobs from the environment, applied on top of `o` (each only when set): TRUSS_CPU_SHARE,
 // TRUSS_CPU_THREADS, TRUSS_CPU_DYNAMIC, TRUSS_CPU_TRELLIS, TRUSS_PCIE_GBPS, TRUSS_PCIE_FRAC, TRUSS_ADAPT_EVERY,
-// TRUSS_ADAPT_SWAPS, TRUSS_RING_GB, TRUSS_HINT_K, TRUSS_PREFILL_ROWS, TRUSS_KV_INT8, TRUSS_PLAN_ALPHA, TRUSS_ADAPT_MIN, TRUSS_ADAPT_DECAY, TRUSS_SPLIT_ROWS, TRUSS_SPLIT_T, TRUSS_SPLIT_MS_ROW. tk-bench-spec and the C API (so the server)
-// both call it, so a config benched is the config served.
+// TRUSS_ADAPT_SWAPS, TRUSS_RING_GB, TRUSS_HINT_K, TRUSS_PREFILL_ROWS, TRUSS_KV_INT8, TRUSS_PLAN_ALPHA, TRUSS_ADAPT_MIN, TRUSS_ADAPT_DECAY, TRUSS_SPLIT_ROWS, TRUSS_SPLIT_T, TRUSS_SPLIT_MS_ROW, TRUSS_HELPER, TRUSS_HELPER_FRAC.
+// tk-bench-spec and the C API (so the server) both call it, so a config benched is the config served.
 void apply_env(ForwardOptions & o);
 
 class Forward {

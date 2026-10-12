@@ -24,6 +24,8 @@
 #include "model/qwen4exp/ple_reader.h"
 #include "runtime/doorbell.cuh"
 #include "runtime/expert_store.h"
+#include "runtime/helper_plan.h"
+#include "runtime/helper_store.h"
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
@@ -325,6 +327,20 @@ struct Forward::Impl {
     } vw;
     std::unique_ptr<runtime::ExpertStore> experts;
     int n_hot = 0;                                       // resident experts, all layers
+    // Helper experts (PLAN Phase 1). With a layer split, this stage plans its hot set inside a smaller budget and
+    // hands the peer stage the give-away list below; the peer's own give-away becomes a static resident set here
+    // (helper), uploaded once both stages exist (Forward's constructor calls load_helper for each).
+    bool helper_on = false;
+    std::vector<runtime::ExpertLayer> peer_tables;             // the peer stage's store tables (its layers + its MTP)
+    std::vector<size_t> peer_bytes;                            // [peer store layer * n_expert] resident bytes
+    std::vector<std::pair<int, int>> give_ranked;              // our give-away, best score first: the peer's fill order
+    std::vector<size_t> own_bytes;                             // [store layer * n_expert], for the peer's fill
+    size_t give_bytes = 0, helper_reserve = 0;
+    long give_count = 0;
+    double owner_mass = 0, give_mass = 0, worst_imbalance = 0;
+    std::unique_ptr<runtime::HelperStore> helper;
+    size_t helper_bytes = 0;
+    long helper_count = 0, helper_dropped = 0;
     std::vector<int32_t> tail;                           // the last ple_ngram - 1 tokens seen (PLE window)
 
     const Activations act;
@@ -490,7 +506,65 @@ struct Forward::Impl {
         z.ring_bytes = o.ring_bytes_override ? o.ring_bytes_override : o.ring_bytes;
         z.plan_alpha = o.plan_alpha;
         if (prefill_rows > FETCH_ROWS) z.stream_extra = big_bytes();
-        const runtime::ExpertStore::HotSet hot = runtime::ExpertStore::plan(tables, expert_budget, z, usage);
+        // Helper experts (PLAN Phase 1). A split stage plans its hot set inside the budget left by the region it
+        // hands its peer, and the peer's give-away becomes this GPU's static helper set (load_helper(), once both
+        // stages exist). Without a split there is no peer, so there is nothing to hand over.
+        auto expert_bytes = [](const std::vector<runtime::ExpertLayer> & T, int l, int e) {
+            size_t b = 0;
+            for (int p = 0; p < 3; ++p) b += (size_t) T[l][p]->words(e) * 2;
+            return b;
+        };
+        auto bytes_table = [&](const std::vector<runtime::ExpertLayer> & T) {
+            std::vector<size_t> b(T.size() * (size_t) c.n_expert);
+            for (size_t l = 0; l < T.size(); ++l)
+                for (int e = 0; e < c.n_expert; ++e) b[l * (size_t) c.n_expert + e] = expert_bytes(T, (int) l, e);
+            return b;
+        };
+        runtime::ExpertStore::HotSet hot;
+        helper_on = o.helper && !(first && last);
+        const double gb = 1073741824.0;
+        if (helper_on) {
+            const int plb = first ? le : 0, ple = last ? lb : c.n_layer;   // the peer stage's model layers
+            for (int l = plb; l < ple; ++l) {
+                const Layer & L = w.layers[l];
+                peer_tables.push_back({ &L.moe.gate, &L.moe.up, &L.moe.down });
+            }
+            if (!last && o.mtp)   // the peer is the last stage: its store ends with the MTP block
+                peer_tables.push_back({ &o.mtp->layer.moe.gate, &o.mtp->layer.moe.up, &o.mtp->layer.moe.down });
+            require(!peer_tables.empty(), "TRUSS_HELPER needs a layer split (there is no other GPU to help)");
+            require(!usage.empty(), "TRUSS_HELPER needs expert_usage (it ranks the hot set the split divides)");
+            own_bytes = bytes_table(tables);
+            peer_bytes = bytes_table(peer_tables);
+            // Plan once with the whole budget to learn the shape, divide it, then plan the owner share inside what
+            // the region leaves. One pass would have to guess the give-away's size, which is what the plan decides.
+            runtime::HotPlan hp{ c.n_expert, z.plan_alpha,
+                                 runtime::ExpertStore::plan(tables, expert_budget, z, usage), usage, own_bytes };
+            const runtime::HelperSplit sp = runtime::helper_split(hp, o.helper_frac);
+            give_ranked = sp.give_ranked;
+            give_bytes = sp.give_bytes;
+            give_count = sp.give_count;
+            owner_mass = sp.owner_mass;
+            give_mass = sp.give_mass;
+            worst_imbalance = sp.worst_imbalance;
+            helper_reserve = sp.give_bytes + runtime::HelperStore::fixed_bytes(peer_tables);
+            require(helper_reserve + (16ull << 20) < expert_budget, "TRUSS_HELPER: the reserved region exceeds the budget");
+            hot = runtime::ExpertStore::plan(tables, expert_budget - helper_reserve, z, usage);
+            long keep = 0;
+            size_t keep_bytes = 0;
+            for (size_t l = 0; l < hot.size(); ++l)
+                for (int e = 0; e < c.n_expert; ++e)
+                    if (hot[l][e]) ++keep, keep_bytes += own_bytes[l * (size_t) c.n_expert + e];
+            std::fprintf(stderr,
+                         "helper: device %d layers %d-%d%s: split %.2f GiB / %ld hot -> owner %.2f GiB / %ld "
+                         "(mass %.0f), give-away %.2f GiB / %ld (mass %.0f, worst per-layer imbalance %.2f%%); "
+                         "region %.2f + %.2f GiB tables for peer layers; owner re-planned -> %ld resident experts\n",
+                         device, lb, le - 1, mtp ? "+MTP" : "", (sp.owner_bytes + sp.give_bytes) / gb,
+                         sp.owner_count + sp.give_count, sp.owner_bytes / gb, sp.owner_count, sp.owner_mass,
+                         sp.give_bytes / gb, sp.give_count, sp.give_mass, 100 * sp.worst_imbalance,
+                         sp.give_bytes / gb, runtime::HelperStore::fixed_bytes(peer_tables) / gb, keep);
+        } else {
+            hot = runtime::ExpertStore::plan(tables, expert_budget, z, usage);
+        }
         for (const auto & h : hot) n_hot += (int) std::count(h.begin(), h.end(), 1);
         load_mark("expert plan");
         experts = std::make_unique<runtime::ExpertStore>(tables, hot, z);
@@ -575,6 +649,35 @@ struct Forward::Impl {
             for (auto & a : sect_ev)
                 for (cudaEvent_t & e : a) TRUSS_CUDA(cudaEventCreate(&e));
         }
+    }
+
+    // This GPU's helper set: the peer stage's give-away, as much of it as the region reserved at plan time holds.
+    // Forward's constructor calls it for both stages once both have planned (a stage's give-away is only known
+    // after its own plan). The bytes are read from the shards again — after_upload() only drops the file pages, so
+    // read_mapped() re-reads them without faulting the mapping.
+    void load_helper(const Impl & peer)
+    {
+        if (!helper_on) return;
+        DeviceGuard g(device);
+        size_t used = 0;
+        long dropped = 0;
+        const auto items =
+            runtime::helper_fill(peer.give_ranked, peer.own_bytes, c.n_expert, give_bytes, &used, &dropped);
+        helper = std::make_unique<runtime::HelperStore>(peer_tables, items);
+        helper_bytes = helper->trellis_bytes() + helper->fixed_bytes_used();
+        helper_count = helper->count();
+        helper_dropped = dropped;
+        const double gb = 1073741824.0;
+        const int p0 = first ? le : 0;                       // the peer stage's first model layer
+        const int pl = p0 + (int) peer_tables.size() - (peer.mtp ? 1 : 0) - 1;
+        std::fprintf(stderr,
+                     "helper: device %d uploaded %ld helper experts of layers %d-%d%s: %.2f + %.2f GiB tables "
+                     "(region %.2f GiB held %.2f, %ld of the peer's %ld did not fit); this GPU now holds %ld experts "
+                     "(%.2f GiB owner + %.2f GiB helper)\n",
+                     device, helper_count, p0, pl, peer.mtp ? "+MTP" : "",
+                     helper->trellis_bytes() / gb, helper->fixed_bytes_used() / gb, give_bytes / gb,
+                     (double) used / gb, dropped, peer.give_count, n_hot + helper_count,
+                     experts->device_bytes() / gb, helper->trellis_bytes() / gb);
     }
 
     ~Impl()
@@ -1620,14 +1723,17 @@ struct Forward::Impl {
             // the shared expert does not need the plan or the copies: it runs while the driver splits and the
             // copies land (TRACKER #112; same math, so the same output)
             shared();
-            // the driver's plan (mapped), the layer's copies when it queued any, the masked ids into d_mids
+            // the driver's plan (masked ids in mapped b.mids), the layer's copies when it queued any, and the mask
+            // itself into d_mids. The mask is always uploaded and always what the kernel reads: a slot the driver
+            // hands elsewhere (the CPU tier, Phase 2's helper GPU) or drops is id -1 there, and when nothing is
+            // handed elsewhere mids is ids verbatim, so the output is unchanged either way.
             if (sect) {   // profiling: the plan and the copies waited for apart (two launches instead of one)
                 runtime::spin_until(b.plan, seq, s);
                 sect_record(l, 9);
             }
-            runtime::wait_plan(b.plan, b.need_copy, b.go, seq, b.mids, b.d_mids, cpu_on ? T * K : 0, s);
+            runtime::wait_plan(b.plan, b.need_copy, b.go, seq, b.mids, b.d_mids, T * K, s);
             if (sect) sect_record(l, 8);
-            moe::window<MoeShape>(experts->weights(sl(l)), in, cpu_on ? b.d_mids : ids, wts, T, routed, window_ws, s);
+            moe::window<MoeShape>(experts->weights(sl(l)), in, b.d_mids, wts, T, routed, window_ws, s);
             if (cpu_on) cpu_rows = -T;            // the CPU rows join after the shared expert (mapped)
         } else if (!stream) {   // fetch the few cold experts this chunk routes to
             // pre-gating: the next layer's router on this layer's input predicts 72% of its experts (TRACKER #58);
@@ -2263,6 +2369,8 @@ Forward::Forward(const Config & c, const Weights & w, int n_ctx, int max_chunk, 
 {
     const int S = o.layer_split;
     if (S <= 0 || S >= c.n_layer) {
+        if (o.helper)
+            std::fprintf(stderr, "helper: TRUSS_HELPER needs TRUSS_LAYER_SPLIT (there is no other GPU to help); off\n");
         m_ = std::make_unique<Impl>(c, w, n_ctx, max_chunk, o, StageSpec{ 0, c.n_layer, -1, 1.0, nullptr, nullptr });
         return;
     }
@@ -2281,6 +2389,23 @@ Forward::Forward(const Config & c, const Weights & w, int n_ctx, int max_chunk, 
     std::fprintf(stderr, "layer split: layers 0-%d on device %d (%d experts resident), layers %d-%d, head and MTP on "
                          "device %d (%d resident)\n",
                  S - 1, d0, f.n_hot, S, c.n_layer - 1, cur, m_->n_hot);
+    // Helper experts (PLAN Phase 1): both stages have planned, so each uploads the other's give-away into the region
+    // it reserved for it, and the totals can be compared with what the two stores would hold unsplit.
+    if (f.helper_on) {
+        { DeviceGuard g(d0); f.load_helper(*m_); }
+        { DeviceGuard g(cur); m_->load_helper(f); }
+        const double gb = 1073741824.0;
+        const long all = f.n_hot + m_->n_hot + f.helper_count + m_->helper_count;
+        const long unsplit = all + f.helper_dropped + m_->helper_dropped;   // the same plans without the region
+        std::fprintf(stderr,
+                     "helper: experts per device %d: %d own + %ld helper, %d: %d own + %ld helper; %ld resident "
+                     "against %ld for the same plans unsplit (%+.1f%%); %.2f + %.2f GiB of helper VRAM; routed mass "
+                     "owner/give %.1f/%.1f and %.1f/%.1f, worst per-layer imbalance %.2f%%\n",
+                     d0, f.n_hot, f.helper_count, cur, m_->n_hot, m_->helper_count, all, unsplit,
+                     100.0 * (all - unsplit) / (double) unsplit, f.helper_bytes / gb, m_->helper_bytes / gb,
+                     f.owner_mass, f.give_mass, m_->owner_mass, m_->give_mass,
+                     100 * std::max(f.worst_imbalance, m_->worst_imbalance));
+    }
 }
 
 Forward::~Forward()
@@ -2640,6 +2765,8 @@ void apply_env(ForwardOptions & o)
     f("TRUSS_LAYER_SPLIT", o.layer_split);             // two devices: layers [0, N) on TRUSS_LAYER_SPLIT_DEVICE
     f("TRUSS_LAYER_SPLIT_DEVICE", o.layer_split_device);
     f("TRUSS_LAYER_SPLIT_FRAC", o.layer_split_frac);
+    f("TRUSS_HELPER", o.helper);               // helper experts: each GPU holds half of the other stage's hot set
+    f("TRUSS_HELPER_FRAC", o.helper_frac);     // ... the share of every layer's hot routed mass that side takes
     f("TRUSS_SPLIT_ROWS", o.split_rows);       // E7: short prompt chunks split cold experts CPU / PCIe
     f("TRUSS_SPLIT_T", o.split_t);
     f("TRUSS_SPLIT_MS_ROW", o.split_ms_row);
