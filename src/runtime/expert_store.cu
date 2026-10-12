@@ -104,7 +104,7 @@ size_t ExpertStore::device_bytes(const std::vector<ExpertLayer> & layers, const 
 }
 
 ExpertStore::HotSet ExpertStore::plan(const std::vector<ExpertLayer> & layers, size_t budget, const Sizes & z,
-                                      const std::vector<float> & usage)
+                                      const std::vector<float> & usage, const HotSet * ban)
 {
     const int L = (int) layers.size(), n_expert = layers.empty() ? 0 : layers[0][0]->n_expert;
     HotSet hot(L, std::vector<uint8_t>(n_expert, 0));
@@ -139,6 +139,9 @@ ExpertStore::HotSet ExpertStore::plan(const std::vector<ExpertLayer> & layers, s
     std::vector<int> order(size.size());
     for (size_t i = 0; i < order.size(); ++i) order[i] = (int) i;
     std::stable_sort(order.begin(), order.end(), better);
+    if (ban) {   // experts a peer already holds: not ours to plan, still ours to stream (they stay in cold)
+        std::erase_if(order, [&](int i) { return (*ban)[i / n_expert][i % n_expert] != 0; });
+    }
     std::vector<std::vector<int>> by_layer(L);
     for (int i : order) by_layer[i / n_expert].push_back(i);
 

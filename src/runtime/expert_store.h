@@ -59,8 +59,10 @@ public:
     // layer first gets its top `floor` experts by count / bytes^plan_alpha, then greedy in that order over all layers; the
     // floor (steps of 8) with the most hot usage wins, since a layer with few hot experts makes the stream slots
     // large. Without usage: the same count per layer, index order.
+    // `ban` (TRUSS_HELPER): experts another GPU already holds. They leave the plannable universe - the greedy may not
+    // spend the budget twice on one expert - but stay cold here, so they stay fetchable and streamable.
     static HotSet plan(const std::vector<ExpertLayer> & layers, size_t budget, const Sizes & z,
-                       const std::vector<float> & usage = {});
+                       const std::vector<float> & usage = {}, const HotSet * ban = nullptr);
     // usage file: n_layer * n_expert little-endian float32, layer-major (flashnext_truss_usage.py writes it)
     static std::vector<float> load_usage(const std::string & path, int n_layer, int n_expert);
 
