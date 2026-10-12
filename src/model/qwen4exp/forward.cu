@@ -302,6 +302,22 @@ struct Forward::Impl {
     int32_t * draft_host = nullptr;                      // pinned
     int32_t * commit_host = nullptr;                     // pinned [2][MAX_ROWS + 1]: a decode commit's tokens (mtp_commit)
     int commit_flip = 0;
+    // accept() defers the MTP commit to draft(), which runs it together with the first draft row (pending_h = the
+    // last accepted row's state, the bonus token): one MTP pass fewer per decode step. That row is the next commit's
+    // first row, so it is remembered (ahead_*) and the next commit skips it when its token matches; otherwise the
+    // commit recomputes it, which rewrites every position-indexed cache row it touched.
+    bool dc_on = false;
+    int dc_pos0 = 0, dc_T = 0;
+    std::vector<int32_t> dc_tokens;
+    bool mtp_ahead = false;
+    int32_t ahead_tok = -1;
+    int ahead_pos = -1;
+    void flush_commit()
+    {
+        if (!dc_on) return;
+        dc_on = false;
+        mtp_commit(dc_tokens.data(), dc_pos0, dc_T, false);
+    }
     struct Verify {                                      // the window verify() left uncommitted
         bool open = false;
         int pos0 = 0, T = 0;
@@ -1792,6 +1808,7 @@ struct Forward::Impl {
         ple_next = nullptr; ple_next_T = 0; ple_tk_valid = false;   // a dangling ticket is replaced by the next issue
         last_T = 0;
         has_pending = false;
+        dc_on = false, mtp_ahead = false;
         vw.open = false;
         kv_reserve(0, true);
     }
@@ -1802,6 +1819,7 @@ struct Forward::Impl {
         require(T > 0 && T <= max_chunk, "chunk of " + std::to_string(T) + " tokens (max " + std::to_string(max_chunk) + ")");
         require(pos0 + T <= n_ctx, "sequence longer than n_ctx");
         require(!vw.open, "run()/verify() before accept() of the previous verify()");
+        flush_commit();   // it reads res, which this chunk rewrites
         check_driver();
         kv_reserve(pos0 + T, false);
         const bool stream = !fetch_mode(T);
@@ -1956,7 +1974,7 @@ struct Forward::Impl {
         }
         commit_tail(vw.tokens.data(), n);
         last_T = n;
-        if (mtp) mtp_commit(vw.tokens.data(), vw.pos0, n, false);
+        if (mtp) dc_on = true, dc_pos0 = vw.pos0, dc_T = n, dc_tokens.assign(vw.tokens.begin(), vw.tokens.begin() + n);
     }
 
     // Sequence checkpoint (Forward::checkpoint / restore): every recurrent piece of the committed sequence - GDN state
@@ -1994,6 +2012,7 @@ struct Forward::Impl {
     void checkpoint(int pos)
     {
         require(!vw.open, "checkpoint() inside a verify window");
+        flush_commit();
         if (!ck.host) {
             each_ck_buffer([&](float *, size_t n) { ck.bytes += n * sizeof(float); });
             TRUSS_CUDA(cudaMallocHost(&ck.host, ck.bytes));
@@ -2018,6 +2037,7 @@ struct Forward::Impl {
         });
         TRUSS_CUDA(cudaStreamSynchronize(s));
         has_pending = ck.has_pending, tail = ck.tail, last_T = 0;
+        dc_on = false, mtp_ahead = false;   // the next commit recomputes its first row
         kv_reserve(ck.pos, true);
         return ck.pos;
     }
@@ -2118,7 +2138,10 @@ struct Forward::Impl {
     void mtp_commit(const int32_t * tokens, int pos0, int T, bool stream)
     {
         const size_t row = c.hc_dim();
-        const int skip = has_pending ? 0 : 1;   // only position 0 lacks a pending state
+        // only position 0 lacks a pending state; draft() may have computed the first row already (ahead)
+        const bool ahead_hit = mtp_ahead && T > 0 && tokens[0] == ahead_tok && pos0 == ahead_pos;
+        mtp_ahead = false;
+        const int skip = has_pending && !ahead_hit ? 0 : 1;
         const int n = T - skip;
         if (n > 0) {
             float * mh = cur.mh;
@@ -2159,14 +2182,42 @@ struct Forward::Impl {
         experts->begin_ring();
         sc->reset();
         const size_t row = c.hc_dim();
+        // the deferred commit and the first draft row (pending state = the last accepted row, token = next) as one
+        // MTP pass when they fit a window; that row is true, not tentative, so it is kept (ahead) below
+        int merged = 0;   // rows of the merged pass (0: none)
+        if (dc_on) {
+            dc_on = false;
+            const int T = dc_T;
+            const bool ahead_hit = mtp_ahead && T > 0 && dc_tokens[0] == ahead_tok && dc_pos0 == ahead_pos;
+            const int skip = has_pending && !ahead_hit ? 0 : 1, nc = T - skip;
+            if (nc + 1 <= moe::MAX_ROWS && dc_pos0 + T == pos && T >= 1) {
+                mtp_ahead = false;
+                float * mh = cur.mh;
+                if (!skip) copy(mh, pending_h, row);
+                copy(mh + (size_t) (1 - skip) * row, res, (size_t) T * row);
+                int32_t * h = commit_host + (size_t) commit_flip * (moe::MAX_ROWS + 1);
+                commit_flip ^= 1;
+                std::copy(dc_tokens.begin() + skip, dc_tokens.begin() + T, h);
+                h[nc] = next;
+                int * d_ids = sc->alloc<int>(nc + 1);
+                TRUSS_CUDA(cudaMemcpyAsync(d_ids, h, sizeof(int32_t) * (nc + 1), cudaMemcpyHostToDevice, s));
+                mtp_rows(mh, d_ids, dc_pos0 + skip, nc + 1, false, true, true);
+                copy(pending_h, res + (size_t) (T - 1) * row, row);
+                has_pending = true;
+                mtp_ahead = true, ahead_tok = next, ahead_pos = pos;
+                merged = nc + 1;
+            } else {
+                mtp_commit(dc_tokens.data(), dc_pos0, T, false);
+            }
+        }
         copy(mtp_partial_snap, mst.idx_partial, (size_t) (DsaShape::RATIO - 1) * c.idx_head_dim);
         draft_host[0] = next;
         TRUSS_CUDA(cudaMemcpyAsync(draft_ids, draft_host, sizeof(int32_t), cudaMemcpyHostToDevice, s));
-        copy(cur.mh, pending_h, row);
+        if (!merged) copy(cur.mh, pending_h, row);
         const int nv = draft_head.q ? draft_head.out : c.n_vocab;
         int made = 0;
         for (int i = 0; i < n; ++i) {
-            mtp_rows(cur.mh, draft_ids + i, pos + i, 1, false, true);
+            if (i > 0 || !merged) mtp_rows(cur.mh, draft_ids + i, pos + i, 1, false, true);
             sampling::argmax_prob(mtp_logits, nv, draft_map, draft_ids + i + 1, draft_prob + i, s);
             if (ds_p)   // the guess becomes a sample of q (the argmax probability above still decides the stop)
                 sampling::draft_sample(mtp_logits, nv, draft_map, c.n_vocab, *ds_p, ds_counter + i,
@@ -2177,7 +2228,7 @@ struct Forward::Impl {
                 if (draft_prob_host[i] < draft_min_p) break;
             }
             ++made;
-            if (i + 1 < n) copy(cur.mh, cur.mres, row);
+            if (i + 1 < n) copy(cur.mh, cur.mres + (size_t) (i == 0 && merged ? merged - 1 : 0) * row, row);
         }
         copy(mst.idx_partial, mtp_partial_snap, (size_t) (DsaShape::RATIO - 1) * c.idx_head_dim);
         if (made) TRUSS_CUDA(cudaMemcpyAsync(draft_host, draft_ids + 1, sizeof(int32_t) * made, cudaMemcpyDeviceToHost, s));
