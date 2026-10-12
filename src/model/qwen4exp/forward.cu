@@ -802,11 +802,30 @@ struct Forward::Impl {
         } else if (ct) {
             for (int i = 0; i < n; ++i) to_cpu[i] = ct->is_cpu[l][b.ids[i]];
         }
+        // TRUSS_ABL_HALF=1 (Phase 0b, timing only: the output is wrong): every second distinct GPU-side expert of
+        // this layer, in routing order, is computed nowhere — mids -1, no CPU slot, no copy. The gap to the base run
+        // is the ceiling of what a helper GPU taking those experts could remove from this GPU's verify window.
+        static const bool abl_half = [] { const char * e = std::getenv("TRUSS_ABL_HALF"); return e && std::atoi(e); }();
+        uint8_t abl[8 * 16] = {};
+        if (abl_half) {
+            int drop[8 * 16], nd = 0;                       // distinct GPU-side experts, routing order
+            for (int i = 0; i < n; ++i) {
+                if (to_cpu[i]) continue;
+                const int e = b.ids[i];
+                bool seen = false;
+                for (int q = 0; q < nd; ++q) seen |= drop[q] == e;
+                if (seen) continue;
+                if (nd % 2 == 1)
+                    for (int q = 0; q < n; ++q)
+                        if (!to_cpu[q] && b.ids[q] == e) abl[q] = 1;
+                drop[nd++] = e;
+            }
+        }
         for (int i = 0; i < n; ++i) {
             const int e = b.ids[i];
-            b.mids[i] = to_cpu[i] ? -1 : e;
+            b.mids[i] = (to_cpu[i] || abl[i]) ? -1 : e;
             if (to_cpu[i]) slots.push_back(ct->slot(i / K, l, e, b.w[i]));
-            else gpu_ids.push_back(e);
+            else if (!abl[i]) gpu_ids.push_back(e);
         }
         drv_t[1] = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> pool_lock;   // a split's stages share the pool (pipelined windows overlap)
