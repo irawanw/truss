@@ -2191,7 +2191,8 @@ struct Forward::Impl {
             const int T = dc_T;
             const bool ahead_hit = mtp_ahead && T > 0 && dc_tokens[0] == ahead_tok && dc_pos0 == ahead_pos;
             const int skip = has_pending && !ahead_hit ? 0 : 1, nc = T - skip;
-            if (nc + 1 <= moe::MAX_ROWS && dc_pos0 + T == pos && T >= 1) {
+            static const bool merge_on = [] { const char * e = std::getenv("TRUSS_MTP_MERGE"); return !e || std::atoi(e); }();
+            if (merge_on && nc + 1 <= moe::MAX_ROWS && dc_pos0 + T == pos && T >= 1) {
                 mtp_ahead = false;
                 float * mh = cur.mh;
                 if (!skip) copy(mh, pending_h, row);
