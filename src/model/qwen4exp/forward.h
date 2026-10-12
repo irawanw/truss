@@ -114,6 +114,8 @@ struct ForwardOptions {
     const gguf::File * ple_file = nullptr;
     int hint_k = 4;                           // pre-gated prefetch: per row, the next layer's top hint_k predicted
                                               // experts start copying early (0: off; 3-6 measured equal, TRACKER #59)
+    int hint_min_rows = 0;                    // ... only for windows of at least this many rows: the next layer's router
+                                              // costs ~0.6 ms a pass at 1-5 rows and repays it only at 7-8 (TRUSS_HINT_MIN_ROWS)
     // Layer split over two devices (TRUSS_LAYER_SPLIT, TRUSS_LAYER_SPLIT_DEVICE): layers [0, layer_split) run on
     // layer_split_device, the rest, the head and the MTP block on the current device (so the logits, stream() and
     // the caller's buffers stay there). Each stage has its own expert store, K/V, recurrent state and driver; the

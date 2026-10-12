@@ -329,6 +329,7 @@ struct Forward::Impl {
 
     const Activations act;
     const int hint_k;                                    // Options::hint_k
+    const int hint_min_rows;                             // Options::hint_min_rows
     const int split_rows, split_t;                       // Options::split_rows / split_t (E7)
     const double split_ms_row;                           // Options::split_ms_row
     bool split_chunk = false;                            // this prompt chunk runs E7's split (run_chunk)
@@ -358,7 +359,7 @@ struct Forward::Impl {
           prefill_rows(prefill_rows_of(mc, o.prefill_rows)),
           lb(sg.lb), le(sg.le), device(sg.device), first(sg.lb == 0), last(sg.le == cc.n_layer),
           small_scratch(scratch_bytes(cc, std::min(mc, FETCH_ROWS), nc, o.mtp)),
-          spec_rows(o.spec_rows), act(o.act), hint_k(o.hint_k), split_rows(o.split_rows), split_t(o.split_t), split_ms_row(o.split_ms_row)
+          spec_rows(o.spec_rows), act(o.act), hint_k(o.hint_k), hint_min_rows(o.hint_min_rows), split_rows(o.split_rows), split_t(o.split_t), split_ms_row(o.split_ms_row)
     {
         load_mark("Forward: start");
         if (device >= 0) TRUSS_CUDA(cudaSetDevice(device));   // the caller's guard restores its device
@@ -1569,7 +1570,7 @@ struct Forward::Impl {
         };
         // the router, the next layer's router on this input (pre-gating hint, TRACKER #58) and the shared-expert
         // gate read the same fp32 rows: one launch at decode sizes
-        const bool hint = !stream && hint_k > 0 && l + 1 < le;   // not across a split stage
+        const bool hint = !stream && hint_k > 0 && l + 1 < le && T >= hint_min_rows;   // not across a split stage
         float * pl = nullptr;
         if (hint) pl = sc->alloc((size_t) T * E);
         {
@@ -2606,6 +2607,7 @@ void apply_env(ForwardOptions & o)
     f("TRUSS_ADAPT_MIN", o.adapt_min);
     f("TRUSS_ADAPT_DECAY", o.adapt_decay);
     f("TRUSS_HINT_K", o.hint_k);               // pre-gated prefetch width
+    f("TRUSS_HINT_MIN_ROWS", o.hint_min_rows);
     f("TRUSS_ADMIT_IDLE", o.admit_idle);       // admission on the idle link, experts per pass
     f("TRUSS_KV_LEND", o.kv_lend);             // E6: the KV caches' unused tail lent to the expert ring
     f("TRUSS_ADMIT_MIN", o.admit_min);
