@@ -1426,6 +1426,20 @@ struct Forward::Impl {
         }
         for (const Proj & p : ps) lin(p.first, a, rows, p.second);
     }
+    // lin_multi with the first matrix's output written as silu(row * scale) in fp16 by the gemv itself: the same
+    // launch, the same arithmetic, and one kernel fewer after it (TRUSS_HC_SILU).
+    void lin_multi_silu(const std::vector<Proj> & ps, half * y16, float scale, const Act & a, int rows)
+    {
+        const int n = (int) ps.size();
+        const dense::Q8Matrix * W[dense::MULTI_MAX];
+        float * y[dense::MULTI_MAX];
+        half * o16[dense::MULTI_MAX];
+        float s16[dense::MULTI_MAX];
+        for (int i = 0; i < n; ++i) W[i] = &q8.at(ps[i].first), y[i] = ps[i].second, o16[i] = nullptr, s16[i] = 0.f;
+        o16[0] = y16, s16[0] = scale;
+        dense::q8_gemv_multi_a16_silu(W, y, o16, s16, n, a.x, rows, s);
+    }
+
     void lin32_multi(const std::vector<Proj> & ps, const float * x, int rows)
     {
         if (rows <= FETCH_ROWS && ps.size() > 1 && ps.size() <= (size_t) dense::MULTI_MAX) {
@@ -1444,6 +1458,20 @@ struct Forward::Impl {
         for (const Proj & p : ps) lin32(p.first, x, rows, p.second);
     }
 
+    // Phase 1's two hyper-connection fusions, each off until its gate: TRUSS_HC_SILU folds the down projection's
+    // silu into the gemv that produces its input, TRUSS_HC_COLLAPSE folds the stream collapse into the up
+    // projection's launch. Neither changes an operation; they remove launches and the round trips between them.
+    static bool hc_silu()
+    {
+        static const bool v = [] { const char * e = std::getenv("TRUSS_HC_SILU"); return e && std::atoi(e); }();
+        return v;
+    }
+    static bool hc_collapse()
+    {
+        static const bool v = [] { const char * e = std::getenv("TRUSS_HC_COLLAPSE"); return e && std::atoi(e); }();
+        return v;
+    }
+
     // hyper-connection mix: mixed [T][d] (fp32 and fp16), inject [T][hc] when h.inject.
     // L3 (Order 11): with Q8_1 activations the norm fuses the activation quantize (and, when cout/cinj are
     // given, the preceding hc::combine) into one launch; bit-identical arithmetic, see hc_prefill.cuh.
@@ -1451,10 +1479,16 @@ struct Forward::Impl {
                 const float * cout = nullptr, const float * cinj = nullptr)
     {
         const size_t m = sc->mark();
+        // Both fusions live in the fp16-activation gemv at decode rows; anything else (q8_1 activations, prefill
+        // row counts, TRUSS_GEMV_MMA=0) takes the plain path.
+        const bool gemv_ok = act == Activations::FP16 && T <= dense::GEMV_ROWS && dense::mma_on();
+        const bool silu_epi = gemv_ok && hc_silu();
+        const bool collapse_epi = gemv_ok && hc_collapse() &&
+                                  dense::up_collapse_ok((int) d(h.up).ne[0], (int) d(h.up).ne[1], c.hc, (int) c.d_model);
         float * rstd = sc->alloc((size_t) T * c.hc);
-        float * lo = sc->alloc((size_t) T * c.hc_rank);
+        float * lo = silu_epi ? nullptr : sc->alloc((size_t) T * c.hc_rank);   // the epilogue makes it dead
         half * lo16 = sc->alloc<half>((size_t) T * c.hc_rank);
-        float * gate = sc->alloc((size_t) T * c.hc_dim());
+        float * gate = collapse_epi ? nullptr : sc->alloc((size_t) T * c.hc_dim());   // ditto the gate
         Act xa;
         if (act == Activations::Q8_1)
         {
@@ -1470,11 +1504,23 @@ struct Forward::Impl {
             else hc::norm(res, f32(h.norm), T, c.hc, c.d_model, c.rms_eps, xn16, rstd, s);
             xa = quant(xn16, T, c.hc_dim());
         }
-        if (h.inject) lin_multi({ { h.down, lo }, { h.inject, inject } }, xa, T);   // inject reads the same xa
-        else lin(h.down, xa, T, lo);
-        hc::silu(lo, T * c.hc_rank, 1.f / c.hc, lo16, s);
-        lin(h.up, lo16, T, gate);
-        hc::collapse(res, rstd, f32(h.norm), gate, T, c.hc, c.d_model, mixed, mixed16, s);
+        const float inv_hc = 1.f / c.hc;
+        if (silu_epi) {   // the down projection writes silu(lo) as fp16 itself; inject shares the launch
+            std::vector<Proj> ps = { { h.down, nullptr } };
+            if (h.inject) ps.push_back({ h.inject, inject });   // inject reads the same xa
+            lin_multi_silu(ps, lo16, inv_hc, xa, T);
+        } else {
+            if (h.inject) lin_multi({ { h.down, lo }, { h.inject, inject } }, xa, T);   // inject reads the same xa
+            else lin(h.down, xa, T, lo);
+            hc::silu(lo, T * c.hc_rank, inv_hc, lo16, s);
+        }
+        if (collapse_epi)   // gate stays in the CTA that computed it; mixed and mixed16 come out of the gemv
+            dense::q8_gemv_a16_up_collapse(q8.at(h.up), lo16, T, res, rstd, f32(h.norm), mixed, mixed16, c.hc,
+                                           (int) c.d_model, s);
+        else {
+            lin(h.up, lo16, T, gate);
+            hc::collapse(res, rstd, f32(h.norm), gate, T, c.hc, c.d_model, mixed, mixed16, s);
+        }
         sc->release(m);
     }
 

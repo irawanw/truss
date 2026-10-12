@@ -66,9 +66,26 @@ void q8_gemv_a16(const Q8Matrix & W, const half * x, int rows, float * y, cudaSt
 // result does not depend on the row count, but a matrix fused with others may differ from it alone in the last bits.
 struct MmaSplit { int S, KB; };
 MmaSplit mma_split(int in, int outs);
+// The tensor-core gemv is on unless TRUSS_GEMV_MMA=0; the fused epilogues below exist only in it.
+bool mma_on();
 // the same with a given split (tuning: tools/tk-bench/gemv_split_bench)
 void q8_gemv_multi_a16_cfg(const Q8Matrix * const * W, float * const * y, int n, const half * x, int rows, MmaSplit c,
                            cudaStream_t stream);
+
+// Two fused launches for the hyper-connection (the engine puts them behind TRUSS_HC_SILU / TRUSS_HC_COLLAPSE).
+// Neither changes a single arithmetic operation of the gemv it replaces: only what happens to the result does.
+//   q8_gemv_multi_a16_silu: a matrix whose y16[i] is non-null writes silu(row * y16s[i]) as fp16 [rows][out] in the
+//     gemv's epilogue and leaves y[i] alone. The hc down projection's fp32 output feeds nothing but the silu the up
+//     projection then reads, so that separate kernel disappears (same expression, same value, same rounding).
+//   q8_gemv_a16_up_collapse: the hc up projection (W.out == hc * d) plus the collapse of the streams in one launch:
+//     gate never reaches memory and mixed/mixed16 come straight out of the CTA that holds all hc gate values of its
+//     own 16 columns. Needs the shape's own k split to stay inside a block (up_collapse_ok).
+void q8_gemv_multi_a16_silu(const Q8Matrix * const * W, float * const * y, half * const * y16,
+                            const float * y16s, int n, const half * x, int rows, cudaStream_t stream);
+bool up_collapse_ok(int in, int out, int hc, int d);
+void q8_gemv_a16_up_collapse(const Q8Matrix & W, const half * x, int rows, const float * res, const float * rstd,
+                             const float * gamma, float * mixed, half * mixed16, int hc, int d, cudaStream_t stream);
+
 void f32_gemv_multi(const float * const * W, const int * out, float * const * y, int n, int in, const float * x,
                     int rows, cudaStream_t stream);
 
