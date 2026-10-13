@@ -2,9 +2,10 @@
 
 Checks, through Engine.generate:
   1. two requests in flight take different slots, and each slot's sequence stays exactly its own prompt + reply;
-  2. a third request waits for a free sequence and runs after one is released;
-  3. a request goes to the slot whose sequence or checkpoint is the longest prefix of its prompt, and to the least
-     recently used slot when none matches;
+  2. a third request waits for a free sequence, runs once one is released, and gets 503 rather than waiting forever;
+  3. a request goes to the slot whose sequence or checkpoint is the longest prefix of its prompt and, when none
+     matches, to the free slot holding the fewest cached tokens (ties: least recently used) - so a short side
+     request cannot evict a long conversation - and every request logs its longest common prefix with each slot;
   4. while another slot is busy the prompt read is split into TRUSS_PREFILL_PIECE pieces, and produces the same ids
      (greedy and sampled, penalty history included) as the single-call read it replaces;
   5. the slot comes back when the request raises, and Engine.call refuses to nest (that would deadlock the lock).
@@ -30,6 +31,7 @@ class FakeSlots:
 
     def __init__(self, slots=2, n_ctx=100000, round_ms=0.0, fail=None):
         self.n_ctx, self.slots, self.drafts = n_ctx, slots, 0
+        self.n_vocab = 1_000_000   # the real Model exposes this; the raw-prompt route checks client ids on it (F1)
         self.seq, self.ck = [[] for _ in range(slots)], [None] * slots
         self.selected, self.calls, self.evals = 0, [], 0
         self.round_s, self.fail = round_ms / 1e3, fail   # decode cost per round; call number that raises
@@ -184,7 +186,7 @@ def test_third_waits():
 
 
 def test_assignment():
-    """Longest cached/checkpoint prefix wins; otherwise the least recently used sequence."""
+    """Longest cached/checkpoint prefix wins; with no match anywhere, the slot with the fewest cached tokens."""
     m = FakeSlots()
     e = engine(m)
     pa, pb = prompt(1, 120), prompt(2, 120)
@@ -207,10 +209,77 @@ def test_assignment():
     fed = sum(c[2] for c in new[:first + 1] if c[1] in ("eval", "eval_argmax"))
     check("and read only its tail", [c[1] for c in new[:first]] == ["restore", "eval", "checkpoint"]
           and fed == len(pc) - 120, f"{new[:first + 1]}, {fed} tokens fed of {len(pc)}")
-    pd = prompt(4, 60)   # matches neither sequence: the least recently used, which slot 0 now is
+    pd = prompt(4, 60)   # matches neither: the free slot with the fewest cached tokens, not the LRU one
     run(e, pd)
-    check("a prompt matching neither takes the least recently used", e.slots[0].cached[:3] == pd[:3],
-          f"slot 0 now holds {len(e.slots[0].cached)} tokens of D")
+    check("a prompt matching neither takes the slot with the least cached", e.slots[1].cached[:3] == pd[:3],
+          f"slot 1 holds {len(e.slots[1].cached)} of D, slot 0 keeps {len(e.slots[0].cached)} of A")
+
+
+def test_side_request():
+    """A1: a short request that matches nothing must not evict a long conversation while a slot with less cached is
+    free, whichever of the two was used last. The old rule was pure LRU, and in the live two-agent test a 55-token
+    side request took a 126K conversation's sequence (3 of its 16 full reads) and made that conversation read 126K
+    again on its next turn."""
+    for recent in (0, 1):   # the long conversation as the older sequence, then as the newer one
+        m = FakeSlots()
+        e = engine(m)
+        run(e, prompt(1, 5000))      # slot 0: the conversation, checkpointed before its generation prompt
+        run(e, prompt(2, 40))        # slot 1: a short exchange
+        now = time.time()
+        e.slots[recent].last_used, e.slots[1 - recent].last_used = now + 100, now + 50
+        side = [900000 + i for i in range(55)] + [IM, 7, 8]   # shares nothing with either sequence
+        run(e, side)
+        check(f"a 55-token side request spares the conversation (slot {recent} used last)",
+              len(e.slots[0].cached) > 4000 and e.slots[1].cached[:3] == side[:3],
+              f"slot 0 keeps {len(e.slots[0].cached)} tokens, slot 1 holds {len(e.slots[1].cached)}")
+        cont, n_gen = e.slots[0].cached + [4001, IM, 7, 8], 4
+        mark, cached = len(m.calls), len(e.slots[0].cached)
+        run(e, cont, n_gen)
+        fed = sum(c[2] for c in m.calls[mark:] if c[1].startswith("eval"))
+        check("and that conversation resumes on its own sequence",
+              fed == (len(cont) - cached) + (n_gen - 1),   # the prompt's last token is what yields the first reply
+              f"{fed} tokens fed: {len(cont) - cached} new + {n_gen - 1} more rounds, {cached} reused")
+
+
+def test_lcp_log():
+    """A1: every request logs the longest common prefix with every slot's cache and checkpoint, reused or not -
+    the prefill line only ever says 0 or all of it, which is what hid the reads."""
+    m = FakeSlots()
+    e = engine(m)
+    pa = prompt(1, 300)
+    run(e, pa)      # both sequences empty when it was picked
+    check("an empty server logs a zero lcp", any("lcp s0 0/ck 0, s1 0/ck 0" in l for l in e.progress_lines),
+          next((l for l in e.progress_lines if "lcp " in l), "no lcp line"))
+    e.progress_lines.clear()
+    # slot 0 holds 303 prompt tokens + its reply, checkpointed at 300: the new prompt shares the 303, not the reply
+    run(e, pa + [4001, 4002, IM, 7, 8])
+    line = next((l for l in e.progress_lines if "lcp " in l), "")
+    check("the line says what each slot shared with the prompt", "lcp s0 303/ck 300, s1 0/ck 0" in line, line)
+
+
+def test_slot_wait_503():
+    """Review F3: the queue for a free sequence is bounded. TRUSS_ENGINE_CALL_TIMEOUT covers the engine lock, which
+    the live configuration (engine_slots) never takes, so a wedged slot used to queue every later request forever."""
+    m = FakeSlots()
+    os.environ["TRUSS_SLOT_WAIT_TIMEOUT"] = "0.2"   # read by init_sequences
+    try:
+        e = engine(m)
+        check("the slot gate carries the timeout", e.slot_gate.timeout == 0.2, f"{e.slot_gate.timeout} s")
+        for _ in range(e.n_slots):
+            e.acquire_slot(prompt(1, 20))   # every permit taken and none given back: the wedged-slot case
+        try:
+            e.acquire_slot(prompt(2, 20))
+            check("a request behind a full queue fails instead of hanging", False, "acquire_slot returned")
+        except app.HTTPException as x:
+            check("a request behind a full queue gets 503", x.status_code == 503 and "slot gate" in str(x.detail),
+                  f"{x.status_code}: {x.detail}")
+        e.release_slot(e.slots[0])   # one sequence comes free: the waiter that timed out must have left no ticket
+        t = time.time()
+        s = e.acquire_slot(prompt(3, 20))
+        check("and the queue still works for the next request", s.idx == 0 and time.time() - t < 0.2,
+              f"slot {s.idx} after {time.time() - t:.2f} s")
+    finally:
+        os.environ.pop("TRUSS_SLOT_WAIT_TIMEOUT", None)
 
 
 def test_piecewise_prefill():
@@ -307,8 +376,9 @@ def test_fair_order():
 
 
 def main():
-    for t in (test_two_streams, test_third_waits, test_assignment, test_piecewise_prefill, test_released_on_error,
-              test_no_nesting, test_fair_order):
+    for t in (test_two_streams, test_third_waits, test_assignment, test_side_request, test_lcp_log,
+              test_slot_wait_503, test_piecewise_prefill, test_released_on_error, test_no_nesting,
+              test_fair_order):
         print(f"-- {t.__name__}")
         t()
     print("PASS" if ok else "FAIL")

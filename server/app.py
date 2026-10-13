@@ -45,6 +45,39 @@ def prefix_len(prompt, seq):
     return n if 0 < n < len(prompt) and prompt[:n] == seq else 0
 
 
+def lcp(prompt, seq):
+    """How many leading tokens a slot's cache shares with this prompt, whether or not it can be reused. Cheap in
+    the common case: when seq is a proper prefix of prompt the answer is already known from the reuse test, so only
+    a genuine miss pays the scan, and a miss is a read of seconds. A1 logs this per slot - the size of the miss (a
+    126K conversation whose first difference sits at 60K) is what A2's checkpoints have to be sized against."""
+    n = prefix_len(prompt, seq)
+    if n:
+        return n
+    m = min(len(prompt), len(seq))
+    for i in range(m):
+        if prompt[i] != seq[i]:
+            return i
+    return m
+
+
+def raw_ids(raw, n_vocab):
+    """The token ids of a client-supplied `prompt` field, validated (review F1). That field moved the trust boundary
+    from the tokenizer to the client and nothing downstream checks the values: rows_kernel takes the embedding row
+    at (size_t) id with no bound, so one id >= n_vocab reads off the end of the table and a negative one becomes an
+    address of ~1.8e19 - an illegal address, which a CUDA context does not survive, and both slots go down with it
+    until a restart. So: a flat list of ints in [0, n_vocab), never empty (an empty prompt leaves the engine nothing
+    to sample and its error reaches the client as a 500). numpy does the range test because a Python loop over a
+    150K-token prompt costs ~50 ms; the dtype test is what rejects floats, strings, bools and None."""
+    if not raw:
+        raise ValueError("prompt: the token id list must not be empty")
+    a = np.asarray(raw)
+    if a.ndim != 1 or not np.issubdtype(a.dtype, np.integer):
+        raise ValueError(f"prompt: token ids must be a flat list of ints, got {a.dtype.name} of shape {a.shape}")
+    if a.min() < 0 or a.max() >= n_vocab:
+        raise ValueError(f"prompt: token ids must be in [0, {n_vocab}), got {int(a.min())}..{int(a.max())}")
+    return a.tolist()
+
+
 class FairGate:
     """A counting semaphore that serves waiters strictly in arrival order. threading.Lock/Semaphore make no fairness
     promise: the thread that just released can re-acquire ahead of the other one indefinitely, which with two
@@ -168,7 +201,11 @@ class Engine:
         # hanging behind a wedged call (H3). Generous: the lock is held for one engine call, and a full-chunk prefill
         # of a long prompt is the longest normal one.
         self.lock = FairGate(1, "engine lock", timeout=float(os.environ.get("TRUSS_ENGINE_CALL_TIMEOUT", 600)))
-        self.slot_gate = FairGate(self.n_slots, "slot gate", thread_bound=False)   # one permit per FREE slot: a 3rd request queues
+        # One permit per FREE slot: a 3rd request queues. TRUSS_SLOT_WAIT_TIMEOUT (review F3) bounds that queue:
+        # this is the gate the live configuration actually waits on (with the engine running its own slots, the
+        # engine lock is never taken), so without a limit one wedged slot queues every later request behind it.
+        self.slot_gate = FairGate(self.n_slots, "slot gate", thread_bound=False,
+                                  timeout=float(os.environ.get("TRUSS_SLOT_WAIT_TIMEOUT", 600)))
         # TRUSS_PREFILL_PIECE: how big a prompt piece is while another stream decodes. It has to be a multiple of
         # --chunk: measured on the served model (GATE 2, reports/LOG.md), the same 25,170-token prompt cut at 4096
         # produced a different first generated token than one call did, while cut at 8192 or 16384 it produced the
@@ -247,31 +284,47 @@ class Engine:
         return out
 
     def pick_slot(self, prompt_ids):
-        """The free slot whose sequence, or checkpoint, is the longest prefix of this prompt; else the least recently
-        used. Called while holding a slot_gate permit, which is what makes a free slot guaranteed."""
+        """The free slot whose sequence, or checkpoint, is the longest prefix of this prompt; when nothing matches,
+        the free slot holding the FEWEST cached tokens (ties: least recently used). Called while holding a
+        slot_gate permit, which is what makes a free slot guaranteed.
+
+        A1 (LOG.md "v1.6 merged build live"): the LRU-only rule gave a prompt that matched nothing whatever had
+        sat idle longest, which is how a 55-token side request evicted a 126K conversation (3 of that test's 16
+        full reads) and made its next turn read 126K again. Least-cached puts the side request on the slot with the
+        least to lose while the conversation that is mid-exchange stays free for its own next turn."""
         best, best_rank = None, None
         for s in self.slots:
             if s.busy:
                 continue
             match = max(prefix_len(prompt_ids, s.cached), prefix_len(prompt_ids, s.ck_tokens))
-            rank = (match, -s.last_used)   # longest prefix first, then the least recently used
+            # a slot that matches beats one that does not, then the longest match; with no match anywhere, the slot
+            # with the fewest cached tokens to throw away. -last_used keeps the old tie-break.
+            rank = (1 if match else 0, match if match else -len(s.cached), -s.last_used)
             if best_rank is None or rank > best_rank:
                 best, best_rank = s, rank
         return best
 
     def acquire_slot(self, prompt_ids, note=""):
         """Take a sequence for a request, waiting FIFO while every slot is busy, and say which one it got. The
-        request line from the route arrives in `note` and is logged here, because only now is the slot known."""
+        request line from the route arrives in `note` and is logged here, because only now is the slot known. The
+        lcp field is the longest common prefix with every slot's cache and checkpoint, reused or not (A1): the
+        reuse number in the prefill line only ever says 0 or all of it, which is what hid the reads in the first
+        place."""
         t = time.time()
-        self.slot_gate.acquire()
+        try:
+            self.slot_gate.acquire()
+        except TimeoutError as e:   # the same shape the engine lock's timeout already answers with
+            raise HTTPException(503, str(e))
         waited = time.time() - t
         slot = self.pick_slot(prompt_ids)
         slot.busy, slot.taken = True, t
+        lcp_line = "lcp " + ", ".join(f"s{o.idx} {lcp(prompt_ids, o.cached)}/ck {lcp(prompt_ids, o.ck_tokens)}"
+                                      for o in self.slots)
+        wait = f", waited {waited:.1f} s for a free sequence" if waited >= 1.0 else ""
         if note:
-            self.log(f"{self.log_tag}: {note}, slot {slot.idx}"
-                     + (f", waited {waited:.1f} s for a free sequence" if waited >= 1.0 else ""))
-        elif waited >= 1.0:
-            self.progress(f"{self.log_tag}: slot {slot.idx} waited {waited:.1f} s for a free sequence")
+            self.log(f"{self.log_tag}: {note}, slot {slot.idx}, {lcp_line}{wait}")
+        else:
+            self.progress(f"{self.log_tag}: slot {slot.idx}, {lcp_line}{wait}")
         return slot
 
     def release_slot(self, slot):
@@ -732,7 +785,7 @@ def make_app(engine: Engine) -> FastAPI:
         # gets those exact tokens, which is what makes a served measurement comparable to an in-process one.
         raw = body.get("prompt")
         if isinstance(raw, list):
-            ids = [int(x) for x in raw]
+            ids = raw_ids(raw, engine.model.n_vocab)   # F1: these ids go to the embedding table unchecked
         elif raw is not None:
             ids = await anyio.to_thread.run_sync(engine.chat.encode, raw)
         else:
