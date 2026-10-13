@@ -1480,11 +1480,13 @@ struct Forward::Impl {
     {
         const size_t m = sc->mark();
         // Both fusions live in the fp16-activation gemv at decode rows; anything else (q8_1 activations, prefill
-        // row counts, TRUSS_GEMV_MMA=0) takes the plain path.
         const bool gemv_ok = act == Activations::FP16 && T <= dense::GEMV_ROWS && dense::mma_on();
         const bool silu_epi = gemv_ok && hc_silu();
-        const bool collapse_epi = gemv_ok && hc_collapse() &&
-                                  dense::up_collapse_ok((int) d(h.up).ne[0], (int) d(h.up).ne[1], c.hc, (int) c.d_model);
+        // The shapes come from the q8 table because that is what the fused launch reads. It matters: the head's
+        // hyper-connection (w.hc_head, output_hc_*) has its up matrix there but not as an uploaded fp16 tensor.
+        const dense::Q8Matrix & wup = q8.at(h.up);
+        const bool collapse_epi =
+            gemv_ok && hc_collapse() && dense::up_collapse_ok(wup.in, wup.out, c.hc, c.d_model);
         float * rstd = sc->alloc((size_t) T * c.hc);
         float * lo = silu_epi ? nullptr : sc->alloc((size_t) T * c.hc_rank);   // the epilogue makes it dead
         half * lo16 = sc->alloc<half>((size_t) T * c.hc_rank);
@@ -1515,8 +1517,7 @@ struct Forward::Impl {
             hc::silu(lo, T * c.hc_rank, inv_hc, lo16, s);
         }
         if (collapse_epi)   // gate stays in the CTA that computed it; mixed and mixed16 come out of the gemv
-            dense::q8_gemv_a16_up_collapse(q8.at(h.up), lo16, T, res, rstd, f32(h.norm), mixed, mixed16, c.hc,
-                                           (int) c.d_model, s);
+            dense::q8_gemv_a16_up_collapse(wup, lo16, T, res, rstd, f32(h.norm), mixed, mixed16, c.hc, c.d_model, s);
         else {
             lin(h.up, lo16, T, gate);
             hc::collapse(res, rstd, f32(h.norm), gate, T, c.hc, c.d_model, mixed, mixed16, s);
