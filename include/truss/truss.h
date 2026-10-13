@@ -109,6 +109,18 @@ int truss_eval_sample(truss_model * m, const int32_t * tokens, int n, const trus
 int truss_spec_step_sampled(truss_model * m, int32_t next, const truss_sampling * sp, int32_t * emitted,
                             int * n_emitted, int32_t * new_next);
 
+/* Speculative rounds with CALLER-SUPPLIED drafts (a host-side n-gram / prompt-lookup proposer). Same verify and
+   accept rule as the two rounds above, so the output distribution is unchanged whatever the drafts are; only their
+   source differs. `nd_req` drafts are offered and clamped to truss_drafts() and the remaining context before the
+   verify pass; *n_draft returns the number actually offered (0 when there was no room and a plain step ran).
+   truss_spec_step_lookup_sampled refuses to run with TRUSS_SPEC_SAMPLE=1: that path needs draft probabilities q,
+   which only the MTP drafter produces, and a lookup draft has none. */
+int truss_spec_step_lookup(truss_model * m, int32_t next, const int32_t * draft, int nd_req, int32_t * emitted,
+                           int * n_emitted, int32_t * new_next, int * n_draft);
+int truss_spec_step_lookup_sampled(truss_model * m, int32_t next, const int32_t * draft, int nd_req,
+                                   const truss_sampling * sp, int32_t * emitted, int * n_emitted,
+                                   int32_t * new_next, int * n_draft);
+
 #ifdef __cplusplus
 }
 #endif

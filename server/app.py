@@ -30,6 +30,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from server.chat import Chat, Detokenizer
+from server.lookup import SuffixLookup
 from server.tools import ToolStream, normalize_messages, parse_calls
 from server.truss_ctypes import PENALTY_CAP, Model, Sampling, TrussError
 
@@ -61,6 +62,14 @@ class Engine:
         self.im_start = self.chat.token_id("<|im_start|>")
         self.think_close = self.chat.token_id("</think>")
         self.lock = threading.Lock()
+        # Suffix (prompt-lookup) drafts: TRUSS_LOOKUP="m:n" (e.g. "8:7") proposes the continuation of an n-gram that
+        # already occurred in this sequence and offers it to the SAME verify the MTP drafts use — so the output is
+        # unchanged whatever it proposes, and only the round's cost changes. Unset (served) is MTP only.
+        lk = os.environ.get("TRUSS_LOOKUP", "")
+        m, _, n = lk.partition(":")
+        self.lookup = SuffixLookup(int(m), int(n) if n.strip().isdigit() else 7) if m.strip().isdigit() else None
+        if self.lookup and not self.model.drafts:
+            raise RuntimeError("TRUSS_LOOKUP needs --mtp and --drafts: a lookup round reuses the MTP verify window")
 
     def log(self, line: str):
         print(line, flush=True)
@@ -206,6 +215,8 @@ class Engine:
         real token, the reply stops mid-sentence with no tool call, and an agent client stalls."""
         with self.lock:
             n_prompt = len(prompt_ids)
+            if self.lookup:
+                self.lookup.built_ms = 0.0   # the index persists across requests; this timer is per request
             if n_prompt == 0:
                 raise ValueError("empty prompt")
             max_tokens = max(0, min(max_tokens, self.model.n_ctx - n_prompt))
@@ -224,9 +235,11 @@ class Engine:
                                               (seed if seed is not None else np.random.SeedSequence().entropy) % (1 << 64),
                                               repetition_penalty, frequency_penalty, presence_penalty,
                                               PENALTY_CAP if penalty_last_n < 0 else penalty_last_n)
+            ban_now = []   # ids the sampler currently refuses; a draft of one can never be accepted
             if (sp is not None and think_open and BAN_EOS_IN_THINK and self.think_close is not None
                     and self.think_close >= 0):
                 sp.set_ban(sorted(self.stop_ids), self.think_close)
+                ban_now = sorted(self.stop_ids)
 
             def counted():   # the tokens the penalties see, from the engine's own sequence
                 if penalty_last_n < 0:
@@ -275,6 +288,7 @@ class Engine:
             detok, text, n_gen, finish = Detokenizer(self.chat), "", 0, "length"
             spec = self.model.drafts > 0
             drafted = accepted = 0
+            n_lookup_rounds = n_lookup_rows = 0   # rounds/rows the suffix proposer supplied (telemetry only)
             pending = []   # tokens the engine already holds that are still to be emitted (speculative rounds)
             rounds = []    # (generated tokens before the round, emitted [nxt + accepted drafts], next): stop diagnosis
             try:
@@ -284,10 +298,22 @@ class Engine:
                             break
                         if not greedy and sp.penalized:
                             sp.set_history(counted())   # before nxt; the engine adds nxt and the drafts per row
-                        emitted, after = self.model.spec_step(nxt) if greedy else self.model.spec_step_sampled(nxt, sp)
+                        draft = self.lookup.propose(self.cached, ban_now) if self.lookup else []
+                        if draft:   # caller-supplied drafts: the verify and accept rule are the MTP round's own
+                            if greedy:
+                                emitted, after, offered = self.model.spec_step_lookup(nxt, draft, len(draft))
+                            else:
+                                emitted, after, offered = self.model.spec_step_lookup_sampled(nxt, draft, len(draft),
+                                                                                              sp)
+                            n_lookup_rounds += 1
+                            n_lookup_rows += offered
+                        else:
+                            emitted, after = (self.model.spec_step(nxt) if greedy
+                                              else self.model.spec_step_sampled(nxt, sp))
+                            offered = self.model.drafts
                         rounds.append((len(self.cached) - n_prompt, list(emitted), after))   # stop diagnosis
                         self.cached += emitted
-                        drafted += self.model.drafts
+                        drafted += offered   # rows actually offered: a lookup window is shorter than --drafts
                         accepted += len(emitted) - 1
                         pending, nxt = emitted, after
                     tok = pending.pop(0) if spec else nxt
@@ -296,6 +322,7 @@ class Engine:
                         # the reasoning block closed (the engine lifts the ban only inside the call that feeds
                         # </think>), or it ran so long that a stuck reply must still be able to end
                         sp.set_ban([])
+                        ban_now = []
                     if tok in self.stop_ids:
                         finish = "stop"
                         self.log_stop(tok, n_prompt, n_gen, rounds)
@@ -322,9 +349,12 @@ class Engine:
             finally:
                 t2 = time.time()
                 read, gen_s = t1 - t0, t2 - t1
+                extra = (f", lookup supplied {n_lookup_rows} drafts in {n_lookup_rounds} of {len(rounds)} rounds "
+                         f"(index {self.lookup.built_ms:.0f} ms)") if self.lookup else ""
                 self.log(f"{self.log_tag}: prompt {n_prompt} tokens = {reuse} reused + {n_prompt - reuse} read in "
                          f"{read * 1e3:.0f} ms ({(n_prompt - reuse) / max(read, 1e-9):.1f} tok/s), {n_gen} generated "
-                         f"in {gen_s * 1e3:.0f} ms ({n_gen / max(gen_s, 1e-9):.1f} tok/s), drafts accepted {accepted} of {drafted}")
+                         f"in {gen_s * 1e3:.0f} ms ({n_gen / max(gen_s, 1e-9):.1f} tok/s), drafts accepted "
+                         f"{accepted} of {drafted}{extra}")
                 self.save_request(prompt_ids, self.cached[n_prompt:], finish, n_gen,
                                   dict(temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p, think_open=think_open))
                 self.dump(prompt_ids, text, finish, dict(temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p,

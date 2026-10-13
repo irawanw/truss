@@ -61,6 +61,7 @@ def main():
     e.chat = types.SimpleNamespace(tok=types.SimpleNamespace(decode=lambda ids, **k: "".join(f"<{i}>" for i in ids)))
     e.stop_ids, e.log_tag, e.log_path, e.dump_dir, e.cached, e.lock = set(), "test", None, None, [], threading.Lock()
     e.ck_tokens, e.log, e.im_start = [], (lambda line: None), IM
+    e.lookup = None   # suffix drafts off: this test is about prompt reuse
     S = [IM, 7, 8]   # the generation prompt's "<|im_start|>assistant\n": the checkpoint goes before it
     ok = True
 

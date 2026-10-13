@@ -89,6 +89,10 @@ class Model:
             "truss_eval_sample": (c_int, [p, i32p, c_int, ctypes.POINTER(Sampling), i32p]),
             "truss_spec_step_sampled": (c_int, [p, ctypes.c_int32, ctypes.POINTER(Sampling), i32p,
                                                 ctypes.POINTER(c_int), i32p]),
+            "truss_spec_step_lookup": (c_int, [p, ctypes.c_int32, i32p, c_int, i32p, ctypes.POINTER(c_int), i32p,
+                                               ctypes.POINTER(c_int)]),
+            "truss_spec_step_lookup_sampled": (c_int, [p, ctypes.c_int32, i32p, c_int, ctypes.POINTER(Sampling),
+                                                       i32p, ctypes.POINTER(c_int), i32p, ctypes.POINTER(c_int)]),
         }
         for name, (res, args) in sig.items():
             fn = getattr(lib, name)
@@ -188,3 +192,24 @@ class Model:
         self._check(self._lib.truss_spec_step_sampled(self._m, nxt, ctypes.byref(sp), self._emitted, ctypes.byref(n),
                                                       ctypes.byref(new)))
         return list(self._emitted[:n.value]), new.value
+
+    def spec_step_lookup(self, nxt: int, draft, nd: int):
+        """One greedy speculative round with CALLER-SUPPLIED drafts: returns (tokens appended, starting with nxt;
+        the next greedy token; drafts actually offered, after clamping to the window and the context)."""
+        arr = np.ascontiguousarray(draft, dtype=np.int32)
+        n, new, ndone = ctypes.c_int(), ctypes.c_int32(), ctypes.c_int()
+        self._check(self._lib.truss_spec_step_lookup(self._m, nxt,
+                                                     arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), nd,
+                                                     self._emitted, ctypes.byref(n), ctypes.byref(new),
+                                                     ctypes.byref(ndone)))
+        return list(self._emitted[:n.value]), new.value, ndone.value
+
+    def spec_step_lookup_sampled(self, nxt: int, draft, nd: int, sp: Sampling):
+        """spec_step_lookup for sampled decoding (exact-match verify: lossless for any proposer)."""
+        arr = np.ascontiguousarray(draft, dtype=np.int32)
+        n, new, ndone = ctypes.c_int(), ctypes.c_int32(), ctypes.c_int()
+        self._check(self._lib.truss_spec_step_lookup_sampled(self._m, nxt,
+                                                             arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), nd,
+                                                             ctypes.byref(sp), self._emitted, ctypes.byref(n),
+                                                             ctypes.byref(new), ctypes.byref(ndone)))
+        return list(self._emitted[:n.value]), new.value, ndone.value

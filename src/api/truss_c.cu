@@ -424,4 +424,105 @@ int truss_spec_step(truss_model * m, int32_t next, int32_t * emitted, int * n_em
         -1);
 }
 
+/* Caller-supplied drafts, for a proposer that lives outside the engine (host-side n-gram / prompt-lookup). Identical
+   verify/accept to truss_spec_step / truss_spec_step_sampled; only the source of win[1 .. nw] differs. `nd_req` is
+   clamped to truss_drafts() and the remaining context BEFORE verify, so a proposer cannot overflow the 8-row window
+   (an over-wide verify throws and leaves the window open, poisoning every later call). *n_draft reports the rows
+   actually offered (0 on the plain-step fallback) so the caller's acceptance telemetry stays exact.
+   Losslessness is the verify's, not the proposer's: a row is accepted iff the target's own token (greedy argmax, or
+   that row's own sample) equals the draft, so any proposer — deterministic included — yields the same output
+   distribution as plain decoding. The sampled variant REJECTS TRUSS_SPEC_SAMPLE=1: that path reads q_full rows that
+   only the MTP drafter writes, and a caller-supplied draft has no q. */
+int truss_spec_step_lookup(truss_model * m, int32_t next, const int32_t * draft, int nd_req, int32_t * emitted,
+                           int * n_emitted, int32_t * new_next, int * n_draft)
+{
+    return guarded(
+        [&] {
+            if (!m->drafts) throw std::logic_error("truss_spec_step_lookup: opened without an MTP block");
+            if (!draft || nd_req < 1) throw std::logic_error("truss_spec_step_lookup: needs at least one draft");
+            *n_draft = 0;
+            const int nd = std::min(nd_req, std::min(m->drafts, m->n_ctx - m->fwd->position() - 1));
+            if (nd < 1) {   // no room for a window: one plain step
+                eval(*m, &next, 1);
+                sampling::argmax(m->logits, m->config.n_vocab, m->next, m->fwd->stream());
+                TRUSS_CUDA(cudaMemcpyAsync(new_next, m->next, sizeof(int), cudaMemcpyDeviceToHost, m->fwd->stream()));
+                TRUSS_CUDA(cudaStreamSynchronize(m->fwd->stream()));
+                emitted[0] = next, *n_emitted = 1;
+                return 0;
+            }
+            int32_t win[8];
+            win[0] = next;
+            for (int i = 0; i < nd; ++i) win[1 + i] = draft[i];
+            const int nw = nd;
+            m->fwd->verify(win, nw + 1);
+            m->fwd->head(0, nw + 1, m->logits);
+            const int V = m->config.n_vocab;
+            for (int r = 0; r <= nw; ++r)
+                sampling::argmax(m->logits + (size_t) r * V, V, m->spec_next + r, m->fwd->stream());
+            TRUSS_CUDA(cudaMemcpyAsync(m->spec_host, m->spec_next, sizeof(int) * (nw + 1), cudaMemcpyDeviceToHost,
+                                       m->fwd->stream()));
+            TRUSS_CUDA(cudaStreamSynchronize(m->fwd->stream()));
+            int j = 0;
+            while (j < nw && m->spec_host[j] == win[j + 1]) ++j;
+            m->fwd->accept(j + 1);
+            for (int i = 0; i <= j; ++i) emitted[i] = win[i];
+            *n_emitted = j + 1;
+            *new_next = m->spec_host[j];
+            *n_draft = nw;
+            return 0;
+        },
+        -1);
+}
+
+int truss_spec_step_lookup_sampled(truss_model * m, int32_t next, const int32_t * draft, int nd_req,
+                                   const truss_sampling * sp, int32_t * emitted, int * n_emitted, int32_t * new_next,
+                                   int * n_draft)
+{
+    return guarded(
+        [&] {
+            if (!m->drafts) throw std::logic_error("truss_spec_step_lookup_sampled: opened without an MTP block");
+            if (m->spec_sample)
+                throw std::logic_error("truss_spec_step_lookup_sampled: caller-supplied drafts have no q; "
+                                       "run with TRUSS_SPEC_SAMPLE=0 (exact-match verify)");
+            if (!draft || nd_req < 1)
+                throw std::logic_error("truss_spec_step_lookup_sampled: needs at least one draft");
+            *n_draft = 0;
+            const sampling::SampleParams p = params_of(sp);
+            const int V = m->config.n_vocab;
+            const int nd = std::min(nd_req, std::min(m->drafts, m->n_ctx - m->fwd->position() - 1));
+            if (nd < 1) {   // no room for a window: one plain step
+                eval(*m, &next, 1);
+                penalize_rows(*m, *sp, &next, 1, 1);
+                ban_rows(*m, *sp, &next, 1, 1);
+                sampling::sample(m->logits, V, 1, p, m->sample_counter++, m->next, m->fwd->stream());
+                TRUSS_CUDA(cudaMemcpyAsync(new_next, m->next, sizeof(int), cudaMemcpyDeviceToHost, m->fwd->stream()));
+                TRUSS_CUDA(cudaStreamSynchronize(m->fwd->stream()));
+                emitted[0] = next, *n_emitted = 1;
+                return 0;
+            }
+            int32_t win[8];
+            win[0] = next;
+            for (int i = 0; i < nd; ++i) win[1 + i] = draft[i];
+            const int nw = nd;
+            m->fwd->verify(win, nw + 1);
+            m->fwd->head(0, nw + 1, m->logits);
+            penalize_rows(*m, *sp, win, nw + 1, nw + 1);
+            ban_rows(*m, *sp, win, nw + 1, nw + 1);
+            sampling::sample(m->logits, V, nw + 1, p, m->sample_counter, m->spec_next, m->fwd->stream());
+            m->sample_counter += nw + 1;   // verify rows only: a lookup round draws no drafts
+            TRUSS_CUDA(cudaMemcpyAsync(m->spec_host, m->spec_next, sizeof(int) * (nw + 1), cudaMemcpyDeviceToHost,
+                                       m->fwd->stream()));
+            TRUSS_CUDA(cudaStreamSynchronize(m->fwd->stream()));
+            int j = 0;
+            while (j < nw && m->spec_host[j] == win[j + 1]) ++j;
+            m->fwd->accept(j + 1);
+            for (int i = 0; i <= j; ++i) emitted[i] = win[i];
+            *n_emitted = j + 1;
+            *new_next = m->spec_host[j];
+            *n_draft = nw;
+            return 0;
+        },
+        -1);
+}
+
 }  // extern "C"
