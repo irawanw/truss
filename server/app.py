@@ -103,6 +103,96 @@ class Engine:
         except OSError as e:
             print(f"dump failed: {e}", flush=True)
 
+    def log_stop(self, tok, n_gen, rounds, spec, greedy, sp):
+        """A reply ended with an end-of-turn token: where it came from (the round's sampled first token, i.e. the
+        previous round's verified sample, or an accepted draft) and the text before it, for stall diagnosis."""
+        src = "plain step"
+        pos = n_gen - 1   # index of the stop token among the generated tokens
+        for start, emitted, after in reversed(rounds):
+            if start <= pos < start + len(emitted):
+                i = pos - start
+                src = (f"round at gen {start}: emitted[{i}] of {len(emitted)} "
+                       f"({'the verified sample fed as nxt' if i == 0 else 'an ACCEPTED DRAFT'})")
+                break
+        tail = self.chat.tok.decode(self.cached[-min(len(self.cached), n_gen + 1):][-40:], skip_special_tokens=False)
+        ban = f", ban n={sp.n_ban} lift={sp.ban_lift}" if sp is not None else ""
+        self.log(f"{self.log_tag}: STOP token {tok} at gen {n_gen}: {src}; {'greedy' if greedy else 'sampled'}"
+                 f"{ban}; tail {tail[-200:]!r}")
+
+    def save_request(self, prompt_ids, gen_ids, finish, n_gen, meta):
+        """TRUSS_REQ_LOG_DIR: the last 12 requests as .npz (prompt ids, generated ids as held by the engine, meta),
+        so a stopped reply can be replayed by /debug/probe."""
+        d = os.environ.get("TRUSS_REQ_LOG_DIR")
+        if not d:
+            return
+        try:
+            os.makedirs(d, exist_ok=True)
+            name = time.strftime("%Y%m%d-%H%M%S") + f"-{finish}-{n_gen}"
+            np.savez(os.path.join(d, name + ".npz"), prompt=np.asarray(prompt_ids, dtype=np.int32),
+                     gen=np.asarray(gen_ids[:n_gen], dtype=np.int32), meta=json.dumps(dict(meta, finish=finish)))
+            for old in sorted(os.listdir(d))[:-12]:
+                os.remove(os.path.join(d, old))
+        except OSError as e:
+            print(f"save_request failed: {e}", flush=True)
+
+    def probe(self, name, window=400):
+        """Replay a saved request on the plain path (truss_eval, no drafts) and measure, at each of the last
+        `window` generated positions, the model's probability of the token it produced and of the stop tokens,
+        raw (T 1) and under the request's sampling filters. The engine's sequence is lost (the next request reads
+        its prompt again)."""
+        d = os.environ.get("TRUSS_REQ_LOG_DIR")
+        z = np.load(os.path.join(d, name), allow_pickle=False)
+        prompt, gen = [int(x) for x in z["prompt"]], [int(x) for x in z["gen"]]
+        meta = json.loads(str(z["meta"]))
+        stops = sorted(self.stop_ids)
+        T, tp, tk, mp = meta["temperature"], meta["top_p"], meta["top_k"], meta["min_p"]
+
+        def dist(logits):
+            x = logits.astype(np.float64)
+            raw = np.exp(x - x.max()); raw /= raw.sum()
+            if T <= 0:
+                return raw, raw
+            y = x / T
+            q = np.exp(y - y.max()); q /= q.sum()
+            keep = np.ones_like(q, dtype=bool)
+            if tk and tk > 0:
+                keep &= y >= np.sort(y)[-tk]
+            if mp and mp > 0:
+                keep &= q >= mp * q.max()
+            if tp and 0 < tp < 1:
+                o = np.argsort(-q)
+                c = np.cumsum(q[o])
+                kp = np.zeros_like(keep); kp[o[:int(np.searchsorted(c, tp) + 1)]] = True
+                keep &= kp
+            f = np.where(keep, q, 0.0); f /= f.sum()
+            return raw, f
+
+        with self.lock:
+            self.cached, self.ck_tokens = [], []
+            self.model.reset()
+            n = len(gen)
+            j0 = max(0, n - window)
+            logits = self.model.eval(prompt + gen[:j0])
+            rows = []
+            think_closed = bool(self.think_close in gen[:j0])
+            for j in range(j0, n):
+                raw, f = dist(logits)
+                t = gen[j]
+                rows.append(dict(j=j, tok=int(t), text=self.chat.tok.decode([t]), p_tok=float(f[t]), p_tok_raw=float(raw[t]),
+                                 p_stop=float(sum(f[s] for s in stops)), p_stop_raw=float(sum(raw[s] for s in stops)),
+                                 think_closed=think_closed,
+                                 top=[(self.chat.tok.decode([int(i)]), round(float(f[i]), 4)) for i in np.argsort(-f)[:6]]))
+                think_closed = think_closed or t == self.think_close
+                if j + 1 < n:
+                    logits = self.model.eval([t])
+            self.model.reset()
+        last = rows[-1]
+        risky = [r for r in rows if r["p_stop"] > 0.001]
+        return dict(meta=meta, n_prompt=len(prompt), n_gen=n, last=last,
+                    positions_with_p_stop_over_0_001=[{k: r[k] for k in ("j", "text", "p_stop", "p_stop_raw", "think_closed")}
+                                                      for r in risky],
+                    tail_text=self.chat.tok.decode(gen[-60:], skip_special_tokens=False))
+
     def generate(self, prompt_ids, max_tokens, temperature, top_p, top_k, seed, stop_strings, min_p=0.0,
                  presence_penalty=0.0, frequency_penalty=0.0, repetition_penalty=1.0, penalty_last_n=64,
                  think_open=False):
@@ -186,6 +276,7 @@ class Engine:
             spec = self.model.drafts > 0
             drafted = accepted = 0
             pending = []   # tokens the engine already holds that are still to be emitted (speculative rounds)
+            rounds = []    # (generated tokens before the round, emitted [nxt + accepted drafts], next): stop diagnosis
             try:
                 while n_gen < max_tokens:
                     if spec and not pending:   # one round: nxt plus the accepted drafts enter the sequence
@@ -194,6 +285,7 @@ class Engine:
                         if not greedy and sp.penalized:
                             sp.set_history(counted())   # before nxt; the engine adds nxt and the drafts per row
                         emitted, after = self.model.spec_step(nxt) if greedy else self.model.spec_step_sampled(nxt, sp)
+                        rounds.append((len(self.cached) - n_prompt, list(emitted), after))   # stop diagnosis
                         self.cached += emitted
                         drafted += self.model.drafts
                         accepted += len(emitted) - 1
@@ -206,6 +298,7 @@ class Engine:
                         sp.set_ban([])
                     if tok in self.stop_ids:
                         finish = "stop"
+                        self.log_stop(tok, n_gen, rounds, spec, greedy, sp)
                         break
                     delta = detok.push(tok)
                     text += delta
@@ -232,6 +325,8 @@ class Engine:
                 self.log(f"{self.log_tag}: prompt {n_prompt} tokens = {reuse} reused + {n_prompt - reuse} read in "
                          f"{read * 1e3:.0f} ms ({(n_prompt - reuse) / max(read, 1e-9):.1f} tok/s), {n_gen} generated "
                          f"in {gen_s * 1e3:.0f} ms ({n_gen / max(gen_s, 1e-9):.1f} tok/s), drafts accepted {accepted} of {drafted}")
+                self.save_request(prompt_ids, self.cached[n_prompt:], finish, n_gen,
+                                  dict(temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p, think_open=think_open))
                 self.dump(prompt_ids, text, finish, dict(temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p,
                                                          presence_penalty=presence_penalty,
                                                          frequency_penalty=frequency_penalty,
@@ -346,6 +441,16 @@ def make_app(engine: Engine) -> FastAPI:
     @app.get("/health")
     def health():
         return {"status": "ok"}
+
+    @app.get("/debug/requests")
+    def debug_requests():
+        d = os.environ.get("TRUSS_REQ_LOG_DIR")
+        return {"files": sorted(os.listdir(d)) if d and os.path.isdir(d) else []}
+
+    @app.post("/debug/probe")
+    async def debug_probe(req: Request):
+        body = await req.json()
+        return await anyio.to_thread.run_sync(lambda: engine.probe(body["file"], int(body.get("window", 400))))
 
     @app.get("/v1/models")
     def models():
