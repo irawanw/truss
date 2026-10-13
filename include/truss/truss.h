@@ -71,6 +71,21 @@ int truss_drafts(const truss_model * m);            /* 0: opened without MTP */
 int truss_slots(const truss_model * m);
 int truss_select(truss_model * m, int slot);
 
+/* The same calls naming their slot. Calls on DIFFERENT slots may run on different threads at once: the engine holds
+   each layer-split stage only while one slot's work is enqueued there, so the two GPUs work on two conversations at
+   the same time. Calls on one slot must not overlap. */
+int truss_position_s(const truss_model * m, int slot);
+void truss_progress_s(const truss_model * m, int slot, int * done, int * total);
+int truss_reset_s(truss_model * m, int slot);
+int truss_eval_s(truss_model * m, int slot, const int32_t * tokens, int n, float * logits);
+/* truss_eval_s in prompt chunks of at most `step` tokens (a chunk holds each GPU for its whole pass: smaller chunks let
+   another slot's rounds through more often, at some prompt speed) */
+int truss_eval_step_s(truss_model * m, int slot, const int32_t * tokens, int n, int step, float * logits);
+int truss_eval_argmax_s(truss_model * m, int slot, const int32_t * tokens, int n, int32_t * next);
+int truss_spec_step_s(truss_model * m, int slot, int32_t next, int32_t * emitted, int * n_emitted, int32_t * new_next);
+int truss_checkpoint_s(truss_model * m, int slot);
+int truss_restore_s(truss_model * m, int slot);
+
 /* Sequence checkpoint (one slot, pinned host memory): truss_checkpoint saves the sequence's recurrent state at
    truss_position(); truss_restore returns the sequence to it and returns that position (-1: none taken). A later
    prompt that extends only the checkpointed prefix then reads only its own tail. */
@@ -114,6 +129,10 @@ int truss_eval_sample(truss_model * m, const int32_t * tokens, int n, const trus
    `history` is what counts before `next`; verify row t also counts `next` and drafts 1..t (Strata's per-row rule). */
 int truss_spec_step_sampled(truss_model * m, int32_t next, const truss_sampling * sp, int32_t * emitted,
                             int * n_emitted, int32_t * new_next);
+int truss_eval_sample_s(truss_model * m, int slot, const int32_t * tokens, int n, const truss_sampling * sp,
+                        int32_t * next);
+int truss_spec_step_sampled_s(truss_model * m, int slot, int32_t next, const truss_sampling * sp, int32_t * emitted,
+                              int * n_emitted, int32_t * new_next);
 
 #ifdef __cplusplus
 }

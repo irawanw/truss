@@ -205,14 +205,33 @@ public:
     void checkpoint();
     int restore();
 
-    // Options::slots: make slot k (0 .. slots() - 1) the sequence every other call acts on. Not inside a verify
-    // window. Each slot keeps its position, caches, recurrent state and checkpoint; slot 0 is selected at start.
+    // Options::slots: make slot k (0 .. slots() - 1) the sequence the calls without a slot act on. Each slot keeps
+    // its position, caches, recurrent state, verify window and checkpoint; slot 0 is selected at start.
     void select(int k);
     int slots() const { return (int) seq_pos_.size(); }
     int slot() const { return active_; }
     int seq_ctx() const { return seq_ctx_; }   // positions per slot (n_ctx with one slot)
 
-    int position() const { return pos_; }   // tokens consumed so far
+    // Concurrent slots. These name their slot and may run on different threads at once (one thread per slot at a
+    // time): each stage is held only while a slot's work is enqueued on it, so with a layer split one slot's rows run
+    // on one GPU while another slot's run on the other (Strata's pipelined batch groups, with every slot's own MTP
+    // drafts and verify window).
+    // prompt(): tokens [0, n) appended to `slot` in chunks of `step` (the stages a chunk apart, as run_prompt); with
+    // logits, the last row's logits go there and after() runs, both while the last stage is still held for this slot.
+    void prompt(int slot, const int32_t * tokens, int n, int step, float * logits, const std::function<void()> & after,
+                const std::function<void(int)> & done = nullptr);
+    // round(): one speculative round of `slot` after token `next` (the token at its position): up to nd MTP drafts
+    // into win[1..] (win[0] = next; draft sampling with ds_p as set_draft_sampling, nullptr: greedy), the verify window
+    // over win, its logits [nw + 1][n_vocab] into `logits`, then pick(nw) - run with the last stage held - returns
+    // how many window rows to keep (1 .. nw + 1). Returns that count; position(slot) advances by it.
+    int round(int slot, int32_t next, int nd, int32_t * win, float * logits, const sampling::SampleParams * ds_p,
+              uint64_t ds_counter, float * ds_q, const std::function<int(int)> & pick);
+    void reset(int slot);
+    void checkpoint(int slot);
+    int restore(int slot);
+    int position(int slot) const;
+
+    int position() const { return seq_pos_[active_]; }   // tokens consumed so far (the selected slot)
     static int fetch_rows();                // run() chunks of at most this many tokens take the fetch (decode) path
     int hot_experts() const;                // resident experts, all layers
     size_t cold_bytes() const;              // streamed per chunk
@@ -264,8 +283,7 @@ private:
     std::unique_ptr<Impl> m_;                    // the last stage (the whole model without a split)
     template <class F> void each_stage(F && f);  // every stage in layer order, its device current
     void construct(const Config & c, const Weights & w, int n_ctx, int max_chunk, const Options & o);
-    int pos_ = 0;
-    std::vector<int> seq_pos_{ 0 };              // each slot's position (pos_ is the selected one's)
+    std::vector<int> seq_pos_{ 0 };              // each slot's position
     int active_ = 0, seq_ctx_ = 0;
 };
 

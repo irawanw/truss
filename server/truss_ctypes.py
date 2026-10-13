@@ -86,6 +86,18 @@ class Model:
             "truss_drafts": (c_int, [p]),
             "truss_slots": (c_int, [p]),
             "truss_select": (c_int, [p, c_int]),
+            "truss_position_s": (c_int, [p, c_int]),
+            "truss_progress_s": (None, [p, c_int, ctypes.POINTER(c_int), ctypes.POINTER(c_int)]),
+            "truss_reset_s": (c_int, [p, c_int]),
+            "truss_eval_s": (c_int, [p, c_int, i32p, c_int, f32p]),
+            "truss_eval_step_s": (c_int, [p, c_int, i32p, c_int, c_int, f32p]),
+            "truss_eval_argmax_s": (c_int, [p, c_int, i32p, c_int, i32p]),
+            "truss_spec_step_s": (c_int, [p, c_int, ctypes.c_int32, i32p, ctypes.POINTER(c_int), i32p]),
+            "truss_checkpoint_s": (c_int, [p, c_int]),
+            "truss_restore_s": (c_int, [p, c_int]),
+            "truss_eval_sample_s": (c_int, [p, c_int, i32p, c_int, ctypes.POINTER(Sampling), i32p]),
+            "truss_spec_step_sampled_s": (c_int, [p, c_int, ctypes.c_int32, ctypes.POINTER(Sampling), i32p,
+                                                  ctypes.POINTER(c_int), i32p]),
             "truss_checkpoint": (c_int, [p]),
             "truss_restore": (c_int, [p]),
             "truss_eval_sample": (c_int, [p, i32p, c_int, ctypes.POINTER(Sampling), i32p]),
@@ -195,3 +207,67 @@ class Model:
         self._check(self._lib.truss_spec_step_sampled(self._m, nxt, ctypes.byref(sp), self._emitted, ctypes.byref(n),
                                                       ctypes.byref(new)))
         return list(self._emitted[:n.value]), new.value
+
+    # ---- slot-explicit calls (TRUSS_SLOTS): calls on different slots may run on different threads at once (the
+    # engine overlaps them on the two GPUs); calls on one slot must not overlap. Buffers are per call.
+
+    def position_s(self, slot: int) -> int:
+        return self._lib.truss_position_s(self._m, slot)
+
+    def progress_s(self, slot: int):
+        d, t = ctypes.c_int(0), ctypes.c_int(0)
+        self._lib.truss_progress_s(self._m, slot, ctypes.byref(d), ctypes.byref(t))
+        return d.value, t.value
+
+    def reset_s(self, slot: int):
+        self._check(self._lib.truss_reset_s(self._m, slot))
+
+    def checkpoint_s(self, slot: int):
+        self._check(self._lib.truss_checkpoint_s(self._m, slot))
+
+    def restore_s(self, slot: int) -> int:
+        r = self._lib.truss_restore_s(self._m, slot)
+        if r < -1:
+            raise TrussError(self._error())
+        return r
+
+    def eval_s(self, slot: int, tokens) -> np.ndarray:
+        arr = np.ascontiguousarray(tokens, dtype=np.int32)
+        out = np.empty(self.n_vocab, dtype=np.float32)
+        self._check(self._lib.truss_eval_s(self._m, slot, arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), len(arr),
+                                           out.ctypes.data_as(ctypes.POINTER(ctypes.c_float))))
+        return out
+
+    def eval_step_s(self, slot: int, tokens, step: int, logits: bool = False):
+        """eval_s in prompt chunks of at most `step` tokens (lets another slot's rounds through more often)."""
+        arr = np.ascontiguousarray(tokens, dtype=np.int32)
+        out = np.empty(self.n_vocab, dtype=np.float32) if logits else None
+        self._check(self._lib.truss_eval_step_s(self._m, slot, arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                                                len(arr), step,
+                                                out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)) if logits else None))
+        return out
+
+    def eval_argmax_s(self, slot: int, tokens) -> int:
+        arr = np.ascontiguousarray(tokens, dtype=np.int32)
+        out = ctypes.c_int32()
+        self._check(self._lib.truss_eval_argmax_s(self._m, slot, arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                                                  len(arr), ctypes.byref(out)))
+        return out.value
+
+    def eval_sample_s(self, slot: int, tokens, sp: Sampling) -> int:
+        arr = np.ascontiguousarray(tokens, dtype=np.int32)
+        out = ctypes.c_int32()
+        self._check(self._lib.truss_eval_sample_s(self._m, slot, arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                                                  len(arr), ctypes.byref(sp), ctypes.byref(out)))
+        return out.value
+
+    def spec_step_s(self, slot: int, nxt: int):
+        n, new, em = ctypes.c_int(), ctypes.c_int32(), (ctypes.c_int32 * 8)()
+        self._check(self._lib.truss_spec_step_s(self._m, slot, nxt, em, ctypes.byref(n), ctypes.byref(new)))
+        return list(em[:n.value]), new.value
+
+    def spec_step_sampled_s(self, slot: int, nxt: int, sp: Sampling):
+        n, new, em = ctypes.c_int(), ctypes.c_int32(), (ctypes.c_int32 * 8)()
+        self._check(self._lib.truss_spec_step_sampled_s(self._m, slot, nxt, ctypes.byref(sp), em, ctypes.byref(n),
+                                                        ctypes.byref(new)))
+        return list(em[:n.value]), new.value

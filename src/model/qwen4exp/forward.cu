@@ -37,6 +37,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <exception>
 #include <immintrin.h>
 #include <mutex>
@@ -96,6 +97,50 @@ struct DeviceGuard {
 };
 
 }  // namespace
+
+// A stage's host-side lock for concurrent slots (Forward::prompt / round): FIFO among waiters, except that work which
+// takes a hand-off from the previous stage carries that hand-off's ticket and is only granted in ticket order (the
+// stage's input buffer holds one hand-off at a time, taken in the order they were handed on). Kernels are only
+// enqueued under it, so two stages hold different slots' work on their GPUs at the same time.
+struct StageLock {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool held = false;
+    uint64_t next_id = 0;
+    std::map<uint64_t, long> waiting;   // arrival order -> the hand-off ticket it takes (0: none)
+
+    template <class Turn> void lock(long ticket, Turn turn)
+    {
+        std::unique_lock<std::mutex> l(mu);
+        const uint64_t me = next_id++;
+        waiting.emplace(me, ticket);
+        cv.wait(l, [&] {
+            if (held) return false;
+            const long t = turn();
+            for (const auto & [id, tk] : waiting)
+                if (tk == 0 || tk == t) return id == me;   // the earliest waiter that may go now
+            return false;
+        });
+        waiting.erase(me);
+        held = true;
+    }
+    void unlock()
+    {
+        {
+            std::lock_guard<std::mutex> l(mu);
+            held = false;
+        }
+        cv.notify_all();
+    }
+};
+
+template <class M> struct Held {   // a stage held for one piece of work (M::acquire / M::release)
+    M & m;
+    Held(M & mm, long ticket) : m(mm) { m.acquire(ticket); }
+    ~Held() { m.release(); }
+    Held(const Held &) = delete;
+    Held & operator=(const Held &) = delete;
+};
 
 // One stage of a layer split (Options::split_layer): layers [lb, le) on `device`; the first stage embeds the tokens,
 // the last one (le == n_layer) has the head and the MTP block. One stage over every layer is the unsplit engine.
@@ -1958,6 +2003,7 @@ struct Forward::Impl {
         has_pending = false;
         dc_on = false, mtp_ahead = false;
         vw.open = false;
+        if (!defer_n.empty()) defer_n[active_seq] = 0;
         kv_reserve(0, true);
     }
 
@@ -2203,6 +2249,10 @@ struct Forward::Impl {
         half * idx_k = nullptr;
         float * idx_partial = nullptr, * state_buf[2] = {}, * conv = nullptr, * ple_hist = nullptr;
         int cur = 0;
+        // the verify window's snapshots and raw rows: a front stage keeps a slot's window open while another slot
+        // runs on it (its accept() comes with that slot's next call there, defer_n)
+        float * conv_snap = nullptr, * raw_qkv = nullptr, * raw_alpha = nullptr, * raw_beta = nullptr;
+        float * partial_snap = nullptr, * raw_ik = nullptr, * hist_snap = nullptr, * normed_rows = nullptr;
     };
     struct Seq {
         std::vector<SeqLayer> layers;                    // [l - lb]
@@ -2213,6 +2263,7 @@ struct Forward::Impl {
         int32_t ahead_tok = -1;
         std::vector<int32_t> dc_tokens, tail;
         Checkpoint ck;
+        Verify vw;
     };
     std::vector<Seq> seqs;
     int active_seq = 0;
@@ -2220,12 +2271,32 @@ struct Forward::Impl {
 
     static SeqLayer seq_layer(const LayerState & L)
     {
-        return { L.kv, L.idx_k, L.idx_partial, { L.state_buf[0], L.state_buf[1] }, L.conv, L.ple_hist, L.cur };
+        return { L.kv, L.idx_k, L.idx_partial, { L.state_buf[0], L.state_buf[1] }, L.conv, L.ple_hist, L.cur,
+                 L.conv_snap, L.raw_qkv, L.raw_alpha, L.raw_beta, L.partial_snap, L.raw_ik, L.hist_snap,
+                 L.normed_rows };
     }
     static void load_layer(LayerState & L, const SeqLayer & q)
     {
         L.kv = q.kv, L.idx_k = q.idx_k, L.idx_partial = q.idx_partial, L.conv = q.conv, L.ple_hist = q.ple_hist;
         L.state_buf[0] = q.state_buf[0], L.state_buf[1] = q.state_buf[1], L.cur = q.cur;
+        L.conv_snap = q.conv_snap, L.raw_qkv = q.raw_qkv, L.raw_alpha = q.raw_alpha, L.raw_beta = q.raw_beta;
+        L.partial_snap = q.partial_snap, L.raw_ik = q.raw_ik, L.hist_snap = q.hist_snap, L.normed_rows = q.normed_rows;
+    }
+
+    // Concurrent slots: the stage lock, and the accept() a slot's last round left for this (front) stage
+    StageLock lk;
+    std::vector<int> defer_n;   // [slot]: rows to accept before that slot's next work here (0: none)
+    void acquire(long ticket)
+    {
+        lk.lock(ticket, [this] { return taken.load(std::memory_order_acquire) + 1; });
+    }
+    void release() { lk.unlock(); }
+    void settle()   // the selected slot's deferred accept, before anything else it does here
+    {
+        if (defer_n.empty() || !defer_n[active_seq]) return;
+        const int n = defer_n[active_seq];
+        defer_n[active_seq] = 0;
+        accept(n);
     }
 
     // slot 0 is the live state allocated above; slots 1.. get their own recurrent buffers and a cache sub-range
@@ -2233,6 +2304,7 @@ struct Forward::Impl {
     {
         seq_ctx = n_ctx;
         seqs.resize(n);
+        defer_n.assign(n, 0);
         if (n == 1) return;
         const int R = DsaShape::RATIO;
         seq_ctx = n_ctx / n / 256 * 256;
@@ -2251,7 +2323,17 @@ struct Forward::Impl {
                 if (b) b = alloc<float>(sz);
             q.cur = 0;
             if (q.conv) q.conv = alloc<float>((size_t) (c.ssm_conv - 1) * c.conv_dim());
-            if (q.ple_hist) q.ple_hist = alloc<float>((size_t) (c.ple_conv - 1) * c.ple_ngram * c.hc_dim());
+            const size_t hist = (size_t) (c.ple_conv - 1) * c.ple_ngram * c.hc_dim();
+            if (q.ple_hist) q.ple_hist = alloc<float>(hist);
+            const size_t W = spec_rows;
+            if (q.conv_snap) q.conv_snap = alloc<float>((size_t) (c.ssm_conv - 1) * c.conv_dim());
+            if (q.raw_qkv) q.raw_qkv = alloc<float>(W * c.conv_dim());
+            if (q.raw_alpha) q.raw_alpha = alloc<float>(W * c.ssm_v_heads);
+            if (q.raw_beta) q.raw_beta = alloc<float>(W * c.ssm_v_heads);
+            if (q.partial_snap) q.partial_snap = alloc<float>((size_t) (R - 1) * c.idx_head_dim);
+            if (q.raw_ik) q.raw_ik = alloc<float>(W * c.idx_head_dim);
+            if (q.hist_snap) q.hist_snap = alloc<float>(hist);
+            if (q.normed_rows) q.normed_rows = alloc<float>(W * c.hc_dim());
             return q;
         };
         for (int k = 1; k < n; ++k) {
@@ -2271,7 +2353,7 @@ struct Forward::Impl {
     {
         require(k >= 0 && k < (int) seqs.size(), "select(" + std::to_string(k) + "): no such slot");
         if (k == active_seq) return;
-        require(!vw.open, "select() inside a verify window");
+        require(!(last && vw.open), "select() inside the last stage's verify window");
         const size_t row = c.hc_dim();
         {   // park the live sequence
             Seq & q = seqs[active_seq];
@@ -2286,6 +2368,7 @@ struct Forward::Impl {
             q.dc_pos0 = dc_pos0, q.dc_T = dc_T, q.ahead_pos = ahead_pos, q.ahead_tok = ahead_tok, q.last_T = last_T;
             q.dc_tokens.swap(dc_tokens), q.tail.swap(tail);
             std::swap(q.ck, ck);
+            std::swap(q.vw, vw);
         }
         Seq & q = seqs[k];
         for (int l = lb; l < le; ++l) load_layer(st[l], q.layers[l - lb]);
@@ -2301,6 +2384,7 @@ struct Forward::Impl {
         dc_pos0 = q.dc_pos0, dc_T = q.dc_T, ahead_pos = q.ahead_pos, ahead_tok = q.ahead_tok, last_T = q.last_T;
         dc_tokens.swap(q.dc_tokens), tail.swap(q.tail);
         std::swap(q.ck, ck);
+        std::swap(q.vw, vw);
         ple_next = nullptr, ple_next_T = 0, ple_tk_valid = false;   // a lookahead ticket belongs to the old slot
         active_seq = k;
     }
@@ -2557,6 +2641,8 @@ Forward::Forward(const Config & c, const Weights & w, int n_ctx, int max_chunk, 
     }
     construct(c, w, n_ctx, max_chunk, o);
     seq_pos_.assign(std::max(1, o.slots), 0);
+    for (auto & p : front_) p->defer_n.resize(seq_pos_.size(), 0);
+    m_->defer_n.resize(seq_pos_.size(), 0);
     seq_ctx_ = m_->seq_ctx;
     if (o.slots > 1) std::fprintf(stderr, "sequence slots: %d x %d positions\n", o.slots, seq_ctx_);
 }
@@ -2785,51 +2871,138 @@ std::vector<float> Forward::route_counts() const   // the stages' store layers i
     return out;
 }
 
-void Forward::head(int first, int n, float * logits) { m_->head(first, n, logits); }
+// ---- Sequences. Every call names a slot (the old calls: the selected one, select()); each stage is held only while its
+// work is enqueued (Held), so with a layer split two slots' work runs on the two GPUs at once. A stage's verify
+// window for a slot stays open until that slot's next call there (defer_n), and work that takes a hand-off from the
+// previous stage is granted in hand-off order (StageLock). The last stage is never held while waiting for an earlier
+// one, so the locks cannot cycle.
 
-void Forward::reset()
+int Forward::position(int slot) const { return seq_pos_.at(slot); }
+
+void Forward::select(int k)
+{
+    if (k < 0 || k >= (int) seq_pos_.size())
+        throw std::runtime_error("qwen4exp::Forward: select(" + std::to_string(k) + "): " +
+                                 std::to_string(seq_pos_.size()) + " slots");
+    active_ = k;
+}
+
+void Forward::head(int first, int n, float * logits)
+{
+    Held<Impl> h(*m_, 0);
+    m_->select(active_);
+    m_->head(first, n, logits);
+}
+
+void Forward::reset(int slot)
 {
     if (m_->route_trace) {   // the driver is idle between passes; the marker separates sequences
         const int32_t h[2] = { -1, 0 };
         std::fwrite(h, 4, 2, m_->route_trace);
     }
-    each_stage([](Impl & m) { m.reset(); });
-    pos_ = 0, seq_pos_[active_] = 0;   // the saved position belongs to the slot being reset, not to slot 0
+    each_stage([slot](Impl & m) {
+        Held<Impl> h(m, 0);
+        m.select(slot);
+        m.reset();
+    });
+    seq_pos_.at(slot) = 0;
 }
+
+void Forward::reset() { reset(active_); }
+
+void Forward::checkpoint(int slot)
+{
+    const int pos = seq_pos_.at(slot);
+    each_stage([&](Impl & m) {
+        Held<Impl> h(m, 0);
+        m.select(slot);
+        m.settle();
+        m.checkpoint(pos);
+    });
+}
+
+void Forward::checkpoint() { checkpoint(active_); }
+
+int Forward::restore(int slot)
+{
+    int p = -1;
+    each_stage([&](Impl & m) {
+        Held<Impl> h(m, 0);
+        m.select(slot);
+        m.settle();
+        p = m.restore();
+    });
+    if (p >= 0) seq_pos_.at(slot) = p;
+    return p;
+}
+
+int Forward::restore() { return restore(active_); }
 
 void Forward::run(const int32_t * tokens, int T, const LayerHook & hook, const int32_t * next, int next_T)
 {
     if (next) require(next == tokens + T && next_T > 0, "PLE lookahead must follow the chunk");
+    const int slot = active_, pos = seq_pos_[slot];
+    long ticket = 0;
     each_stage([&](Impl & m) {
+        Held<Impl> h(m, ticket);
+        m.select(slot);
+        m.settle();
         m.ple_next = next; m.ple_next_T = next_T;
-        m.run_chunk(tokens, pos_, T, hook, false);
+        m.run_chunk(tokens, pos, T, hook, false);
+        ticket = m.handed.load();
     });
-    pos_ += T;
+    seq_pos_[slot] += T;
 }
 
 void Forward::run_prompt(const int32_t * tokens, int n, int step, const std::function<void(int)> & done)
 {
+    prompt(active_, tokens, n, step, nullptr, nullptr, done);
+}
+
+void Forward::prompt(int slot, const int32_t * tokens, int n, int step, float * logits,
+                     const std::function<void()> & after, const std::function<void(int)> & done)
+{
     require(n > 0 && step > 0, "run_prompt: no tokens");
+    require(slot >= 0 && slot < (int) seq_pos_.size(), "prompt(): no such slot");
     auto chunk = [&](int s, int & T, const int32_t *& nxt, int & nxt_T) {   // the run() loop's chunks and lookahead
         T = std::min(step, n - s);
         nxt_T = std::max(0, std::min(step, n - s - T));
         nxt = nxt_T > 0 ? tokens + s + T : nullptr;
     };
+    const int pos0 = seq_pos_[slot];
+    auto last_chunk = [&](int s, int T, long ticket) {   // the last stage's part of a chunk; the head after the last one
+        const int32_t * nx;
+        int TT, nT;
+        chunk(s, TT, nx, nT);
+        Held<Impl> h(*m_, ticket);
+        m_->select(slot);
+        m_->settle();
+        m_->ple_next = nx, m_->ple_next_T = nT;
+        m_->run_chunk(tokens + s, pos0 + s, T, nullptr, false);
+        if (s + T == n) {
+            if (logits) m_->head(T - 1, 1, logits);
+            if (after) after();
+        }
+    };
     if (front_.empty()) {
         for (int s = 0; s < n; s += step) {
-            int T, nT;
-            const int32_t * nx;
-            chunk(s, T, nx, nT);
-            run(tokens + s, T, nullptr, nx, nT);
+            const int T = std::min(step, n - s);
+            last_chunk(s, T, 0);
             if (done) done(s + T);
         }
+        seq_pos_[slot] += n;
         return;
     }
     // Layer split: the first stage runs on its own thread, a chunk ahead of the last one (the hand-off's handshake
-    // orders them), so both devices compute at once. Every row is what run() computes: the same output.
+    // orders them), so both devices compute at once. Every row is what run() computes: the same output. Each chunk
+    // holds a stage only while it is enqueued there, so another slot's rounds pass between the chunks.
+    require(front_.size() == 1, "prompt(): more than two stages");
     Impl & f = *front_[0];
+    std::mutex qm;
+    std::condition_variable qcv;
+    std::deque<long> tickets;   // the hand-off ticket of each chunk the first stage has enqueued
+    bool front_failed = false;
     std::exception_ptr err;
-    const int pos0 = pos_;
     const auto t0 = std::chrono::steady_clock::now();
     double front_s = 0;
     std::thread t([&] {
@@ -2839,24 +3012,46 @@ void Forward::run_prompt(const int32_t * tokens, int n, int step, const std::fun
                 int T, nT;
                 const int32_t * nx;
                 chunk(s, T, nx, nT);
-                f.ple_next = nx, f.ple_next_T = nT;
-                f.run_chunk(tokens + s, pos0 + s, T, nullptr, false);
+                long tk;
+                {
+                    Held<Impl> h(f, 0);
+                    f.select(slot);
+                    f.settle();
+                    f.ple_next = nx, f.ple_next_T = nT;
+                    f.run_chunk(tokens + s, pos0 + s, T, nullptr, false);
+                    tk = f.handed.load();
+                }
+                {
+                    std::lock_guard<std::mutex> l(qm);
+                    tickets.push_back(tk);
+                }
+                qcv.notify_all();
             }
             TRUSS_CUDA(cudaStreamSynchronize(f.s));
             front_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         } catch (...) {
             err = std::current_exception();
             f.halted = true;
+            {
+                std::lock_guard<std::mutex> l(qm);
+                front_failed = true;
+            }
+            qcv.notify_all();
         }
     });
     std::exception_ptr err2;
     try {
         for (int s = 0; s < n; s += step) {
-            int T, nT;
-            const int32_t * nx;
-            chunk(s, T, nx, nT);
-            m_->ple_next = nx, m_->ple_next_T = nT;
-            m_->run_chunk(tokens + s, pos0 + s, T, nullptr, false);
+            const int T = std::min(step, n - s);
+            long tk;
+            {
+                std::unique_lock<std::mutex> l(qm);
+                qcv.wait(l, [&] { return !tickets.empty() || front_failed; });
+                require(!tickets.empty(), "the previous layer-split stage failed");
+                tk = tickets.front();
+                tickets.pop_front();
+            }
+            last_chunk(s, T, tk);
             if (done) done(s + T);
         }
     } catch (...) {
@@ -2870,7 +3065,54 @@ void Forward::run_prompt(const int32_t * tokens, int n, int step, const std::fun
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     if (err) std::rethrow_exception(err);
     if (err2) std::rethrow_exception(err2);
-    pos_ += n;
+    seq_pos_[slot] += n;
+}
+
+int Forward::round(int slot, int32_t next, int nd, int32_t * win, float * logits, const sampling::SampleParams * ds_p,
+                   uint64_t ds_counter, float * ds_q, const std::function<int(int)> & pick)
+{
+    require(slot >= 0 && slot < (int) seq_pos_.size(), "round(): no such slot");
+    const int pos = seq_pos_[slot];
+    int nw;
+    {   // the drafts (the MTP block lives on the last stage)
+        Held<Impl> h(*m_, 0);
+        m_->select(slot);
+        m_->ds_p = ds_p, m_->ds_counter = ds_counter, m_->ds_q = ds_q;
+        try {
+            nw = m_->draft(next, pos, nd, win + 1);
+        } catch (...) {
+            m_->ds_p = nullptr, m_->ds_q = nullptr;
+            throw;
+        }
+        m_->ds_p = nullptr, m_->ds_q = nullptr;
+    }
+    win[0] = next;
+    const int T = nw + 1;
+    if (!m_->spec_rows || T > m_->spec_rows)
+        throw std::runtime_error("qwen4exp::Forward: verify() of " + std::to_string(T) + " rows (spec_rows " +
+                                 std::to_string(m_->spec_rows) + ")");
+    long ticket = 0;
+    for (auto & p : front_) {   // the window's rows on the earlier stages, held only while they are enqueued
+        DeviceGuard g(p->device);
+        Held<Impl> h(*p, ticket);
+        p->select(slot);
+        p->settle();
+        p->run_chunk(win, pos, T, nullptr, true);
+        ticket = p->handed.load();
+    }
+    int keep;
+    {   // the last stage: its rows, the head, the caller's pick, the accept
+        Held<Impl> h(*m_, ticket);
+        m_->select(slot);
+        m_->run_chunk(win, pos, T, nullptr, true);
+        m_->head(0, T, logits);
+        keep = pick(nw);
+        require(keep >= 1 && keep <= T, "round(): pick() kept " + std::to_string(keep) + " of " + std::to_string(T));
+        m_->accept(keep);
+    }
+    for (auto & p : front_) p->defer_n[slot] = keep;   // read under that stage's lock by this slot's next call
+    seq_pos_[slot] += keep;
+    return keep;
 }
 
 void Forward::verify(const int32_t * tokens, int T)
@@ -2878,50 +3120,40 @@ void Forward::verify(const int32_t * tokens, int T)
     if (!m_->spec_rows || T > m_->spec_rows)
         throw std::runtime_error("qwen4exp::Forward: verify() of " + std::to_string(T) + " rows (spec_rows " +
                                  std::to_string(m_->spec_rows) + ")");
-    each_stage([&](Impl & m) { m.run_chunk(tokens, pos_, T, nullptr, true); });
+    const int slot = active_, pos = seq_pos_[slot];
+    long ticket = 0;
+    each_stage([&](Impl & m) {
+        Held<Impl> h(m, ticket);
+        m.select(slot);
+        m.settle();
+        m.run_chunk(tokens, pos, T, nullptr, true);
+        ticket = m.handed.load();
+    });
 }
 
 void Forward::accept(int n)
 {
-    // the last stage first: its rollback and MTP commit are queued (no host wait) and run on its device while this
-    // thread launches the other stages' rollbacks (~100 small launches each), off the draft's critical path
-    m_->accept(n);
-    for (auto & p : front_) {
-        DeviceGuard g(p->device);
-        p->accept(n);
+    // the last stage now (its rollback and MTP commit are queued, no host wait); the earlier stages' rollbacks run with
+    // this slot's next call there (defer_n), off the draft's critical path
+    {
+        Held<Impl> h(*m_, 0);
+        m_->select(active_);
+        m_->accept(n);
     }
-    pos_ += n;
+    for (auto & p : front_) p->defer_n[active_] = n;
+    seq_pos_[active_] += n;
 }
 
-int Forward::draft(int32_t next, int n, int32_t * out) { return m_->draft(next, pos_, n, out); }
+int Forward::draft(int32_t next, int n, int32_t * out)
+{
+    Held<Impl> h(*m_, 0);
+    m_->select(active_);
+    return m_->draft(next, seq_pos_[active_], n, out);
+}
 
 void Forward::set_draft_sampling(const sampling::SampleParams * p, uint64_t counter, float * q_full)
 {
     m_->ds_p = p, m_->ds_counter = counter, m_->ds_q = q_full;
-}
-
-void Forward::select(int k)
-{
-    if (k == active_) return;
-    if (k < 0 || k >= (int) seq_pos_.size())
-        throw std::runtime_error("qwen4exp::Forward: select(" + std::to_string(k) + "): " +
-                                 std::to_string(seq_pos_.size()) + " slots");
-    seq_pos_[active_] = pos_;
-    each_stage([k](Impl & m) { m.select(k); });
-    active_ = k, pos_ = seq_pos_[k];
-}
-
-void Forward::checkpoint()
-{
-    each_stage([this](Impl & m) { m.checkpoint(pos_); });
-}
-
-int Forward::restore()
-{
-    int p = -1;
-    each_stage([&](Impl & m) { p = m.restore(); });
-    if (p >= 0) pos_ = p;
-    return p;
 }
 
 void apply_env(ForwardOptions & o)
