@@ -108,9 +108,13 @@ struct StageLock {
     bool held = false;
     uint64_t next_id = 0;
     std::map<uint64_t, long> waiting;   // arrival order -> the hand-off ticket it takes (0: none)
+    // time held / waited, ns (Forward::lock_ms)
+    std::atomic<long long> held_ns{ 0 }, wait_ns{ 0 };
+    std::chrono::steady_clock::time_point t_held;
 
     template <class Turn> void lock(long ticket, Turn turn)
     {
+        const auto t0 = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> l(mu);
         const uint64_t me = next_id++;
         waiting.emplace(me, ticket);
@@ -123,12 +127,15 @@ struct StageLock {
         });
         waiting.erase(me);
         held = true;
+        t_held = std::chrono::steady_clock::now();
+        wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t_held - t0).count();
     }
     void unlock()
     {
         {
             std::lock_guard<std::mutex> l(mu);
             held = false;
+            held_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_held).count();
         }
         cv.notify_all();
     }
@@ -654,6 +661,7 @@ struct Forward::Impl {
         if (out_host) cudaFreeHost(out_host);
         if (out_ready) cudaEventDestroy(out_ready);
         if (in_taken) cudaEventDestroy(in_taken);
+        for (cudaEvent_t e : slot_done) cudaEventDestroy(e);
         if (ple_stage) cudaFreeHost(ple_stage);
         if (ple_copied) cudaEventDestroy(ple_copied);
         if (driver.joinable()) {
@@ -2286,6 +2294,9 @@ struct Forward::Impl {
     // Concurrent slots: the stage lock, and the accept() a slot's last round left for this (front) stage
     StageLock lk;
     std::vector<int> defer_n;   // [slot]: rows to accept before that slot's next work here (0: none)
+    // [slot]: recorded behind a slot's verify rows on this (front) stage; round() waits for it with no stage held, so
+    // the last stage serves another slot while this slot's rows are still on the earlier GPU
+    std::vector<cudaEvent_t> slot_done;
     void acquire(long ticket)
     {
         lk.lock(ticket, [this] { return taken.load(std::memory_order_acquire) + 1; });
@@ -2641,7 +2652,14 @@ Forward::Forward(const Config & c, const Weights & w, int n_ctx, int max_chunk, 
     }
     construct(c, w, n_ctx, max_chunk, o);
     seq_pos_.assign(std::max(1, o.slots), 0);
-    for (auto & p : front_) p->defer_n.resize(seq_pos_.size(), 0);
+    round_ns_ = std::make_unique<std::atomic<long long>[]>(seq_pos_.size());
+    for (size_t i = 0; i < seq_pos_.size(); ++i) round_ns_[i] = 0;
+    for (auto & p : front_) {
+        p->defer_n.resize(seq_pos_.size(), 0);
+        DeviceGuard g(p->device);
+        p->slot_done.resize(seq_pos_.size());
+        for (cudaEvent_t & e : p->slot_done) TRUSS_CUDA(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+    }
     m_->defer_n.resize(seq_pos_.size(), 0);
     seq_ctx_ = m_->seq_ctx;
     if (o.slots > 1) std::fprintf(stderr, "sequence slots: %d x %d positions\n", o.slots, seq_ctx_);
@@ -2879,6 +2897,16 @@ std::vector<float> Forward::route_counts() const   // the stages' store layers i
 
 int Forward::position(int slot) const { return seq_pos_.at(slot); }
 
+void Forward::lock_ms(double out[4], bool reset)
+{
+    Impl * st[2] = { front_.empty() ? nullptr : front_[0].get(), m_.get() };
+    for (int i = 0; i < 2; ++i) {
+        out[2 * i] = st[i] ? st[i]->lk.held_ns.load() / 1e6 : 0;
+        out[2 * i + 1] = st[i] ? st[i]->lk.wait_ns.load() / 1e6 : 0;
+        if (reset && st[i]) st[i]->lk.held_ns = 0, st[i]->lk.wait_ns = 0;
+    }
+}
+
 void Forward::select(int k)
 {
     if (k < 0 || k >= (int) seq_pos_.size())
@@ -3002,16 +3030,47 @@ void Forward::prompt(int slot, const int32_t * tokens, int n, int step, float * 
     std::condition_variable qcv;
     std::deque<long> tickets;   // the hand-off ticket of each chunk the first stage has enqueued
     bool front_failed = false;
+    // Strata's decode share (STRATA_BATCH_DECODE_SHARE, docs/BATCHING.md): while another slot is decoding, the
+    // prompt gives way after each chunk - the first stage waits until the last one has finished the chunks handed
+    // to it, then for TRUSS_DECODE_SHARE x that chunk's time - so the decoding slot runs on both GPUs in between
+    // instead of waiting a chunk on each. 0: off (the prompt keeps both GPUs).
+    static const double share = [] { const char * e = std::getenv("TRUSS_DECODE_SHARE"); return e ? std::atof(e) : 0.5; }();
+    int main_done = 0;                                  // chunks the last stage has finished (under qm)
+    std::vector<std::chrono::steady_clock::time_point> t_start((size_t) (n + step - 1) / step);   // a chunk's first-stage start
+    double chunk_s = 0;                                 // the last chunk's time on the stages (start to last stage done)
+    auto others_decoding = [&] {
+        const long long now = std::chrono::steady_clock::now().time_since_epoch().count();
+        for (size_t i = 0; i < seq_pos_.size(); ++i)
+            if ((int) i != slot) {
+                const long long t = round_ns_[i].load();
+                if (t < 0 || (t > 0 && now - t < 300'000'000LL)) return true;   // in a round, or one ended < 0.3 s ago
+            }
+        return false;
+    };
     std::exception_ptr err;
     const auto t0 = std::chrono::steady_clock::now();
     double front_s = 0;
     std::thread t([&] {
         DeviceGuard g(f.device);
         try {
-            for (int s = 0; s < n; s += step) {
+            int k = 0;
+            for (int s = 0; s < n; s += step, ++k) {
                 int T, nT;
                 const int32_t * nx;
                 chunk(s, T, nx, nT);
+                if (share > 0 && k > 0 && others_decoding()) {   // give way: drain, then the decode window
+                    double w;
+                    {
+                        std::unique_lock<std::mutex> l(qm);
+                        qcv.wait(l, [&] { return main_done >= k || front_failed; });
+                        w = share * chunk_s;
+                    }
+                    std::this_thread::sleep_for(std::chrono::duration<double>(std::min(w, 5.0)));
+                }
+                {
+                    std::lock_guard<std::mutex> l(qm);
+                    t_start[(size_t) k] = std::chrono::steady_clock::now();
+                }
                 long tk;
                 {
                     Held<Impl> h(f, 0);
@@ -3052,6 +3111,12 @@ void Forward::prompt(int slot, const int32_t * tokens, int n, int step, float * 
                 tickets.pop_front();
             }
             last_chunk(s, T, tk);
+            {
+                std::lock_guard<std::mutex> l(qm);
+                chunk_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start[(size_t) main_done]).count();
+                ++main_done;
+            }
+            qcv.notify_all();
             if (done) done(s + T);
         }
     } catch (...) {
@@ -3073,6 +3138,11 @@ int Forward::round(int slot, int32_t next, int nd, int32_t * win, float * logits
 {
     require(slot >= 0 && slot < (int) seq_pos_.size(), "round(): no such slot");
     const int pos = seq_pos_[slot];
+    round_ns_[slot] = -1;   // inside a round (the prompt of another slot gives way to it)
+    struct Out {
+        std::atomic<long long> & t;
+        ~Out() { t = std::chrono::steady_clock::now().time_since_epoch().count(); }
+    } out{ round_ns_[slot] };
     int nw;
     {   // the drafts (the MTP block lives on the last stage)
         Held<Impl> h(*m_, 0);
@@ -3099,7 +3169,16 @@ int Forward::round(int slot, int32_t next, int nd, int32_t * win, float * logits
         p->settle();
         p->run_chunk(win, pos, T, nullptr, true);
         ticket = p->handed.load();
+        TRUSS_CUDA(cudaEventRecord(p->slot_done[slot], p->s));
     }
+    // the rows reach the last stage's input when the earlier GPUs are done: wait for that holding nothing (the last
+    // stage meanwhile verifies or drafts for another slot), then take the last stage in hand-off order
+    static const bool wait_free = [] { const char * e = std::getenv("TRUSS_ROUND_WAIT_FREE"); return !e || std::atoi(e); }();
+    if (wait_free)
+        for (auto & p : front_) {
+            DeviceGuard g(p->device);
+            TRUSS_CUDA(cudaEventSynchronize(p->slot_done[slot]));
+        }
     int keep;
     {   // the last stage: its rows, the head, the caller's pick, the accept
         Held<Impl> h(*m_, ticket);

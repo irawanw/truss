@@ -87,6 +87,7 @@ class Model:
             "truss_slots": (c_int, [p]),
             "truss_select": (c_int, [p, c_int]),
             "truss_position_s": (c_int, [p, c_int]),
+            "truss_lock_ms": (None, [p, ctypes.POINTER(ctypes.c_double), c_int]),
             "truss_progress_s": (None, [p, c_int, ctypes.POINTER(c_int), ctypes.POINTER(c_int)]),
             "truss_reset_s": (c_int, [p, c_int]),
             "truss_eval_s": (c_int, [p, c_int, i32p, c_int, f32p]),
@@ -271,3 +272,9 @@ class Model:
         self._check(self._lib.truss_spec_step_sampled_s(self._m, slot, nxt, ctypes.byref(sp), em, ctypes.byref(n),
                                                         ctypes.byref(new)))
         return list(em[:n.value]), new.value
+
+    def lock_ms(self, reset: bool = False):
+        """[front held, front wait, last held, last wait] ms since the last reset (engine stage locks)."""
+        out = (ctypes.c_double * 4)()
+        self._lib.truss_lock_ms(self._m, out, int(reset))
+        return list(out)

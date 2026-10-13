@@ -17,6 +17,7 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -230,6 +231,8 @@ public:
     void checkpoint(int slot);
     int restore(int slot);
     int position(int slot) const;
+    // host time each stage was held and waited for (ms since the last reset): [front held, front wait, last held, last wait]
+    void lock_ms(double out[4], bool reset = false);
 
     int position() const { return seq_pos_[active_]; }   // tokens consumed so far (the selected slot)
     static int fetch_rows();                // run() chunks of at most this many tokens take the fetch (decode) path
@@ -284,6 +287,7 @@ private:
     template <class F> void each_stage(F && f);  // every stage in layer order, its device current
     void construct(const Config & c, const Weights & w, int n_ctx, int max_chunk, const Options & o);
     std::vector<int> seq_pos_{ 0 };              // each slot's position
+    std::unique_ptr<std::atomic<long long>[]> round_ns_;   // each slot's last round() end (steady clock ns)
     int active_ = 0, seq_ctx_ = 0;
 };
 

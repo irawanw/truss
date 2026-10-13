@@ -69,6 +69,9 @@ int truss_drafts(const truss_model * m);            /* 0: opened without MTP */
    positions (n_ctx / n: the K/V memory is shared out, not added). truss_select makes one current; every other call
    (eval, spec steps, reset, checkpoint, position) acts on it. Switch only between calls. Slot 0 is current at open. */
 int truss_slots(const truss_model * m);
+/* diagnostics: host ms each layer-split stage was held / waited for since the last reset: [front held, front wait,
+   last held, last wait] */
+void truss_lock_ms(truss_model * m, double * out4, int reset);
 int truss_select(truss_model * m, int slot);
 
 /* The same calls naming their slot. Calls on DIFFERENT slots may run on different threads at once: the engine holds

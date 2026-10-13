@@ -317,6 +317,8 @@ int truss_drafts(const truss_model * m) { return m->drafts; }
 
 int truss_slots(const truss_model * m) { return m->fwd->slots(); }
 
+void truss_lock_ms(truss_model * m, double * out4, int reset) { m->fwd->lock_ms(out4, reset != 0); }
+
 int truss_select(truss_model * m, int slot)
 {
     return guarded(

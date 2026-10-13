@@ -156,7 +156,10 @@ class Engine:
         # produced a different first generated token than one call did, while cut at 8192 or 16384 it produced the
         # same 64 tokens — a piece smaller than an engine chunk moves the row-count boundaries the kernels tile on.
         # 0 = never split, which is how it behaved before slots.
-        self.prefill_piece = int(os.environ.get("TRUSS_PREFILL_PIECE", chunk))
+        # the engine runs the slots itself (Forward::prompt / round with per-stage locks) when the binding has the
+        # slot-explicit calls: then the server splits nothing (the engine interleaves at its chunks)
+        self.engine_slots = self.n_slots > 1 and hasattr(self.model, "spec_step_sampled_s")
+        self.prefill_piece = 0 if self.engine_slots else int(os.environ.get("TRUSS_PREFILL_PIECE", chunk))
         self.last_rounds = 0
 
     @property
@@ -183,8 +186,14 @@ class Engine:
         return self.last_rounds
 
     def call(self, slot, fn, *args):
-        """Every engine call goes through here: the fair lock, select(slot), the call, and the slot's position
-        recorded. Nothing else touches self.model, so no call can run on another slot's sequence. Not re-entrant."""
+        """Every engine call goes through here, so no call can run on another slot's sequence. With several slots the
+        engine's slot-explicit call (`<name>_s`) runs WITHOUT a server lock: the engine holds each GPU stage only while
+        this slot's work is enqueued there, so two requests' rounds overlap on the two GPUs, and a long prompt gives
+        way to the other slot's rounds (TRUSS_DECODE_SHARE). One slot: the fair lock and select(), as before."""
+        if self.engine_slots:
+            out = getattr(self.model, fn.__name__ + "_s")(slot.idx, *args)
+            slot.pos = self.model.position_s(slot.idx)
+            return out
         with self.lock:
             self.model.select(slot.idx)
             out = fn(*args)
@@ -255,7 +264,8 @@ class Engine:
         when that eval holds the engine to itself, since truss_progress() is per model, not per slot."""
         seen = 0
         while not stop.wait(0.5):
-            done, total = self.model.progress()
+            done, total = (self.model.progress_s(slot) if self.engine_slots and slot >= 0
+                           else self.model.progress())
             if done < seen:   # a second eval call (the prompt's tail after the checkpoint) restarted the counter
                 base, seen = base + seen, 0
             if done <= seen or total <= 0:
