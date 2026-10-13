@@ -9,7 +9,6 @@ checkpoint and reads only the rest; (3) an unrelated prompt resets; (4) the fake
 """
 import os
 import sys
-import threading
 
 IM = 99999   # <|im_start|>
 import types
@@ -20,29 +19,45 @@ from server import app  # noqa: E402
 
 class FakeModel:
     def __init__(self):
-        self.n_ctx, self.drafts, self.seq, self.ck, self.fed, self.restores, self.resets = 10000, 0, [], None, 0, 0, 0
+        self.n_ctx, self.slots, self.drafts = 10000, 1, 0
+        self.seq, self.ck, self.fed, self.restores, self.resets = [], None, 0, 0, 0
+        self.selected, self.off_slot, self.fresh = 0, 0, False   # every call must arrive with the slot selected
 
     @property
     def position(self):
         return len(self.seq)
 
+    def select(self, slot):
+        """truss_select. The fake holds one sequence, so it also records that every call arrives right after
+        Engine.call selected a slot: a call made without a select could run on another slot's sequence."""
+        self.selected, self.fresh = slot, True
+
+    def touch(self):
+        self.off_slot += not self.fresh
+        self.fresh = False
+
     def reset(self):
+        self.touch()
         self.seq, self.resets = [], self.resets + 1
 
     def checkpoint(self):
+        self.touch()
         self.ck = list(self.seq)
 
     def restore(self):
+        self.touch()
         if self.ck is None:
             return -1
         self.seq, self.restores = list(self.ck), self.restores + 1
         return len(self.seq)
 
     def eval(self, tokens):
+        self.touch()
         self.seq += list(tokens)
         self.fed += len(tokens)
 
     def eval_argmax(self, tokens):
+        self.touch()
         self.seq += list(tokens)
         self.fed += len(tokens)
         return 5000 + len(self.seq)
@@ -59,8 +74,9 @@ def main():
     e = app.Engine.__new__(app.Engine)
     e.model = FakeModel()
     e.chat = types.SimpleNamespace(tok=types.SimpleNamespace(decode=lambda ids, **k: "".join(f"<{i}>" for i in ids)))
-    e.stop_ids, e.log_tag, e.log_path, e.dump_dir, e.cached, e.lock = set(), "test", None, None, [], threading.Lock()
-    e.ck_tokens, e.log, e.im_start = [], (lambda line: None), IM
+    e.stop_ids, e.log_tag, e.log_path, e.dump_dir = set(), "test", None, None
+    e.log, e.im_start = (lambda line: None), IM
+    e.init_sequences()   # the slot records and the two fair gates; slot 0 is the only sequence here
     S = [IM, 7, 8]   # the generation prompt's "<|im_start|>assistant\n": the checkpoint goes before it
     ok = True
 
@@ -89,6 +105,9 @@ def main():
     # an unrelated prompt: reset
     g4, fed, rs, zs = request(e, list(range(7001, 7101)) + S)
     check("unrelated prompt", fed == 103 + 4 and zs == 1 and rs == 0, f"fed {fed}, restores {rs}, resets {zs}")
+    check("every call followed a select", e.model.off_slot == 0, f"{e.model.off_slot} calls made without one")
+    check("slot 0 held the whole conversation", len(e.slots) == 1 and len(e.slots[0].cached) == len(e.model.seq),
+          f"slot {e.slots[0].idx} holds {len(e.slots[0].cached)} tokens, the fake {len(e.model.seq)}")
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 
