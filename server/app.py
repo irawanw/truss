@@ -62,6 +62,7 @@ class Engine:
         self.im_start = self.chat.token_id("<|im_start|>")
         self.think_close = self.chat.token_id("</think>")
         self.lock = threading.Lock()
+        self.n_rounds = 0              # speculative rounds the last generate() ran (its own count, not derived)
         # Suffix (prompt-lookup) drafts: TRUSS_LOOKUP="m:n" (e.g. "8:7") proposes the continuation of an n-gram that
         # already occurred in this sequence and offers it to the SAME verify the MTP drafts use — so the output is
         # unchanged whatever it proposes, and only the round's cost changes. Unset (served) is MTP only.
@@ -349,6 +350,7 @@ class Engine:
             finally:
                 t2 = time.time()
                 read, gen_s = t1 - t0, t2 - t1
+                self.n_rounds = len(rounds)   # the honest round count: drafted/drafts is wrong for a short window
                 extra = (f", lookup supplied {n_lookup_rows} drafts in {n_lookup_rounds} of {len(rounds)} rounds "
                          f"(index {self.lookup.built_ms:.0f} ms)") if self.lookup else ""
                 self.log(f"{self.log_tag}: prompt {n_prompt} tokens = {reuse} reused + {n_prompt - reuse} read in "
