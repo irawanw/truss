@@ -19,7 +19,6 @@ round-gap clauses are appended at the END of the line, never before "prompt"). P
 usage: CUDA_VISIBLE_DEVICES=2 python3 -m server.app --model <gguf> --tokenizer <tokenizer.json> [--port 8080]
 """
 import argparse
-import atexit
 import json
 import os
 import threading
@@ -147,10 +146,6 @@ class Engine:
         self.init_sequences(a.chunk)   # one record per sequence + the two fair gates (see below)
         self.im_start = self.chat.token_id("<|im_start|>")
         self.think_close = self.chat.token_id("</think>")
-        # TRUSS_ROUND_TRACE (scripts/u_trace_report.py): flush the engine's interval log when the process exits, so
-        # a served run can be attributed the same way a bench run is. No effect when the variable is unset.
-        if os.environ.get("TRUSS_ROUND_TRACE") and hasattr(self.model, "trace_dump"):
-            atexit.register(self.model.trace_dump)
 
     def log(self, line: str):
         print(line, flush=True)
@@ -713,6 +708,16 @@ def make_app(engine: Engine) -> FastAPI:
     @app.get("/v1/models")
     def models():
         return {"object": "list", "data": [{"id": engine.name, "object": "model", "owned_by": "truss"}]}
+
+    @app.post("/debug/round_trace")
+    def round_trace():
+        """TRUSS_ROUND_TRACE (scripts/u_trace_report.py): flush the engine's buffered intervals to the file now,
+        while the server is alive, so a bench can attribute a served run the way it attributes an in-process one.
+        A shutdown hook would not do: uvicorn leaves on SIGTERM without running atexit handlers."""
+        if not os.environ.get("TRUSS_ROUND_TRACE"):
+            raise ValueError("TRUSS_ROUND_TRACE is not set")
+        engine.model.trace_dump()
+        return {"path": os.environ["TRUSS_ROUND_TRACE"]}
 
     @app.post("/v1/chat/completions")
     async def chat_completions(req: Request):
