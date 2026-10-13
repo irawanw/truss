@@ -126,6 +126,9 @@ target_link_libraries(gemv_multi_test PRIVATE truss_kernels)
 add_executable(hc_fuse_test tests/unit/hc_fuse_test.cu)
 target_link_libraries(hc_fuse_test PRIVATE truss_kernels)
 
+add_executable(route_publish_test tests/unit/route_publish_test.cu)
+target_link_libraries(route_publish_test PRIVATE truss_engine)
+
 add_executable(gdn_prefill_test tests/unit/gdn_prefill_test.cu)
 target_link_libraries(gdn_prefill_test PRIVATE truss_kernels truss_reference)
 add_executable(dsa_prefill_test tests/unit/dsa_prefill_test.cu)
@@ -153,6 +156,8 @@ add_executable(tk-bench-hc tools/tk-bench/hc_bench.cu)
 target_link_libraries(tk-bench-hc PRIVATE truss_kernels)
 add_executable(tk-bench-gemv-pattern tools/tk-bench/gemv_pattern_bench.cu)
 target_link_libraries(tk-bench-gemv-pattern PRIVATE truss_kernels)
+add_executable(tk-bench-router tools/tk-bench/router_bench.cu)
+target_link_libraries(tk-bench-router PRIVATE truss_engine)
 add_executable(tk-bench-moe-trace tools/tk-bench/moe_trace.cu)
 target_link_libraries(tk-bench-moe-trace PRIVATE truss_kernels)
 

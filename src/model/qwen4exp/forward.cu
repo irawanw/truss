@@ -182,6 +182,7 @@ struct Forward::Impl {
         int * doorbell = nullptr, * cpu_done = nullptr;             // mapped words
         int * plan = nullptr, * need_copy = nullptr;                // mapped words the driver writes (wait_plan)
         int * go = nullptr, * d_mids = nullptr;                       // device
+        unsigned * arrive = nullptr;      // device: the fused route+publish's CTA counter (zeroed once, resets itself)
         int seq = 0;                                                  // host: the last seq enqueued
         // TRUSS_SECT_CSV: the host side of this layer's chain, microseconds after the driver saw the doorbell
         // (drv_t[0]) - the same origin as the CSV's GPU columns, which start at the publish event a few us earlier.
@@ -687,6 +688,8 @@ struct Forward::Impl {
             mapped((void **) &b.plan, sizeof(int));
             mapped((void **) &b.need_copy, sizeof(int));
             b.go = alloc<int>(1);
+            b.arrive = alloc<unsigned>(1);   // TRUSS_ROUTE_PUBLISH; the kernel zeroes it again after every launch
+            TRUSS_CUDA(cudaMemset(b.arrive, 0, sizeof(unsigned)));
             b.d_mids = alloc<int>((size_t) R * K);
         }
         drv_ts = std::getenv("TRUSS_DRIVER_TS") && std::atoi(std::getenv("TRUSS_DRIVER_TS"));
@@ -1651,6 +1654,22 @@ struct Forward::Impl {
     static constexpr int FETCH_ROWS = 32;
     static bool fetch_mode(int T) { return T <= FETCH_ROWS; }
 
+    // Phase 2's two doorbell changes, each off until its gate. TRUSS_ROUTE_PUBLISH folds the publish into the
+    // routing: one launch instead of route + route(pred) + publish, and the FFN rows stream out of several CTAs
+    // next to the top-k instead of out of one 1024-thread CTA after it. TRUSS_PUB_X_LAZY publishes the rows only
+    // for a layer whose CPU tier reads them - serve() touches b.x behind `if (ct)`, so with no CPU tier the copy
+    // is dead work on the link (measured: 18 us of every publish on device 0, 24 layers a pass).
+    static bool route_publish_on()
+    {
+        static const bool v = [] { const char * e = std::getenv("TRUSS_ROUTE_PUBLISH"); return e && std::atoi(e); }();
+        return v;
+    }
+    static bool pub_x_lazy()
+    {
+        static const bool v = [] { const char * e = std::getenv("TRUSS_PUB_X_LAZY"); return e && std::atoi(e); }();
+        return v;
+    }
+
     // stream: this chunk streams whole layers (prompt chunk, stream mode); else it fetches (decode, windows)
     void ffn(int l, const Moe & mo, const float * in, const half * in16, int T, float * out, bool stream)
     {
@@ -1690,19 +1709,29 @@ struct Forward::Impl {
             if (hint) ps.push_back({ w.layers[l + 1].moe.router, pl });
             lin32_multi(ps, in, T);
         }
-        ffn::route(logits, T, E, K, ids, wts, s);
+        const bool door = !stream && use_doorbell && T <= cpu::MAX_ROWS;   // no host sync: the driver serves this FFN
+        const bool cpu_on = cpu_tier && l < c.n_layer;
+        const bool fused_pub = door && route_publish_on();
+        if (!fused_pub) ffn::route(logits, T, E, K, ids, wts, s);   // the fused launch does the top-k itself
         if (route_counts) ffn::count(ids, T * K, route_counts + (size_t) sl(l) * E, s);
-        if (!stream && use_doorbell && T <= cpu::MAX_ROWS) {   // no host sync: the driver thread serves this FFN
-            int * pred = nullptr;
-            if (hint) {
-                float * pw = sc->alloc((size_t) T * K);
-                pred = sc->alloc<int>((size_t) T * K);
-                ffn::route(pl, T, E, K, pred, pw, s);
-            }
-            const bool cpu_on = cpu_tier && l < c.n_layer;
+        if (door) {
             Bell & b = bells[l];
             const int seq = ++b.seq;
-            runtime::publish(ids, pred, wts, T * K, in, T * dm, b.ids, b.pred, b.w, b.x, b.doorbell, seq, s);
+            const int n_x = pub_x_lazy() && !cpu_on ? 0 : T * dm;
+            if (fused_pub) {
+                // the hint's prediction goes along in the same launch; its weights were never read, so it needs no
+                // device buffer at all
+                ffn::route_publish(logits, hint ? pl : nullptr, T, E, K, ids, wts, in, n_x, b.ids, b.pred, b.w, b.x,
+                                   b.doorbell, seq, b.arrive, ffn::publish_ctas(n_x), s);
+            } else {
+                int * pred = nullptr;
+                if (hint) {
+                    float * pw = sc->alloc((size_t) T * K);
+                    pred = sc->alloc<int>((size_t) T * K);
+                    ffn::route(pl, T, E, K, pred, pw, s);
+                }
+                runtime::publish(ids, pred, wts, T * K, in, n_x, b.ids, b.pred, b.w, b.x, b.doorbell, seq, s);
+            }
             if (sect) sect_record(l, 7), sect_bell[l] = 1;
             {
                 std::lock_guard<std::mutex> g(dq_mu);
