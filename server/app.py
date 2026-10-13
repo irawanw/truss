@@ -299,7 +299,9 @@ class Engine:
                             break
                         if not greedy and sp.penalized:
                             sp.set_history(counted())   # before nxt; the engine adds nxt and the drafts per row
-                        draft = self.lookup.propose(self.cached, ban_now) if self.lookup else []
+                        # `nxt` is win[0] of this round: the drafts are guesses for the positions after it, so the
+                        # m-gram the proposer looks up has to end on `nxt`, not on the last token of `cached`
+                        draft = self.lookup.propose(self.cached, ban_now, extra=nxt) if self.lookup else []
                         if draft:   # caller-supplied drafts: the verify and accept rule are the MTP round's own
                             if greedy:
                                 emitted, after, offered = self.model.spec_step_lookup(nxt, draft, len(draft))

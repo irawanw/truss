@@ -19,23 +19,25 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from server.lookup import SuffixLookup  # noqa: E402
 
 
-def reference(seq, m, n, max_back=64, banned=()):
-    """The same rule computed the slow obvious way: scan every start position of the prefix."""
-    L = len(seq)
+def reference(seq, m, n, max_back=64, banned=(), extra=None):
+    """The same rule computed the slow obvious way: scan every start position of the prefix. `extra` is the token
+    under verification (the round's win[0]): the m-gram must end on it, and only decided tokens can be proposed."""
+    L = len(seq) + (1 if extra is not None else 0)
+    limit = len(seq)
     if L < m + 1:
         return []
-    tail = seq[L - m:]
+    tail = seq[L - m:] + ([extra] if extra is not None else [])
     best_p, best_back, best_room = -1, 0, 0
-    for p in range(0, L - m):
+    for p in range(0, limit - m):
         if seq[p:p + m] != tail:
             continue
         back = 0
-        while back < max_back and p - back - 1 >= 0 and seq[p - back - 1] == seq[L - m - back - 1]:
+        while back < max_back and p - back - 1 >= 0 and seq[p - back - 1] == seq[L - m - 1 - back]:
             back += 1
-        room = min(n, L - (p + m))
+        room = min(n, limit - (p + m))
         if (back, room) > (best_back, best_room):
             best_p, best_back, best_room = p, back, room
-    if best_p < 0 or best_room <= 0:
+    if best_p < 0:
         return []
     out = list(seq[best_p + m: best_p + m + best_room])
     if banned:
@@ -97,14 +99,18 @@ def test_incremental_matches_brute_force():
         rng = (1103515245 * rng + 12345) & 0x7FFFFFFF
         seq.append((rng >> 7) % 29)                        # a small alphabet: repeats happen constantly
     lk = SuffixLookup(m=m, n=n, keep=1000)                 # keep large: this tests the rule, not the eviction
-    bad = 0
+    bad, checked = 0, 0
     for L in range(1, len(seq) + 1):
-        got, want = lk.propose(seq[:L]), reference(seq[:L], m, n)
-        if got != want:
-            bad += 1
-            if bad <= 3:
-                print(f"  prefix {L}: got {got} want {want} tail {seq[max(0, L - m):L]}")
-    assert bad == 0, f"{bad} of {len(seq)} prefixes disagree"
+        pre = seq[:L]
+        for extra in [None] + ([seq[L]] if L < len(seq) else []):    # the round verifies seq[L], or nothing does
+            got, want = lk.propose(pre, extra=extra), reference(pre, m, n, extra=extra)
+            checked += 1
+            if got != want:
+                bad += 1
+                if bad <= 3:
+                    print(f"  prefix {L} extra {extra}: got {got} want {want} "
+                          f"tail {seq[max(0, L - m + (1 if extra is not None else 0)):L]} + {extra}")
+    assert bad == 0, f"{bad} of {checked} prefixes disagree"
 
 
 def test_truncated_sequence_is_dropped():
@@ -114,8 +120,25 @@ def test_truncated_sequence_is_dropped():
     assert lk.propose([5, 6, 7, 8, 1, 2, 5, 6, 7, 8]) == [1, 2, 5]   # rebuilt over the new sequence only
 
 
+def test_extra_is_the_token_under_verification():
+    """The round verifies `extra` and the drafts are the positions AFTER it, so the m-gram being looked up ends on
+    `extra`. Keying it on `seq` alone proposes one position early - the bug the first GPU run caught (a fired round
+    worth 0.6 tokens instead of a match), and invisible to a test that never passes `extra`."""
+    seq = [1, 2, 3, 4, 5, 6, 7, 1, 2, 3, 4]          # 1,2,3,4 occurred once, followed by 5,6,7
+    lk = SuffixLookup(m=4, n=3)
+    assert lk.propose(seq, extra=5) == [6, 7, 1]     # tail 2,3,4,5 matches the earlier 2,3,4,5 -> 6,7, then 1
+    assert lk.propose(seq, extra=5) == reference(seq, 4, 3, extra=5)
+    assert lk.propose(seq) == [5, 6, 7]              # without extra the tail is 1,2,3,4 -> its follower
+    # the last occurrence is the tail itself: nothing may be proposed from it
+    assert SuffixLookup(m=4, n=3).propose([9, 9, 1, 2, 3, 4], extra=5) == []
+    # a proposal may not invent the token under verification: only decided tokens are followers
+    assert SuffixLookup(m=4, n=3).propose([1, 2, 3, 4, 1, 2, 3], extra=4) == reference([1, 2, 3, 4, 1, 2, 3], 4, 3,
+                                                                                       extra=4)
+
+
 def main():
     for fn in (test_silence, test_copy_the_continuation, test_caps, test_longest_context_wins, test_banned_truncates,
+               test_extra_is_the_token_under_verification,
                test_incremental_matches_brute_force, test_truncated_sequence_is_dropped):
         fn()
         print(f"  ok  {fn.__name__}")

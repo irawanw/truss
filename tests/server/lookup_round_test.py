@@ -2,8 +2,9 @@
 engine, and what the request's telemetry counts. `server/lookup.py`'s own rules are tested by lookup_test.py; this
 covers the wiring in Engine.generate:
 
-  - the proposer is asked with the engine's own sequence (`cached`) BEFORE the round, and what it returns is exactly
-    what reaches `truss_spec_step_lookup_sampled` — checked against an independent brute-force scan;
+  - the proposer is asked BEFORE the round with the engine's own sequence (`cached`) plus the token that round
+    verifies (`nxt`), and what it returns is exactly what reaches `truss_spec_step_lookup_sampled` — checked against
+    an independent brute-force scan;
   - a round it stays silent on runs the MTP chain instead, unchanged;
   - `drafts accepted A of D` counts the rows actually OFFERED, not `--drafts`: a 2-row lookup window is 2 rows, and
     counting it as 3 silently inflates the acceptance rate the served dashboard reads.
@@ -56,17 +57,19 @@ class FakeModel:
     def spec_step_sampled(self, nxt, sp):
         self.i += 1
         self.rounds.append({"kind": "mtp", "offered": self.drafts})
-        self.seq += [nxt, 600 + self.i, 601 + self.i]
-        return [nxt, 600 + self.i, 601 + self.i], 602 + self.i
+        self.seq += [nxt, 700, 701]        # a fixed tail, so a later round's (cached + nxt) repeats a 4-gram
+        return [nxt, 700, 701], 702
 
     def spec_step_lookup_sampled(self, nxt, draft, nd, sp):
         self.i += 1
         # the engine must hand us the sequence as it stood before the round, and the proposer's own proposal
         offered = min(nd, self.drafts)          # the engine clamps to the window; the C entrypoint reports it back
-        self.rounds.append({"kind": "lookup", "got": list(draft), "want": reference(self.e.cached, M, N),
-                            "seq": list(self.e.cached[-2 * M:]), "offered": offered})
+        # the oracle: the m-gram must end on `nxt` (this round's win[0]), and only decided tokens can be proposed
+        self.rounds.append({"kind": "lookup", "got": list(draft),
+                            "want": reference(self.e.cached, M, N, extra=nxt),
+                            "seq": list(self.e.cached[-2 * M:]) + [nxt], "offered": offered})
         self.seq += [nxt]
-        return [nxt], 700 + self.i, offered
+        return [nxt], 702, offered
 
 
 def main():
@@ -79,8 +82,10 @@ def main():
     lines = []
     e.log = lines.append
 
-    prompt = [1, 2, 1, 2, 1, 2]   # a period-2 repeat: the tail's 4-gram occurred 2 tokens back, so the first
-    out = [t for t, _, _ in e.generate(prompt, 8, 0.8, 0.95, 40, 7, [], 0.05) if t is not None]   # proposal is 2 long
+    prompt = [1, 2, 1, 2, 1, 2]   # a period-2 repeat, so the proposer has something to find early on
+    # 14 tokens is six rounds: three MTP (each emits a window) before the fixed tail repeats a 4-gram, then the
+    # proposer takes over on alternate rounds. Fewer tokens and the request ends before the lookup can ever fire.
+    out = [t for t, _, _ in e.generate(prompt, 14, 0.8, 0.95, 40, 7, [], 0.05) if t is not None]
 
     kinds = [r["kind"] for r in e.model.rounds]
     bad = [r for r in e.model.rounds if r["kind"] == "lookup" and r["got"] != r["want"]]
@@ -97,7 +102,7 @@ def main():
           + (f": got {bad[0]['got']} want {bad[0]['want']} tail {bad[0]['seq']}" if bad else ""))
     # the last round emits a whole window but the request ends mid-window: the engine keeps what was not streamed
     check("output is what the rounds emitted",
-          len(out) == 8 and e.cached[:len(prompt)] == prompt and e.cached[len(prompt):len(prompt) + len(out)] == out
+          len(out) == 14 and e.cached[:len(prompt)] == prompt and e.cached[len(prompt):len(prompt) + len(out)] == out
           and len(e.cached) >= len(prompt) + len(out),
           f"{len(out)} tokens streamed, engine holds {len(e.cached)}")
 
