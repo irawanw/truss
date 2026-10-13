@@ -182,7 +182,18 @@ struct Forward::Impl {
         int * doorbell = nullptr, * cpu_done = nullptr;             // mapped words
         int * plan = nullptr, * need_copy = nullptr;                // mapped words the driver writes (wait_plan)
         int * go = nullptr, * d_mids = nullptr;                       // device
+        unsigned * arrive = nullptr;      // device: the fused route+publish's CTA counter (zeroed once, resets itself)
         int seq = 0;                                                  // host: the last seq enqueued
+        // TRUSS_SECT_CSV: the host side of this layer's chain, microseconds after the driver saw the doorbell
+        // (drv_t[0]) - the same origin as the CSV's GPU columns, which start at the publish event a few us earlier.
+        // All of it is written before the release fence in front of cpu_done, and the GPU only reaches its last
+        // event after that, so sect_flush reads these without racing the driver.
+        double h_t[5] = {};      // split done, pool started, plan written, hint + admit done, pool wait returned
+        double h_pool = 0;       // the pool's own span for this call (start -> last item)
+        double h_wake = 0;       // ... its start -> first item started (-1: no item ran)
+        double h_item = 0;       // ... its sum of item time, over every thread that ran one
+        double h_longest = 0;    // ... its longest single item (the straggler the call ends with)
+        int h_ncpu = 0;          // slots the CPU tier took for this layer (0: no CPU tier)
     };
     std::vector<Bell> bells;
     struct Job {
@@ -568,13 +579,25 @@ struct Forward::Impl {
         }
         load_mark("Forward: done");
         if (mtp) mtp_calib_open(prefill_rows);
-        if (getenv("TRUSS_PROFILE_SECTIONS")) {
+        if (getenv("TRUSS_PROFILE_SECTIONS") || getenv("TRUSS_SECT_CSV")) {
             sect_on = true;
             sect_ev.resize(c.n_layer + 1);   // by model layer (MTP: n_layer)
             sect_rec.assign(c.n_layer + 1, 0);
             sect_bell.assign(c.n_layer + 1, 0);
             for (auto & a : sect_ev)
                 for (cudaEvent_t & e : a) TRUSS_CUDA(cudaEventCreate(&e));
+            if (const char * p = getenv("TRUSS_SECT_CSV")) {   // one line per layer per pass (the pass breakdown)
+                char path[1024];
+                // One FILE per stage: two stages appending to one path interleave their half-written lines.
+                std::snprintf(path, sizeof path, "%s.d%d", p, device);
+                sect_csv = std::fopen(path, "ab");
+                if (sect_csv)
+                    std::fprintf(sect_csv,
+                                 "# pass rows layer route_publish wait_plan wait_copies window cpu_join helper_join "
+                                 "tail ple_attn_mix mixer hc_mix moe_total shared combine host_split host_pool_start "
+                                 "host_plan host_hint_admit host_publish pool_span pool_wake pool_compute "
+                                 "pool_longest ncpu\n");
+            }
         }
     }
 
@@ -596,6 +619,10 @@ struct Forward::Impl {
             driver.join();
             if (watchdog.joinable()) watchdog.join();
         }
+        if (sect_on)   // where the two threads that matter ran: the caller launches, the driver plans and copies
+            std::fprintf(stderr, "threads: caller %ld on cpu %d, driver %ld on cpu %d; aux %s\n",
+                         (long) cpu::this_tid(), caller_cpu, (long) driver_tid.load(), drv_cpu.load(),
+                         aux.on ? aux.text.c_str() : "off");
         for (Bell & b : bells)
             for (void * p : { (void *) b.ids, (void *) b.pred, (void *) b.mids, (void *) b.w, (void *) b.x, (void *) b.y,
                               (void *) b.doorbell, (void *) b.cpu_done, (void *) b.plan, (void *) b.need_copy })
@@ -616,6 +643,7 @@ struct Forward::Impl {
         for (auto & a : sect_ev)
             for (cudaEvent_t e : a)
                 if (e) cudaEventDestroy(e);
+        if (sect_csv) std::fclose(sect_csv);
         if (blas) cublasDestroy(blas);
         if (s) cudaStreamDestroy(s);
     }
@@ -660,6 +688,8 @@ struct Forward::Impl {
             mapped((void **) &b.plan, sizeof(int));
             mapped((void **) &b.need_copy, sizeof(int));
             b.go = alloc<int>(1);
+            b.arrive = alloc<unsigned>(1);   // TRUSS_ROUTE_PUBLISH; the kernel zeroes it again after every launch
+            TRUSS_CUDA(cudaMemset(b.arrive, 0, sizeof(unsigned)));
             b.d_mids = alloc<int>((size_t) R * K);
         }
         drv_ts = std::getenv("TRUSS_DRIVER_TS") && std::atoi(std::getenv("TRUSS_DRIVER_TS"));
@@ -705,6 +735,7 @@ struct Forward::Impl {
             for (int i = 0; i < 200000 && jobs_pushed.load(std::memory_order_acquire) <= taken; ++i) {
                 _mm_pause();
                 if (admit_idle > 0 && i % 64 == 0) dbg_phase = 8, experts->admit_step(), dbg_phase = 1;   // the link is ours while we wait
+                if (sect_on && i == 4096 && (dbg_served & 127) == 0) drv_cpu.store(last_cpu(driver_tid.load()));
             }
             {
                 std::unique_lock<std::mutex> g(dq_mu);
@@ -820,6 +851,7 @@ struct Forward::Impl {
         drv_t[1] = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> pool_lock;   // a split's stages share the pool (pipelined windows overlap)
         if (ct && ct->pool_mu) pool_lock = std::unique_lock<std::mutex>(*ct->pool_mu);
+        const long long item0 = sect_on && ct ? ct->pool->item_us() : 0;   // cumulative; the call's own is the diff
         if (ct) ct->pool->start(b.x, j.T, slots, b.y);   // CPU first: it runs while the copies are issued
         drv_t[2] = std::chrono::steady_clock::now();
         // the plan (masked ids in mapped b.mids) goes to the GPU through mapped words, as Strata's: a layer that needs
@@ -841,6 +873,14 @@ struct Forward::Impl {
                 ts_ms[1] += ms(drv_t[0], drv_t[1]), ts_ms[2] += ms(drv_t[1], drv_t[2]), ts_ms[3] += ms(drv_t[2], t3);
                 ts_t3 = t3;
             }
+        }
+        if (sect_on)   // this layer's host chain, us after the driver saw the doorbell (Bell::h_t -> the CSV)
+        {
+            auto us = [](auto a, auto t) { return std::chrono::duration<double, std::micro>(t - a).count(); };
+            b.h_t[0] = us(drv_t[0], drv_t[1]);
+            b.h_t[1] = us(drv_t[0], drv_t[2]);
+            b.h_t[2] = us(drv_t[0], std::chrono::steady_clock::now());
+            b.h_ncpu = n_cpu;
         }
         if (j.hint) {
             std::vector<int> h;
@@ -870,12 +910,21 @@ struct Forward::Impl {
             for (size_t i = 0; i < cand.size() && i < 2 && admit_pass < admit_idle; ++i)
                 admit_pass += experts->claim(sl(l), cand[i].second);
         }
-        if (drv_ts) ts_t3b = std::chrono::steady_clock::now();
+        if (drv_ts || sect_on) ts_t3b = std::chrono::steady_clock::now();
+        if (sect_on) b.h_t[3] = std::chrono::duration<double, std::micro>(ts_t3b - drv_t[0]).count();   // hint + admit
         if (ct) {
             dbg_phase = 7;
             ct->pool->wait();
             if (cpu_dynamic && n_cpu > 0)   // the pool's own time (start to last item), not this thread's
                 fit_cpu_cost(n_cpu, ct->pool->last_call_ms());
+            if (sect_on)   // the pool's own split, and the instant cpu_done is about to be raised (the GPU sees it
+            {              // a round trip later: see the residuals sect.py prints)
+                b.h_t[4] = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - drv_t[0]).count();
+                b.h_pool = 1000.0 * ct->pool->last_call_ms();
+                b.h_wake = (double) ct->pool->last_wake_us();
+                b.h_item = (double) (ct->pool->item_us() - item0);   // item_us_ is cumulative over the run
+                b.h_longest = (double) ct->pool->last_longest_us();
+            }
             std::atomic_thread_fence(std::memory_order_release);
             *(volatile int *) b.cpu_done = j.seq;
             if (drv_ts)
@@ -1380,6 +1429,20 @@ struct Forward::Impl {
         }
         for (const Proj & p : ps) lin(p.first, a, rows, p.second);
     }
+    // lin_multi with the first matrix's output written as silu(row * scale) in fp16 by the gemv itself: the same
+    // launch, the same arithmetic, and one kernel fewer after it (TRUSS_HC_SILU).
+    void lin_multi_silu(const std::vector<Proj> & ps, half * y16, float scale, const Act & a, int rows)
+    {
+        const int n = (int) ps.size();
+        const dense::Q8Matrix * W[dense::MULTI_MAX];
+        float * y[dense::MULTI_MAX];
+        half * o16[dense::MULTI_MAX];
+        float s16[dense::MULTI_MAX];
+        for (int i = 0; i < n; ++i) W[i] = &q8.at(ps[i].first), y[i] = ps[i].second, o16[i] = nullptr, s16[i] = 0.f;
+        o16[0] = y16, s16[0] = scale;
+        dense::q8_gemv_multi_a16_silu(W, y, o16, s16, n, a.x, rows, s);
+    }
+
     void lin32_multi(const std::vector<Proj> & ps, const float * x, int rows)
     {
         if (rows <= FETCH_ROWS && ps.size() > 1 && ps.size() <= (size_t) dense::MULTI_MAX) {
@@ -1398,6 +1461,20 @@ struct Forward::Impl {
         for (const Proj & p : ps) lin32(p.first, x, rows, p.second);
     }
 
+    // Phase 1's two hyper-connection fusions, each off until its gate: TRUSS_HC_SILU folds the down projection's
+    // silu into the gemv that produces its input, TRUSS_HC_COLLAPSE folds the stream collapse into the up
+    // projection's launch. Neither changes an operation; they remove launches and the round trips between them.
+    static bool hc_silu()
+    {
+        static const bool v = [] { const char * e = std::getenv("TRUSS_HC_SILU"); return e && std::atoi(e); }();
+        return v;
+    }
+    static bool hc_collapse()
+    {
+        static const bool v = [] { const char * e = std::getenv("TRUSS_HC_COLLAPSE"); return e && std::atoi(e); }();
+        return v;
+    }
+
     // hyper-connection mix: mixed [T][d] (fp32 and fp16), inject [T][hc] when h.inject.
     // L3 (Order 11): with Q8_1 activations the norm fuses the activation quantize (and, when cout/cinj are
     // given, the preceding hc::combine) into one launch; bit-identical arithmetic, see hc_prefill.cuh.
@@ -1405,10 +1482,18 @@ struct Forward::Impl {
                 const float * cout = nullptr, const float * cinj = nullptr)
     {
         const size_t m = sc->mark();
+        // Both fusions live in the fp16-activation gemv at decode rows; anything else (q8_1 activations, prefill
+        const bool gemv_ok = act == Activations::FP16 && T <= dense::GEMV_ROWS && dense::mma_on();
+        const bool silu_epi = gemv_ok && hc_silu();
+        // The shapes come from the q8 table because that is what the fused launch reads. It matters: the head's
+        // hyper-connection (w.hc_head, output_hc_*) has its up matrix there but not as an uploaded fp16 tensor.
+        const dense::Q8Matrix & wup = q8.at(h.up);
+        const bool collapse_epi =
+            gemv_ok && hc_collapse() && dense::up_collapse_ok(wup.in, wup.out, c.hc, c.d_model);
         float * rstd = sc->alloc((size_t) T * c.hc);
-        float * lo = sc->alloc((size_t) T * c.hc_rank);
+        float * lo = silu_epi ? nullptr : sc->alloc((size_t) T * c.hc_rank);   // the epilogue makes it dead
         half * lo16 = sc->alloc<half>((size_t) T * c.hc_rank);
-        float * gate = sc->alloc((size_t) T * c.hc_dim());
+        float * gate = collapse_epi ? nullptr : sc->alloc((size_t) T * c.hc_dim());   // ditto the gate
         Act xa;
         if (act == Activations::Q8_1)
         {
@@ -1424,11 +1509,22 @@ struct Forward::Impl {
             else hc::norm(res, f32(h.norm), T, c.hc, c.d_model, c.rms_eps, xn16, rstd, s);
             xa = quant(xn16, T, c.hc_dim());
         }
-        if (h.inject) lin_multi({ { h.down, lo }, { h.inject, inject } }, xa, T);   // inject reads the same xa
-        else lin(h.down, xa, T, lo);
-        hc::silu(lo, T * c.hc_rank, 1.f / c.hc, lo16, s);
-        lin(h.up, lo16, T, gate);
-        hc::collapse(res, rstd, f32(h.norm), gate, T, c.hc, c.d_model, mixed, mixed16, s);
+        const float inv_hc = 1.f / c.hc;
+        if (silu_epi) {   // the down projection writes silu(lo) as fp16 itself; inject shares the launch
+            std::vector<Proj> ps = { { h.down, nullptr } };
+            if (h.inject) ps.push_back({ h.inject, inject });   // inject reads the same xa
+            lin_multi_silu(ps, lo16, inv_hc, xa, T);
+        } else {
+            if (h.inject) lin_multi({ { h.down, lo }, { h.inject, inject } }, xa, T);   // inject reads the same xa
+            else lin(h.down, xa, T, lo);
+            hc::silu(lo, T * c.hc_rank, inv_hc, lo16, s);
+        }
+        if (collapse_epi)   // gate stays in the CTA that computed it; mixed and mixed16 come out of the gemv
+            dense::q8_gemv_a16_up_collapse(wup, lo16, T, res, rstd, f32(h.norm), mixed, mixed16, c.hc, c.d_model, s);
+        else {
+            lin(h.up, lo16, T, gate);
+            hc::collapse(res, rstd, f32(h.norm), gate, T, c.hc, c.d_model, mixed, mixed16, s);
+        }
         sc->release(m);
     }
 
@@ -1558,6 +1654,22 @@ struct Forward::Impl {
     static constexpr int FETCH_ROWS = 32;
     static bool fetch_mode(int T) { return T <= FETCH_ROWS; }
 
+    // Phase 2's two doorbell changes, each off until its gate. TRUSS_ROUTE_PUBLISH folds the publish into the
+    // routing: one launch instead of route + route(pred) + publish, and the FFN rows stream out of several CTAs
+    // next to the top-k instead of out of one 1024-thread CTA after it. TRUSS_PUB_X_LAZY publishes the rows only
+    // for a layer whose CPU tier reads them - serve() touches b.x behind `if (ct)`, so with no CPU tier the copy
+    // is dead work on the link (measured: 18 us of every publish on device 0, 24 layers a pass).
+    static bool route_publish_on()
+    {
+        static const bool v = [] { const char * e = std::getenv("TRUSS_ROUTE_PUBLISH"); return e && std::atoi(e); }();
+        return v;
+    }
+    static bool pub_x_lazy()
+    {
+        static const bool v = [] { const char * e = std::getenv("TRUSS_PUB_X_LAZY"); return e && std::atoi(e); }();
+        return v;
+    }
+
     // stream: this chunk streams whole layers (prompt chunk, stream mode); else it fetches (decode, windows)
     void ffn(int l, const Moe & mo, const float * in, const half * in16, int T, float * out, bool stream)
     {
@@ -1597,19 +1709,29 @@ struct Forward::Impl {
             if (hint) ps.push_back({ w.layers[l + 1].moe.router, pl });
             lin32_multi(ps, in, T);
         }
-        ffn::route(logits, T, E, K, ids, wts, s);
+        const bool door = !stream && use_doorbell && T <= cpu::MAX_ROWS;   // no host sync: the driver serves this FFN
+        const bool cpu_on = cpu_tier && l < c.n_layer;
+        const bool fused_pub = door && route_publish_on();
+        if (!fused_pub) ffn::route(logits, T, E, K, ids, wts, s);   // the fused launch does the top-k itself
         if (route_counts) ffn::count(ids, T * K, route_counts + (size_t) sl(l) * E, s);
-        if (!stream && use_doorbell && T <= cpu::MAX_ROWS) {   // no host sync: the driver thread serves this FFN
-            int * pred = nullptr;
-            if (hint) {
-                float * pw = sc->alloc((size_t) T * K);
-                pred = sc->alloc<int>((size_t) T * K);
-                ffn::route(pl, T, E, K, pred, pw, s);
-            }
-            const bool cpu_on = cpu_tier && l < c.n_layer;
+        if (door) {
             Bell & b = bells[l];
             const int seq = ++b.seq;
-            runtime::publish(ids, pred, wts, T * K, in, T * dm, b.ids, b.pred, b.w, b.x, b.doorbell, seq, s);
+            const int n_x = pub_x_lazy() && !cpu_on ? 0 : T * dm;
+            if (fused_pub) {
+                // the hint's prediction goes along in the same launch; its weights were never read, so it needs no
+                // device buffer at all
+                ffn::route_publish(logits, hint ? pl : nullptr, T, E, K, ids, wts, in, n_x, b.ids, b.pred, b.w, b.x,
+                                   b.doorbell, seq, b.arrive, ffn::publish_ctas(n_x), s);
+            } else {
+                int * pred = nullptr;
+                if (hint) {
+                    float * pw = sc->alloc((size_t) T * K);
+                    pred = sc->alloc<int>((size_t) T * K);
+                    ffn::route(pl, T, E, K, pred, pw, s);
+                }
+                runtime::publish(ids, pred, wts, T * K, in, n_x, b.ids, b.pred, b.w, b.x, b.doorbell, seq, s);
+            }
             if (sect) sect_record(l, 7), sect_bell[l] = 1;
             {
                 std::lock_guard<std::mutex> g(dq_mu);
@@ -1628,6 +1750,7 @@ struct Forward::Impl {
             runtime::wait_plan(b.plan, b.need_copy, b.go, seq, b.mids, b.d_mids, cpu_on ? T * K : 0, s);
             if (sect) sect_record(l, 8);
             moe::window<MoeShape>(experts->weights(sl(l)), in, cpu_on ? b.d_mids : ids, wts, T, routed, window_ws, s);
+            if (sect) sect_record(l, 10);   // the window kernel ends here; the joins below wait for other workers
             if (cpu_on) cpu_rows = -T;            // the CPU rows join after the shared expert (mapped)
         } else if (!stream) {   // fetch the few cold experts this chunk routes to
             // pre-gating: the next layer's router on this layer's input predicts 72% of its experts (TRACKER #58);
@@ -1753,6 +1876,10 @@ struct Forward::Impl {
             runtime::add_mapped(routed, bells[l].y, -cpu_rows * dm, s);
             cpu_rows = 0;
         }
+        // The join boundary is recorded on every path: cudaEventElapsedTime between a recorded and a never-recorded
+        // event reads garbage, and the CSV is read per layer whether or not this layer had CPU rows to join.
+        if (sect) sect_record(l, 11);   // the CPU tier's rows are in, or this layer had none
+        if (sect) sect_record(l, 12);   // no peer join on this branch: the segment between 11 and 12 is empty
         if (cpu_rows) {   // the CPU experts' sum joins the routed output
             CpuTier & ct = *cpu_tier;
             float * yc = sc->alloc((size_t) cpu_rows * dm);
@@ -1919,7 +2046,7 @@ struct Forward::Impl {
             TRUSS_CUDA(cudaEventRecord(out_ready, s));
             handed.fetch_add(1, std::memory_order_release);
         }
-        sect_flush();
+        sect_flush(T);
         ple_next = nullptr; ple_next_T = 0;   // consumed by this chunk's ple(), or there was no lookahead
         last_T = T;
         if (tentative) {
@@ -2073,13 +2200,37 @@ struct Forward::Impl {
     // stream order, so elapsed(e[i-1], e[i]) is one section's device time including any host stall inside it.
     // Sums accumulate per run()/verify(); section_ms() reads them back.
     bool sect_on = false;
-    std::vector<std::array<cudaEvent_t, 10>> sect_ev;   // [layer][0..6] section bounds; 7, 9, 8: inside routed MoE (doorbell)
+    std::vector<std::array<cudaEvent_t, 13>> sect_ev;   // [layer][0..6] sections; 7, 9, 8, 10, 11, 12: inside the MoE
     mutable std::vector<uint8_t> sect_rec;             // layers recorded since the last flush
     mutable double sect_ms[6] = { 0, 0, 0, 0, 0, 0 };
     // routed MoE on the doorbell path split at events 7 (doorbell raised), 9 (plan received) and 8 (copies landed,
     // TRACKER #77): router + publish, wait for the host's plan, wait for the layer's copies, expert kernel
     mutable std::vector<uint8_t> sect_bell;
     mutable double sect_moe[4] = { 0, 0, 0, 0 };
+    // /proc/self/task/<tid>/stat field 39: the logical CPU the thread last ran on. Field 2 (comm) can hold spaces
+    // and parentheses, so parse from after the last ')'. -2: not readable.
+    static int last_cpu(pid_t tid)
+    {
+        char path[64], buf[2048];
+        std::snprintf(path, sizeof path, "/proc/self/task/%ld/stat", (long) tid);
+        FILE * f = std::fopen(path, "r");
+        if (!f) return -2;
+        const size_t n = std::fread(buf, 1, sizeof buf - 1, f);
+        std::fclose(f);
+        buf[n] = 0;
+        char * p = buf + n;
+        while (p > buf && *(p - 1) != ')') --p;   // just past the last ')'
+        for (int i = 0; i < 36; ++i) {            // fields 3..38 precede the processor field
+            while (p < buf + n && *p == ' ') ++p;
+            while (p < buf + n && *p != ' ') ++p;
+        }
+        while (p < buf + n && *p == ' ') ++p;
+        return p < buf + n ? (int) std::strtol(p, nullptr, 10) : -2;
+    }
+    int caller_cpu = -1;                                // sampled by sect_flush, on the thread that launches
+    std::atomic<int> drv_cpu{ -1 };                     // the driver's CPU, sampled by the driver itself
+    FILE * sect_csv = nullptr;                          // TRUSS_SECT_CSV: per layer per pass, the doorbell path
+    long sect_pass = 0;                                 // chunks flushed (one per verify pass)
     void sect_record(int layer, int i)
     {
         if (!sect_on) return;
@@ -2088,16 +2239,22 @@ struct Forward::Impl {
     }
     // Read the events back after the whole chunk (one sync, no per-layer stall) and add the five sections. Only
     // the layers that ran are read: draft()'s MTP steps record only some.
-    void sect_flush()
+    void sect_flush(int T = 0)
     {
         if (!sect_on) return;
-        for (int l = 0; l <= c.n_layer; ++l) {   // by model layer
+        ++sect_pass;
+        caller_cpu = last_cpu(cpu::this_tid());
+        // The events were recorded on THIS stage's device; the thread reading them runs both stages, so its current
+        // device is whichever one ran last - reading another device's event is "invalid resource handle".
+        DeviceGuard g(device);
+        for (int l = 0; l <= c.n_layer; ++l) {
             if (!sect_rec[l]) continue;
-            TRUSS_CUDA(cudaEventSynchronize(sect_ev[l][6]));
+            TRUSS_CUDA(cudaEventSynchronize(sect_ev[l][6]));   // the last one recorded for the layer, stream order
+            float sec[6];   // the layer chain around the MoE: see Forward::section_ms
             for (int i = 1; i <= 6; ++i) {
                 float ms = 0.f;
                 TRUSS_CUDA(cudaEventElapsedTime(&ms, sect_ev[l][i - 1], sect_ev[l][i]));
-                sect_ms[i - 1] += ms;
+                sect_ms[i - 1] += sec[i - 1] = ms;
             }
             if (sect_bell[l]) {
                 const int at[5] = { 3, 7, 9, 8, 4 };
@@ -2105,6 +2262,22 @@ struct Forward::Impl {
                     float ms = 0.f;
                     TRUSS_CUDA(cudaEventElapsedTime(&ms, sect_ev[l][at[i]], sect_ev[l][at[i + 1]]));
                     sect_moe[i] += ms;
+                }
+                if (sect_csv) {   // the doorbell FFN to its last boundary, plus the whole layer chain around it
+                    const int b[8] = { 3, 7, 9, 8, 10, 11, 12, 6 };
+                    std::fprintf(sect_csv, "%ld %d %d", sect_pass, T, l);
+                    for (int i = 0; i < 7; ++i) {
+                        float ms = 0.f;
+                        TRUSS_CUDA(cudaEventElapsedTime(&ms, sect_ev[l][b[i]], sect_ev[l][b[i + 1]]));
+                        std::fprintf(sect_csv, " %.3f", ms);
+                    }
+                    for (int i = 0; i < 6; ++i) std::fprintf(sect_csv, " %.3f", sec[i]);
+                    // the host chain of this layer, us after the driver saw the doorbell (see Bell::h_t). The GPU
+                    // waits for the plan and the copies, so the driver had served this seq when its last event
+                    // completed: no race with the writer.
+                    const Bell & hb = bells[l];
+                    for (int i = 0; i < 5; ++i) std::fprintf(sect_csv, " %.1f", hb.h_t[i]);
+                    std::fprintf(sect_csv, " %.1f %.1f %.1f %.1f %d\n", hb.h_pool, hb.h_wake, hb.h_item, hb.h_longest, hb.h_ncpu);
                 }
             }
             sect_rec[l] = 0, sect_bell[l] = 0;

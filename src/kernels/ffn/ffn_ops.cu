@@ -2,6 +2,7 @@
 
 #include "core/cuda_check.h"
 
+#include <cstdlib>
 #include <stdexcept>
 
 namespace truss::ffn {
@@ -13,13 +14,13 @@ __device__ __forceinline__ float sigmoid(float v) { return 1.f / (1.f + __expf(-
 
 unsigned grid(int64_t n) { return (unsigned) ((n + THREADS - 1) / THREADS); }
 
-// one warp per token; expert e = 32 j + lane in p[j]
+// one warp's top-k of one token's logits; expert e = 32 j + lane in p[j]. Lanes 0..k-1 end with the winners'
+// (id, weight), in descending probability. route_kernel and the doorbell's fused route+publish share it so the two
+// paths cannot drift apart: the ids and weights the driver splits on have to be the same bits either way.
 template <int PER_LANE>
-__global__ void route_kernel(const float * logits, int T, int E, int k, int * ids, float * wts)
+__device__ __forceinline__ void topk_row(const float * l, int E, int k, int & my_id, float & my_w)
 {
-    const int t = blockIdx.x * (THREADS / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
-    if (t >= T) return;
-    const float * l = logits + (size_t) t * E;
+    const int lane = threadIdx.x % 32;
     float p[PER_LANE];
     float mx = -INFINITY;
 #pragma unroll
@@ -35,8 +36,9 @@ __global__ void route_kernel(const float * logits, int T, int E, int k, int * id
 #pragma unroll
     for (int j = 0; j < PER_LANE; ++j) p[j] /= sum;
 
-    float kept = 0.f, my_w = 0.f;
-    int my_id = -1;
+    float kept = 0.f;
+    int my_id_ = -1;
+    my_w = 0.f;
     // (probability, expert) as one 64-bit key: probabilities are >= 0 (taken: -1, never picked while k <= E), so
     // their bits order like the values; the low word ~e makes a tie go to the lower expert. One shuffle per step.
     for (int s = 0; s < k; ++s) {
@@ -56,14 +58,86 @@ __global__ void route_kernel(const float * logits, int T, int E, int k, int * id
         const float best = __uint_as_float((unsigned) (key >> 32));
         const int best_e = (int) ~(unsigned) key;
         kept += best;
-        if (lane == s) my_id = best_e, my_w = best;
+        if (lane == s) my_id_ = best_e, my_w = best;
 #pragma unroll
         for (int j = 0; j < PER_LANE; ++j)
             if (32 * j + lane == best_e) p[j] = -1.f;   // taken
     }
+    my_id = my_id_;
+    if (lane < k) my_w /= fmaxf(kept, 6.103515625e-5f);
+}
+
+// one warp per token. The row guard is not decoration: the grid is sized in warps (grid(T*32) blocks of THREADS),
+// so a launch at T=1 still runs 8 warps, and the seven past the end would top-k logits that are not theirs and
+// write ids/wts past the end of the T*K scratch - which is exactly how the driver came back with an expert id of
+// 1065353216 = 0x3F800000 = 1.0f, a neighbouring scratch float.
+template <int PER_LANE>
+__global__ void route_kernel(const float * logits, int T, int E, int k, int * ids, float * wts)
+{
+    const int t = blockIdx.x * (THREADS / 32) + threadIdx.x / 32;
+    if (t >= T) return;
+    int my_id;
+    float my_w;
+    topk_row<PER_LANE>(logits + (size_t) t * E, E, k, my_id, my_w);
+    const int lane = threadIdx.x % 32;
     if (lane < k) {
         ids[(size_t) t * k + lane] = my_id;
-        wts[(size_t) t * k + lane] = my_w / fmaxf(kept, 6.103515625e-5f);
+        wts[(size_t) t * k + lane] = my_w;
+    }
+}
+
+// The doorbell's routing and publish in one launch (TRUSS_ROUTE_PUBLISH, Phase 2). Block 0's warps run the top-k:
+// T rows of this layer's logits, then (pre-gating hint) T rows of the next layer's, and write ids and weights to
+// device + mapped memory and the prediction to mapped memory. Blocks 1..copy_ctas stream the FFN input rows into
+// mapped memory: publish_kernel did the same 80 KB from ONE 1024-thread CTA, which the link serves at a quarter of
+// the width a handful of CTAs reach, and did it after the routing instead of next to it. Every CTA fences before it
+// arrives on `arrive` (a device word, zero before the first launch and reset by the last arriver, so the count is
+// per launch and the CTA count may change between rows); the last one rings the doorbell. The driver therefore
+// still sees every byte it reads before the seq word, and it sees it ~2 launches earlier.
+constexpr int RP_THREADS = 512;   // block 0: 16 warps = T rows of logits + T of prediction, T <= cpu::MAX_ROWS
+
+template <int PER_LANE>
+__global__ void __launch_bounds__(RP_THREADS) route_publish_kernel(
+        const float * logits, const float * pred_logits, int T, int E, int k, int * ids, float * wts,
+        const float4 * x, int n4, int * dst_ids, int * dst_pred, float * dst_wts, float4 * dst_x,
+        volatile int * doorbell, int seq, unsigned * arrive, int copy_ctas)
+{
+    if (blockIdx.x == 0) {
+        const int w = threadIdx.x / 32, lane = threadIdx.x % 32;
+        const bool pr = pred_logits && w >= T;   // the upper warps predict the next layer's routing
+        const int t = pr ? w - T : w;
+        if (t < T) {
+            int my_id;
+            float my_w;
+            topk_row<PER_LANE>((pr ? pred_logits : logits) + (size_t) t * E, E, k, my_id, my_w);
+            if (lane < k) {
+                const size_t i = (size_t) t * k + lane;
+                if (pr)
+                    dst_pred[i] = my_id;   // the prediction's weights were never read; the ids are the point
+                else {
+                    ids[i] = my_id;
+                    wts[i] = my_w;
+                    dst_ids[i] = my_id;
+                    dst_wts[i] = my_w;
+                }
+            }
+        }
+    } else {
+        const int per = (n4 + copy_ctas - 1) / copy_ctas;
+        const int lo = (blockIdx.x - 1) * per, hi = min(n4, lo + per);
+        for (int i = lo + threadIdx.x; i < hi; i += RP_THREADS) dst_x[i] = x[i];
+    }
+    __threadfence_system();   // the data reaches host memory before the doorbell does
+    __syncthreads();
+    // doorbell == nullptr: the caller publishes the rows with the copy engine and rings behind that copy, so this
+    // launch only writes and fences (route_publish_words).
+    if (doorbell && threadIdx.x == 0) {
+        const unsigned old = atomicAdd(arrive, 1u);
+        if (old == (unsigned) copy_ctas) {   // the last of 1 + copy_ctas CTAs
+            *arrive = 0;
+            __threadfence_system();
+            *doorbell = seq;
+        }
     }
 }
 
@@ -110,6 +184,45 @@ void route(const float * logits, int T, int E, int k, int * ids, float * wts, cu
     if (E % 32 || E > 1024 || k > 32 || k > E) throw std::invalid_argument("ffn::route: unsupported E / k");
     if (E <= 512) route_kernel<16><<<grid((int64_t) T * 32), THREADS, 0, stream>>>(logits, T, E, k, ids, wts);
     else route_kernel<32><<<grid((int64_t) T * 32), THREADS, 0, stream>>>(logits, T, E, k, ids, wts);
+    TRUSS_CUDA(cudaGetLastError());
+}
+
+// How many CTAs publish a layer's FFN rows. Measured on an idle GPU (tk-bench-router, 8 rows, 80 KB): one CTA
+// pushes it at 4.1-4.4 GB/s, and that is the link's ceiling - the fused launch takes 20.0 us with one copy CTA and
+// 23.1 / 25.6 / 26.8 / 28.6 / 33.2 us with 2 / 4 / 8 / 16 / 32, because every extra CTA pays a system fence that
+// drains its own write queue over the same link. So: one. TRUSS_PUB_CTAS overrides it, for the measurement.
+int publish_ctas(int n_x)
+{
+    if (n_x <= 0) return 0;
+    int ctas = 1;
+    if (const char * e = std::getenv("TRUSS_PUB_CTAS")) {
+        const int v = std::atoi(e);
+        if (v > 0) ctas = v;
+    }
+    return ctas;
+}
+
+void route_publish(const float * logits, const float * pred_logits, int T, int E, int k, int * ids, float * wts,
+                   const float * x, int n_x, int * dst_ids, int * dst_pred, float * dst_wts, float * dst_x,
+                   volatile int * doorbell, int seq, unsigned * arrive, int copy_ctas, cudaStream_t stream)
+{
+    if (E % 32 || E > 1024 || k > 32 || k > E) throw std::invalid_argument("ffn::route_publish: unsupported E / k");
+    if (T < 1 || T > RP_THREADS / 64) throw std::invalid_argument("ffn::route_publish: rows must be 1..8");
+    if (n_x < 0 || n_x % 4 || (n_x && !x)) throw std::invalid_argument("ffn::route_publish: bad FFN rows");
+    if (pred_logits && !dst_pred) throw std::invalid_argument("ffn::route_publish: nowhere for the prediction");
+    if (!!doorbell != !!arrive) throw std::invalid_argument("ffn::route_publish: doorbell and arrive go together");
+    const int n4 = n_x / 4;
+    if (n4 > 0 && copy_ctas < 1) copy_ctas = 1;
+    if (n4 == 0) copy_ctas = 0;
+    const unsigned blocks = (unsigned) (1 + copy_ctas);
+    if (E <= 512)
+        route_publish_kernel<16><<<blocks, RP_THREADS, 0, stream>>>(
+                logits, pred_logits, T, E, k, ids, wts, reinterpret_cast<const float4 *>(x), n4, dst_ids, dst_pred,
+                dst_wts, reinterpret_cast<float4 *>(dst_x), doorbell, seq, arrive, copy_ctas);
+    else
+        route_publish_kernel<32><<<blocks, RP_THREADS, 0, stream>>>(
+                logits, pred_logits, T, E, k, ids, wts, reinterpret_cast<const float4 *>(x), n4, dst_ids, dst_pred,
+                dst_wts, reinterpret_cast<float4 *>(dst_x), doorbell, seq, arrive, copy_ctas);
     TRUSS_CUDA(cudaGetLastError());
 }
 

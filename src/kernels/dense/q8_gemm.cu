@@ -242,6 +242,8 @@ struct MultiQ8 {
     const int8_t * q[MULTI_MAX];
     const half * d[MULTI_MAX];
     float * y[MULTI_MAX];
+    half * y16[MULTI_MAX];   // non-null: this matrix's row goes out as silu(acc * y16s) fp16 here, y[i] unused
+    float y16s[MULTI_MAX];
     int start[MULTI_MAX + 1];   // output prefix sums
     int n;
 };
@@ -354,6 +356,10 @@ __device__ __forceinline__ void mma16816(float c[4], const uint32_t a[4], const 
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 
+// sigmoid exactly as kernels/hc/hc_prefill.cu computes it, so an epilogue that does the work of that file's silu
+// or collapse kernel is bit-identical to it.
+__device__ __forceinline__ float hc_sigmoid(float v) { return 1.f / (1.f + __expf(-v)); }
+
 template <int S>   // warps per tile (k split); a CTA has max(4, S) warps = max(4, S) / S tiles
 __global__ void __launch_bounds__(512) gemv_mma_a16_kernel(MultiQ8 m, int in, const half * __restrict__ x, int rows,
                                                            float * __restrict__ ws, int * __restrict__ ctr)
@@ -370,6 +376,8 @@ __global__ void __launch_bounds__(512) gemv_mma_a16_kernel(MultiQ8 m, int in, co
     const int8_t * wq[2] = { nullptr, nullptr };
     const half * wd[2] = { nullptr, nullptr };
     float * wy[2] = { nullptr, nullptr };
+    half * w16[2] = { nullptr, nullptr };
+    float s16[2] = { 0.f, 0.f };
     int wout[2] = { 0, 0 }, woo[2] = { 0, 0 };
 #pragma unroll
     for (int j = 0; j < 2; ++j)
@@ -378,6 +386,7 @@ __global__ void __launch_bounds__(512) gemv_mma_a16_kernel(MultiQ8 m, int in, co
             while (o[j] >= m.start[seg + 1]) ++seg;
             woo[j] = o[j] - m.start[seg], wout[j] = m.start[seg + 1] - m.start[seg];
             wq[j] = m.q[seg] + (size_t) woo[j] * in + 8 * q, wd[j] = m.d[seg] + (size_t) woo[j] * nb, wy[j] = m.y[seg];
+            w16[j] = m.y16[seg], s16[j] = m.y16s[seg];
         }
     const bool xrow = g < rows;   // B column g = window row g
     const half * xr = x + (size_t) (xrow ? g : 0) * in + 8 * q;
@@ -435,12 +444,89 @@ __global__ void __launch_bounds__(512) gemv_mma_a16_kernel(MultiQ8 m, int in, co
     // C: (row g, cols 2q, 2q + 1), (row g + 8, same cols); col = window row
 #pragma unroll
     for (int j = 0; j < 2; ++j)
-        if (wy[j])
+        if (w16[j] || wy[j])
 #pragma unroll
             for (int t = 0; t < 2; ++t) {
                 const int r = 2 * q + t;
-                if (r < rows) wy[j][(size_t) r * wout[j] + woo[j]] = acc[2 * j + t];
+                if (r >= rows) continue;
+                if (w16[j]) {   // the hc silu: hc::silu_kernel's expression and rounding, on this thread's value
+                    const float a = acc[2 * j + t] * s16[j];
+                    w16[j][(size_t) r * wout[j] + woo[j]] = __float2half(a * hc_sigmoid(a));
+                } else wy[j][(size_t) r * wout[j] + woo[j]] = acc[2 * j + t];
             }
+}
+
+// The up projection of a hyper-connection mix with the collapse of the streams folded into the same launch
+// (TRUSS_HC_COLLAPSE). gate = W . x runs on exactly the arithmetic of gemv_mma_a16_kernel<S> with KB = 1: same tile
+// of 16 outputs, same k slice per warp (warp ks takes Q8 blocks ks, ks + S, ...), same warp-order k combine, so
+// every gate value is bit-identical to the separate launch's. What changes is where the value goes. A CTA owns 16
+// consecutive output columns of *every* stream - warp c * S + ks is stream c, k slice ks - so the hc gate values of
+// one element are all in the CTA that has to combine them: they go to shared instead of to memory, and the CTA
+// finishes what collapse_kernel would have done for those elements, in the same order:
+//   mixed[t][e] = (1 / hc) * sum_c res[(t*hc + c)*d + e] * rstd[t*hc + c] * gamma[c*d + e] * sigmoid(gate[t][c][e])
+// (out == hc * d, d % 16 == 0, rows <= 8; the separate path pays a launch plus the gate round trip instead).
+template <int S, int HC>
+__global__ void __launch_bounds__(32 * HC * S) up_collapse_kernel(const int8_t * __restrict__ wq,
+                                                                  const half * __restrict__ wd, int in,
+                                                                  const half * __restrict__ x, int rows, int d,
+                                                                  const float * __restrict__ res,
+                                                                  const float * __restrict__ rstd,
+                                                                  const float * __restrict__ gamma,
+                                                                  float * __restrict__ mixed, half * __restrict__ mixed16)
+{
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, nb = in / 32;
+    const int cs = warp / S, ks = warp % S;   // this warp's stream and its slice of the k range
+    const int g = lane >> 2, q = lane & 3;
+    const int e = blockIdx.x * 16 + g;   // this thread's two output rows (e, e + 8) within every stream
+    const int8_t * wr = wq + ((size_t) cs * d + e) * in + 8 * q;
+    const half * wds = wd + ((size_t) cs * d + e) * nb;
+    const bool xrow = g < rows;   // B column g = window row g
+    const half * xr = x + (size_t) (xrow ? g : 0) * in + 8 * q;
+    float acc[4] = { 0.f, 0.f, 0.f, 0.f };
+#pragma unroll 4
+    for (int b = ks; b < nb; b += S) {
+        const uint2 w0 = __ldg(reinterpret_cast<const uint2 *>(wr + b * 32));
+        const uint2 w1 = __ldg(reinterpret_cast<const uint2 *>(wr + (size_t) 8 * in + b * 32));
+        const uint4 xv = xrow ? __ldg(reinterpret_cast<const uint4 *>(xr + b * 32)) : make_uint4(0, 0, 0, 0);
+        const float d0 = __half2float(wds[b]), d1 = __half2float(wds[(size_t) 8 * nb + b]);
+        uint32_t a[4], bb[2];
+        float c[4] = { 0.f, 0.f, 0.f, 0.f };
+        i8x4_to_h2(w0.x, a[0], a[2]);   // row e, k 8q..8q+3
+        i8x4_to_h2(w1.x, a[1], a[3]);   // row e + 8
+        bb[0] = xv.x, bb[1] = xv.y;
+        mma16816(c, a, bb);
+        i8x4_to_h2(w0.y, a[0], a[2]);   // k 8q+4..8q+7
+        i8x4_to_h2(w1.y, a[1], a[3]);
+        bb[0] = xv.z, bb[1] = xv.w;
+        mma16816(c, a, bb);
+        acc[0] += c[0] * d0, acc[1] += c[1] * d0, acc[2] += c[2] * d1, acc[3] += c[3] * d1;
+    }
+    __shared__ float part[HC * S][32][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) part[warp][lane][i] = acc[i];
+    __shared__ float g4[HC][16][8];   // gate[stream][column][window row]
+    __syncthreads();
+    if (ks == 0) {   // the S warps' partials added in warp order, as the separate launch does
+#pragma unroll
+        for (int k = 1; k < S; ++k)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) acc[i] += part[warp + k][lane][i];
+        // C: (row e, cols 2q, 2q + 1), (row e + 8, the same cols); col = window row
+        g4[cs][g][2 * q] = acc[0], g4[cs][g][2 * q + 1] = acc[1];
+        g4[cs][g + 8][2 * q] = acc[2], g4[cs][g + 8][2 * q + 1] = acc[3];
+    }
+    __syncthreads();
+    const int el = threadIdx.x % 16, t = threadIdx.x / 16;
+    if (t >= rows) return;
+    const int ee = blockIdx.x * 16 + el;
+    float s = 0.f;
+#pragma unroll
+    for (int cc = 0; cc < HC; ++cc)
+        s += res[((size_t) t * HC + cc) * d + ee] * rstd[(size_t) t * HC + cc] * gamma[(size_t) cc * d + ee] *
+             hc_sigmoid(g4[cc][el][t]);
+    s *= 1.f / HC;
+    mixed[(size_t) t * d + ee] = s;
+    if (mixed16) mixed16[(size_t) t * d + ee] = __float2half(s);
 }
 
 // cross-block split workspace, one per (device, stream): launches on one stream run in order, so each finds the
@@ -486,12 +572,6 @@ void gemv_mma_a16_cfg(const MultiQ8 & m, int in, const half * x, int rows, MmaSp
 void gemv_mma_a16(const MultiQ8 & m, int in, const half * x, int rows, cudaStream_t stream)
 {
     gemv_mma_a16_cfg(m, in, x, rows, mma_split(in, m.start[m.n]), stream);
-}
-
-bool mma_on()   // TRUSS_GEMV_MMA=0: the scalar A16 kernel (A/B switch, read once)
-{
-    static const bool v = [] { const char * e = std::getenv("TRUSS_GEMV_MMA"); return !e || std::atoi(e); }();
-    return v;
 }
 
 template <int ROWS, bool A16 = false>
@@ -579,6 +659,12 @@ __global__ void gather_kernel(const int8_t * __restrict__ q, const half * __rest
 }
 
 }  // namespace
+
+bool mma_on()   // TRUSS_GEMV_MMA=0: the scalar A16 kernel (A/B switch, read once); the fused epilogues live only
+{               // in the tensor-core one, so the engine asks this before asking for one
+    static const bool v = [] { const char * e = std::getenv("TRUSS_GEMV_MMA"); return !e || std::atoi(e); }();
+    return v;
+}
 
 void q8_gather(const Q8Matrix & W, const int * ids, int n, int8_t * q, half * d, cudaStream_t stream)
 {
@@ -725,6 +811,56 @@ void q8_gemv_a16(const Q8Matrix & W, const half * x, int rows, float * y, cudaSt
 {
     const Q8Matrix * w = &W;
     q8_gemv_multi_a16(&w, &y, 1, x, rows, stream);
+}
+
+// The hc down projection's silu, folded into the gemv that produces its input (TRUSS_HC_SILU): a matrix whose
+// y16[i] is non-null has its row written as silu(acc * y16s[i]) in fp16 by the gemv epilogue instead of as fp32
+// y[i]. The value is the one the separate hc::silu kernel would have read and computed, in the same expression.
+void q8_gemv_multi_a16_silu(const Q8Matrix * const * W, float * const * y, half * const * y16,
+                            const float * y16s, int n, const half * x, int rows, cudaStream_t stream)
+{
+    if (n < 1 || n > MULTI_MAX) throw std::runtime_error("q8_gemv_multi_a16_silu: 1.." + std::to_string(MULTI_MAX) +
+                                                         " matrices");
+    if (!mma_on()) throw std::runtime_error("q8_gemv_multi_a16_silu: needs the mma gemv (TRUSS_GEMV_MMA)");
+    if (rows < 1 || rows > GEMV_ROWS)
+        throw std::runtime_error("q8_gemv_multi_a16_silu: rows must be 1.." + std::to_string(GEMV_ROWS));
+    MultiQ8 m{};
+    m.n = n, m.start[0] = 0;
+    for (int i = 0; i < n; ++i) {
+        if (W[i]->in != W[0]->in || W[i]->in % 32)
+            throw std::runtime_error("q8_gemv_multi_a16_silu: same in for all, a multiple of 32");
+        m.q[i] = W[i]->q, m.d[i] = W[i]->d, m.y[i] = y[i], m.start[i + 1] = m.start[i] + W[i]->out;
+        m.y16[i] = y16 ? y16[i] : nullptr, m.y16s[i] = y16s ? y16s[i] : 0.f;
+    }
+    gemv_mma_a16(m, W[0]->in, x, rows, stream);
+    TRUSS_CUDA(cudaGetLastError());
+}
+
+// The hc up projection with the collapse folded in (TRUSS_HC_COLLAPSE). The shape must be the engine's own up
+// projection: out == hc * d with d a multiple of 16, hc 4 streams, and the shape's k split must stay inside one
+// block (KB 1, S <= 4), because a CTA has to see every stream's gate value of its own 16 columns.
+bool up_collapse_ok(int in, int out, int hc, int d)
+{
+    const MmaSplit sp = mma_split(in, out);
+    return hc == 4 && out == hc * d && d % 16 == 0 && sp.KB == 1 && sp.S >= 1 && sp.S <= 4;
+}
+
+void q8_gemv_a16_up_collapse(const Q8Matrix & W, const half * x, int rows, const float * res, const float * rstd,
+                             const float * gamma, float * mixed, half * mixed16, int hc, int d, cudaStream_t stream)
+{
+    if (!up_collapse_ok(W.in, W.out, hc, d))
+        throw std::runtime_error("q8_gemv_a16_up_collapse: hc " + std::to_string(hc) + ", out " + std::to_string(W.out) +
+                                 " != hc * d, or the shape's k split leaves the block");
+    if (rows < 1 || rows > GEMV_ROWS)
+        throw std::runtime_error("q8_gemv_a16_up_collapse: rows must be 1.." + std::to_string(GEMV_ROWS));
+    const MmaSplit sp = mma_split(W.in, W.out);
+    const dim3 gd(d / 16);
+    // one warp per (stream, k slice), so the block is 32 * hc * S
+    void (*k)(const int8_t *, const half *, int, const half *, int, int, const float *, const float *, const float *,
+              float *, half *) = sp.S == 1 ? up_collapse_kernel<1, 4>
+                            : sp.S == 2 ? up_collapse_kernel<2, 4> : up_collapse_kernel<4, 4>;
+    k<<<gd, 32 * 4 * sp.S, 0, stream>>>(W.q, W.d, W.in, x, rows, d, res, rstd, gamma, mixed, mixed16);
+    TRUSS_CUDA(cudaGetLastError());
 }
 
 void f32_gemv_multi(const float * const * W, const int * out, float * const * y, int n, int in, const float * x,
