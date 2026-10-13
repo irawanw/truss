@@ -22,6 +22,7 @@
 #include <exception>
 #include <memory>
 #include <string>
+#include <vector>
 
 using namespace truss;
 namespace q = truss::qwen4exp;
@@ -39,7 +40,8 @@ struct truss_model {
     float * logits = nullptr;                // device [n_vocab]
     int * next = nullptr;                    // device, argmax
     int n_ctx = 0, max_chunk = 0;
-    uint64_t sample_counter = 0;             // random stream of the next sampled row
+    uint64_t sample_counter = 0;             // random stream of the next sampled row (the selected slot's)
+    std::vector<uint64_t> slot_counter;      // TRUSS_SLOTS: each slot's sample_counter while another is selected
     std::atomic<int> prog_done{ 0 }, prog_total{ 0 };   // the running eval(): tokens run / tokens asked (truss_progress)
     int * pen_cnt = nullptr;                 // device [drafts + 1][n_vocab] penalty counts, zero between calls
     int * pen_hist = nullptr, * pen_host = nullptr;   // device / pinned [drafts + 1][TRUSS_PENALTY_CAP] row histories
@@ -175,6 +177,8 @@ truss_model * truss_open_params(const char * gguf_path, const truss_params * p)
             TRUSS_CUDA(cudaMalloc(&m->pen_hist, sizeof(int) * rows * TRUSS_PENALTY_CAP));
             TRUSS_CUDA(cudaMallocHost(&m->pen_host, sizeof(int) * rows * TRUSS_PENALTY_CAP));
             m->fwd = std::make_unique<q::Forward>(m->config, m->weights, m->n_ctx, m->max_chunk, o);
+            m->n_ctx = m->fwd->seq_ctx();   // TRUSS_SLOTS: every limit below is per sequence
+            m->slot_counter.assign(m->fwd->slots(), 0);
             m->file->release_pages();
             return m.release();
         },
@@ -254,6 +258,22 @@ int truss_eval_argmax(truss_model * m, const int32_t * tokens, int n, int32_t * 
 }
 
 int truss_drafts(const truss_model * m) { return m->drafts; }
+
+int truss_slots(const truss_model * m) { return m->fwd->slots(); }
+
+int truss_select(truss_model * m, int slot)
+{
+    return guarded(
+        [&] {
+            const int cur = m->fwd->slot();
+            if (slot == cur) return 0;
+            m->fwd->select(slot);
+            m->slot_counter[cur] = m->sample_counter;
+            m->sample_counter = m->slot_counter[slot];
+            return 0;
+        },
+        -1);
+}
 
 int truss_checkpoint(truss_model * m)
 {

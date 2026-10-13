@@ -65,6 +65,12 @@ int truss_eval_argmax(truss_model * m, const int32_t * tokens, int n, int32_t * 
 int truss_spec_step(truss_model * m, int32_t next, int32_t * emitted, int * n_emitted, int32_t * new_next);
 int truss_drafts(const truss_model * m);            /* 0: opened without MTP */
 
+/* Sequence slots (TRUSS_SLOTS=n at open): the model holds n independent sequences, each with truss_n_ctx()
+   positions (n_ctx / n: the K/V memory is shared out, not added). truss_select makes one current; every other call
+   (eval, spec steps, reset, checkpoint, position) acts on it. Switch only between calls. Slot 0 is current at open. */
+int truss_slots(const truss_model * m);
+int truss_select(truss_model * m, int slot);
+
 /* Sequence checkpoint (one slot, pinned host memory): truss_checkpoint saves the sequence's recurrent state at
    truss_position(); truss_restore returns the sequence to it and returns that position (-1: none taken). A later
    prompt that extends only the checkpointed prefix then reads only its own tail. */

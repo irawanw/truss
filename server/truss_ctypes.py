@@ -84,6 +84,8 @@ class Model:
             "truss_open_params": (p, [ctypes.c_char_p, ctypes.POINTER(Params)]),
             "truss_spec_step": (c_int, [p, ctypes.c_int32, i32p, ctypes.POINTER(c_int), i32p]),
             "truss_drafts": (c_int, [p]),
+            "truss_slots": (c_int, [p]),
+            "truss_select": (c_int, [p, c_int]),
             "truss_checkpoint": (c_int, [p]),
             "truss_restore": (c_int, [p]),
             "truss_eval_sample": (c_int, [p, i32p, c_int, ctypes.POINTER(Sampling), i32p]),
@@ -107,7 +109,12 @@ class Model:
         self.n_ctx = lib.truss_n_ctx(self._m)
         self._logits = np.empty(self.n_vocab, dtype=np.float32)
         self.drafts = lib.truss_drafts(self._m)
+        self.slots = lib.truss_slots(self._m)   # TRUSS_SLOTS; n_ctx above is per slot
         self._emitted = (ctypes.c_int32 * 8)()
+
+    def select(self, slot: int):
+        """Make sequence slot `slot` current (TRUSS_SLOTS); every other call acts on it."""
+        self._check(self._lib.truss_select(self._m, slot))
 
     def _error(self) -> str:
         return self._lib.truss_last_error().decode(errors="replace")

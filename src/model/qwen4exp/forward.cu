@@ -461,6 +461,7 @@ struct Forward::Impl {
             }
         }
         if (mtp) dsa_state(mst);
+        alloc_seqs(std::max(1, o.slots));
         const double vram_st = vram_used();
         std::vector<runtime::ExpertLayer> tables;
         for (int l = lb; l < le; ++l) {
@@ -1964,7 +1965,7 @@ struct Forward::Impl {
     void run_chunk(const int32_t * tokens, int pos0, int T, const LayerHook & hook, bool tentative)
     {
         require(T > 0 && T <= max_chunk, "chunk of " + std::to_string(T) + " tokens (max " + std::to_string(max_chunk) + ")");
-        require(pos0 + T <= n_ctx, "sequence longer than n_ctx");
+        require(pos0 + T <= seq_ctx, "sequence longer than n_ctx" + std::string(seqs.size() > 1 ? " / slots" : ""));
         require(!vw.open, "run()/verify() before accept() of the previous verify()");
         flush_commit();   // it reads res, which this chunk rewrites
         check_driver();
@@ -2188,6 +2189,117 @@ struct Forward::Impl {
         dc_on = false, mtp_ahead = false;   // the next commit recomputes its first row
         kv_reserve(ck.pos, true);
         return ck.pos;
+    }
+
+    // Sequence slots (Options::slots). The live members above (st[l]'s per-sequence pointers, mst's, pending_h, the
+    // deferred MTP commit, the PLE window, the checkpoint) always describe the selected slot; select() parks them in
+    // seqs[active_seq] and loads another slot's. Position-indexed caches are sub-ranges of the arrays allocated for
+    // n_ctx positions (slot k starts at position k * seq_ctx); the recurrent pieces are separate buffers per slot.
+    // Verify-window temporaries (snapshots, raw rows) are shared: a switch happens only between calls. A deferred MTP
+    // commit (accept() -> the next draft()) reads the accepted rows' residual from small.res, which the other slot's
+    // calls overwrite: those rows are parked in res_keep with the slot.
+    struct SeqLayer {
+        dsa::KvCache kv;
+        half * idx_k = nullptr;
+        float * idx_partial = nullptr, * state_buf[2] = {}, * conv = nullptr, * ple_hist = nullptr;
+        int cur = 0;
+    };
+    struct Seq {
+        std::vector<SeqLayer> layers;                    // [l - lb]
+        SeqLayer mtpl;
+        float * pending_h = nullptr, * res_keep = nullptr;
+        bool has_pending = false, dc_on = false, mtp_ahead = false;
+        int dc_pos0 = 0, dc_T = 0, ahead_pos = -1, last_T = 0;
+        int32_t ahead_tok = -1;
+        std::vector<int32_t> dc_tokens, tail;
+        Checkpoint ck;
+    };
+    std::vector<Seq> seqs;
+    int active_seq = 0;
+    int seq_ctx = 0;                                     // positions per slot
+
+    static SeqLayer seq_layer(const LayerState & L)
+    {
+        return { L.kv, L.idx_k, L.idx_partial, { L.state_buf[0], L.state_buf[1] }, L.conv, L.ple_hist, L.cur };
+    }
+    static void load_layer(LayerState & L, const SeqLayer & q)
+    {
+        L.kv = q.kv, L.idx_k = q.idx_k, L.idx_partial = q.idx_partial, L.conv = q.conv, L.ple_hist = q.ple_hist;
+        L.state_buf[0] = q.state_buf[0], L.state_buf[1] = q.state_buf[1], L.cur = q.cur;
+    }
+
+    // slot 0 is the live state allocated above; slots 1.. get their own recurrent buffers and a cache sub-range
+    void alloc_seqs(int n)
+    {
+        seq_ctx = n_ctx;
+        seqs.resize(n);
+        if (n == 1) return;
+        const int R = DsaShape::RATIO;
+        seq_ctx = n_ctx / n / 256 * 256;
+        require(seq_ctx >= 4096, "TRUSS_SLOTS: under 4,096 positions per slot");
+        const size_t rowkv = (size_t) c.n_head_kv * c.head_dim;
+        auto sub = [&](const LayerState & L, int k) {   // slot k's view of the live (slot 0) caches
+            SeqLayer q = seq_layer(L);
+            const size_t off = (size_t) k * seq_ctx;
+            if (q.kv.kq) q.kv.kq += off * rowkv, q.kv.vq += off * rowkv, q.kv.ks += off * rowkv / dsa::KV_GROUP,
+                         q.kv.vs += off * rowkv / dsa::KV_GROUP;
+            if (q.kv.k16) q.kv.k16 += off * rowkv, q.kv.v16 += off * rowkv;
+            if (q.idx_k) q.idx_k += off / R * c.idx_head_dim;
+            if (q.idx_partial) q.idx_partial = alloc<float>((size_t) (R - 1) * c.idx_head_dim);
+            const size_t sz = (size_t) c.ssm_v_heads * c.ssm_state * c.ssm_state;
+            for (float *& b : q.state_buf)
+                if (b) b = alloc<float>(sz);
+            q.cur = 0;
+            if (q.conv) q.conv = alloc<float>((size_t) (c.ssm_conv - 1) * c.conv_dim());
+            if (q.ple_hist) q.ple_hist = alloc<float>((size_t) (c.ple_conv - 1) * c.ple_ngram * c.hc_dim());
+            return q;
+        };
+        for (int k = 1; k < n; ++k) {
+            Seq & q = seqs[k];
+            q.layers.resize(le - lb);
+            for (int l = lb; l < le; ++l) q.layers[l - lb] = sub(st[l], k);
+            if (mtp) {
+                q.mtpl = sub(mst, k);
+                q.pending_h = alloc<float>(c.hc_dim());
+            }
+        }
+        if (mtp)
+            for (Seq & q : seqs) q.res_keep = alloc<float>((size_t) (moe::MAX_ROWS + 1) * c.hc_dim());
+    }
+
+    void select(int k)
+    {
+        require(k >= 0 && k < (int) seqs.size(), "select(" + std::to_string(k) + "): no such slot");
+        if (k == active_seq) return;
+        require(!vw.open, "select() inside a verify window");
+        const size_t row = c.hc_dim();
+        {   // park the live sequence
+            Seq & q = seqs[active_seq];
+            q.layers.resize(le - lb);
+            for (int l = lb; l < le; ++l) q.layers[l - lb] = seq_layer(st[l]);
+            if (mtp) {
+                q.mtpl = seq_layer(mst);
+                q.pending_h = pending_h;
+                if (dc_on) copy(q.res_keep, small.res, (size_t) dc_T * row);
+            }
+            q.has_pending = has_pending, q.dc_on = dc_on, q.mtp_ahead = mtp_ahead;
+            q.dc_pos0 = dc_pos0, q.dc_T = dc_T, q.ahead_pos = ahead_pos, q.ahead_tok = ahead_tok, q.last_T = last_T;
+            q.dc_tokens.swap(dc_tokens), q.tail.swap(tail);
+            std::swap(q.ck, ck);
+        }
+        Seq & q = seqs[k];
+        for (int l = lb; l < le; ++l) load_layer(st[l], q.layers[l - lb]);
+        if (mtp) {
+            load_layer(mst, q.mtpl);
+            pending_h = q.pending_h;
+            if (q.dc_on) copy(small.res, q.res_keep, (size_t) q.dc_T * row);
+        }
+        has_pending = q.has_pending, dc_on = q.dc_on, mtp_ahead = q.mtp_ahead;
+        dc_pos0 = q.dc_pos0, dc_T = q.dc_T, ahead_pos = q.ahead_pos, ahead_tok = q.ahead_tok, last_T = q.last_T;
+        dc_tokens.swap(q.dc_tokens), tail.swap(q.tail);
+        std::swap(q.ck, ck);
+        ple_next = nullptr, ple_next_T = 0, ple_tk_valid = false;   // a lookahead ticket belongs to the old slot
+        active_seq = k;
     }
 
     // MTP calibration capture (TRUSS_MTP_CALIB=/path/file.f32): the MTP block's FFN input rows (fp32 [d_model],
@@ -2433,7 +2545,20 @@ struct Forward::Impl {
     }
 };
 
-Forward::Forward(const Config & c, const Weights & w, int n_ctx, int max_chunk, const Options & o)
+Forward::Forward(const Config & c, const Weights & w, int n_ctx, int max_chunk, const Options & oo)
+{
+    Options o = oo;
+    if (o.slots > 1 && o.kv_lend) {
+        std::fprintf(stderr, "TRUSS_SLOTS=%d: TRUSS_KV_LEND off (it lends one sequence's unused K/V tail)\n", o.slots);
+        o.kv_lend = false;
+    }
+    construct(c, w, n_ctx, max_chunk, o);
+    seq_pos_.assign(std::max(1, o.slots), 0);
+    seq_ctx_ = m_->seq_ctx;
+    if (o.slots > 1) std::fprintf(stderr, "sequence slots: %d x %d positions\n", o.slots, seq_ctx_);
+}
+
+void Forward::construct(const Config & c, const Weights & w, int n_ctx, int max_chunk, const Options & o)
 {
     const int S = o.layer_split;
     if (S <= 0 || S >= c.n_layer) {
@@ -2772,6 +2897,17 @@ void Forward::set_draft_sampling(const sampling::SampleParams * p, uint64_t coun
     m_->ds_p = p, m_->ds_counter = counter, m_->ds_q = q_full;
 }
 
+void Forward::select(int k)
+{
+    if (k == active_) return;
+    if (k < 0 || k >= (int) seq_pos_.size())
+        throw std::runtime_error("qwen4exp::Forward: select(" + std::to_string(k) + "): " +
+                                 std::to_string(seq_pos_.size()) + " slots");
+    seq_pos_[active_] = pos_;
+    each_stage([k](Impl & m) { m.select(k); });
+    active_ = k, pos_ = seq_pos_[k];
+}
+
 void Forward::checkpoint()
 {
     each_stage([this](Impl & m) { m.checkpoint(pos_); });
@@ -2814,6 +2950,7 @@ void apply_env(ForwardOptions & o)
     f("TRUSS_LAYER_SPLIT", o.layer_split);             // two devices: layers [0, N) on TRUSS_LAYER_SPLIT_DEVICE
     f("TRUSS_LAYER_SPLIT_DEVICE", o.layer_split_device);
     f("TRUSS_LAYER_SPLIT_FRAC", o.layer_split_frac);
+    f("TRUSS_SLOTS", o.slots);                 // sequence slots (Forward::select)
     f("TRUSS_SPLIT_ROWS", o.split_rows);       // E7: short prompt chunks split cold experts CPU / PCIe
     f("TRUSS_SPLIT_T", o.split_t);
     f("TRUSS_SPLIT_MS_ROW", o.split_ms_row);

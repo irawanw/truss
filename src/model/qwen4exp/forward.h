@@ -126,6 +126,12 @@ struct ForwardOptions {
     int layer_split = 0;
     int layer_split_device = -1;
     float layer_split_frac = 0.5f;
+    // Sequence slots (TRUSS_SLOTS): the engine holds `slots` independent sequences. Each slot's position-indexed
+    // caches (K/V, indexer blocks, MTP rows) are a sub-range of the same n_ctx-row arrays (n_ctx / slots positions
+    // each, so the VRAM is unchanged), its recurrent state (GDN state and conv rows, the indexer's open block, PLE
+    // history, the MTP pending row) has its own copy. select() switches between them between calls. > 1 turns
+    // kv_lend off (it lends one sequence's unused tail).
+    int slots = 1;
     // Called once upload() has the weights on the device but before the constructor does anything else expensive
     // (the expert plan, the CPU tier). The owner releases the model's file-backed pages there — the shards fault to a
     // ~47 GB resident peak during upload, and the CPU tier's anonymous vector then allocates on top of it and the
@@ -199,6 +205,13 @@ public:
     void checkpoint();
     int restore();
 
+    // Options::slots: make slot k (0 .. slots() - 1) the sequence every other call acts on. Not inside a verify
+    // window. Each slot keeps its position, caches, recurrent state and checkpoint; slot 0 is selected at start.
+    void select(int k);
+    int slots() const { return (int) seq_pos_.size(); }
+    int slot() const { return active_; }
+    int seq_ctx() const { return seq_ctx_; }   // positions per slot (n_ctx with one slot)
+
     int position() const { return pos_; }   // tokens consumed so far
     static int fetch_rows();                // run() chunks of at most this many tokens take the fetch (decode) path
     int hot_experts() const;                // resident experts, all layers
@@ -250,7 +263,10 @@ private:
     std::vector<std::unique_ptr<Impl>> front_;   // a layer split's stages before the last (destroyed after m_)
     std::unique_ptr<Impl> m_;                    // the last stage (the whole model without a split)
     template <class F> void each_stage(F && f);  // every stage in layer order, its device current
+    void construct(const Config & c, const Weights & w, int n_ctx, int max_chunk, const Options & o);
     int pos_ = 0;
+    std::vector<int> seq_pos_{ 0 };              // each slot's position (pos_ is the selected one's)
+    int active_ = 0, seq_ctx_ = 0;
 };
 
 }  // namespace truss::qwen4exp
