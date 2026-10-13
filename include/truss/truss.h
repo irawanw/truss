@@ -72,6 +72,11 @@ int truss_slots(const truss_model * m);
 /* diagnostics: host ms each layer-split stage was held / waited for since the last reset: [front held, front wait,
    last held, last wait] */
 void truss_lock_ms(truss_model * m, double * out4, int reset);
+/* TRUSS_ROUND_TRACE=<file>: the engine writes an interval log (per stage: host waits, lock hand-offs, and the
+   device-busy spans of a layer-split round) for track U's idle attribution. Process-global, and nothing happens
+   when the variable is unset. dump flushes the buffer; mark records a phase boundary the reader can key on. */
+void truss_round_trace_dump(void);
+void truss_round_trace_mark(int tag);
 int truss_select(truss_model * m, int slot);
 
 /* The same calls naming their slot. Calls on DIFFERENT slots may run on different threads at once: the engine holds

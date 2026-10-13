@@ -108,6 +108,15 @@ class Model:
         for name, (res, args) in sig.items():
             fn = getattr(lib, name)
             fn.restype, fn.argtypes = res, args
+        # The track-U trace hooks bind when present: a library without them still serves, and the two wrappers
+        # below no-op. Binding them eagerly turns a stale .so into "the served server will not start".
+        for name, (res, args) in {
+            "truss_round_trace_dump": (None, []),
+            "truss_round_trace_mark": (None, [c_int]),
+        }.items():
+            fn = getattr(lib, name, None)
+            if fn is not None:
+                fn.restype, fn.argtypes = res, args
         self._lib = lib
         prm = lib.truss_default_params()
         enc = lambda v: v.encode() if v else None   # noqa: E731
@@ -278,3 +287,13 @@ class Model:
         out = (ctypes.c_double * 4)()
         self._lib.truss_lock_ms(self._m, out, int(reset))
         return list(out)
+
+    def trace_mark(self, tag: int):
+        """TRUSS_ROUND_TRACE: a phase boundary in the engine's interval log (nothing when the variable is unset)."""
+        if getattr(self._lib, "truss_round_trace_mark", None) is not None:
+            self._lib.truss_round_trace_mark(tag)
+
+    def trace_dump(self):
+        """TRUSS_ROUND_TRACE: flush the buffered intervals to the file (scripts/u_trace_report.py reads it)."""
+        if getattr(self._lib, "truss_round_trace_dump", None) is not None:
+            self._lib.truss_round_trace_dump()

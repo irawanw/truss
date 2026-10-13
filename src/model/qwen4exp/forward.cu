@@ -22,6 +22,7 @@
 #include "kernels/spec/rollback.cuh"
 #include "model/qwen4exp/ple.h"
 #include "model/qwen4exp/ple_reader.h"
+#include "model/qwen4exp/round_trace.h"
 #include "runtime/doorbell.cuh"
 #include "runtime/expert_store.h"
 
@@ -2414,11 +2415,37 @@ struct Forward::Impl {
     // [slot]: recorded behind a slot's verify rows on this (front) stage; round() waits for it with no stage held, so
     // the last stage serves another slot while this slot's rows are still on the earlier GPU
     std::vector<cudaEvent_t> slot_done;
+    // TRUSS_ROUND_TRACE (track U): which stage this is (0 the front one, 1 the last) for the interval log, the
+    // stage the thread was working on before this one was acquired, and this stage's device-work accounting.
+    int trace_stage = -1, rt_prev_stage = -1;
+    int64_t rt_held_t0 = 0;
+    rt::StageState rt_st;
     void acquire(long ticket)
     {
+        const bool tr = rt::on();
+        const int64_t t0 = tr ? rt::now() : 0;
+        rt_prev_stage = rt::ctx().stage;
         lk.lock(ticket, [this] { return taken.load(std::memory_order_acquire) + 1; });
+        rt::ctx().stage = trace_stage;
+        if (tr)
+        {
+            rt::push({ t0, rt::now() - t0, trace_stage == 0 ? rt::kLockFront : rt::kLockLast, rt::ctx().slot,
+                       trace_stage, rt::kKindHost, rt::ctx().round });
+            rt_held_t0 = rt::now();
+            rt::stage_begin(rt_st, s, device, trace_stage);   // the device takes this section over here
+        }
     }
-    void release() { lk.unlock(); }
+    void release()
+    {
+        if (rt::on())
+        {
+            rt::stage_end(rt_st);   // before the lock drops: what is queued now is this section's work
+            rt::push({ rt_held_t0, rt::now() - rt_held_t0, trace_stage == 0 ? rt::kHeldFront : rt::kHeldLast,
+                       rt::ctx().slot, trace_stage, rt::kKindHost, rt::ctx().round });
+        }
+        rt::ctx().stage = rt_prev_stage;   // acquire stores this whether or not the trace is on; both sides match
+        lk.unlock();
+    }
     void settle()   // the selected slot's deferred accept, before anything else it does here
     {
         if (defer_n.empty() || !defer_n[active_seq]) return;
@@ -2745,6 +2772,8 @@ struct Forward::Impl {
                 sampling::draft_sample(mtp_logits, nv, draft_map, c.n_vocab, *ds_p, ds_counter + i,
                                        ds_q + (size_t) i * c.n_vocab, draft_ids + i + 1, s);
             if (draft_min_p > 0.f) {   // an unsure guess does not enter the window, and ends the chain
+                TRUSS_RT(rt::kDraftMinP);   // one host round trip per draft step, with the stage held through it
+                rt::Wait w(rt_st);          // how much of it the device was actually working
                 TRUSS_CUDA(cudaMemcpyAsync(draft_prob_host + i, draft_prob + i, sizeof(float), cudaMemcpyDeviceToHost, s));
                 TRUSS_CUDA(cudaStreamSynchronize(s));
                 if (draft_prob_host[i] < draft_min_p) break;
@@ -2754,6 +2783,8 @@ struct Forward::Impl {
         }
         copy(mst.idx_partial, mtp_partial_snap, (size_t) (DsaShape::RATIO - 1) * c.idx_head_dim);
         if (made) TRUSS_CUDA(cudaMemcpyAsync(draft_host, draft_ids + 1, sizeof(int32_t) * made, cudaMemcpyDeviceToHost, s));
+        TRUSS_RT(rt::kDraftEnd);
+        rt::Wait we(rt_st);
         TRUSS_CUDA(cudaStreamSynchronize(s));
         std::copy(draft_host, draft_host + made, out);
         return made;
@@ -2785,8 +2816,18 @@ Forward::Forward(const Config & c, const Weights & w, int n_ctx, int max_chunk, 
 void Forward::construct(const Config & c, const Weights & w, int n_ctx, int max_chunk, const Options & o)
 {
     const int S = o.layer_split;
+    // TRUSS_ROUND_TRACE: which stage is which (0 the front one, 1 the last) and the device each runs on
+    auto tag_stages = [&] {
+        for (auto & p : front_) p->trace_stage = 0;
+        m_->trace_stage = 1;
+        int dev = m_->device;
+        if (dev < 0) cudaGetDevice(&dev);
+        rt::set_stage_device(1, dev);
+        if (!front_.empty()) rt::set_stage_device(0, front_[0]->device);
+    };
     if (S <= 0 || S >= c.n_layer) {
         m_ = std::make_unique<Impl>(c, w, n_ctx, max_chunk, o, StageSpec{ 0, c.n_layer, -1, 1.0, nullptr, nullptr });
+        tag_stages();
         return;
     }
     int cur = 0;
@@ -2801,6 +2842,7 @@ void Forward::construct(const Config & c, const Weights & w, int n_ctx, int max_
     StageSpec b{ S, c.n_layer, cur, 1.0, f.cpu_tier ? f.cpu_tier->pool : nullptr, a.pool_mu };
     m_ = std::make_unique<Impl>(c, w, n_ctx, max_chunk, o, b);
     m_->prev = &f, f.next = m_.get();
+    tag_stages();
     std::fprintf(stderr, "layer split: layers 0-%d on device %d (%d experts resident), layers %d-%d, head and MTP on "
                          "device %d (%d resident)\n",
                  S - 1, d0, f.n_hot, S, c.n_layer - 1, cur, m_->n_hot);
@@ -2813,6 +2855,7 @@ Forward::~Forward()
     m_.reset();   // the last stage first: its driver may share the first stage's CPU pool
     front_.clear();
     cudaSetDevice(d);
+    rt::close();   // TRUSS_ROUND_TRACE: the last records of the run
 }
 
 // every stage in layer order, each with its device current
@@ -3031,6 +3074,8 @@ std::vector<float> Forward::route_counts() const   // the stages' store layers i
 
 int Forward::position(int slot) const { return seq_pos_.at(slot); }
 
+rt::StageState * Forward::rt_last_stage() { return &m_->rt_st; }   // TRUSS_ROUND_TRACE: for the caller's pick
+
 void Forward::lock_ms(double out[4], bool reset)
 {
     Impl * st[2] = { front_.empty() ? nullptr : front_[0].get(), m_.get() };
@@ -3127,6 +3172,7 @@ void Forward::prompt(int slot, const int32_t * tokens, int n, int step, float * 
 {
     require(n > 0 && step > 0, "run_prompt: no tokens");
     require(slot >= 0 && slot < (int) seq_pos_.size(), "prompt(): no such slot");
+    rt::ctx().slot = slot, ++rt::ctx().round;   // TRUSS_ROUND_TRACE: the records of this call belong to this slot
     auto chunk = [&](int s, int & T, const int32_t *& nxt, int & nxt_T) {   // the run() loop's chunks and lookahead
         T = std::min(step, n - s);
         nxt_T = std::max(0, std::min(step, n - s - T));
@@ -3189,6 +3235,7 @@ void Forward::prompt(int slot, const int32_t * tokens, int n, int step, float * 
     double front_s = 0;
     std::thread t([&] {
         DeviceGuard g(f.device);
+        rt::ctx().slot = slot;   // thread-local: the front thread's records are this slot's front-stage work
         try {
             int k = 0;
             for (int s = 0; s < n; s += step, ++k) {
@@ -3196,6 +3243,7 @@ void Forward::prompt(int slot, const int32_t * tokens, int n, int step, float * 
                 const int32_t * nx;
                 chunk(s, T, nx, nT);
                 if (share > 0 && k > 0 && others_decoding()) {   // give way: drain, then the decode window
+                    TRUSS_RT(rt::kGiveWay);   // both GPUs are free here: whose decode window this is, the report cannot tell
                     double w;
                     {
                         std::unique_lock<std::mutex> l(qm);
@@ -3228,6 +3276,7 @@ void Forward::prompt(int slot, const int32_t * tokens, int n, int step, float * 
                 }
                 qcv.notify_all();
             }
+            TRUSS_RT(rt::kFrontDrain);
             TRUSS_CUDA(cudaStreamSynchronize(f.s));
             front_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         } catch (...) {
@@ -3294,6 +3343,8 @@ int Forward::round(int slot, int32_t next, int nd, int32_t * win, float * logits
                    uint64_t ds_counter, float * ds_q, const std::function<int(int)> & pick)
 {
     require(slot >= 0 && slot < (int) seq_pos_.size(), "round(): no such slot");
+    rt::ctx().slot = slot, ++rt::ctx().round;
+    TRUSS_RT(rt::kRound);
     const int pos = seq_pos_[slot];
     round_ns_[slot] = -1;   // inside a round (the prompt of another slot gives way to it)
     struct Out {
@@ -3376,7 +3427,13 @@ int Forward::round(int slot, int32_t next, int nd, int32_t * win, float * logits
         if (wait_free)
             for (auto & p : front_) {
                 DeviceGuard g(p->device);
-                TRUSS_CUDA(cudaEventSynchronize(p->slot_done[slot]));
+                const int rt_saved = rt::ctx().stage;
+                rt::ctx().stage = 0;   // the record is about that device, though this thread holds no stage
+                {
+                    TRUSS_RT(rt::kFrontWait);   // the earlier GPU's rows, before this slot's last-stage work can start
+                    TRUSS_CUDA(cudaEventSynchronize(p->slot_done[slot]));
+                }
+                rt::ctx().stage = rt_saved;
             }
         {   // the last stage: its rows, the head, the caller's pick, the accept
             Held<Impl> h(*m_, ticket);
@@ -3385,7 +3442,10 @@ int Forward::round(int slot, int32_t next, int nd, int32_t * win, float * logits
             last_open = true;
             m_->head(0, T, logits);
             inject_fault("round-pick", slot);   // exactly the state a throw inside pick() leaves (truss_c.cu's pick)
-            keep = pick(nw);
+            {
+                TRUSS_RT(rt::kPick);   // the last stage is held through this: its device idles while the host samples
+                keep = pick(nw);
+            }
             require(keep >= 1 && keep <= T, "round(): pick() kept " + std::to_string(keep) + " of " + std::to_string(T));
             m_->accept(keep);
             last_open = false;

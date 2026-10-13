@@ -10,6 +10,7 @@
 #include "kernels/sampling/spec.cuh"
 #include "model/qwen4exp/config.h"
 #include "model/qwen4exp/forward.h"
+#include "model/qwen4exp/round_trace.h"
 #include "model/qwen4exp/weights.h"
 #include "runtime/expert_store.h"
 
@@ -327,6 +328,11 @@ int truss_slots(const truss_model * m) { return m->fwd->slots(); }
 
 void truss_lock_ms(truss_model * m, double * out4, int reset) { m->fwd->lock_ms(out4, reset != 0); }
 
+/* TRUSS_ROUND_TRACE=<file> (track U): the interval log is process-global. dump flushes what is buffered; mark
+   records a phase boundary (the tag is the harness's). Both do nothing when the variable is unset. */
+void truss_round_trace_dump(void) { q::rt::dump(); }
+void truss_round_trace_mark(int tag) { q::rt::mark(tag); }
+
 int truss_select(truss_model * m, int slot)
 {
     return guarded(
@@ -442,7 +448,7 @@ int truss_spec_step_sampled_s(truss_model * m, int slot, int32_t next, const tru
                     ban_rows(*m, *sp, &next, 1, 1);
                     sampling::sample(m->logits, V, 1, p, ctr++, m->next, m->fwd->stream());
                     TRUSS_CUDA(cudaMemcpyAsync(new_next, m->next, sizeof(int), cudaMemcpyDeviceToHost, m->fwd->stream()));
-                    sync(*m);
+                    { TRUSS_RT(q::rt::kPlainSync); q::rt::Wait w(*m->fwd->rt_last_stage()); sync(*m); }
                 });
                 emitted[0] = next, *n_emitted = 1;
                 return 0;
@@ -463,7 +469,8 @@ int truss_spec_step_sampled_s(truss_model * m, int slot, int32_t next, const tru
                     ctr += nw + 1;
                     TRUSS_CUDA(cudaMemcpyAsync(m->spec_host, m->spec_next, sizeof(int) * 2, cudaMemcpyDeviceToHost,
                                                m->fwd->stream()));
-                    sync(*m);
+                    { TRUSS_RT(q::rt::kPickSync); q::rt::Wait w(*m->fwd->rt_last_stage());   // the sampled token: the
+                      sync(*m); }                                                             // last stage held through it
                     *new_next = m->spec_host[1];
                     return m->spec_host[0] + 1;
                 });
@@ -478,7 +485,7 @@ int truss_spec_step_sampled_s(truss_model * m, int slot, int32_t next, const tru
                 ctr += nw + 1;
                 TRUSS_CUDA(cudaMemcpyAsync(m->spec_host, m->spec_next, sizeof(int) * (nw + 1), cudaMemcpyDeviceToHost,
                                            m->fwd->stream()));
-                sync(*m);
+                { TRUSS_RT(q::rt::kPickSyncQ); q::rt::Wait w(*m->fwd->rt_last_stage()); sync(*m); }
                 int j = 0;
                 while (j < nw && m->spec_host[j] == win[j + 1]) ++j;
                 *new_next = m->spec_host[j];

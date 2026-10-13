@@ -26,6 +26,7 @@
 #include <vector>
 
 namespace truss::qwen4exp {
+namespace rt { struct StageState; }   // round_trace.h: TRUSS_ROUND_TRACE's per-stage device-work accounting
 
 // Activations into the dense Q8_0 GEMMs. Q8_1 (default): llama-paw's rounding on the int8 GEMM; full-model KL to
 // llama-paw's Q8 logits 0.0131 = its own run-to-run floor, and the lower perplexity of the two on chat text (TRACKER
@@ -233,6 +234,9 @@ public:
     int position(int slot) const;
     // host time each stage was held and waited for (ms since the last reset): [front held, front wait, last held, last wait]
     void lock_ms(double out[4], bool reset = false);
+    // TRUSS_ROUND_TRACE: the last stage's accounting, for a host wait on its device made outside the engine (the
+    // caller's pick). Harmless when the trace is off.
+    rt::StageState * rt_last_stage();
 
     int position() const { return seq_pos_[active_]; }   // tokens consumed so far (the selected slot)
     static int fetch_rows();                // run() chunks of at most this many tokens take the fetch (decode) path
