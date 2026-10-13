@@ -51,14 +51,18 @@ class FairGate:
     streams means one of them freezes behind the other's prefill. Tickets go in a deque and only the head may take
     a permit. Not re-entrant (a request must never hold the engine lock while asking for it again)."""
 
-    def __init__(self, permits: int, name: str = "gate"):
+    def __init__(self, permits: int, name: str = "gate", thread_bound: bool = True):
         self.cv, self.permits, self.queue, self.name = threading.Condition(), permits, deque(), name
         self.holders = set()   # thread ids holding a permit, so a re-acquire raises instead of deadlocking
+        # thread_bound False: a permit belongs to a request, not a thread (the slot gate: a streaming request's
+        # generator steps run on whichever anyio worker thread is free, so it may take its slot on one thread and
+        # give it back on another, and one worker may serve two requests' steps). No holder bookkeeping then.
+        self.thread_bound = thread_bound
 
     def acquire(self):
         me, tid = object(), threading.get_ident()
         with self.cv:
-            if tid in self.holders:
+            if self.thread_bound and tid in self.holders:
                 raise RuntimeError(f"{self.name}: re-entrant acquire would deadlock; every engine call goes "
                                    f"through Engine.call, which locks for one call only")
             self.queue.append(me)
@@ -72,15 +76,17 @@ class FairGate:
                 raise
             self.permits -= 1
             self.queue.popleft()
-            self.holders.add(tid)
+            if self.thread_bound:
+                self.holders.add(tid)
             return me
 
     def release(self):
         with self.cv:
             tid = threading.get_ident()
-            if tid not in self.holders:
-                raise RuntimeError(f"{self.name}: release without a permit")
-            self.holders.discard(tid)
+            if self.thread_bound:
+                if tid not in self.holders:
+                    raise RuntimeError(f"{self.name}: release without a permit")
+                self.holders.discard(tid)
             self.permits += 1
             self.cv.notify_all()
 
@@ -150,7 +156,7 @@ class Engine:
         self.n_slots = max(1, getattr(self.model, "slots", 1))   # truss_slots(), 1 without TRUSS_SLOTS
         self.slots = [Slot(i) for i in range(self.n_slots)]
         self.lock = FairGate(1, "engine lock")        # one engine call; never held across a yield
-        self.slot_gate = FairGate(self.n_slots, "slot gate")   # one permit per FREE slot: a 3rd request queues
+        self.slot_gate = FairGate(self.n_slots, "slot gate", thread_bound=False)   # one permit per FREE slot: a 3rd request queues
         # TRUSS_PREFILL_PIECE: how big a prompt piece is while another stream decodes. It has to be a multiple of
         # --chunk: measured on the served model (GATE 2, reports/LOG.md), the same 25,170-token prompt cut at 4096
         # produced a different first generated token than one call did, while cut at 8192 or 16384 it produced the
