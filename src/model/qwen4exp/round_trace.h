@@ -70,14 +70,21 @@ struct Rec
 {
     int64_t t0 = 0, dur = 0;    // ns on steady_clock (gpu work: placed at the end of the segment, minus its length)
     int32_t site = 0, slot = -1, stage = -1, kind = kKindHost;
-    int64_t aux = 0;            // marks: the tag; others: the round counter
+    int64_t aux = 0;            // marks: the tag; others: the round counter | kAuxPlacedBound (see below)
 };
+
+// A device segment read from a pair whose section had already been released (drain_stage) is placed at the host
+// time of the last stamp INSIDE that section: that is a lower bound on when the device started it - the upper bound
+// on when it ended is the sweep that happened to read the pair, which is not recorded. Such a segment is real device
+// work at an uncertain position, so it carries this bit and the report keeps it out of the busy/idle split of any
+// window it lands in instead of inventing busy time where the device never ran (W0).
+constexpr int64_t kAuxPlacedBound = 1LL << 62;
 
 struct Hdr
 {
     char magic[8] = { 'T', 'R', 'U', 'S', 'S', 'R', 'T', '1' };   // constant; the reader sniffs the layout by SIZE,
                                                                   // because v3 shipped without this field
-    int32_t ver = 5, nstage = 2;
+    int32_t ver = 6, nstage = 2;   // v6: aux carries kAuxPlacedBound; the layout is unchanged from v5
     int64_t epoch = 0;          // steady_clock at open, ns
     int32_t dev[4] = { -1, -1, -1, -1 };   // device of stage 0, 1, ... (the report names the GPU)
     int32_t pad = 0;
@@ -178,7 +185,6 @@ struct StageState
     // splits its segment in two - the work queued before the stamp and the work enqueued after it.
     cudaEvent_t evM = nullptr;
     bool has_m = false;
-    int64_t m_t = 0;            // host time of that stamp: where the first of the two segments ends
     int cur = 0;
     double cum = 0;             // ms of device work already accounted for in this section
     int64_t last_t = 0;         // host time of the stamp cum was taken at: where the next segment starts
@@ -250,8 +256,9 @@ inline void drain_stage(StageState & st, int64_t not_before = 0)
         const double d = ms - st.pend_cum[p];
         const int64_t t0 = st.pend_t0[p];
         st.pend[p] = false;
-        if (d > 0.0 && t0 >= not_before)
-            push({ t0, (int64_t) (d * 1e6), kGpu, st.pend_slot[p], st.stage, kKindGpu, st.pend_round[p] });
+        if (d > 0.0 && t0 >= not_before)   // placement is a lower bound only: see kAuxPlacedBound
+            push({ t0, (int64_t) (d * 1e6), kGpu, st.pend_slot[p], st.stage, kKindGpu,
+                   st.pend_round[p] | kAuxPlacedBound });
     }
 }
 
@@ -302,7 +309,7 @@ inline void stamp_mid(StageState & st)
     if (!on() || !st.held) return;
     DevGuard g(st.device);
     if (!st.evM && cudaEventCreate(&st.evM) != cudaSuccess) return;
-    if (cudaEventRecord(st.evM, st.s) == cudaSuccess) st.m_t = now(), st.has_m = true;
+    if (cudaEventRecord(st.evM, st.s) == cudaSuccess) st.has_m = true;
 }
 
 // A host wait on this stage's own device, inside the held section: stamp before it, account the work after it.
@@ -331,9 +338,20 @@ struct Wait
         const bool split = st->has_m && cudaEventElapsedTime(&mm, st->evA[st->cur], st->evM) == cudaSuccess;
         if (cudaEventElapsedTime(&ms, st->evA[st->cur], st->evB[st->cur]) == cudaSuccess)
         {
+            // Host and device coincide at the return of the wait this object wraps - evB is complete now - so the
+            // device passed evM at t_end - (ms - mm), NOT at the host time of the mid stamp. Anchoring on m_t drew
+            // the queued-work segment 8-11 ms early, inside the PREVIOUS round's pick window, and the reader charged
+            // the window it should have filled to "host wait on this GPU" = idle: 6.08 ms/round of invented idle
+            // (track U W0, 10-14). Chain back from the sync's return instead.
+            const int64_t t_end = now();
             if (split && mm > st->cum)   // what was already queued, drained by this wait
-                push_work(st->cum, st->last_t, mm, st->m_t, st->stage, slot, round);
-            push_work(st->cum, st->last_t, ms, now(), st->stage, slot, round,
+            {
+                const int64_t d_ns = (int64_t) ((mm - st->cum) * 1e6);
+                int64_t mid_end = t_end - (int64_t) ((ms - mm) * 1e6);
+                if (mid_end < st->last_t + d_ns) mid_end = st->last_t + d_ns;   // never overlap the prior segment
+                push_work(st->cum, st->last_t, mm, mid_end, st->stage, slot, round);
+            }
+            push_work(st->cum, st->last_t, ms, t_end, st->stage, slot, round,
                       split ? kGpuSample : kGpu);   // and what ran after the mid stamp
         }
         st->has_m = false;
