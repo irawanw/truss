@@ -221,6 +221,10 @@ int truss_reset(truss_model * m)
     return guarded(
         [&] {
             m->fwd->reset();
+            // A fresh sequence starts a fresh random stream. Every sampled row draws from (seed, sample_counter),
+            // so without this a run's samples depend on how many sampled rows earlier runs consumed. With
+            // TRUSS_SLOTS this is the selected slot's counter; the other slots keep theirs (truss_select swaps).
+            m->sample_counter = 0;
             return 0;
         },
         -1);
