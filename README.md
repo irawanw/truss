@@ -22,6 +22,17 @@ GPUs instead of about a third, which is where most of the 2x comes from. Decode 
 machine. Model card: [PAW-125B-FLASH-NEXT-X3.1](https://huggingface.co/lackonendes/PAW-125B-FLASH-NEXT-X3.1).
 Every number has a row in TRACKER.md (kept locally, internal-only, not in this repo) with the command that produced it.
 
+Tried on the two-GPU decode on 2026-10-13 (measured on a replay of 16 real agent requests, served
+sampling, run-to-run spread 1.2%):
+- **Fused small kernels** (`TRUSS_HC_SILU`, `TRUSS_HC_COLLAPSE`, `TRUSS_ROUTE_PUBLISH`): adopted, bit-exact,
+  +4.7% (122 -> 128 tok/s greedy at 150K).
+- **Context lookup drafts** (branch `agent/draft-tokens`, `TRUSS_LOOKUP`, off by default): exact, but 114 tok/s vs
+  115-116 without. MTP drafts already cover what the context would add.
+- **Draft stop rule and draft count** (min-p 0.3-0.6, 5-7 drafts): the served 0.5 / 7 is on a plateau; other values
+  lose 4-8%.
+- **Early expert window, helper experts** (branches `agent/early-window`, `agent/helper-experts`): slower; the
+  expert window is DRAM-bound (~580 GB/s) and the split adds ~70 us per layer.
+
 ## Start here
 
 - **[docs/reference/](docs/reference/README.md)** — every source file: what it computes, API and shapes, layouts,
