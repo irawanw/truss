@@ -380,6 +380,10 @@ struct Forward::Impl {
     {
         if (!dc_on) return;
         dc_on = false;
+        // a decode pass's commit fetches in ring mode; with two slots the store may be in stream mode now (the other
+        // slot's prompt chunk ran since this slot's verify), and checkpoint() / run_chunk() reach here before setting
+        // a mode: the driver then threw "fetch outside ring mode" (two-agent test, 10-13)
+        experts->begin_ring();
         mtp_commit(dc_tokens.data(), dc_pos0, dc_T, false);
     }
     struct Verify {                                      // the window verify() left uncommitted
