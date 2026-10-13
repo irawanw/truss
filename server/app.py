@@ -1,8 +1,10 @@
 """TRUSS OpenAI-compatible server (chat and text completions, streaming or not) for one model on one GPU.
 
-One sequence at a time. A new prompt that extends the sequence already in the engine (same tokens, then more) only
-evaluates the new tokens; anything else starts a new sequence (the GDN state cannot be rewound). Greedy decoding
-takes the argmax on the device; sampling copies the logits.
+TRUSS_SLOTS sequences at once (1 without the flag, which is today's behaviour): each request owns a sequence for its
+whole life and holds the engine lock for one call at a time, so two streams take turns per round (~30 ms) and
+neither waits for the other's prompt. A new prompt that extends the sequence already in its slot (same tokens, then
+more) only evaluates the new tokens; anything else starts a new sequence in that slot (the GDN state cannot be
+rewound). Greedy decoding takes the argmax on the device; sampling copies the logits.
 
 Tool calls: the model's <tool_call> XML is returned as OpenAI `tool_calls` (finish_reason "tool_calls"), and
 assistant tool calls in the history have their JSON-string arguments parsed before templating (server/tools.py).
@@ -11,7 +13,8 @@ Sampling defaults are llama-server's (temperature 0.8, top_k 40, top_p 0.95, min
 sampling parameters gets what it got from llama-paw on this port; temperature 0 is greedy.
 
 Each request logs one line (to stdout and --log) in the format flashnext_strata_bench.py parses, so that bench runs
-unchanged against TRUSS; --log-tag sets its prefix (the bench counts "strata serve: prompt").
+unchanged against TRUSS; --log-tag sets its prefix (the bench counts "strata serve: prompt", so the slot and the
+round-gap clauses are appended at the END of the line, never before "prompt"). Progress lines carry the slot too.
 
 usage: CUDA_VISIBLE_DEVICES=2 python3 -m server.app --model <gguf> --tokenizer <tokenizer.json> [--port 8080]
 """
@@ -21,12 +24,13 @@ import os
 import threading
 import time
 import uuid
+from collections import deque
 
 import anyio
 import asyncio
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from server.chat import Chat, Detokenizer
@@ -34,8 +38,124 @@ from server.tools import ToolStream, normalize_messages, parse_calls
 from server.truss_ctypes import PENALTY_CAP, Model, Sampling, TrussError
 
 
+def prefix_len(prompt, seq):
+    """len(seq) when seq is a proper prefix of prompt (the request still has to fit its own reply on top of it),
+    else 0. This is what makes a slot's cached prefix reusable by the next request."""
+    n = len(seq)
+    return n if 0 < n < len(prompt) and prompt[:n] == seq else 0
+
+
+def lcp(prompt, seq):
+    """How many leading tokens a slot's cache shares with this prompt, whether or not it can be reused. Cheap in
+    the common case: when seq is a proper prefix of prompt the answer is already known from the reuse test, so only
+    a genuine miss pays the scan, and a miss is a read of seconds. A1 logs this per slot - the size of the miss (a
+    126K conversation whose first difference sits at 60K) is what A2's checkpoints have to be sized against."""
+    n = prefix_len(prompt, seq)
+    if n:
+        return n
+    m = min(len(prompt), len(seq))
+    for i in range(m):
+        if prompt[i] != seq[i]:
+            return i
+    return m
+
+
+def raw_ids(raw, n_vocab):
+    """The token ids of a client-supplied `prompt` field, validated (review F1). That field moved the trust boundary
+    from the tokenizer to the client and nothing downstream checks the values: rows_kernel takes the embedding row
+    at (size_t) id with no bound, so one id >= n_vocab reads off the end of the table and a negative one becomes an
+    address of ~1.8e19 - an illegal address, which a CUDA context does not survive, and both slots go down with it
+    until a restart. So: a flat list of ints in [0, n_vocab), never empty (an empty prompt leaves the engine nothing
+    to sample and its error reaches the client as a 500). numpy does the range test because a Python loop over a
+    150K-token prompt costs ~50 ms; the dtype test is what rejects floats, strings, bools and None."""
+    if not raw:
+        raise ValueError("prompt: the token id list must not be empty")
+    a = np.asarray(raw)
+    if a.ndim != 1 or not np.issubdtype(a.dtype, np.integer):
+        raise ValueError(f"prompt: token ids must be a flat list of ints, got {a.dtype.name} of shape {a.shape}")
+    if a.min() < 0 or a.max() >= n_vocab:
+        raise ValueError(f"prompt: token ids must be in [0, {n_vocab}), got {int(a.min())}..{int(a.max())}")
+    return a.tolist()
+
+
+class FairGate:
+    """A counting semaphore that serves waiters strictly in arrival order. threading.Lock/Semaphore make no fairness
+    promise: the thread that just released can re-acquire ahead of the other one indefinitely, which with two
+    streams means one of them freezes behind the other's prefill. Tickets go in a deque and only the head may take
+    a permit. Not re-entrant (a request must never hold the engine lock while asking for it again)."""
+
+    def __init__(self, permits: int, name: str = "gate", thread_bound: bool = True, timeout=None):
+        # timeout (seconds): how long a waiter may queue before it is an error rather than a hung request. A request
+        # stuck behind an engine call that never returns holds its worker thread and its client's connection open
+        # forever (review H3); the engine's own waits are bounded the same way (TRUSS_SPIN_TIMEOUT_S).
+        self.timeout = timeout
+        self.cv, self.permits, self.queue, self.name = threading.Condition(), permits, deque(), name
+        self.holders = set()   # thread ids holding a permit, so a re-acquire raises instead of deadlocking
+        # thread_bound False: a permit belongs to a request, not a thread (the slot gate: a streaming request's
+        # generator steps run on whichever anyio worker thread is free, so it may take its slot on one thread and
+        # give it back on another, and one worker may serve two requests' steps). No holder bookkeeping then.
+        self.thread_bound = thread_bound
+
+    def acquire(self, timeout=None):
+        me, tid = object(), threading.get_ident()
+        limit = self.timeout if timeout is None else timeout
+        until = None if limit is None else time.monotonic() + limit
+        with self.cv:
+            if self.thread_bound and tid in self.holders:
+                raise RuntimeError(f"{self.name}: re-entrant acquire would deadlock; every engine call goes "
+                                   f"through Engine.call, which locks for one call only")
+            self.queue.append(me)
+            try:
+                while not (self.permits and self.queue[0] is me):
+                    left = None if until is None else until - time.monotonic()
+                    if left is not None and left <= 0:
+                        raise TimeoutError(f"{self.name}: no permit within {limit:.0f} s")
+                    self.cv.wait(left)
+            except BaseException:   # a cancelled wait must not leave its ticket at the head of the queue
+                if me in self.queue:
+                    self.queue.remove(me)
+                    self.cv.notify_all()
+                raise
+            self.permits -= 1
+            self.queue.popleft()
+            if self.thread_bound:
+                self.holders.add(tid)
+            return me
+
+    def release(self):
+        with self.cv:
+            tid = threading.get_ident()
+            if self.thread_bound:
+                if tid not in self.holders:
+                    raise RuntimeError(f"{self.name}: release without a permit")
+                self.holders.discard(tid)
+            self.permits += 1
+            self.cv.notify_all()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *_exc):
+        self.release()
+        return False
+
+
+class Slot:
+    """One sequence in the engine, as the server sees it: the tokens it holds, where its checkpoint is, whether a
+    request owns it, and when it was last used (the tie-break when a prompt matches neither). `pos` is the engine's
+    own position, recorded by Engine.call after every call, so it is never read off the wrong slot."""
+    __slots__ = ("idx", "cached", "ck_tokens", "busy", "last_used", "taken", "pos")
+
+    def __init__(self, idx: int):
+        self.idx, self.cached, self.ck_tokens = idx, [], []
+        self.busy, self.last_used, self.taken, self.pos = False, 0.0, 0.0, 0
+
+
 class Engine:
-    """The model plus the sequence in it; generate() is the only way in and holds the lock."""
+    """The model plus its sequences: TRUSS_SLOTS of them, one before that flag existed. generate() is the only way
+    in; it owns a slot for the whole request and holds the engine lock one call at a time, so two requests take
+    turns per round instead of per request."""
 
     def __init__(self, a):
         # the tokenizer (transformers + torch imports, ~2.3 s) loads on a thread while the model loads: the ctypes
@@ -56,11 +176,9 @@ class Engine:
                          if i is not None and i >= 0}
         self.name, self.log_path, self.log_tag = a.name, a.log, a.log_tag
         self.dump_dir = a.dump_dir
-        self.cached = []               # tokens in the engine's sequence
-        self.ck_tokens = []            # the sequence at the engine's checkpoint (the end of the last prompt)
+        self.init_sequences(a.chunk)   # one record per sequence + the two fair gates (see below)
         self.im_start = self.chat.token_id("<|im_start|>")
         self.think_close = self.chat.token_id("</think>")
-        self.lock = threading.Lock()
 
     def log(self, line: str):
         print(line, flush=True)
@@ -72,11 +190,156 @@ class Engine:
         """Live progress for the console / pm2 log only (the --log file keeps one summary line per request)."""
         print(line, flush=True)
 
-    def watch_prefill(self, n_read, base, t0, stop):
-        """Prints one line per finished prompt chunk while a blocking eval runs on the request thread."""
+    # ------------------------------------------------------------------ the sequences
+
+    def init_sequences(self, chunk=8192):
+        """One record per engine sequence plus the two fair gates. __init__ calls it after the model loads; the
+        host-only tests call it on a bare Engine whose model is a fake."""
+        self.n_slots = max(1, getattr(self.model, "slots", 1))   # truss_slots(), 1 without TRUSS_SLOTS
+        self.slots = [Slot(i) for i in range(self.n_slots)]
+        # TRUSS_ENGINE_CALL_TIMEOUT: a request that cannot get the engine within this fails with 503 instead of
+        # hanging behind a wedged call (H3). Generous: the lock is held for one engine call, and a full-chunk prefill
+        # of a long prompt is the longest normal one.
+        self.lock = FairGate(1, "engine lock", timeout=float(os.environ.get("TRUSS_ENGINE_CALL_TIMEOUT", 600)))
+        # One permit per FREE slot: a 3rd request queues. TRUSS_SLOT_WAIT_TIMEOUT (review F3) bounds that queue:
+        # this is the gate the live configuration actually waits on (with the engine running its own slots, the
+        # engine lock is never taken), so without a limit one wedged slot queues every later request behind it.
+        self.slot_gate = FairGate(self.n_slots, "slot gate", thread_bound=False,
+                                  timeout=float(os.environ.get("TRUSS_SLOT_WAIT_TIMEOUT", 600)))
+        # TRUSS_PREFILL_PIECE: how big a prompt piece is while another stream decodes. It has to be a multiple of
+        # --chunk: measured on the served model (GATE 2, reports/LOG.md), the same 25,170-token prompt cut at 4096
+        # produced a different first generated token than one call did, while cut at 8192 or 16384 it produced the
+        # same 64 tokens — a piece smaller than an engine chunk moves the row-count boundaries the kernels tile on.
+        # 0 = never split, which is how it behaved before slots.
+        # the engine runs the slots itself (Forward::prompt / round with per-stage locks) when the binding has the
+        # slot-explicit calls: then the server splits nothing (the engine interleaves at its chunks)
+        self.engine_slots = self.n_slots > 1 and hasattr(self.model, "spec_step_sampled_s")
+        self.prefill_piece = 0 if self.engine_slots else int(os.environ.get("TRUSS_PREFILL_PIECE", chunk))
+        self.last_rounds = 0
+
+    @property
+    def cached(self):
+        """Slot 0's sequence. With TRUSS_SLOTS=1 that is the engine's sequence, which is what scripts/replay.py and
+        the host-only tests read; with 2 slots, use the slot record."""
+        return self.slots[0].cached
+
+    @cached.setter
+    def cached(self, ids):
+        self.slots[0].cached = ids
+
+    @property
+    def ck_tokens(self):
+        return self.slots[0].ck_tokens
+
+    @ck_tokens.setter
+    def ck_tokens(self, ids):
+        self.slots[0].ck_tokens = ids
+
+    @property
+    def n_rounds(self):
+        """Decode rounds of the request that finished last (scripts/replay.py's tokens-per-round check)."""
+        return self.last_rounds
+
+    def call(self, slot, fn, *args):
+        """Every engine call goes through here, so no call can run on another slot's sequence. With several slots the
+        engine's slot-explicit call (`<name>_s`) runs WITHOUT a server lock: the engine holds each GPU stage only while
+        this slot's work is enqueued there, so two requests' rounds overlap on the two GPUs, and a long prompt gives
+        way to the other slot's rounds (TRUSS_DECODE_SHARE). One slot: the fair lock and select(), as before."""
+        if self.engine_slots:
+            out = getattr(self.model, fn.__name__ + "_s")(slot.idx, *args)
+            slot.pos = self.model.position_s(slot.idx)
+            return out
+        try:
+            with self.lock:
+                self.model.select(slot.idx)
+                out = fn(*args)
+                slot.pos = self.model.position
+                return out
+        except TimeoutError as e:
+            raise HTTPException(503, str(e))
+
+    def other_busy(self, slot):
+        """Another slot has a request in flight: the prompt read then goes in pieces so that stream keeps its rounds."""
+        return any(s.busy and s is not slot for s in self.slots)
+
+    def will_split(self, n, slot):
+        return self.prefill_piece > 0 and n > self.prefill_piece and self.other_busy(slot)
+
+    def read(self, slot, ids):
+        """eval() on this slot: one call when nothing else is running (full prefill speed), otherwise pieces of
+        TRUSS_PREFILL_PIECE with the lock released between them, so the other stream gets a round per piece. The
+        head runs on the last row of every call, so where the pieces fall cannot change the result. Returns the
+        last piece's logits row. truss_progress() is per model, not per slot, so this logs its own progress."""
+        piece = self.prefill_piece
+        if not self.will_split(len(ids), slot):
+            return self.call(slot, self.model.eval, ids)
+        n, t0, out = len(ids), time.time(), None
+        for i in range(0, n, piece):
+            out = self.call(slot, self.model.eval, ids[i:i + piece])
+            done = min(i + piece, n)
+            rate = done / max(time.time() - t0, 1e-9)
+            self.progress(f"{self.log_tag}: slot {slot.idx} prefill {done}/{n} tokens ({100.0 * done / n:.0f}%), "
+                          f"{rate:.0f} tok/s in {piece}-token pieces, "
+                          f"ETA {(n - done) / max(rate, 1e-9):.0f} s")
+        return out
+
+    def pick_slot(self, prompt_ids):
+        """The free slot whose sequence, or checkpoint, is the longest prefix of this prompt; when nothing matches,
+        the free slot holding the FEWEST cached tokens (ties: least recently used). Called while holding a
+        slot_gate permit, which is what makes a free slot guaranteed.
+
+        A1 (LOG.md "v1.6 merged build live"): the LRU-only rule gave a prompt that matched nothing whatever had
+        sat idle longest, which is how a 55-token side request evicted a 126K conversation (3 of that test's 16
+        full reads) and made its next turn read 126K again. Least-cached puts the side request on the slot with the
+        least to lose while the conversation that is mid-exchange stays free for its own next turn."""
+        best, best_rank = None, None
+        for s in self.slots:
+            if s.busy:
+                continue
+            match = max(prefix_len(prompt_ids, s.cached), prefix_len(prompt_ids, s.ck_tokens))
+            # a slot that matches beats one that does not, then the longest match; with no match anywhere, the slot
+            # with the fewest cached tokens to throw away. -last_used keeps the old tie-break.
+            rank = (1 if match else 0, match if match else -len(s.cached), -s.last_used)
+            if best_rank is None or rank > best_rank:
+                best, best_rank = s, rank
+        return best
+
+    def acquire_slot(self, prompt_ids, note=""):
+        """Take a sequence for a request, waiting FIFO while every slot is busy, and say which one it got. The
+        request line from the route arrives in `note` and is logged here, because only now is the slot known. The
+        lcp field is the longest common prefix with every slot's cache and checkpoint, reused or not (A1): the
+        reuse number in the prefill line only ever says 0 or all of it, which is what hid the reads in the first
+        place."""
+        t = time.time()
+        try:
+            self.slot_gate.acquire()
+        except TimeoutError as e:   # the same shape the engine lock's timeout already answers with
+            raise HTTPException(503, str(e))
+        waited = time.time() - t
+        slot = self.pick_slot(prompt_ids)
+        slot.busy, slot.taken = True, t
+        lcp_line = "lcp " + ", ".join(f"s{o.idx} {lcp(prompt_ids, o.cached)}/ck {lcp(prompt_ids, o.ck_tokens)}"
+                                      for o in self.slots)
+        wait = f", waited {waited:.1f} s for a free sequence" if waited >= 1.0 else ""
+        if note:
+            self.log(f"{self.log_tag}: {note}, slot {slot.idx}, {lcp_line}{wait}")
+        else:
+            self.progress(f"{self.log_tag}: slot {slot.idx}, {lcp_line}{wait}")
+        return slot
+
+    def release_slot(self, slot):
+        """generate()'s finally: the sequence is free for the next request again (client disconnect included), and
+        the gate permit goes back so a queued request can take it."""
+        slot.busy, slot.last_used = False, time.time()
+        self.slot_gate.release()
+
+    def watch_prefill(self, n_read, base, t0, stop, slot=-1):
+        """Prints one line per finished prompt chunk while a blocking eval runs on the request thread. Only started
+        when that eval holds the engine to itself, since truss_progress() is per model, not per slot."""
         seen = 0
         while not stop.wait(0.5):
-            done, total = self.model.progress()
+            done, total = (self.model.progress_s(slot) if self.engine_slots and slot >= 0
+                           else self.model.progress())
             if done < seen:   # a second eval call (the prompt's tail after the checkpoint) restarted the counter
                 base, seen = base + seen, 0
             if done <= seen or total <= 0:
@@ -84,7 +347,7 @@ class Engine:
             seen = done
             run = base + done
             rate = run / max(time.time() - t0, 1e-9)
-            self.progress(f"{self.log_tag}: prefill {run}/{n_read} tokens ({100.0 * run / n_read:.0f}%), "
+            self.progress(f"{self.log_tag}: slot {slot} prefill {run}/{n_read} tokens ({100.0 * run / n_read:.0f}%), "
                           f"{rate:.0f} tok/s, ETA {(n_read - run) / max(rate, 1e-9):.0f} s")
 
     def dump(self, prompt_ids, text, finish, sampling, keep=20):
@@ -103,7 +366,7 @@ class Engine:
         except OSError as e:
             print(f"dump failed: {e}", flush=True)
 
-    def log_stop(self, tok, n_prompt, n_gen, rounds):
+    def log_stop(self, slot, tok, n_prompt, n_gen, rounds):
         """A reply ended with an end-of-turn token: where it came from (the round's sampled first token, i.e. the
         previous round's verified sample, or an accepted draft) and the text before it, for stall diagnosis."""
         src = "plain step"
@@ -114,10 +377,10 @@ class Engine:
                 src = (f"round at gen {start}: emitted[{i}] of {len(emitted)} "
                        f"({'the verified sample fed as nxt' if i == 0 else 'an ACCEPTED DRAFT'})")
                 break
-        before = self.chat.tok.decode(self.cached[n_prompt:n_prompt + n_gen - 1][-40:], skip_special_tokens=False)
+        before = self.chat.tok.decode(slot.cached[n_prompt:n_prompt + n_gen - 1][-40:], skip_special_tokens=False)
         if before.rstrip().endswith("</tool_call>"):
             return   # the normal end of an agent step: not logged
-        self.log(f"{self.log_tag}: STOP without a tool call at gen {n_gen} ({src}): ...{before[-120:]!r}")
+        self.log(f"{self.log_tag}: slot {slot.idx} STOP without a tool call at gen {n_gen} ({src}): ...{before[-120:]!r}")
 
     def save_request(self, prompt_ids, gen_ids, finish, n_gen, meta):
         """TRUSS_REQ_LOG_DIR: the last 12 requests as .npz (prompt ids, generated ids as held by the engine, meta),
@@ -167,12 +430,15 @@ class Engine:
             f = np.where(keep, q, 0.0); f /= f.sum()
             return raw, f
 
-        with self.lock:
-            self.cached, self.ck_tokens = [], []
-            self.model.reset()
+        # probe is a request like any other: it takes a sequence (its replay destroys it, so the next request on
+        # that slot reads its prompt again) and every call goes through Engine.call.
+        slot = self.acquire_slot(prompt, f"probe: {name}")
+        try:
+            self.call(slot, self.model.reset)
+            slot.cached, slot.ck_tokens = [], []
             n = len(gen)
             j0 = max(0, n - window)
-            logits = self.model.eval(prompt + gen[:j0])
+            logits = self.call(slot, self.model.eval, prompt + gen[:j0])
             rows = []
             think_closed = bool(self.think_close in gen[:j0])
             for j in range(j0, n):
@@ -184,8 +450,11 @@ class Engine:
                                  top=[(self.chat.tok.decode([int(i)]), round(float(f[i]), 4)) for i in np.argsort(-f)[:6]]))
                 think_closed = think_closed or t == self.think_close
                 if j + 1 < n:
-                    logits = self.model.eval([t])
-            self.model.reset()
+                    logits = self.call(slot, self.model.eval, [t])
+            self.call(slot, self.model.reset)
+            slot.cached = []
+        finally:
+            self.release_slot(slot)
         last = rows[-1]
         risky = [r for r in rows if r["p_stop"] > 0.001]
         return dict(meta=meta, n_prompt=len(prompt), n_gen=n, last=last,
@@ -195,7 +464,7 @@ class Engine:
 
     def generate(self, prompt_ids, max_tokens, temperature, top_p, top_k, seed, stop_strings, min_p=0.0,
                  presence_penalty=0.0, frequency_penalty=0.0, repetition_penalty=1.0, penalty_last_n=64,
-                 think_open=False):
+                 think_open=False, note="", ignore_eos=False):
         """Yields (token id, text delta, finish reason or None); the last item has the finish reason.
         Penalties (sampled requests only; greedy ignores them): llama.cpp's formulas over the last penalty_last_n
         tokens of the sequence (prompt included, as llama-server and Strata count), or with penalty_last_n -1 over
@@ -204,20 +473,25 @@ class Engine:
         the turn before </think>: the end-of-turn tokens are banned until </think> is fed. Without the ban a model
         that writes an end-of-turn marker literally in its reasoning (e.g. while discussing chat templates) emits the
         real token, the reply stops mid-sentence with no tool call, and an agent client stalls."""
-        with self.lock:
-            n_prompt = len(prompt_ids)
-            if n_prompt == 0:
-                raise ValueError("empty prompt")
+        n_prompt = len(prompt_ids)
+        if n_prompt == 0:
+            raise ValueError("empty prompt")
+        # One sequence for the whole request: a free slot (the one holding the longest prefix of this prompt), or a
+        # FIFO wait while every slot is busy. `note` is the route's request line, logged here now that the slot, and
+        # so the answer to "which stream said this", is known.
+        slot = self.acquire_slot(prompt_ids, note)
+        try:
             max_tokens = max(0, min(max_tokens, self.model.n_ctx - n_prompt))
-            reuse = len(self.cached) if 0 < len(self.cached) < n_prompt and prompt_ids[:len(self.cached)] == self.cached else 0
-            ck = len(self.ck_tokens)
-            if not reuse and 0 < ck < n_prompt and prompt_ids[:ck] == self.ck_tokens and self.model.restore() == ck:
+            reuse = len(slot.cached) if 0 < len(slot.cached) < n_prompt and prompt_ids[:len(slot.cached)] == slot.cached else 0
+            ck = len(slot.ck_tokens)
+            if not reuse and 0 < ck < n_prompt and prompt_ids[:ck] == slot.ck_tokens \
+                    and self.call(slot, self.model.restore) == ck:
                 # the last prompt is a prefix but its reply is not (the client re-sent it without its reasoning, or
                 # edited it): back to the end of that prompt instead of reading everything again
-                self.cached, reuse = list(self.ck_tokens), ck
+                slot.cached, reuse = list(slot.ck_tokens), ck
             if not reuse:
-                self.model.reset()
-                self.cached = []
+                self.call(slot, self.model.reset)   # an unrelated prompt: this slot's sequence starts over
+                slot.cached, slot.ck_tokens = [], []   # reset drops the engine's checkpoint too
             greedy = temperature <= 0
             # sampled requests sample on the device and speculate too (Strata's sampled verify)
             sp = None if greedy else Sampling(temperature, top_p if top_p and top_p > 0 else 1.0, top_k or 0, min_p or 0.0,
@@ -230,23 +504,33 @@ class Engine:
 
             def counted():   # the tokens the penalties see, from the engine's own sequence
                 if penalty_last_n < 0:
-                    return self.cached[n_prompt:]
-                return self.cached[-max(1, min(penalty_last_n, PENALTY_CAP)):]
+                    return slot.cached[n_prompt:]
+                return slot.cached[-max(1, min(penalty_last_n, PENALTY_CAP)):]
 
             def step(tokens):
-                self.cached += list(tokens)
-                if greedy:
-                    return self.model.eval_argmax(tokens)
-                if sp.penalized:
+                """Feed tokens on this slot, return the next token. The prompt's first read is the only call long
+                enough to be split: while another slot has a request it goes in as pieces of plain eval and only the
+                last piece is the step that samples, so the other stream gets its rounds in between. The head runs on
+                the last row of every call, so where the pieces fall cannot change the result."""
+                slot.cached += list(tokens)
+                if self.prefill_piece > 0 and len(tokens) > self.prefill_piece and self.other_busy(slot):
+                    self.read(slot, tokens[:-1])
+                    tokens = tokens[-1:]
+                if sp is not None and sp.penalized:
                     sp.set_history(counted())   # truss_eval_sample counts history as given: the fed tokens are in it
-                return self.model.eval_sample(tokens, sp)
+                return (self.call(slot, self.model.eval_argmax, tokens) if greedy
+                        else self.call(slot, self.model.eval_sample, tokens, sp))
 
             t0 = time.time()
             n_read = n_prompt - reuse
             watch_stop, watcher = threading.Event(), None
-            if n_read > 4096:   # a prompt of more than one chunk: log its progress
-                self.progress(f"{self.log_tag}: prefill start, {n_read} tokens to read ({reuse} reused)")
-                watcher = threading.Thread(target=self.watch_prefill, args=(n_read, 0, t0, watch_stop), daemon=True)
+            # truss_progress is per model, not per slot: watch it only when this read is one eval, because then
+            # nothing else can hold the engine. A piece-wise read logs its own lines (Engine.read).
+            if n_read > 4096 and not self.will_split(n_read, slot):
+                self.progress(f"{self.log_tag}: slot {slot.idx} prefill start, {n_read} tokens to read "
+                              f"({reuse} reused)")
+                watcher = threading.Thread(target=self.watch_prefill, args=(n_read, 0, t0, watch_stop, slot.idx),
+                                           daemon=True)
                 watcher.start()
             try:
                 # checkpoint just before the prompt's last <|im_start|> (~10 ms): the next request may resume there.
@@ -254,51 +538,57 @@ class Engine:
                 # once the reply follows it ("\n\n</think>"), but nothing before a special token can change.
                 cut = next((i for i in range(len(prompt_ids) - 1, reuse, -1) if prompt_ids[i] == self.im_start), 0)
                 if cut > reuse:
-                    self.cached += prompt_ids[reuse:cut]
-                    self.model.eval(prompt_ids[reuse:cut])
-                    self.model.checkpoint()
-                    self.ck_tokens = list(prompt_ids[:cut])
+                    slot.cached += prompt_ids[reuse:cut]
+                    self.read(slot, prompt_ids[reuse:cut])
+                    self.call(slot, self.model.checkpoint)
+                    slot.ck_tokens = list(prompt_ids[:cut])
                     reuse_from = cut
                 else:
                     reuse_from = reuse
                 nxt = step(prompt_ids[reuse_from:])
             except TrussError:
-                self.cached, self.ck_tokens = [], []   # the engine's sequence is unknown now: the next request starts over
+                slot.cached, slot.ck_tokens = [], []   # the engine's sequence is unknown now: the next request starts over
                 raise
             finally:
                 watch_stop.set()
             t1 = time.time()
             if watcher:
-                self.progress(f"{self.log_tag}: prefill done, {n_read} tokens in {t1 - t0:.1f} s "
+                self.progress(f"{self.log_tag}: slot {slot.idx} prefill done, {n_read} tokens in {t1 - t0:.1f} s "
                               f"({n_read / max(t1 - t0, 1e-9):.0f} tok/s)")
             last_log = t1
             detok, text, n_gen, finish = Detokenizer(self.chat), "", 0, "length"
             spec = self.model.drafts > 0
-            drafted = accepted = 0
+            drafted = accepted = n_rounds = 0
             pending = []   # tokens the engine already holds that are still to be emitted (speculative rounds)
             rounds = []    # (generated tokens before the round, emitted [nxt + accepted drafts], next): stop diagnosis
+            t_round, max_gap = t1, 0.0   # the gap between the end of one round and the end of the next
             try:
                 while n_gen < max_tokens:
                     if spec and not pending:   # one round: nxt plus the accepted drafts enter the sequence
-                        if self.model.position + 1 >= self.model.n_ctx:
+                        if slot.pos + 1 >= self.model.n_ctx:
                             break
                         if not greedy and sp.penalized:
                             sp.set_history(counted())   # before nxt; the engine adds nxt and the drafts per row
-                        emitted, after = self.model.spec_step(nxt) if greedy else self.model.spec_step_sampled(nxt, sp)
-                        rounds.append((len(self.cached) - n_prompt, list(emitted), after))   # stop diagnosis
-                        self.cached += emitted
+                        emitted, after = (self.call(slot, self.model.spec_step, nxt) if greedy
+                                          else self.call(slot, self.model.spec_step_sampled, nxt, sp))
+                        rounds.append((len(slot.cached) - n_prompt, list(emitted), after))   # stop diagnosis
+                        slot.cached += emitted
                         drafted += self.model.drafts
                         accepted += len(emitted) - 1
                         pending, nxt = emitted, after
+                        n_rounds += 1
+                        tr = time.time()
+                        max_gap = max(max_gap, tr - t_round)   # what the other stream's prefill costs this stream
+                        t_round = tr
                     tok = pending.pop(0) if spec else nxt
                     n_gen += 1
                     if sp is not None and sp.n_ban and (tok == self.think_close or n_gen >= BAN_MAX_TOKENS):
                         # the reasoning block closed (the engine lifts the ban only inside the call that feeds
                         # </think>), or it ran so long that a stuck reply must still be able to end
                         sp.set_ban([])
-                    if tok in self.stop_ids:
+                    if tok in self.stop_ids and not ignore_eos:
                         finish = "stop"
-                        self.log_stop(tok, n_prompt, n_gen, rounds)
+                        self.log_stop(slot, tok, n_prompt, n_gen, rounds)
                         break
                     delta = detok.push(tok)
                     text += delta
@@ -312,20 +602,22 @@ class Engine:
                     now = time.time()
                     if now - last_log >= 3.0:   # live decode rate in the console / pm2 log
                         last_log = now
-                        self.progress(f"{self.log_tag}: decode {n_gen} tokens, {n_gen / max(now - t1, 1e-9):.1f} tok/s, "
-                                      f"drafts accepted {accepted} of {drafted}")
-                    if not spec and n_gen < max_tokens and self.model.position < self.model.n_ctx:
+                        self.progress(f"{self.log_tag}: slot {slot.idx} decode {n_gen} tokens, "
+                                      f"{n_gen / max(now - t1, 1e-9):.1f} tok/s, drafts accepted {accepted} of {drafted}")
+                    if not spec and n_gen < max_tokens and slot.pos < self.model.n_ctx:
                         nxt = step([nxt])
             except TrussError:
-                self.cached = []
+                slot.cached = []
                 raise
             finally:
                 t2 = time.time()
                 read, gen_s = t1 - t0, t2 - t1
+                self.last_rounds = n_rounds
                 self.log(f"{self.log_tag}: prompt {n_prompt} tokens = {reuse} reused + {n_prompt - reuse} read in "
                          f"{read * 1e3:.0f} ms ({(n_prompt - reuse) / max(read, 1e-9):.1f} tok/s), {n_gen} generated "
-                         f"in {gen_s * 1e3:.0f} ms ({n_gen / max(gen_s, 1e-9):.1f} tok/s), drafts accepted {accepted} of {drafted}")
-                self.save_request(prompt_ids, self.cached[n_prompt:], finish, n_gen,
+                         f"in {gen_s * 1e3:.0f} ms ({n_gen / max(gen_s, 1e-9):.1f} tok/s), drafts accepted {accepted} of {drafted}, "
+                         f"slot {slot.idx}, {n_rounds} rounds, longest gap between rounds {max_gap * 1e3:.0f} ms")
+                self.save_request(prompt_ids, slot.cached[n_prompt:], finish, n_gen,
                                   dict(temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p, think_open=think_open))
                 self.dump(prompt_ids, text, finish, dict(temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p,
                                                          presence_penalty=presence_penalty,
@@ -333,6 +625,8 @@ class Engine:
                                                          repetition_penalty=repetition_penalty,
                                                          penalty_last_n=penalty_last_n))
             yield None, "", finish
+        finally:
+            self.release_slot(slot)   # a client disconnect closes the generator: the slot still comes back
 
 
 # TRUSS_BAN_EOS_IN_THINK=1: no end of turn inside an open reasoning block (off: it looped a reply that never fed
@@ -391,15 +685,27 @@ def make_app(engine: Engine) -> FastAPI:
         def get(key, default, cast):
             v = body.get(key)
             return cast(default if v is None else v)
-        return dict(max_tokens=int(body.get("max_tokens") or body.get("max_completion_tokens") or engine.model.n_ctx),
-                    temperature=get("temperature", 0.8, float), top_p=get("top_p", 0.95, float),
-                    top_k=get("top_k", 40, int), min_p=get("min_p", 0.05, float), seed=body.get("seed"),
-                    presence_penalty=get("presence_penalty", 0.0, float),
-                    frequency_penalty=get("frequency_penalty", 0.0, float),
-                    # llama-server's names too
-                    repetition_penalty=get("repetition_penalty", body.get("repeat_penalty") or 1.0, float),
-                    penalty_last_n=get("penalty_last_n", body.get("repeat_last_n") or 64, int),
-                    stop_strings=[stop] if isinstance(stop, str) else list(stop))
+        p = dict(max_tokens=int(body.get("max_tokens") or body.get("max_completion_tokens") or engine.model.n_ctx),
+                 temperature=get("temperature", 0.8, float), top_p=get("top_p", 0.95, float),
+                 top_k=get("top_k", 40, int), min_p=get("min_p", 0.05, float), seed=body.get("seed"),
+                 presence_penalty=get("presence_penalty", 0.0, float),
+                 frequency_penalty=get("frequency_penalty", 0.0, float),
+                 # llama-server's names too
+                 repetition_penalty=get("repetition_penalty", body.get("repeat_penalty") or 1.0, float),
+                 penalty_last_n=get("penalty_last_n", body.get("repeat_last_n") or 64, int),
+                 # llama-server's ignore_eos: keep generating to max_tokens. Used by the decode-speed benches so that
+                 # two streams decode at the same time instead of one ending its turn early.
+                 ignore_eos=bool(body.get("ignore_eos", False)),
+                 stop_strings=[stop] if isinstance(stop, str) else list(stop))
+        # A repetition_penalty of 0 (or less) makes the engine's penalty divide by it, and it throws from inside the
+        # first decode round - after the engine opened a verify window on this slot, which is the state review C2
+        # found unrecoverable. Rejected here, as a 400 through the ValueError handler below, before a slot is taken or
+        # a response starts. 0 is never valid: any other penalty set is off only when repetition_penalty is 1 too.
+        if p["repetition_penalty"] <= 0:
+            raise ValueError("repetition_penalty must be > 0")
+        if p["penalty_last_n"] < -1:   # -1 means "the whole request" (llama-server); the engine clamps the rest
+            raise ValueError("penalty_last_n must be >= -1")
+        return p
 
     _END, KEEPALIVE = object(), object()
 
@@ -456,6 +762,16 @@ def make_app(engine: Engine) -> FastAPI:
     def models():
         return {"object": "list", "data": [{"id": engine.name, "object": "model", "owned_by": "truss"}]}
 
+    @app.post("/debug/round_trace")
+    def round_trace():
+        """TRUSS_ROUND_TRACE (scripts/u_trace_report.py): flush the engine's buffered intervals to the file now,
+        while the server is alive, so a bench can attribute a served run the way it attributes an in-process one.
+        A shutdown hook would not do: uvicorn leaves on SIGTERM without running atexit handlers."""
+        if not os.environ.get("TRUSS_ROUND_TRACE"):
+            raise ValueError("TRUSS_ROUND_TRACE is not set")
+        engine.model.trace_dump()
+        return {"path": os.environ["TRUSS_ROUND_TRACE"]}
+
     @app.post("/v1/chat/completions")
     async def chat_completions(req: Request):
         body = await req.json()
@@ -464,17 +780,29 @@ def make_app(engine: Engine) -> FastAPI:
         tools = body.get("tools") or None
         if body.get("tool_choice") == "none":
             tools = None
-        prompt = await anyio.to_thread.run_sync(
-            lambda: engine.chat.prompt(normalize_messages(body["messages"]), tools=tools, template_kwargs=kw))
-        ids = await anyio.to_thread.run_sync(engine.chat.encode, prompt)
+        # vLLM-compatible `prompt`: an already-rendered prompt, as text or as token ids, bypasses the chat template.
+        # A client that owns its prompt (an agent that renders its own template, a bench replaying recorded ids)
+        # gets those exact tokens, which is what makes a served measurement comparable to an in-process one.
+        raw = body.get("prompt")
+        if isinstance(raw, list):
+            ids = raw_ids(raw, engine.model.n_vocab)   # F1: these ids go to the embedding table unchecked
+        elif raw is not None:
+            ids = await anyio.to_thread.run_sync(engine.chat.encode, raw)
+        else:
+            prompt = await anyio.to_thread.run_sync(
+                lambda: engine.chat.prompt(normalize_messages(body["messages"]), tools=tools, template_kwargs=kw))
+            ids = await anyio.to_thread.run_sync(engine.chat.encode, prompt)
         if (r := too_long(ids)) is not None:
             return r
         p = params(body)
         p["think_open"] = thinking   # the generation prompt opens <think>: no end of turn before </think>
         pen = "".join(f" {k} {p[k]}" for k, off in (("presence_penalty", 0.0), ("frequency_penalty", 0.0),
                                                      ("repetition_penalty", 1.0)) if p[k] != off)
-        engine.log(f"request: temperature {p['temperature']} top_p {p['top_p']} top_k {p['top_k']} min_p {p['min_p']}"
-                   f"{pen}{' penalty_last_n ' + str(p['penalty_last_n']) if pen else ''}, {len(tools or [])} tools, thinking {'on' if thinking else 'off'}")
+        # logged by generate() once the request has a slot, so the line says which sequence it belongs to (a queued
+        # request that is abandoned before it gets a slot never logs one)
+        p["note"] = (f"request: temperature {p['temperature']} top_p {p['top_p']} top_k {p['top_k']} "
+                     f"min_p {p['min_p']}{pen}{' penalty_last_n ' + str(p['penalty_last_n']) if pen else ''}, "
+                     f"{len(tools or [])} tools, thinking {'on' if thinking else 'off'}")
         rid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
 
         if body.get("stream"):

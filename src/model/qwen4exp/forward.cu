@@ -22,6 +22,7 @@
 #include "kernels/spec/rollback.cuh"
 #include "model/qwen4exp/ple.h"
 #include "model/qwen4exp/ple_reader.h"
+#include "model/qwen4exp/round_trace.h"
 #include "runtime/doorbell.cuh"
 #include "runtime/expert_store.h"
 
@@ -37,6 +38,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <exception>
 #include <immintrin.h>
 #include <mutex>
@@ -44,6 +46,7 @@
 #include <thread>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <sys/mman.h>
@@ -72,6 +75,58 @@ void require(bool ok, const std::string & what)
     if (!ok) throw std::runtime_error("qwen4exp::Forward: " + what);
 }
 
+// TRUSS_SPIN_TIMEOUT_S (default 60): how long a hand-off wait may go without progress before it is an error. Every
+// wait in the hand-off chain runs with a stage lock held, so one that can never be granted has to fail rather than
+// hang (review H1: a stage held forever wedges every slot, and the driver's global lock with it).
+double spin_timeout_s()
+{
+    static const double s = [] {
+        const char * e = std::getenv("TRUSS_SPIN_TIMEOUT_S");
+        const double v = e ? std::atof(e) : 0.0;
+        return v > 0 ? v : 60.0;
+    }();
+    return s;
+}
+
+// TRUSS_FAULT=<site>:<n>[@<slot>][,<site>:<n>[@<slot>]...]: throw on the n-th pass of a named point. R's
+// fault-injection test (reports/review_v15_paw.md C1/C2) needs one slot's request to die mid-chunk while the other
+// runs the same work beside it, so a site counts the passes of one slot (@slot: only that slot; without it, any),
+// and n = + (or 1) fires the first time it is reached after the spec was set. Read on every call - the test arms and
+// clears it between phases (os.environ) - which costs a getenv next to a chunk that takes milliseconds.
+// TRUSS_ROBUST=0 switches the error-path recovery off: the negative control for scripts/r_fault_test.py, which must
+// then fail the way review C1/C2 describe (a wedge behind an abandoned hand-off, a verify window left open). The
+// fault injector and the bounded spins stay on, so a failing run stops with an error instead of hanging.
+bool robust_on()
+{
+    const char * env = std::getenv("TRUSS_ROBUST");
+    return !env || std::atoi(env) != 0;
+}
+
+void inject_fault(const char * site, int slot)
+{
+    const char * env = std::getenv("TRUSS_FAULT");
+    if (!env || !*env) return;
+    const std::string spec = env;
+    static std::mutex mu;
+    static std::map<std::string, int> passes;   // site + slot + spec -> passes (a new spec re-arms from one)
+    std::lock_guard<std::mutex> g(mu);
+    for (size_t i = 0; i < spec.size();) {
+        const size_t comma = spec.find(',', i);
+        std::string one = spec.substr(i, comma == std::string::npos ? std::string::npos : comma - i);
+        i = comma == std::string::npos ? spec.size() : comma + 1;
+        int want = -1;
+        const size_t at = one.rfind('@');
+        if (at != std::string::npos) want = std::atoi(one.c_str() + at + 1), one.erase(at);
+        const size_t colon = one.rfind(':');
+        if (colon == std::string::npos || one.substr(0, colon) != site || (want >= 0 && want != slot)) continue;
+        const std::string after = one.substr(colon + 1);
+        const int n = ++passes[one + "@" + std::to_string(slot) + "|" + spec];
+        if (n == 1 ? (after == "+" || after == "1") : std::atoi(after.c_str()) == n)
+            throw std::runtime_error(std::string("qwen4exp::Forward: TRUSS_FAULT fired at ") + one + " on slot " +
+                                     std::to_string(slot) + " pass " + std::to_string(n));
+    }
+}
+
 template <class X> X * dmalloc(size_t n, bool zero = true)
 {
     X * p;
@@ -96,6 +151,70 @@ struct DeviceGuard {
 };
 
 }  // namespace
+
+// A stage's host-side lock for concurrent slots (Forward::prompt / round): FIFO among waiters, except that work which
+// takes a hand-off from the previous stage carries that hand-off's ticket and is only granted in ticket order (the
+// stage's input buffer holds one hand-off at a time, taken in the order they were handed on). Kernels are only
+// enqueued under it, so two stages hold different slots' work on their GPUs at the same time.
+struct StageLock {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool held = false;
+    uint64_t next_id = 0;
+    std::map<uint64_t, long> waiting;   // arrival order -> the hand-off ticket it takes (0: none)
+    // time held / waited, ns (Forward::lock_ms)
+    std::atomic<long long> held_ns{ 0 }, wait_ns{ 0 };
+    std::chrono::steady_clock::time_point t_held;
+
+    template <class Turn> void lock(long ticket, Turn turn)
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::unique_lock<std::mutex> l(mu);
+        const uint64_t me = next_id++;
+        waiting.emplace(me, ticket);
+        const double limit = spin_timeout_s();
+        try {
+            // wait_for, not wait: a ticket whose hand-off was abandoned is never granted (review C1), and a waiter
+            // that stays in this queue forever blocks every later one. The timeout is an error, never a grant -
+            // taking the lock out of ticket order would read another request's residual rows.
+            while (!cv.wait_for(l, std::chrono::seconds(1), [&] {
+                       if (held) return false;
+                       const long t = turn();
+                       for (const auto & [id, tk] : waiting)
+                           if (tk == 0 || tk == t) return id == me;   // the earliest waiter that may go now
+                       return false;
+                   }))
+                require(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < limit,
+                        "stage lock: hand-off ticket " + std::to_string(ticket) + " ungranted for " +
+                            std::to_string((int) limit) + " s (TRUSS_SPIN_TIMEOUT_S)");
+        } catch (...) {
+            waiting.erase(me);   // the queue is how the others order themselves: a leaver must really leave it
+            cv.notify_all();
+            throw;
+        }
+        waiting.erase(me);
+        held = true;
+        t_held = std::chrono::steady_clock::now();
+        wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t_held - t0).count();
+    }
+    void unlock()
+    {
+        {
+            std::lock_guard<std::mutex> l(mu);
+            held = false;
+            held_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_held).count();
+        }
+        cv.notify_all();
+    }
+};
+
+template <class M> struct Held {   // a stage held for one piece of work (M::acquire / M::release)
+    M & m;
+    Held(M & mm, long ticket) : m(mm) { m.acquire(ticket); }
+    ~Held() { m.release(); }
+    Held(const Held &) = delete;
+    Held & operator=(const Held &) = delete;
+};
 
 // One stage of a layer split (Options::split_layer): layers [lb, le) on `device`; the first stage embeds the tokens,
 // the last one (le == n_layer) has the head and the MTP block. One stage over every layer is the unsplit engine.
@@ -124,7 +243,10 @@ struct Forward::Impl {
     // only waited for once recorded, so a stage enqueues its write of out_host after the next stage has enqueued its
     // take of the previous rows (handed == next->taken), and its take after the previous stage handed them on
     std::atomic<long> handed{ 0 }, taken{ 0 };
-    std::atomic<bool> halted{ false };                   // this stage's prompt thread failed: the other stops waiting
+    // Counted up when a forward on this stage throws, and never cleared: a thread waiting on this stage's hand-off
+    // snapshots it and stops waiting when it moves. Clearing a flag here at the next request's start, as this did,
+    // races with a thread still spinning on it (review H1).
+    std::atomic<unsigned long long> failures{ 0 };
     cudaStream_t s = nullptr;
     cublasHandle_t blas = nullptr;
     std::unique_ptr<DeviceTensors> dev;                  // every tensor except Q8_0 matrices and the PLE table
@@ -328,6 +450,10 @@ struct Forward::Impl {
     {
         if (!dc_on) return;
         dc_on = false;
+        // a decode pass's commit fetches in ring mode; with two slots the store may be in stream mode now (the other
+        // slot's prompt chunk ran since this slot's verify), and checkpoint() / run_chunk() reach here before setting
+        // a mode: the driver then threw "fetch outside ring mode" (two-agent test, 10-13)
+        experts->begin_ring();
         mtp_commit(dc_tokens.data(), dc_pos0, dc_T, false);
     }
     struct Verify {                                      // the window verify() left uncommitted
@@ -461,6 +587,7 @@ struct Forward::Impl {
             }
         }
         if (mtp) dsa_state(mst);
+        alloc_seqs(std::max(1, o.slots));
         const double vram_st = vram_used();
         std::vector<runtime::ExpertLayer> tables;
         for (int l = lb; l < le; ++l) {
@@ -608,6 +735,7 @@ struct Forward::Impl {
         if (out_host) cudaFreeHost(out_host);
         if (out_ready) cudaEventDestroy(out_ready);
         if (in_taken) cudaEventDestroy(in_taken);
+        for (cudaEvent_t e : slot_done) cudaEventDestroy(e);
         if (ple_stage) cudaFreeHost(ple_stage);
         if (ple_copied) cudaEventDestroy(ple_copied);
         if (driver.joinable()) {
@@ -1957,14 +2085,51 @@ struct Forward::Impl {
         has_pending = false;
         dc_on = false, mtp_ahead = false;
         vw.open = false;
+        if (!defer_n.empty()) defer_n[active_seq] = 0;
         kv_reserve(0, true);
+    }
+
+    // The hand-off wait, until `ready` holds. A stage whose forward threw is not going to hand anything on (its own
+    // catch says so through `failures`), and a hand-off that never comes - an abandoned one, or any other hole in the
+    // chain - must not hang here: this runs with a stage lock held, and a stage held forever wedges every slot and
+    // the driver's global lock with it (review H1). TRUSS_SPIN_TIMEOUT_S is far above any legitimate wait: a
+    // hand-off is granted once the chunk before it is enqueued, and the prompt's decode share sleeps at most 5 s.
+    template <class P> void spin_until(const char * what, const Impl & other, P ready) const
+    {
+        const auto base = other.failures.load(std::memory_order_acquire);
+        const auto t0 = std::chrono::steady_clock::now();
+        while (!ready()) {
+            require(other.failures.load(std::memory_order_acquire) == base,
+                    std::string(what) + ": the other layer-split stage's forward failed");
+            require(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < spin_timeout_s(),
+                    std::string(what) + ": no progress for " + std::to_string((int) spin_timeout_s()) +
+                        " s (TRUSS_SPIN_TIMEOUT_S)");
+            std::this_thread::yield();
+        }
+    }
+
+    // Take hand-offs up to `up_to` that the previous stage wrote and this stage never read (its request threw between
+    // the write and the read). Each one must still be taken: the stage lock grants a later ticket only once taken + 1
+    // reaches it, so an untaken hand-off wedges every slot queued behind it, and the previous stage cannot write
+    // out_host again until in_taken is recorded. Called with this stage held, and only up to a hand-off the calling
+    // request produced itself - taking another request's would let its chunk run on rows it never copied (C1).
+    void drain_handoffs(long up_to)
+    {
+        if (!robust_on()) return;   // C1 fix off
+        long n = 0;
+        while (taken.load(std::memory_order_relaxed) < up_to) {
+            TRUSS_CUDA(cudaEventRecord(in_taken, s));
+            taken.fetch_add(1, std::memory_order_release);
+            ++n;
+        }
+        if (n) std::fprintf(stderr, "layer split: stage %d took %ld abandoned hand-off(s)\n", device, n);
     }
 
     // One chunk of the target model at positions pos0 .. pos0 + T - 1. tentative: a verify window (accept() commits).
     void run_chunk(const int32_t * tokens, int pos0, int T, const LayerHook & hook, bool tentative)
     {
         require(T > 0 && T <= max_chunk, "chunk of " + std::to_string(T) + " tokens (max " + std::to_string(max_chunk) + ")");
-        require(pos0 + T <= n_ctx, "sequence longer than n_ctx");
+        require(pos0 + T <= seq_ctx, "sequence longer than n_ctx" + std::string(seqs.size() > 1 ? " / slots" : ""));
         require(!vw.open, "run()/verify() before accept() of the previous verify()");
         flush_commit();   // it reads res, which this chunk rewrites
         check_driver();
@@ -1994,10 +2159,8 @@ struct Forward::Impl {
             dense::q8_rows(q8.at(w.token_embd), ids, T, emb, s);
             hc::expand(emb, T, c.hc, c.d_model, res, s);
         } else {   // the previous stage's residual rows (its out_host, behind its out_ready)
-            while (prev->handed.load(std::memory_order_acquire) <= taken.load()) {
-                require(!prev->halted, "the previous layer-split stage failed");
-                std::this_thread::yield();
-            }
+            spin_until("run_chunk: the previous stage's hand-off", *prev,
+                       [&] { return prev->handed.load(std::memory_order_acquire) > taken.load(); });
             TRUSS_CUDA(cudaStreamWaitEvent(s, prev->out_ready, 0));
             TRUSS_CUDA(cudaMemcpyAsync(res, prev->out_host, row_bytes, cudaMemcpyHostToDevice, s));
             TRUSS_CUDA(cudaEventRecord(in_taken, s));
@@ -2036,10 +2199,8 @@ struct Forward::Impl {
         }
         if (!last) {   // hand the residual rows on, once the next stage has taken the previous ones
             if (next) {
-                while (next->taken.load(std::memory_order_acquire) < handed.load()) {
-                    require(!next->halted, "the next layer-split stage failed");
-                    std::this_thread::yield();
-                }
+                spin_until("run_chunk: the next stage taking the hand-off", *next,
+                           [&] { return next->taken.load(std::memory_order_acquire) >= handed.load(); });
                 TRUSS_CUDA(cudaStreamWaitEvent(s, next->in_taken, 0));
             }
             TRUSS_CUDA(cudaMemcpyAsync(out_host, res, row_bytes, cudaMemcpyDeviceToHost, s));
@@ -2089,10 +2250,13 @@ struct Forward::Impl {
     }
 
     // Commit the first n rows of the open verify window: every recurrent state as if only those rows had run.
+    // n == 0 is the full rollback (a round that died before its pick(), review C2): the window ran tentative - its
+    // GDN state went to the other buffer, its KV/indexer rows sit past the committed position - so the state before
+    // the window is still in place and each snapshot only goes back where it came from.
     void accept(int n)
     {
         require(vw.open, "accept() without verify()");
-        require(n >= 1 && n <= vw.T, "accept(" + std::to_string(n) + ") of a " + std::to_string(vw.T) + "-row window");
+        require(n >= 0 && n <= vw.T, "accept(" + std::to_string(n) + ") of a " + std::to_string(vw.T) + "-row window");
         vw.open = false;
         const bool all = n == vw.T;
         const size_t m = sc->mark();
@@ -2104,25 +2268,34 @@ struct Forward::Impl {
                 if (all) {   // the window's final state is the other buffer
                     L.cur ^= 1;
                 } else {     // conv rows and state from before the window, then the accepted rows again
-                    const int kd = c.key_dim(), vd = c.value_dim(), Hv = c.ssm_v_heads;
-                    float * q = sc->alloc((size_t) n * kd), * k = sc->alloc((size_t) n * kd), * v = sc->alloc((size_t) n * vd);
-                    float * gt = sc->alloc((size_t) n * Hv), * beta = sc->alloc((size_t) n * Hv), * core = sc->alloc((size_t) n * vd);
                     copy(L.conv, L.conv_snap, (size_t) (c.ssm_conv - 1) * c.conv_dim());
-                    gdn::prepare(dm, L.raw_qkv, f32(W.gdn.conv1d), L.conv, L.raw_alpha, L.raw_beta, f32(W.gdn.dt_bias),
-                                 f32(W.gdn.a), n, c.rms_eps, q, k, v, gt, beta, s);
-                    gdn::delta_rule(q, k, v, gt, beta, L.state(), L.state(), core, n, c.ssm_groups, Hv, s);
+                    if (n > 0) {   // 0 rows would launch the prepare and the delta rule on an empty grid
+                        const int kd = c.key_dim(), vd = c.value_dim(), Hv = c.ssm_v_heads;
+                        float * q = sc->alloc((size_t) n * kd), * k = sc->alloc((size_t) n * kd), * v = sc->alloc((size_t) n * vd);
+                        float * gt = sc->alloc((size_t) n * Hv), * beta = sc->alloc((size_t) n * Hv), * core = sc->alloc((size_t) n * vd);
+                        gdn::prepare(dm, L.raw_qkv, f32(W.gdn.conv1d), L.conv, L.raw_alpha, L.raw_beta, f32(W.gdn.dt_bias),
+                                     f32(W.gdn.a), n, c.rms_eps, q, k, v, gt, beta, s);
+                        gdn::delta_rule(q, k, v, gt, beta, L.state(), L.state(), core, n, c.ssm_groups, Hv, s);
+                    }
                     sc->release(m);
                 }
             } else if (!all) {   // the indexer's open block: the snapshot plus the accepted rows' raw keys
                 copy(L.idx_partial, L.partial_snap, (size_t) (DsaShape::RATIO - 1) * c.idx_head_dim);
-                dsa::carry_partial<DsaShape>(L.raw_ik, vw.pos0, n, L.idx_partial, s);
+                if (n > 0) dsa::carry_partial<DsaShape>(L.raw_ik, vw.pos0, n, L.idx_partial, s);
             }
-            if (c.is_ple(l) && !all)
-                spec::tail_rows(L.hist_snap, (c.ple_conv - 1) * c.ple_ngram, L.normed_rows, n, c.hc_dim(), L.ple_hist, s);
+            if (c.is_ple(l) && !all) {
+                if (n > 0)
+                    spec::tail_rows(L.hist_snap, (c.ple_conv - 1) * c.ple_ngram, L.normed_rows, n, c.hc_dim(), L.ple_hist, s);
+                else   // none of the window's rows count: the history before it is the snapshot
+                    copy(L.hist_snap, L.ple_hist, (size_t) (c.ple_conv - 1) * c.ple_ngram * c.hc_dim());
+            }
         }
         commit_tail(vw.tokens.data(), n);
         last_T = n;
-        if (mtp) dc_on = true, dc_pos0 = vw.pos0, dc_T = n, dc_tokens.assign(vw.tokens.begin(), vw.tokens.begin() + n);
+        // Nothing was committed, so nothing new is parked for the MTP block: run_chunk() flushed the pending commit
+        // before these rows ran, which is why dc_on is already false here (accept(0) does not drop a real commit).
+        if (mtp)
+            dc_on = n > 0, dc_pos0 = vw.pos0, dc_T = n, dc_tokens.assign(vw.tokens.begin(), vw.tokens.begin() + n);
     }
 
     // Sequence checkpoint (Forward::checkpoint / restore): every recurrent piece of the committed sequence - GDN state
@@ -2188,6 +2361,187 @@ struct Forward::Impl {
         dc_on = false, mtp_ahead = false;   // the next commit recomputes its first row
         kv_reserve(ck.pos, true);
         return ck.pos;
+    }
+
+    // Sequence slots (Options::slots). The live members above (st[l]'s per-sequence pointers, mst's, pending_h, the
+    // deferred MTP commit, the PLE window, the checkpoint) always describe the selected slot; select() parks them in
+    // seqs[active_seq] and loads another slot's. Position-indexed caches are sub-ranges of the arrays allocated for
+    // n_ctx positions (slot k starts at position k * seq_ctx); the recurrent pieces are separate buffers per slot.
+    // Verify-window temporaries (snapshots, raw rows) are shared: a switch happens only between calls. A deferred MTP
+    // commit (accept() -> the next draft()) reads the accepted rows' residual from small.res, which the other slot's
+    // calls overwrite: those rows are parked in res_keep with the slot.
+    struct SeqLayer {
+        dsa::KvCache kv;
+        half * idx_k = nullptr;
+        float * idx_partial = nullptr, * state_buf[2] = {}, * conv = nullptr, * ple_hist = nullptr;
+        int cur = 0;
+        // the verify window's snapshots and raw rows: a front stage keeps a slot's window open while another slot
+        // runs on it (its accept() comes with that slot's next call there, defer_n)
+        float * conv_snap = nullptr, * raw_qkv = nullptr, * raw_alpha = nullptr, * raw_beta = nullptr;
+        float * partial_snap = nullptr, * raw_ik = nullptr, * hist_snap = nullptr, * normed_rows = nullptr;
+    };
+    struct Seq {
+        std::vector<SeqLayer> layers;                    // [l - lb]
+        SeqLayer mtpl;
+        float * pending_h = nullptr, * res_keep = nullptr;
+        bool has_pending = false, dc_on = false, mtp_ahead = false;
+        int dc_pos0 = 0, dc_T = 0, ahead_pos = -1, last_T = 0;
+        int32_t ahead_tok = -1;
+        std::vector<int32_t> dc_tokens, tail;
+        Checkpoint ck;
+        Verify vw;
+    };
+    std::vector<Seq> seqs;
+    int active_seq = 0;
+    int seq_ctx = 0;                                     // positions per slot
+
+    static SeqLayer seq_layer(const LayerState & L)
+    {
+        return { L.kv, L.idx_k, L.idx_partial, { L.state_buf[0], L.state_buf[1] }, L.conv, L.ple_hist, L.cur,
+                 L.conv_snap, L.raw_qkv, L.raw_alpha, L.raw_beta, L.partial_snap, L.raw_ik, L.hist_snap,
+                 L.normed_rows };
+    }
+    static void load_layer(LayerState & L, const SeqLayer & q)
+    {
+        L.kv = q.kv, L.idx_k = q.idx_k, L.idx_partial = q.idx_partial, L.conv = q.conv, L.ple_hist = q.ple_hist;
+        L.state_buf[0] = q.state_buf[0], L.state_buf[1] = q.state_buf[1], L.cur = q.cur;
+        L.conv_snap = q.conv_snap, L.raw_qkv = q.raw_qkv, L.raw_alpha = q.raw_alpha, L.raw_beta = q.raw_beta;
+        L.partial_snap = q.partial_snap, L.raw_ik = q.raw_ik, L.hist_snap = q.hist_snap, L.normed_rows = q.normed_rows;
+    }
+
+    // Concurrent slots: the stage lock, and the accept() a slot's last round left for this (front) stage
+    StageLock lk;
+    std::vector<int> defer_n;   // [slot]: rows to accept before that slot's next work here (0: none)
+    // [slot]: recorded behind a slot's verify rows on this (front) stage; round() waits for it with no stage held, so
+    // the last stage serves another slot while this slot's rows are still on the earlier GPU
+    std::vector<cudaEvent_t> slot_done;
+    // TRUSS_ROUND_TRACE (track U): which stage this is (0 the front one, 1 the last) for the interval log, the
+    // stage the thread was working on before this one was acquired, and this stage's device-work accounting.
+    int trace_stage = -1, rt_prev_stage = -1;
+    int64_t rt_held_t0 = 0;
+    rt::StageState rt_st;
+    void acquire(long ticket)
+    {
+        const bool tr = rt::on();
+        const int64_t t0 = tr ? rt::now() : 0;
+        rt_prev_stage = rt::ctx().stage;
+        lk.lock(ticket, [this] { return taken.load(std::memory_order_acquire) + 1; });
+        rt::ctx().stage = trace_stage;
+        if (tr)
+        {
+            rt::push({ t0, rt::now() - t0, trace_stage == 0 ? rt::kLockFront : rt::kLockLast, rt::ctx().slot,
+                       trace_stage, rt::kKindHost, rt::ctx().round });
+            rt_held_t0 = rt::now();
+            rt::stage_begin(rt_st, s, device, trace_stage);   // the device takes this section over here
+        }
+    }
+    void release()
+    {
+        if (rt::on())
+        {
+            rt::stage_end(rt_st);   // before the lock drops: what is queued now is this section's work
+            rt::push({ rt_held_t0, rt::now() - rt_held_t0, trace_stage == 0 ? rt::kHeldFront : rt::kHeldLast,
+                       rt::ctx().slot, trace_stage, rt::kKindHost, rt::ctx().round });
+        }
+        rt::ctx().stage = rt_prev_stage;   // acquire stores this whether or not the trace is on; both sides match
+        lk.unlock();
+    }
+    void settle()   // the selected slot's deferred accept, before anything else it does here
+    {
+        if (defer_n.empty() || !defer_n[active_seq]) return;
+        const int n = defer_n[active_seq];
+        defer_n[active_seq] = 0;
+        accept(n);
+    }
+
+    // slot 0 is the live state allocated above; slots 1.. get their own recurrent buffers and a cache sub-range
+    void alloc_seqs(int n)
+    {
+        seq_ctx = n_ctx;
+        seqs.resize(n);
+        defer_n.assign(n, 0);
+        if (n == 1) return;
+        const int R = DsaShape::RATIO;
+        seq_ctx = n_ctx / n / 256 * 256;
+        require(seq_ctx >= 4096, "TRUSS_SLOTS: under 4,096 positions per slot");
+        const size_t rowkv = (size_t) c.n_head_kv * c.head_dim;
+        auto sub = [&](const LayerState & L, int k) {   // slot k's view of the live (slot 0) caches
+            SeqLayer q = seq_layer(L);
+            const size_t off = (size_t) k * seq_ctx;
+            if (q.kv.kq) q.kv.kq += off * rowkv, q.kv.vq += off * rowkv, q.kv.ks += off * rowkv / dsa::KV_GROUP,
+                         q.kv.vs += off * rowkv / dsa::KV_GROUP;
+            if (q.kv.k16) q.kv.k16 += off * rowkv, q.kv.v16 += off * rowkv;
+            if (q.idx_k) q.idx_k += off / R * c.idx_head_dim;
+            if (q.idx_partial) q.idx_partial = alloc<float>((size_t) (R - 1) * c.idx_head_dim);
+            const size_t sz = (size_t) c.ssm_v_heads * c.ssm_state * c.ssm_state;
+            for (float *& b : q.state_buf)
+                if (b) b = alloc<float>(sz);
+            q.cur = 0;
+            if (q.conv) q.conv = alloc<float>((size_t) (c.ssm_conv - 1) * c.conv_dim());
+            const size_t hist = (size_t) (c.ple_conv - 1) * c.ple_ngram * c.hc_dim();
+            if (q.ple_hist) q.ple_hist = alloc<float>(hist);
+            const size_t W = spec_rows;
+            if (q.conv_snap) q.conv_snap = alloc<float>((size_t) (c.ssm_conv - 1) * c.conv_dim());
+            if (q.raw_qkv) q.raw_qkv = alloc<float>(W * c.conv_dim());
+            if (q.raw_alpha) q.raw_alpha = alloc<float>(W * c.ssm_v_heads);
+            if (q.raw_beta) q.raw_beta = alloc<float>(W * c.ssm_v_heads);
+            if (q.partial_snap) q.partial_snap = alloc<float>((size_t) (R - 1) * c.idx_head_dim);
+            if (q.raw_ik) q.raw_ik = alloc<float>(W * c.idx_head_dim);
+            if (q.hist_snap) q.hist_snap = alloc<float>(hist);
+            if (q.normed_rows) q.normed_rows = alloc<float>(W * c.hc_dim());
+            return q;
+        };
+        for (int k = 1; k < n; ++k) {
+            Seq & q = seqs[k];
+            q.layers.resize(le - lb);
+            for (int l = lb; l < le; ++l) q.layers[l - lb] = sub(st[l], k);
+            if (mtp) {
+                q.mtpl = sub(mst, k);
+                q.pending_h = alloc<float>(c.hc_dim());
+            }
+        }
+        if (mtp)
+            for (Seq & q : seqs) q.res_keep = alloc<float>((size_t) (moe::MAX_ROWS + 1) * c.hc_dim());
+    }
+
+    void select(int k)
+    {
+        require(k >= 0 && k < (int) seqs.size(), "select(" + std::to_string(k) + "): no such slot");
+        if (k == active_seq) return;
+        require(!(last && vw.open), "select() inside the last stage's verify window");
+        const size_t row = c.hc_dim();
+        {   // park the live sequence
+            Seq & q = seqs[active_seq];
+            q.layers.resize(le - lb);
+            for (int l = lb; l < le; ++l) q.layers[l - lb] = seq_layer(st[l]);
+            if (mtp) {
+                q.mtpl = seq_layer(mst);
+                q.pending_h = pending_h;
+                if (dc_on) copy(q.res_keep, small.res, (size_t) dc_T * row);
+            }
+            q.has_pending = has_pending, q.dc_on = dc_on, q.mtp_ahead = mtp_ahead;
+            q.dc_pos0 = dc_pos0, q.dc_T = dc_T, q.ahead_pos = ahead_pos, q.ahead_tok = ahead_tok, q.last_T = last_T;
+            q.dc_tokens.swap(dc_tokens), q.tail.swap(tail);
+            std::swap(q.ck, ck);
+            std::swap(q.vw, vw);
+        }
+        Seq & q = seqs[k];
+        for (int l = lb; l < le; ++l) load_layer(st[l], q.layers[l - lb]);
+        if (mtp) {
+            load_layer(mst, q.mtpl);
+            pending_h = q.pending_h;
+            if (q.dc_on) {   // flush_commit() reads res, which the other slot's last call may have left on the
+                copy(small.res, q.res_keep, (size_t) q.dc_T * row);   // stream buffer: the rows live in small
+                use(small);
+            }
+        }
+        has_pending = q.has_pending, dc_on = q.dc_on, mtp_ahead = q.mtp_ahead;
+        dc_pos0 = q.dc_pos0, dc_T = q.dc_T, ahead_pos = q.ahead_pos, ahead_tok = q.ahead_tok, last_T = q.last_T;
+        dc_tokens.swap(q.dc_tokens), tail.swap(q.tail);
+        std::swap(q.ck, ck);
+        std::swap(q.vw, vw);
+        ple_next = nullptr, ple_next_T = 0, ple_tk_valid = false;   // a lookahead ticket belongs to the old slot
+        active_seq = k;
     }
 
     // MTP calibration capture (TRUSS_MTP_CALIB=/path/file.f32): the MTP block's FFN input rows (fp32 [d_model],
@@ -2418,6 +2772,8 @@ struct Forward::Impl {
                 sampling::draft_sample(mtp_logits, nv, draft_map, c.n_vocab, *ds_p, ds_counter + i,
                                        ds_q + (size_t) i * c.n_vocab, draft_ids + i + 1, s);
             if (draft_min_p > 0.f) {   // an unsure guess does not enter the window, and ends the chain
+                TRUSS_RT(rt::kDraftMinP);   // one host round trip per draft step, with the stage held through it
+                rt::Wait w(rt_st);          // how much of it the device was actually working
                 TRUSS_CUDA(cudaMemcpyAsync(draft_prob_host + i, draft_prob + i, sizeof(float), cudaMemcpyDeviceToHost, s));
                 TRUSS_CUDA(cudaStreamSynchronize(s));
                 if (draft_prob_host[i] < draft_min_p) break;
@@ -2427,17 +2783,51 @@ struct Forward::Impl {
         }
         copy(mst.idx_partial, mtp_partial_snap, (size_t) (DsaShape::RATIO - 1) * c.idx_head_dim);
         if (made) TRUSS_CUDA(cudaMemcpyAsync(draft_host, draft_ids + 1, sizeof(int32_t) * made, cudaMemcpyDeviceToHost, s));
+        TRUSS_RT(rt::kDraftEnd);
+        rt::Wait we(rt_st);
         TRUSS_CUDA(cudaStreamSynchronize(s));
         std::copy(draft_host, draft_host + made, out);
         return made;
     }
 };
 
-Forward::Forward(const Config & c, const Weights & w, int n_ctx, int max_chunk, const Options & o)
+Forward::Forward(const Config & c, const Weights & w, int n_ctx, int max_chunk, const Options & oo)
+{
+    Options o = oo;
+    if (o.slots > 1 && o.kv_lend) {
+        std::fprintf(stderr, "TRUSS_SLOTS=%d: TRUSS_KV_LEND off (it lends one sequence's unused K/V tail)\n", o.slots);
+        o.kv_lend = false;
+    }
+    construct(c, w, n_ctx, max_chunk, o);
+    seq_pos_.assign(std::max(1, o.slots), 0);
+    round_ns_ = std::make_unique<std::atomic<long long>[]>(seq_pos_.size());
+    for (size_t i = 0; i < seq_pos_.size(); ++i) round_ns_[i] = 0;
+    for (auto & p : front_) {
+        p->defer_n.resize(seq_pos_.size(), 0);
+        DeviceGuard g(p->device);
+        p->slot_done.resize(seq_pos_.size());
+        for (cudaEvent_t & e : p->slot_done) TRUSS_CUDA(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+    }
+    m_->defer_n.resize(seq_pos_.size(), 0);
+    seq_ctx_ = m_->seq_ctx;
+    if (o.slots > 1) std::fprintf(stderr, "sequence slots: %d x %d positions\n", o.slots, seq_ctx_);
+}
+
+void Forward::construct(const Config & c, const Weights & w, int n_ctx, int max_chunk, const Options & o)
 {
     const int S = o.layer_split;
+    // TRUSS_ROUND_TRACE: which stage is which (0 the front one, 1 the last) and the device each runs on
+    auto tag_stages = [&] {
+        for (auto & p : front_) p->trace_stage = 0;
+        m_->trace_stage = 1;
+        int dev = m_->device;
+        if (dev < 0) cudaGetDevice(&dev);
+        rt::set_stage_device(1, dev);
+        if (!front_.empty()) rt::set_stage_device(0, front_[0]->device);
+    };
     if (S <= 0 || S >= c.n_layer) {
         m_ = std::make_unique<Impl>(c, w, n_ctx, max_chunk, o, StageSpec{ 0, c.n_layer, -1, 1.0, nullptr, nullptr });
+        tag_stages();
         return;
     }
     int cur = 0;
@@ -2452,6 +2842,7 @@ Forward::Forward(const Config & c, const Weights & w, int n_ctx, int max_chunk, 
     StageSpec b{ S, c.n_layer, cur, 1.0, f.cpu_tier ? f.cpu_tier->pool : nullptr, a.pool_mu };
     m_ = std::make_unique<Impl>(c, w, n_ctx, max_chunk, o, b);
     m_->prev = &f, f.next = m_.get();
+    tag_stages();
     std::fprintf(stderr, "layer split: layers 0-%d on device %d (%d experts resident), layers %d-%d, head and MTP on "
                          "device %d (%d resident)\n",
                  S - 1, d0, f.n_hot, S, c.n_layer - 1, cur, m_->n_hot);
@@ -2461,7 +2852,9 @@ Forward::~Forward()
 {
     int d = 0;
     cudaGetDevice(&d);
-    m_.reset();   // the last stage first: its driver may share the first stage's CPU pool
+    rt::close();   // TRUSS_ROUND_TRACE: flush and join the sampler BEFORE any stage dies - a stage destructor
+                   // recording, or the sampler thread reading a stage's events, after it is freed is a use-after-free
+    m_.reset();    // the last stage first: its driver may share the first stage's CPU pool
     front_.clear();
     cudaSetDevice(d);
 }
@@ -2473,6 +2866,21 @@ template <class F> void Forward::each_stage(F && f)
         DeviceGuard g(p->device);
         f(*p);
     }
+    f(*m_);
+}
+
+// Every stage in layer order, held while f runs on it (its device current). For the calls that touch a buffer a
+// chunk's kernels may still be writing: without the lock another slot's work can be enqueued on that stage while f
+// runs (review H3). Stages are taken in layer order, front first, like every other path, and a stage held for its
+// own work never waits for an earlier one - so taking them in this order cannot cycle.
+template <class F> void Forward::each_stage_locked(F && f) const
+{
+    for (auto & p : front_) {
+        DeviceGuard g(p->device);
+        Held<Impl> h(*p, 0);
+        f(*p);
+    }
+    Held<Impl> h(*m_, 0);
     f(*m_);
 }
 
@@ -2629,7 +3037,9 @@ size_t Forward::kv_lent() const
 
 void Forward::profile_routes(bool on)
 {
-    each_stage([on](Impl & m) {
+    // Held per stage (H3): cudaFree() of a table that a chunk enqueued on that stage is still routing into is
+    // corruption, and with slots another slot's chunk can be enqueued there at any moment.
+    each_stage_locked([on](Impl & m) {
         if (on && !m.route_counts) m.route_counts = m.alloc<float>((size_t) m.n_store * m.c.n_expert);   // zeroed
         if (!on && m.route_counts) {
             TRUSS_CUDA(cudaStreamSynchronize(m.s));
@@ -2643,7 +3053,9 @@ void Forward::profile_routes(bool on)
 std::vector<float> Forward::route_counts() const   // the stages' store layers in order: [layer][expert], MTP last
 {
     std::vector<float> out;
-    auto add = [&](const Impl & m) {
+    // held like profile_routes()'s (H3): the table is read while nothing of this stage is being enqueued, so the
+    // sync below cannot sit in the middle of another slot's chunk and its rows cannot be written as they are copied.
+    each_stage_locked([&](Impl & m) {
         DeviceGuard g(m.device);
         const size_t at = out.size(), n = (size_t) m.n_store * m.c.n_expert;
         out.resize(at + n, 0.f);
@@ -2651,98 +3063,406 @@ std::vector<float> Forward::route_counts() const   // the stages' store layers i
             TRUSS_CUDA(cudaStreamSynchronize(m.s));
             TRUSS_CUDA(cudaMemcpy(out.data() + at, m.route_counts, n * 4, cudaMemcpyDeviceToHost));
         }
-    };
-    for (auto & p : front_) add(*p);
-    add(*m_);
+    });
     return out;
 }
 
-void Forward::head(int first, int n, float * logits) { m_->head(first, n, logits); }
+// ---- Sequences. Every call names a slot (the old calls: the selected one, select()); each stage is held only while its
+// work is enqueued (Held), so with a layer split two slots' work runs on the two GPUs at once. A stage's verify
+// window for a slot stays open until that slot's next call there (defer_n), and work that takes a hand-off from the
+// previous stage is granted in hand-off order (StageLock). The last stage is never held while waiting for an earlier
+// one, so the locks cannot cycle.
 
-void Forward::reset()
+int Forward::position(int slot) const { return seq_pos_.at(slot); }
+
+rt::StageState * Forward::rt_last_stage() { return &m_->rt_st; }   // TRUSS_ROUND_TRACE: for the caller's pick
+
+void Forward::lock_ms(double out[4], bool reset)
+{
+    Impl * st[2] = { front_.empty() ? nullptr : front_[0].get(), m_.get() };
+    for (int i = 0; i < 2; ++i) {
+        out[2 * i] = st[i] ? st[i]->lk.held_ns.load() / 1e6 : 0;
+        out[2 * i + 1] = st[i] ? st[i]->lk.wait_ns.load() / 1e6 : 0;
+        if (reset && st[i]) st[i]->lk.held_ns = 0, st[i]->lk.wait_ns = 0;
+    }
+}
+
+void Forward::select(int k)
+{
+    if (k < 0 || k >= (int) seq_pos_.size())
+        throw std::runtime_error("qwen4exp::Forward: select(" + std::to_string(k) + "): " +
+                                 std::to_string(seq_pos_.size()) + " slots");
+    active_ = k;
+}
+
+void Forward::head(int first, int n, float * logits)
+{
+    const int slot = active_;   // one snapshot (H2): select() of another slot must not move it between the two calls
+    Held<Impl> h(*m_, 0);
+    m_->select(slot);
+    m_->head(first, n, logits);
+}
+
+void Forward::reset(int slot)
 {
     if (m_->route_trace) {   // the driver is idle between passes; the marker separates sequences
         const int32_t h[2] = { -1, 0 };
         std::fwrite(h, 4, 2, m_->route_trace);
     }
-    each_stage([](Impl & m) { m.reset(); });
-    pos_ = 0;
+    each_stage([slot](Impl & m) {
+        Held<Impl> h(m, 0);
+        m.select(slot);
+        m.reset();
+    });
+    seq_pos_.at(slot) = 0;
 }
+
+void Forward::reset() { reset(active_); }
+
+void Forward::checkpoint(int slot)
+{
+    const int pos = seq_pos_.at(slot);
+    each_stage([&](Impl & m) {
+        Held<Impl> h(m, 0);
+        m.select(slot);
+        m.settle();
+        m.checkpoint(pos);
+    });
+}
+
+void Forward::checkpoint() { checkpoint(active_); }
+
+int Forward::restore(int slot)
+{
+    int p = -1;
+    each_stage([&](Impl & m) {
+        Held<Impl> h(m, 0);
+        m.select(slot);
+        m.settle();
+        p = m.restore();
+    });
+    if (p >= 0) seq_pos_.at(slot) = p;
+    return p;
+}
+
+int Forward::restore() { return restore(active_); }
 
 void Forward::run(const int32_t * tokens, int T, const LayerHook & hook, const int32_t * next, int next_T)
 {
     if (next) require(next == tokens + T && next_T > 0, "PLE lookahead must follow the chunk");
+    const int slot = active_, pos = seq_pos_[slot];
+    long ticket = 0;
     each_stage([&](Impl & m) {
+        Held<Impl> h(m, ticket);
+        m.select(slot);
+        m.settle();
         m.ple_next = next; m.ple_next_T = next_T;
-        m.run_chunk(tokens, pos_, T, hook, false);
+        m.run_chunk(tokens, pos, T, hook, false);
+        ticket = m.handed.load();
     });
-    pos_ += T;
+    seq_pos_[slot] += T;
 }
 
 void Forward::run_prompt(const int32_t * tokens, int n, int step, const std::function<void(int)> & done)
 {
+    prompt(active_, tokens, n, step, nullptr, nullptr, done);
+}
+
+void Forward::prompt(int slot, const int32_t * tokens, int n, int step, float * logits,
+                     const std::function<void()> & after, const std::function<void(int)> & done)
+{
     require(n > 0 && step > 0, "run_prompt: no tokens");
+    require(slot >= 0 && slot < (int) seq_pos_.size(), "prompt(): no such slot");
+    rt::ctx().slot = slot, ++rt::ctx().round;   // TRUSS_ROUND_TRACE: the records of this call belong to this slot
     auto chunk = [&](int s, int & T, const int32_t *& nxt, int & nxt_T) {   // the run() loop's chunks and lookahead
         T = std::min(step, n - s);
         nxt_T = std::max(0, std::min(step, n - s - T));
         nxt = nxt_T > 0 ? tokens + s + T : nullptr;
     };
+    const int pos0 = seq_pos_[slot];
+    auto last_chunk = [&](int s, int T, long ticket) {   // the last stage's part of a chunk; the head after the last one
+        const int32_t * nx;
+        int TT, nT;
+        chunk(s, TT, nx, nT);
+        Held<Impl> h(*m_, ticket);
+        m_->select(slot);
+        m_->settle();
+        m_->ple_next = nx, m_->ple_next_T = nT;
+        m_->run_chunk(tokens + s, pos0 + s, T, nullptr, false);
+        inject_fault("prompt-last", slot);   // this chunk's rows are taken; its head and the chunks after it never run
+        if (s + T == n) {
+            if (logits) m_->head(T - 1, 1, logits);
+            if (after) after();
+        }
+    };
     if (front_.empty()) {
         for (int s = 0; s < n; s += step) {
-            int T, nT;
-            const int32_t * nx;
-            chunk(s, T, nx, nT);
-            run(tokens + s, T, nullptr, nx, nT);
+            const int T = std::min(step, n - s);
+            last_chunk(s, T, 0);
             if (done) done(s + T);
         }
+        seq_pos_[slot] += n;
         return;
     }
     // Layer split: the first stage runs on its own thread, a chunk ahead of the last one (the hand-off's handshake
-    // orders them), so both devices compute at once. Every row is what run() computes: the same output.
+    // orders them), so both devices compute at once. Every row is what run() computes: the same output. Each chunk
+    // holds a stage only while it is enqueued there, so another slot's rounds pass between the chunks.
+    require(front_.size() == 1, "prompt(): more than two stages");
     Impl & f = *front_[0];
+    std::mutex qm;
+    std::condition_variable qcv;
+    std::deque<long> tickets;   // the hand-off ticket of each chunk the first stage has enqueued
+    bool front_failed = false;
+    long front_handed = 0;   // the highest hand-off this request's first stage produced (its own to drain, C1)
+    // Strata's decode share (STRATA_BATCH_DECODE_SHARE, docs/BATCHING.md): while another slot is decoding, the
+    // prompt gives way after each chunk - the first stage waits until the last one has finished the chunks handed
+    // to it, then for TRUSS_DECODE_SHARE x that chunk's time - so the decoding slot runs on both GPUs in between
+    // instead of waiting a chunk on each. 0: off (the prompt keeps both GPUs).
+    static const double share = [] { const char * e = std::getenv("TRUSS_DECODE_SHARE"); return e ? std::atof(e) : 0.5; }();
+    int main_done = 0;                                  // chunks the last stage has finished (under qm)
+    std::vector<std::chrono::steady_clock::time_point> t_start((size_t) (n + step - 1) / step);   // a chunk's first-stage start
+    double chunk_s = 0;                                 // the last chunk's time on the stages (start to last stage done)
+    auto others_decoding = [&] {
+        const long long now = std::chrono::steady_clock::now().time_since_epoch().count();
+        for (size_t i = 0; i < seq_pos_.size(); ++i)
+            if ((int) i != slot) {
+                const long long t = round_ns_[i].load();
+                if (t < 0 || (t > 0 && now - t < 300'000'000LL)) return true;   // in a round, or one ended < 0.3 s ago
+            }
+        return false;
+    };
     std::exception_ptr err;
-    const int pos0 = pos_;
     const auto t0 = std::chrono::steady_clock::now();
     double front_s = 0;
     std::thread t([&] {
         DeviceGuard g(f.device);
+        rt::ctx().slot = slot;   // thread-local: the front thread's records are this slot's front-stage work
         try {
-            for (int s = 0; s < n; s += step) {
+            int k = 0;
+            for (int s = 0; s < n; s += step, ++k) {
                 int T, nT;
                 const int32_t * nx;
                 chunk(s, T, nx, nT);
-                f.ple_next = nx, f.ple_next_T = nT;
-                f.run_chunk(tokens + s, pos0 + s, T, nullptr, false);
+                if (share > 0 && k > 0 && others_decoding()) {   // give way: drain, then the decode window
+                    TRUSS_RT(rt::kGiveWay);   // both GPUs are free here: whose decode window this is, the report cannot tell
+                    double w;
+                    {
+                        std::unique_lock<std::mutex> l(qm);
+                        qcv.wait(l, [&] { return main_done >= k || front_failed; });
+                        w = share * chunk_s;
+                    }
+                    std::this_thread::sleep_for(std::chrono::duration<double>(std::min(w, 5.0)));
+                }
+                {
+                    std::lock_guard<std::mutex> l(qm);
+                    t_start[(size_t) k] = std::chrono::steady_clock::now();
+                }
+                long tk;
+                {
+                    Held<Impl> h(f, 0);
+                    f.select(slot);
+                    f.settle();
+                    f.ple_next = nx, f.ple_next_T = nT;
+                    f.run_chunk(tokens + s, pos0 + s, T, nullptr, false);
+                    tk = f.handed.load();
+                    {
+                        std::lock_guard<std::mutex> l(qm);
+                        front_handed = tk;   // the hand-off exists: the last stage must take it even if we die now
+                    }
+                    inject_fault("prompt-front", slot);   // handed on, ticket not pushed (C1: reset cannot clear it)
+                }
+                {
+                    std::lock_guard<std::mutex> l(qm);
+                    tickets.push_back(tk);
+                }
+                qcv.notify_all();
             }
+            TRUSS_RT(rt::kFrontDrain);
             TRUSS_CUDA(cudaStreamSynchronize(f.s));
             front_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         } catch (...) {
             err = std::current_exception();
-            f.halted = true;
+            f.failures.fetch_add(1, std::memory_order_relaxed);   // the last stage's wait for a hand-off stops (H1)
+            {
+                std::lock_guard<std::mutex> l(qm);
+                front_failed = true;
+            }
+            qcv.notify_all();
         }
     });
     std::exception_ptr err2;
     try {
         for (int s = 0; s < n; s += step) {
-            int T, nT;
-            const int32_t * nx;
-            chunk(s, T, nx, nT);
-            m_->ple_next = nx, m_->ple_next_T = nT;
-            m_->run_chunk(tokens + s, pos0 + s, T, nullptr, false);
+            const int T = std::min(step, n - s);
+            long tk;
+            {
+                std::unique_lock<std::mutex> l(qm);
+                qcv.wait(l, [&] { return !tickets.empty() || front_failed; });
+                require(!tickets.empty(), "the previous layer-split stage failed");
+                tk = tickets.front();
+                tickets.pop_front();
+            }
+            last_chunk(s, T, tk);
+            {
+                std::lock_guard<std::mutex> l(qm);
+                chunk_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start[(size_t) main_done]).count();
+                ++main_done;
+            }
+            qcv.notify_all();
             if (done) done(s + T);
         }
     } catch (...) {
         err2 = std::current_exception();
-        m_->halted = true;
+        m_->failures.fetch_add(1, std::memory_order_relaxed);   // the first stage's wait for a take stops (H1)
     }
     t.join();
-    f.halted = false, m_->halted = false;
+    // C1: hand-offs the first stage wrote that the last one never read - this request threw between the two, or the
+    // first stage died after writing one. Left untaken, the last stage's lock waits for a ticket that can never be
+    // granted and every slot behind it is wedged (a reset does not clear it: only a restart did). Drained up to the
+    // highest hand-off THIS request produced; one belonging to another request would let its chunk read stale rows.
+    {
+        long up_to = 0;
+        {
+            std::lock_guard<std::mutex> l(qm);
+            up_to = front_handed;
+        }
+        if (up_to > 0)
+            try {
+                Held<Impl> h(*m_, 0);
+                m_->drain_handoffs(up_to);
+            } catch (...) {}   // the request's own error is the one the caller has to see
+    }
     if (m_->sect_on && !err && !err2)   // TRUSS_PROFILE_SECTIONS: how balanced the stages are
         std::fprintf(stderr, "layer split prompt: %d tokens, first stage done at %.2f s, last at %.2f s\n", n, front_s,
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     if (err) std::rethrow_exception(err);
     if (err2) std::rethrow_exception(err2);
-    pos_ += n;
+    seq_pos_[slot] += n;
+}
+
+int Forward::round(int slot, int32_t next, int nd, int32_t * win, float * logits, const sampling::SampleParams * ds_p,
+                   uint64_t ds_counter, float * ds_q, const std::function<int(int)> & pick)
+{
+    require(slot >= 0 && slot < (int) seq_pos_.size(), "round(): no such slot");
+    rt::ctx().slot = slot, ++rt::ctx().round;
+    TRUSS_RT(rt::kRound);
+    const int pos = seq_pos_[slot];
+    round_ns_[slot] = -1;   // inside a round (the prompt of another slot gives way to it)
+    struct Out {
+        std::atomic<long long> & t;
+        ~Out() { t = std::chrono::steady_clock::now().time_since_epoch().count(); }
+    } out{ round_ns_[slot] };
+    // What a throw part way through leaves behind, and what every later call then trips on (review C1/C2):
+    //   - this slot's verify window, still open on every stage that ran its rows: run_chunk() and the last stage's
+    //     select() throw from then on, on this slot and - once the last stage cannot be selected - on every slot;
+    //   - a hand-off the front stage wrote that the last stage never read: its lock grants a later ticket only once
+    //     that one is taken, so every slot waiting behind it is wedged until the process restarts.
+    // Both are repairable while the round is still on the stack, so the body runs under this catch: accept(0) closes
+    // each window this round opened (the full rollback - the window's rows were written tentative, so the committed
+    // state is still in place) and drain_handoffs() takes the hand-off this round produced. The faulting slot's own
+    // sequence is not trusted afterwards; the caller must reset() it, which server/app.py does for every TrussError.
+    long handed = 0;   // the last hand-off this round produced on a front stage (0: none)
+    int front_open = 0;   // front stages now holding this slot's verify window
+    bool last_open = false;
+    auto unwind = [&] {
+        if (!robust_on()) return;   // C1/C2 fixes off
+        if (last_open) {   // first, and before any select(): select() inside the last stage's window is forbidden
+            try {
+                Held<Impl> h(*m_, 0);
+                m_->select(slot);
+                if (m_->vw.open) m_->accept(0);
+            } catch (...) {}
+        }
+        for (size_t i = 0; i < front_.size() && (int) i < front_open; ++i) {
+            Impl * p = front_[i].get();
+            try {
+                DeviceGuard g(p->device);
+                Held<Impl> h(*p, 0);
+                p->select(slot);   // a front stage may switch slots with a window open (it parks it, as any round does)
+                if (p->vw.open) p->accept(0);
+            } catch (...) {}
+        }
+        if (handed > 0) {
+            try {
+                Held<Impl> h(*m_, 0);
+                m_->drain_handoffs(handed);
+            } catch (...) {}
+        }
+    };
+    int nw = 0, keep = 0;
+    long ticket = 0;
+    try {
+        {   // the drafts (the MTP block lives on the last stage)
+            Held<Impl> h(*m_, 0);
+            m_->select(slot);
+            m_->ds_p = ds_p, m_->ds_counter = ds_counter, m_->ds_q = ds_q;
+            try {
+                inject_fault("round-draft", slot);
+                nw = m_->draft(next, pos, nd, win + 1);
+            } catch (...) {
+                m_->ds_p = nullptr, m_->ds_q = nullptr;
+                throw;
+            }
+            m_->ds_p = nullptr, m_->ds_q = nullptr;
+        }
+        win[0] = next;
+        const int T = nw + 1;
+        if (!m_->spec_rows || T > m_->spec_rows)
+            throw std::runtime_error("qwen4exp::Forward: verify() of " + std::to_string(T) + " rows (spec_rows " +
+                                     std::to_string(m_->spec_rows) + ")");
+        for (auto & p : front_) {   // the window's rows on the earlier stages, held only while they are enqueued
+            DeviceGuard g(p->device);
+            Held<Impl> h(*p, ticket);
+            p->select(slot);
+            p->settle();
+            p->run_chunk(win, pos, T, nullptr, true);
+            ++front_open;
+            ticket = p->handed.load();
+            handed = ticket;
+            TRUSS_CUDA(cudaEventRecord(p->slot_done[slot], p->s));
+            inject_fault("round-front", slot);   // window open here, its rows handed on, nothing taken yet
+        }
+        // the rows reach the last stage's input when the earlier GPUs are done: wait for that holding nothing (the last
+        // stage meanwhile verifies or drafts for another slot), then take the last stage in hand-off order
+        static const bool wait_free = [] { const char * e = std::getenv("TRUSS_ROUND_WAIT_FREE"); return !e || std::atoi(e); }();
+        if (wait_free)
+            for (auto & p : front_) {
+                DeviceGuard g(p->device);
+                const int rt_saved = rt::ctx().stage;
+                rt::ctx().stage = 0;   // the record is about that device, though this thread holds no stage
+                {
+                    TRUSS_RT(rt::kFrontWait);   // the earlier GPU's rows, before this slot's last-stage work can start
+                    TRUSS_CUDA(cudaEventSynchronize(p->slot_done[slot]));
+                }
+                rt::ctx().stage = rt_saved;
+            }
+        {   // the last stage: its rows, the head, the caller's pick, the accept
+            Held<Impl> h(*m_, ticket);
+            m_->select(slot);
+            m_->run_chunk(win, pos, T, nullptr, true);
+            last_open = true;
+            m_->head(0, T, logits);
+            inject_fault("round-pick", slot);   // exactly the state a throw inside pick() leaves (truss_c.cu's pick)
+            // U2: where the pick's sync time actually goes. Everything queued up to here (this slot's verify rows
+            // through layers 28-47, then the head) is drained by the sync inside pick(); the sampling kernels are
+            // what runs after. This stamp splits the wait's device segment into those two (gpu work / gpu sampling).
+            rt::stamp_mid(m_->rt_st);
+            {
+                TRUSS_RT(rt::kPick);   // the last stage is held through this: its device idles while the host samples
+                keep = pick(nw);
+            }
+            require(keep >= 1 && keep <= T, "round(): pick() kept " + std::to_string(keep) + " of " + std::to_string(T));
+            m_->accept(keep);
+            last_open = false;
+        }
+        for (auto & p : front_) p->defer_n[slot] = keep;   // read under that stage's lock by this slot's next call
+    } catch (...) {
+        const std::exception_ptr first = std::current_exception();
+        unwind();
+        std::rethrow_exception(first);
+    }
+    seq_pos_[slot] += keep;
+    return keep;
 }
 
 void Forward::verify(const int32_t * tokens, int T)
@@ -2750,39 +3470,42 @@ void Forward::verify(const int32_t * tokens, int T)
     if (!m_->spec_rows || T > m_->spec_rows)
         throw std::runtime_error("qwen4exp::Forward: verify() of " + std::to_string(T) + " rows (spec_rows " +
                                  std::to_string(m_->spec_rows) + ")");
-    each_stage([&](Impl & m) { m.run_chunk(tokens, pos_, T, nullptr, true); });
+    const int slot = active_, pos = seq_pos_[slot];
+    long ticket = 0;
+    each_stage([&](Impl & m) {
+        Held<Impl> h(m, ticket);
+        m.select(slot);
+        m.settle();
+        m.run_chunk(tokens, pos, T, nullptr, true);
+        ticket = m.handed.load();
+    });
 }
 
 void Forward::accept(int n)
 {
-    // the last stage first: its rollback and MTP commit are queued (no host wait) and run on its device while this
-    // thread launches the other stages' rollbacks (~100 small launches each), off the draft's critical path
-    m_->accept(n);
-    for (auto & p : front_) {
-        DeviceGuard g(p->device);
-        p->accept(n);
+    // the last stage now (its rollback and MTP commit are queued, no host wait); the earlier stages' rollbacks run with
+    // this slot's next call there (defer_n), off the draft's critical path
+    const int slot = active_;   // one snapshot: another thread's select() must not move the slot mid-call (H2)
+    {
+        Held<Impl> h(*m_, 0);
+        m_->select(slot);
+        m_->accept(n);
     }
-    pos_ += n;
+    for (auto & p : front_) p->defer_n[slot] = n;
+    seq_pos_[slot] += n;
 }
 
-int Forward::draft(int32_t next, int n, int32_t * out) { return m_->draft(next, pos_, n, out); }
+int Forward::draft(int32_t next, int n, int32_t * out)
+{
+    const int slot = active_;
+    Held<Impl> h(*m_, 0);
+    m_->select(slot);
+    return m_->draft(next, seq_pos_[slot], n, out);
+}
 
 void Forward::set_draft_sampling(const sampling::SampleParams * p, uint64_t counter, float * q_full)
 {
     m_->ds_p = p, m_->ds_counter = counter, m_->ds_q = q_full;
-}
-
-void Forward::checkpoint()
-{
-    each_stage([this](Impl & m) { m.checkpoint(pos_); });
-}
-
-int Forward::restore()
-{
-    int p = -1;
-    each_stage([&](Impl & m) { p = m.restore(); });
-    if (p >= 0) pos_ = p;
-    return p;
 }
 
 void apply_env(ForwardOptions & o)
@@ -2814,6 +3537,7 @@ void apply_env(ForwardOptions & o)
     f("TRUSS_LAYER_SPLIT", o.layer_split);             // two devices: layers [0, N) on TRUSS_LAYER_SPLIT_DEVICE
     f("TRUSS_LAYER_SPLIT_DEVICE", o.layer_split_device);
     f("TRUSS_LAYER_SPLIT_FRAC", o.layer_split_frac);
+    f("TRUSS_SLOTS", o.slots);                 // sequence slots (Forward::select)
     f("TRUSS_SPLIT_ROWS", o.split_rows);       // E7: short prompt chunks split cold experts CPU / PCIe
     f("TRUSS_SPLIT_T", o.split_t);
     f("TRUSS_SPLIT_MS_ROW", o.split_ms_row);

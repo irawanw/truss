@@ -17,6 +17,7 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -25,6 +26,7 @@
 #include <vector>
 
 namespace truss::qwen4exp {
+namespace rt { struct StageState; }   // round_trace.h: TRUSS_ROUND_TRACE's per-stage device-work accounting
 
 // Activations into the dense Q8_0 GEMMs. Q8_1 (default): llama-paw's rounding on the int8 GEMM; full-model KL to
 // llama-paw's Q8 logits 0.0131 = its own run-to-run floor, and the lower perplexity of the two on chat text (TRACKER
@@ -126,6 +128,12 @@ struct ForwardOptions {
     int layer_split = 0;
     int layer_split_device = -1;
     float layer_split_frac = 0.5f;
+    // Sequence slots (TRUSS_SLOTS): the engine holds `slots` independent sequences. Each slot's position-indexed
+    // caches (K/V, indexer blocks, MTP rows) are a sub-range of the same n_ctx-row arrays (n_ctx / slots positions
+    // each, so the VRAM is unchanged), its recurrent state (GDN state and conv rows, the indexer's open block, PLE
+    // history, the MTP pending row) has its own copy. select() switches between them between calls. > 1 turns
+    // kv_lend off (it lends one sequence's unused tail).
+    int slots = 1;
     // Called once upload() has the weights on the device but before the constructor does anything else expensive
     // (the expert plan, the CPU tier). The owner releases the model's file-backed pages there — the shards fault to a
     // ~47 GB resident peak during upload, and the CPU tier's anonymous vector then allocates on top of it and the
@@ -199,7 +207,38 @@ public:
     void checkpoint();
     int restore();
 
-    int position() const { return pos_; }   // tokens consumed so far
+    // Options::slots: make slot k (0 .. slots() - 1) the sequence the calls without a slot act on. Each slot keeps
+    // its position, caches, recurrent state, verify window and checkpoint; slot 0 is selected at start.
+    void select(int k);
+    int slots() const { return (int) seq_pos_.size(); }
+    int slot() const { return active_; }
+    int seq_ctx() const { return seq_ctx_; }   // positions per slot (n_ctx with one slot)
+
+    // Concurrent slots. These name their slot and may run on different threads at once (one thread per slot at a
+    // time): each stage is held only while a slot's work is enqueued on it, so with a layer split one slot's rows run
+    // on one GPU while another slot's run on the other (Strata's pipelined batch groups, with every slot's own MTP
+    // drafts and verify window).
+    // prompt(): tokens [0, n) appended to `slot` in chunks of `step` (the stages a chunk apart, as run_prompt); with
+    // logits, the last row's logits go there and after() runs, both while the last stage is still held for this slot.
+    void prompt(int slot, const int32_t * tokens, int n, int step, float * logits, const std::function<void()> & after,
+                const std::function<void(int)> & done = nullptr);
+    // round(): one speculative round of `slot` after token `next` (the token at its position): up to nd MTP drafts
+    // into win[1..] (win[0] = next; draft sampling with ds_p as set_draft_sampling, nullptr: greedy), the verify window
+    // over win, its logits [nw + 1][n_vocab] into `logits`, then pick(nw) - run with the last stage held - returns
+    // how many window rows to keep (1 .. nw + 1). Returns that count; position(slot) advances by it.
+    int round(int slot, int32_t next, int nd, int32_t * win, float * logits, const sampling::SampleParams * ds_p,
+              uint64_t ds_counter, float * ds_q, const std::function<int(int)> & pick);
+    void reset(int slot);
+    void checkpoint(int slot);
+    int restore(int slot);
+    int position(int slot) const;
+    // host time each stage was held and waited for (ms since the last reset): [front held, front wait, last held, last wait]
+    void lock_ms(double out[4], bool reset = false);
+    // TRUSS_ROUND_TRACE: the last stage's accounting, for a host wait on its device made outside the engine (the
+    // caller's pick). Harmless when the trace is off.
+    rt::StageState * rt_last_stage();
+
+    int position() const { return seq_pos_[active_]; }   // tokens consumed so far (the selected slot)
     static int fetch_rows();                // run() chunks of at most this many tokens take the fetch (decode) path
     int hot_experts() const;                // resident experts, all layers
     size_t cold_bytes() const;              // streamed per chunk
@@ -250,7 +289,18 @@ private:
     std::vector<std::unique_ptr<Impl>> front_;   // a layer split's stages before the last (destroyed after m_)
     std::unique_ptr<Impl> m_;                    // the last stage (the whole model without a split)
     template <class F> void each_stage(F && f);  // every stage in layer order, its device current
-    int pos_ = 0;
+    // The same, with each stage held while f runs on it: for anything touching a buffer a chunk's kernels may still
+    // be writing (profile_routes() frees one, route_counts() reads one). Without the lock another slot's forward can
+    // be enqueued on that stage while it happens (review H3).
+    template <class F> void each_stage_locked(F && f) const;
+    void construct(const Config & c, const Weights & w, int n_ctx, int max_chunk, const Options & o);
+    std::vector<int> seq_pos_{ 0 };              // each slot's position
+    std::unique_ptr<std::atomic<long long>[]> round_ns_;   // each slot's last round() end (steady clock ns)
+    // The selected slot. Another thread's accept()/draft() read it while this thread is between select() and its
+    // work (review H2), so it is atomic; a call that uses it more than once snapshots it (the hazard is a change
+    // mid-call, not a torn read).
+    std::atomic<int> active_{ 0 };
+    int seq_ctx_ = 0;
 };
 
 }  // namespace truss::qwen4exp

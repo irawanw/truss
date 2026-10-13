@@ -65,6 +65,35 @@ int truss_eval_argmax(truss_model * m, const int32_t * tokens, int n, int32_t * 
 int truss_spec_step(truss_model * m, int32_t next, int32_t * emitted, int * n_emitted, int32_t * new_next);
 int truss_drafts(const truss_model * m);            /* 0: opened without MTP */
 
+/* Sequence slots (TRUSS_SLOTS=n at open): the model holds n independent sequences, each with truss_n_ctx()
+   positions (n_ctx / n: the K/V memory is shared out, not added). truss_select makes one current; every other call
+   (eval, spec steps, reset, checkpoint, position) acts on it. Switch only between calls. Slot 0 is current at open. */
+int truss_slots(const truss_model * m);
+/* diagnostics: host ms each layer-split stage was held / waited for since the last reset: [front held, front wait,
+   last held, last wait] */
+void truss_lock_ms(truss_model * m, double * out4, int reset);
+/* TRUSS_ROUND_TRACE=<file>: the engine writes an interval log (per stage: host waits, lock hand-offs, and the
+   device-busy spans of a layer-split round) for track U's idle attribution. Process-global, and nothing happens
+   when the variable is unset. dump flushes the buffer; mark records a phase boundary the reader can key on. */
+void truss_round_trace_dump(void);
+void truss_round_trace_mark(int tag);
+int truss_select(truss_model * m, int slot);
+
+/* The same calls naming their slot. Calls on DIFFERENT slots may run on different threads at once: the engine holds
+   each layer-split stage only while one slot's work is enqueued there, so the two GPUs work on two conversations at
+   the same time. Calls on one slot must not overlap. */
+int truss_position_s(const truss_model * m, int slot);
+void truss_progress_s(const truss_model * m, int slot, int * done, int * total);
+int truss_reset_s(truss_model * m, int slot);
+int truss_eval_s(truss_model * m, int slot, const int32_t * tokens, int n, float * logits);
+/* truss_eval_s in prompt chunks of at most `step` tokens (a chunk holds each GPU for its whole pass: smaller chunks let
+   another slot's rounds through more often, at some prompt speed) */
+int truss_eval_step_s(truss_model * m, int slot, const int32_t * tokens, int n, int step, float * logits);
+int truss_eval_argmax_s(truss_model * m, int slot, const int32_t * tokens, int n, int32_t * next);
+int truss_spec_step_s(truss_model * m, int slot, int32_t next, int32_t * emitted, int * n_emitted, int32_t * new_next);
+int truss_checkpoint_s(truss_model * m, int slot);
+int truss_restore_s(truss_model * m, int slot);
+
 /* Sequence checkpoint (one slot, pinned host memory): truss_checkpoint saves the sequence's recurrent state at
    truss_position(); truss_restore returns the sequence to it and returns that position (-1: none taken). A later
    prompt that extends only the checkpointed prefix then reads only its own tail. */
@@ -108,6 +137,10 @@ int truss_eval_sample(truss_model * m, const int32_t * tokens, int n, const trus
    `history` is what counts before `next`; verify row t also counts `next` and drafts 1..t (Strata's per-row rule). */
 int truss_spec_step_sampled(truss_model * m, int32_t next, const truss_sampling * sp, int32_t * emitted,
                             int * n_emitted, int32_t * new_next);
+int truss_eval_sample_s(truss_model * m, int slot, const int32_t * tokens, int n, const truss_sampling * sp,
+                        int32_t * next);
+int truss_spec_step_sampled_s(truss_model * m, int slot, int32_t next, const truss_sampling * sp, int32_t * emitted,
+                              int * n_emitted, int32_t * new_next);
 
 #ifdef __cplusplus
 }

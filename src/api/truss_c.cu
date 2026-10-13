@@ -10,10 +10,12 @@
 #include "kernels/sampling/spec.cuh"
 #include "model/qwen4exp/config.h"
 #include "model/qwen4exp/forward.h"
+#include "model/qwen4exp/round_trace.h"
 #include "model/qwen4exp/weights.h"
 #include "runtime/expert_store.h"
 
 #include <atomic>
+#include <functional>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -22,6 +24,7 @@
 #include <exception>
 #include <memory>
 #include <string>
+#include <vector>
 
 using namespace truss;
 namespace q = truss::qwen4exp;
@@ -32,15 +35,21 @@ struct truss_model {
     int drafts = 0;
     int * spec_next = nullptr, * spec_host = nullptr;   // device / pinned argmax of each verify row
     bool spec_sample = false;                // TRUSS_SPEC_SAMPLE=1: sampled drafts + min(1, p/q) acceptance
-    float * q_full = nullptr;                // device [drafts][n_vocab]: the sampled drafts' q
-    int * spec_drafts = nullptr;             // device [drafts]: the window's guesses
+    std::vector<float *> q_full;             // per slot, device [drafts][n_vocab]: the sampled drafts' q
+    int * spec_drafts = nullptr;             // device [drafts]: the window's guesses (used under the last stage's hold)
     q::Config config;
     q::Weights weights;
     float * logits = nullptr;                // device [n_vocab]
     int * next = nullptr;                    // device, argmax
     int n_ctx = 0, max_chunk = 0;
-    uint64_t sample_counter = 0;             // random stream of the next sampled row
-    std::atomic<int> prog_done{ 0 }, prog_total{ 0 };   // the running eval(): tokens run / tokens asked (truss_progress)
+    // Per slot (TRUSS_SLOTS): the random stream of the next sampled row, and the running eval's progress (tokens run /
+    // tokens asked, truss_progress). The device buffers above and below are shared: they are only used while the
+    // engine holds its last stage for one slot (Forward::prompt's after(), Forward::round's pick()).
+    std::vector<uint64_t> counter;
+    std::unique_ptr<std::atomic<int>[]> prog_done, prog_total;
+    // truss_select(): the slot of the calls without one. Another thread reads it (the legacy wrappers of a server
+    // running slots) while truss_select writes it (review H2).
+    std::atomic<int> cur{ 0 };
     int * pen_cnt = nullptr;                 // device [drafts + 1][n_vocab] penalty counts, zero between calls
     int * pen_hist = nullptr, * pen_host = nullptr;   // device / pinned [drafts + 1][TRUSS_PENALTY_CAP] row histories
     std::unique_ptr<q::Forward> fwd;         // last: its expert budget takes the memory left
@@ -51,7 +60,7 @@ struct truss_model {
         cudaFree(logits);
         cudaFree(next);
         cudaFree(spec_next);
-        cudaFree(q_full);
+        for (float * q : q_full) cudaFree(q);
         cudaFree(spec_drafts);
         if (spec_host) cudaFreeHost(spec_host);
         cudaFree(pen_cnt);
@@ -61,6 +70,11 @@ struct truss_model {
 };
 
 namespace {
+
+// A verify window is `next` plus at most DRAFTS_MAX drafts, so the window buffers on the stack in the spec steps
+// have room for any configuration truss_open_params() accepts (the engine's own cap is moe::MAX_ROWS rows).
+constexpr int DRAFTS_MAX = 7;
+constexpr int WINDOW_ROWS = DRAFTS_MAX + 1;
 
 thread_local std::string last_error;
 
@@ -74,25 +88,33 @@ template <class F> auto guarded(F && f, decltype(f()) fail)
     }
 }
 
-// append tokens in chunks; the last chunk's last row feeds the head
-void eval(truss_model & m, const int32_t * tokens, int n)
+void check_slot(const truss_model & m, int slot)
 {
+    if (slot < 0 || slot >= (int) m.counter.size())
+        throw std::invalid_argument("truss: slot " + std::to_string(slot) + " of " + std::to_string(m.counter.size()));
+}
+
+// append tokens in chunks; the last chunk's last row feeds the head (m.logits), then after() runs while the engine
+// still holds the last stage for this slot (it reads m.logits)
+void eval(truss_model & m, int slot, const int32_t * tokens, int n, const std::function<void()> & after, int step_max = 0)
+{
+    check_slot(m, slot);
     if (n <= 0) throw std::invalid_argument("truss_eval: no tokens");
-    if (m.fwd->position() + n > m.n_ctx)
-        throw std::length_error("truss_eval: sequence of " + std::to_string(m.fwd->position() + n) +
+    if (m.fwd->position(slot) + n > m.n_ctx)
+        throw std::length_error("truss_eval: sequence of " + std::to_string(m.fwd->position(slot) + n) +
                                 " tokens exceeds n_ctx " + std::to_string(m.n_ctx));
     // A short prompt runs as decode-sized chunks (fetch path: only the experts its rows route to move), not as a
     // prompt chunk that streams every cold expert layer (~2.3 s at 256K whatever the length; TRACKER #89).
     const int fetch_max = std::getenv("TRUSS_FETCH_PROMPT") ? std::atoi(std::getenv("TRUSS_FETCH_PROMPT")) : 0;
-    const int step = n <= fetch_max ? std::min(m.max_chunk, q::Forward::fetch_rows()) : m.max_chunk;
-    int last = 0;
-    m.prog_done = 0, m.prog_total = n;
+    int step = n <= fetch_max ? std::min(m.max_chunk, q::Forward::fetch_rows()) : m.max_chunk;
+    if (step_max > 0) step = std::min(step, std::max(4, step_max / 4 * 4));   // a smaller chunk (truss_eval_step_s)
+    m.prog_done[slot] = 0, m.prog_total[slot] = n;
     // in chunks with the PLE lookahead (the next chunk's trigram rows are read while this chunk computes); a layer
-    // split runs its stages a chunk apart (Forward::run_prompt)
-    last = (n - 1) % step + 1;
-    m.fwd->run_prompt(tokens, n, step, [&](int done) { m.prog_done = done; });
-    m.fwd->head(last - 1, 1, m.logits);
+    // split runs its stages a chunk apart (Forward::prompt)
+    m.fwd->prompt(slot, tokens, n, step, m.logits, after, [&](int done) { m.prog_done[slot] = done; });
 }
+
+void sync(truss_model & m) { TRUSS_CUDA(cudaStreamSynchronize(m.fwd->stream())); }
 
 }  // namespace
 
@@ -131,7 +153,8 @@ truss_model * truss_open_params(const char * gguf_path, const truss_params * p)
             if (p->expert_usage && *p->expert_usage)
                 o.expert_usage = runtime::ExpertStore::load_usage(p->expert_usage, m->config.n_layer, m->config.n_expert);
             if (p->mtp && *p->mtp) {
-                if (p->drafts < 1 || p->drafts > 7) throw std::invalid_argument("drafts must be 1..7");
+                if (p->drafts < 1 || p->drafts > DRAFTS_MAX)
+                    throw std::invalid_argument("drafts must be 1.." + std::to_string(DRAFTS_MAX));
                 m->mtp_file = gguf::File::open(p->mtp);
                 m->mtp = std::make_unique<q::Mtp>(q::bind_mtp(*m->mtp_file, m->config));
                 m->drafts = p->drafts;
@@ -165,8 +188,10 @@ truss_model * truss_open_params(const char * gguf_path, const truss_params * p)
             TRUSS_CUDA(cudaMalloc(&m->spec_next, sizeof(int) * (m->drafts + 1)));
             TRUSS_CUDA(cudaMallocHost(&m->spec_host, sizeof(int) * (m->drafts + 1)));
             if (const char * e = std::getenv("TRUSS_SPEC_SAMPLE")) m->spec_sample = std::atoi(e) != 0 && m->drafts > 0;
-            if (m->spec_sample) {   // 3 MB at 3 drafts
-                TRUSS_CUDA(cudaMalloc(&m->q_full, sizeof(float) * m->config.n_vocab * m->drafts));
+            const int n_slots = std::max(1, std::getenv("TRUSS_SLOTS") ? std::atoi(std::getenv("TRUSS_SLOTS")) : 1);
+            if (m->spec_sample) {   // 3 MB a slot at 3 drafts
+                m->q_full.assign(n_slots, nullptr);
+                for (float *& qf : m->q_full) TRUSS_CUDA(cudaMalloc(&qf, sizeof(float) * m->config.n_vocab * m->drafts));
                 TRUSS_CUDA(cudaMalloc(&m->spec_drafts, sizeof(int) * m->drafts));
             }
             const size_t rows = m->drafts + 1;   // penalties: 4 MB of counts at 3 drafts
@@ -175,6 +200,13 @@ truss_model * truss_open_params(const char * gguf_path, const truss_params * p)
             TRUSS_CUDA(cudaMalloc(&m->pen_hist, sizeof(int) * rows * TRUSS_PENALTY_CAP));
             TRUSS_CUDA(cudaMallocHost(&m->pen_host, sizeof(int) * rows * TRUSS_PENALTY_CAP));
             m->fwd = std::make_unique<q::Forward>(m->config, m->weights, m->n_ctx, m->max_chunk, o);
+            m->n_ctx = m->fwd->seq_ctx();   // TRUSS_SLOTS: every limit below is per sequence
+            const int ns = m->fwd->slots();
+            if (m->spec_sample && ns != n_slots) throw std::logic_error("TRUSS_SLOTS: slot count mismatch");
+            m->counter.assign(ns, 0);
+            m->prog_done.reset(new std::atomic<int>[ns]);
+            m->prog_total.reset(new std::atomic<int>[ns]);
+            for (int i = 0; i < ns; ++i) m->prog_done[i] = 0, m->prog_total[i] = 0;
             m->file->release_pages();
             return m.release();
         },
@@ -196,7 +228,9 @@ int truss_n_vocab(const truss_model * m) { return m->config.n_vocab; }
 
 int truss_n_ctx(const truss_model * m) { return m->n_ctx; }
 
-int truss_position(const truss_model * m) { return m->fwd->position(); }
+int truss_position(const truss_model * m) { return m->fwd->position(m->cur); }
+
+int truss_position_s(const truss_model * m, int slot) { return m->fwd->position(slot); }
 
 const char * truss_meta_string(const truss_model * m, const char * key)
 {
@@ -212,29 +246,72 @@ int64_t truss_meta_int(const truss_model * m, const char * key, int64_t def)
     return i ? *i : def;
 }
 
-int truss_reset(truss_model * m)
+int truss_reset_s(truss_model * m, int slot)
 {
     return guarded(
         [&] {
-            m->fwd->reset();
+            check_slot(*m, slot);
+            m->fwd->reset(slot);
+            // A fresh sequence starts a fresh random stream. Every sampled row draws from (seed, counter), so without
+            // this a run's samples depend on how many sampled rows earlier runs consumed.
+            m->counter[slot] = 0;
             return 0;
         },
         -1);
 }
 
-void truss_progress(const truss_model * m, int * done, int * total)
+int truss_reset(truss_model * m) { return truss_reset_s(m, m->cur); }
+
+void truss_progress_s(const truss_model * m, int slot, int * done, int * total)
 {
-    *done = m->prog_done.load(std::memory_order_relaxed), *total = m->prog_total.load(std::memory_order_relaxed);
+    if (slot < 0 || slot >= (int) m->counter.size()) {
+        *done = *total = 0;
+        return;
+    }
+    *done = m->prog_done[slot].load(std::memory_order_relaxed), *total = m->prog_total[slot].load(std::memory_order_relaxed);
 }
 
-int truss_eval(truss_model * m, const int32_t * tokens, int n, float * logits)
+void truss_progress(const truss_model * m, int * done, int * total) { truss_progress_s(m, m->cur, done, total); }
+
+int truss_eval_s(truss_model * m, int slot, const int32_t * tokens, int n, float * logits)
 {
     return guarded(
         [&] {
-            eval(*m, tokens, n);
-            if (logits) TRUSS_CUDA(cudaMemcpyAsync(logits, m->logits, sizeof(float) * m->config.n_vocab,
-                                                   cudaMemcpyDeviceToHost, m->fwd->stream()));
-            TRUSS_CUDA(cudaStreamSynchronize(m->fwd->stream()));
+            eval(*m, slot, tokens, n, [&] {
+                if (logits) TRUSS_CUDA(cudaMemcpyAsync(logits, m->logits, sizeof(float) * m->config.n_vocab,
+                                                       cudaMemcpyDeviceToHost, m->fwd->stream()));
+                sync(*m);
+            });
+            return 0;
+        },
+        -1);
+}
+
+int truss_eval(truss_model * m, const int32_t * tokens, int n, float * logits) { return truss_eval_s(m, m->cur, tokens, n, logits); }
+
+int truss_eval_step_s(truss_model * m, int slot, const int32_t * tokens, int n, int step, float * logits)
+{
+    return guarded(
+        [&] {
+            eval(*m, slot, tokens, n, [&] {
+                if (logits) TRUSS_CUDA(cudaMemcpyAsync(logits, m->logits, sizeof(float) * m->config.n_vocab,
+                                                       cudaMemcpyDeviceToHost, m->fwd->stream()));
+                sync(*m);
+            }, step);
+            return 0;
+        },
+        -1);
+}
+
+int truss_eval_argmax_s(truss_model * m, int slot, const int32_t * tokens, int n, int32_t * next)
+{
+    return guarded(
+        [&] {
+            eval(*m, slot, tokens, n, [&] {
+                sampling::argmax(m->logits, m->config.n_vocab, m->next, m->fwd->stream());
+                TRUSS_CUDA(cudaMemcpyAsync(next, m->next, sizeof(int), cudaMemcpyDeviceToHost, m->fwd->stream()));
+                sync(*m);
+            });
             return 0;
         },
         -1);
@@ -242,33 +319,58 @@ int truss_eval(truss_model * m, const int32_t * tokens, int n, float * logits)
 
 int truss_eval_argmax(truss_model * m, const int32_t * tokens, int n, int32_t * next)
 {
+    return truss_eval_argmax_s(m, m->cur, tokens, n, next);
+}
+
+int truss_drafts(const truss_model * m) { return m->drafts; }
+
+int truss_slots(const truss_model * m) { return m->fwd->slots(); }
+
+void truss_lock_ms(truss_model * m, double * out4, int reset) { m->fwd->lock_ms(out4, reset != 0); }
+
+/* TRUSS_ROUND_TRACE=<file> (track U): the interval log is process-global. dump flushes what is buffered; mark
+   records a phase boundary (the tag is the harness's). Both do nothing when the variable is unset. */
+void truss_round_trace_dump(void) { q::rt::dump(); }
+void truss_round_trace_mark(int tag) { q::rt::mark(tag); }
+
+int truss_select(truss_model * m, int slot)
+{
     return guarded(
         [&] {
-            eval(*m, tokens, n);
-            sampling::argmax(m->logits, m->config.n_vocab, m->next, m->fwd->stream());
-            TRUSS_CUDA(cudaMemcpyAsync(next, m->next, sizeof(int), cudaMemcpyDeviceToHost, m->fwd->stream()));
-            TRUSS_CUDA(cudaStreamSynchronize(m->fwd->stream()));
+            check_slot(*m, slot);
+            m->fwd->select(slot);
+            m->cur = slot;
             return 0;
         },
         -1);
 }
 
-int truss_drafts(const truss_model * m) { return m->drafts; }
-
-int truss_checkpoint(truss_model * m)
+int truss_checkpoint_s(truss_model * m, int slot)
 {
-    return guarded([&] { m->fwd->checkpoint(); return 0; }, -1);
+    return guarded([&] { check_slot(*m, slot); m->fwd->checkpoint(slot); return 0; }, -1);
 }
 
-int truss_restore(truss_model * m)
+int truss_checkpoint(truss_model * m) { return truss_checkpoint_s(m, m->cur); }
+
+int truss_restore_s(truss_model * m, int slot)
 {
-    return guarded([&] { return m->fwd->restore(); }, -2);
+    return guarded([&] { check_slot(*m, slot); return m->fwd->restore(slot); }, -2);
 }
+
+int truss_restore(truss_model * m) { return truss_restore_s(m, m->cur); }
 
 namespace {
 sampling::SampleParams params_of(const truss_sampling * sp)
 {
     if (!sp || !(sp->temperature > 0.f)) throw std::invalid_argument("truss sampling: temperature must be > 0");
+    // Reject a penalty set that penalize_rows() would throw on, here, where no engine state is open yet. Its check
+    // stays (defense in depth), but from a spec step it would fire inside Forward::round's pick() - after the verify
+    // window is open - which is the state review C2 found the engine could not recover from (review R3: a request
+    // with repetition_penalty: 0 must fail, not poison the slot or the one next to it).
+    sampling::PenaltyParams pp;
+    pp.repeat = sp->repetition_penalty, pp.frequency = sp->frequency_penalty, pp.presence = sp->presence_penalty;
+    if (sampling::penalties_on(pp) && !(pp.repeat > 0.f))
+        throw std::invalid_argument("truss sampling: repetition_penalty must be > 0");
     sampling::SampleParams p;
     p.temperature = sp->temperature, p.top_p = sp->top_p, p.top_k = sp->top_k, p.min_p = sp->min_p, p.seed = sp->seed;
     return p;
@@ -306,17 +408,91 @@ void ban_rows(truss_model & m, const truss_sampling & sp, const int32_t * feed, 
 }
 }  // namespace
 
-int truss_eval_sample(truss_model * m, const int32_t * tokens, int n, const truss_sampling * sp, int32_t * next)
+int truss_eval_sample_s(truss_model * m, int slot, const int32_t * tokens, int n, const truss_sampling * sp,
+                        int32_t * next)
 {
     return guarded(
         [&] {
             const sampling::SampleParams p = params_of(sp);
-            eval(*m, tokens, n);
-            penalize_rows(*m, *sp, nullptr, 0, 1);
-            ban_rows(*m, *sp, tokens, n, 1);
-            sampling::sample(m->logits, m->config.n_vocab, 1, p, m->sample_counter++, m->next, m->fwd->stream());
-            TRUSS_CUDA(cudaMemcpyAsync(next, m->next, sizeof(int), cudaMemcpyDeviceToHost, m->fwd->stream()));
-            TRUSS_CUDA(cudaStreamSynchronize(m->fwd->stream()));
+            eval(*m, slot, tokens, n, [&] {
+                penalize_rows(*m, *sp, nullptr, 0, 1);
+                ban_rows(*m, *sp, tokens, n, 1);
+                sampling::sample(m->logits, m->config.n_vocab, 1, p, m->counter[slot]++, m->next, m->fwd->stream());
+                TRUSS_CUDA(cudaMemcpyAsync(next, m->next, sizeof(int), cudaMemcpyDeviceToHost, m->fwd->stream()));
+                sync(*m);
+            });
+            return 0;
+        },
+        -1);
+}
+
+int truss_eval_sample(truss_model * m, const int32_t * tokens, int n, const truss_sampling * sp, int32_t * next)
+{
+    return truss_eval_sample_s(m, m->cur, tokens, n, sp, next);
+}
+
+int truss_spec_step_sampled_s(truss_model * m, int slot, int32_t next, const truss_sampling * sp, int32_t * emitted,
+                              int * n_emitted, int32_t * new_next)
+{
+    return guarded(
+        [&] {
+            if (!m->drafts) throw std::logic_error("truss_spec_step_sampled: opened without an MTP block");
+            check_slot(*m, slot);
+            const sampling::SampleParams p = params_of(sp);
+            const int V = m->config.n_vocab;
+            const int nd = std::min(m->drafts, m->n_ctx - m->fwd->position(slot) - 1);
+            uint64_t & ctr = m->counter[slot];
+            if (nd < 1) {   // no room for a window: one plain step
+                eval(*m, slot, &next, 1, [&] {
+                    penalize_rows(*m, *sp, &next, 1, 1);
+                    ban_rows(*m, *sp, &next, 1, 1);
+                    sampling::sample(m->logits, V, 1, p, ctr++, m->next, m->fwd->stream());
+                    TRUSS_CUDA(cudaMemcpyAsync(new_next, m->next, sizeof(int), cudaMemcpyDeviceToHost, m->fwd->stream()));
+                    { TRUSS_RT(q::rt::kPlainSync); q::rt::Wait w(*m->fwd->rt_last_stage()); sync(*m); }
+                });
+                emitted[0] = next, *n_emitted = 1;
+                return 0;
+            }
+            int32_t win[WINDOW_ROWS];
+            if (m->spec_sample) {   // speculative sampling: lossless, accepts sum min(p, q) instead of p(argmax q)
+                float * qf = m->q_full[slot];
+                const uint64_t c0 = ctr;
+                const int keep = m->fwd->round(slot, next, nd, win, m->logits, &p, c0, qf, [&](int nw) {
+                    ctr = c0 + nd;
+                    penalize_rows(*m, *sp, win, nw + 1, nw + 1);
+                    ban_rows(*m, *sp, win, nw + 1, nw + 1);
+                    sampling::probs_inplace(m->logits, V, nw + 1, p, m->fwd->stream());
+                    if (nw) TRUSS_CUDA(cudaMemcpyAsync(m->spec_drafts, win + 1, sizeof(int) * nw, cudaMemcpyHostToDevice,
+                                                       m->fwd->stream()));
+                    sampling::spec_accept(m->logits, qf, m->spec_drafts, nw, V, p.seed, ctr, m->spec_next,
+                                          m->fwd->stream());
+                    ctr += nw + 1;
+                    TRUSS_CUDA(cudaMemcpyAsync(m->spec_host, m->spec_next, sizeof(int) * 2, cudaMemcpyDeviceToHost,
+                                               m->fwd->stream()));
+                    { TRUSS_RT(q::rt::kPickSync); q::rt::Wait w(*m->fwd->rt_last_stage());   // the sampled token: the
+                      sync(*m); }                                                             // last stage held through it
+                    *new_next = m->spec_host[1];
+                    return m->spec_host[0] + 1;
+                });
+                for (int i = 0; i < keep; ++i) emitted[i] = win[i];
+                *n_emitted = keep;
+                return 0;
+            }
+            const int keep = m->fwd->round(slot, next, nd, win, m->logits, nullptr, 0, nullptr, [&](int nw) {
+                penalize_rows(*m, *sp, win, nw + 1, nw + 1);
+                ban_rows(*m, *sp, win, nw + 1, nw + 1);
+                sampling::sample(m->logits, V, nw + 1, p, ctr, m->spec_next, m->fwd->stream());
+                ctr += nw + 1;
+                TRUSS_CUDA(cudaMemcpyAsync(m->spec_host, m->spec_next, sizeof(int) * (nw + 1), cudaMemcpyDeviceToHost,
+                                           m->fwd->stream()));
+                { TRUSS_RT(q::rt::kPickSyncQ); q::rt::Wait w(*m->fwd->rt_last_stage()); sync(*m); }
+                int j = 0;
+                while (j < nw && m->spec_host[j] == win[j + 1]) ++j;
+                *new_next = m->spec_host[j];
+                return j + 1;
+            });
+            for (int i = 0; i < keep; ++i) emitted[i] = win[i];
+            *n_emitted = keep;
             return 0;
         },
         -1);
@@ -325,65 +501,40 @@ int truss_eval_sample(truss_model * m, const int32_t * tokens, int n, const trus
 int truss_spec_step_sampled(truss_model * m, int32_t next, const truss_sampling * sp, int32_t * emitted,
                             int * n_emitted, int32_t * new_next)
 {
+    return truss_spec_step_sampled_s(m, m->cur, next, sp, emitted, n_emitted, new_next);
+}
+
+int truss_spec_step_s(truss_model * m, int slot, int32_t next, int32_t * emitted, int * n_emitted, int32_t * new_next)
+{
     return guarded(
         [&] {
-            if (!m->drafts) throw std::logic_error("truss_spec_step_sampled: opened without an MTP block");
-            const sampling::SampleParams p = params_of(sp);
-            const int V = m->config.n_vocab;
-            const int nd = std::min(m->drafts, m->n_ctx - m->fwd->position() - 1);
+            if (!m->drafts) throw std::logic_error("truss_spec_step: opened without an MTP block");
+            check_slot(*m, slot);
+            const int nd = std::min(m->drafts, m->n_ctx - m->fwd->position(slot) - 1);
             if (nd < 1) {   // no room for a window: one plain step
-                eval(*m, &next, 1);
-                penalize_rows(*m, *sp, &next, 1, 1);
-                ban_rows(*m, *sp, &next, 1, 1);
-                sampling::sample(m->logits, V, 1, p, m->sample_counter++, m->next, m->fwd->stream());
-                TRUSS_CUDA(cudaMemcpyAsync(new_next, m->next, sizeof(int), cudaMemcpyDeviceToHost, m->fwd->stream()));
-                TRUSS_CUDA(cudaStreamSynchronize(m->fwd->stream()));
+                eval(*m, slot, &next, 1, [&] {
+                    sampling::argmax(m->logits, m->config.n_vocab, m->next, m->fwd->stream());
+                    TRUSS_CUDA(cudaMemcpyAsync(new_next, m->next, sizeof(int), cudaMemcpyDeviceToHost, m->fwd->stream()));
+                    sync(*m);
+                });
                 emitted[0] = next, *n_emitted = 1;
                 return 0;
             }
-            int32_t win[8];
-            win[0] = next;
-            if (m->spec_sample) {   // speculative sampling: lossless, accepts sum min(p, q) instead of p(argmax q)
-                m->fwd->set_draft_sampling(&p, m->sample_counter, m->q_full);
-                const int nw = m->fwd->draft(next, nd, win + 1);
-                m->fwd->set_draft_sampling(nullptr, 0, nullptr);
-                m->sample_counter += nd;
-                m->fwd->verify(win, nw + 1);
-                m->fwd->head(0, nw + 1, m->logits);
-                penalize_rows(*m, *sp, win, nw + 1, nw + 1);
-                ban_rows(*m, *sp, win, nw + 1, nw + 1);
-                sampling::probs_inplace(m->logits, V, nw + 1, p, m->fwd->stream());
-                if (nw) TRUSS_CUDA(cudaMemcpyAsync(m->spec_drafts, win + 1, sizeof(int) * nw, cudaMemcpyHostToDevice,
-                                                   m->fwd->stream()));
-                sampling::spec_accept(m->logits, m->q_full, m->spec_drafts, nw, V, p.seed, m->sample_counter,
-                                      m->spec_next, m->fwd->stream());
-                m->sample_counter += nw + 1;
-                TRUSS_CUDA(cudaMemcpyAsync(m->spec_host, m->spec_next, sizeof(int) * 2, cudaMemcpyDeviceToHost,
+            int32_t win[WINDOW_ROWS];
+            const int V = m->config.n_vocab;
+            const int keep = m->fwd->round(slot, next, nd, win, m->logits, nullptr, 0, nullptr, [&](int nw) {
+                for (int r = 0; r <= nw; ++r)
+                    sampling::argmax(m->logits + (size_t) r * V, V, m->spec_next + r, m->fwd->stream());
+                TRUSS_CUDA(cudaMemcpyAsync(m->spec_host, m->spec_next, sizeof(int) * (nw + 1), cudaMemcpyDeviceToHost,
                                            m->fwd->stream()));
-                TRUSS_CUDA(cudaStreamSynchronize(m->fwd->stream()));
-                const int j = m->spec_host[0];
-                m->fwd->accept(j + 1);
-                for (int i = 0; i <= j; ++i) emitted[i] = win[i];
-                *n_emitted = j + 1;
-                *new_next = m->spec_host[1];
-                return 0;
-            }
-            const int nw = m->fwd->draft(next, nd, win + 1);
-            m->fwd->verify(win, nw + 1);
-            m->fwd->head(0, nw + 1, m->logits);
-            penalize_rows(*m, *sp, win, nw + 1, nw + 1);
-            ban_rows(*m, *sp, win, nw + 1, nw + 1);
-            sampling::sample(m->logits, V, nw + 1, p, m->sample_counter, m->spec_next, m->fwd->stream());
-            m->sample_counter += nw + 1;
-            TRUSS_CUDA(cudaMemcpyAsync(m->spec_host, m->spec_next, sizeof(int) * (nw + 1), cudaMemcpyDeviceToHost,
-                                       m->fwd->stream()));
-            TRUSS_CUDA(cudaStreamSynchronize(m->fwd->stream()));
-            int j = 0;
-            while (j < nw && m->spec_host[j] == win[j + 1]) ++j;
-            m->fwd->accept(j + 1);
-            for (int i = 0; i <= j; ++i) emitted[i] = win[i];
-            *n_emitted = j + 1;
-            *new_next = m->spec_host[j];
+                sync(*m);
+                int j = 0;
+                while (j < nw && m->spec_host[j] == win[j + 1]) ++j;
+                *new_next = m->spec_host[j];
+                return j + 1;
+            });
+            for (int i = 0; i < keep; ++i) emitted[i] = win[i];
+            *n_emitted = keep;
             return 0;
         },
         -1);
@@ -391,37 +542,7 @@ int truss_spec_step_sampled(truss_model * m, int32_t next, const truss_sampling 
 
 int truss_spec_step(truss_model * m, int32_t next, int32_t * emitted, int * n_emitted, int32_t * new_next)
 {
-    return guarded(
-        [&] {
-            if (!m->drafts) throw std::logic_error("truss_spec_step: opened without an MTP block");
-            const int nd = std::min(m->drafts, m->n_ctx - m->fwd->position() - 1);
-            if (nd < 1) {   // no room for a window: one plain step
-                eval(*m, &next, 1);
-                sampling::argmax(m->logits, m->config.n_vocab, m->next, m->fwd->stream());
-                TRUSS_CUDA(cudaMemcpyAsync(new_next, m->next, sizeof(int), cudaMemcpyDeviceToHost, m->fwd->stream()));
-                TRUSS_CUDA(cudaStreamSynchronize(m->fwd->stream()));
-                emitted[0] = next, *n_emitted = 1;
-                return 0;
-            }
-            int32_t win[8];
-            win[0] = next;
-            const int nw = m->fwd->draft(next, nd, win + 1);   // may stop early on an unsure guess
-            m->fwd->verify(win, nw + 1);
-            m->fwd->head(0, nw + 1, m->logits);
-            const int V = m->config.n_vocab;
-            for (int r = 0; r <= nw; ++r) sampling::argmax(m->logits + (size_t) r * V, V, m->spec_next + r, m->fwd->stream());
-            TRUSS_CUDA(cudaMemcpyAsync(m->spec_host, m->spec_next, sizeof(int) * (nw + 1), cudaMemcpyDeviceToHost,
-                                       m->fwd->stream()));
-            TRUSS_CUDA(cudaStreamSynchronize(m->fwd->stream()));
-            int j = 0;
-            while (j < nw && m->spec_host[j] == win[j + 1]) ++j;
-            m->fwd->accept(j + 1);
-            for (int i = 0; i <= j; ++i) emitted[i] = win[i];
-            *n_emitted = j + 1;
-            *new_next = m->spec_host[j];
-            return 0;
-        },
-        -1);
+    return truss_spec_step_s(m, m->cur, next, emitted, n_emitted, new_next);
 }
 
 }  // extern "C"
