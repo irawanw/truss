@@ -2852,10 +2852,11 @@ Forward::~Forward()
 {
     int d = 0;
     cudaGetDevice(&d);
-    m_.reset();   // the last stage first: its driver may share the first stage's CPU pool
+    rt::close();   // TRUSS_ROUND_TRACE: flush and join the sampler BEFORE any stage dies - a stage destructor
+                   // recording, or the sampler thread reading a stage's events, after it is freed is a use-after-free
+    m_.reset();    // the last stage first: its driver may share the first stage's CPU pool
     front_.clear();
     cudaSetDevice(d);
-    rt::close();   // TRUSS_ROUND_TRACE: the last records of the run
 }
 
 // every stage in layer order, each with its device current
