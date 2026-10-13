@@ -3442,6 +3442,10 @@ int Forward::round(int slot, int32_t next, int nd, int32_t * win, float * logits
             last_open = true;
             m_->head(0, T, logits);
             inject_fault("round-pick", slot);   // exactly the state a throw inside pick() leaves (truss_c.cu's pick)
+            // U2: where the pick's sync time actually goes. Everything queued up to here (this slot's verify rows
+            // through layers 28-47, then the head) is drained by the sync inside pick(); the sampling kernels are
+            // what runs after. This stamp splits the wait's device segment into those two (gpu work / gpu sampling).
+            rt::stamp_mid(m_->rt_st);
             {
                 TRUSS_RT(rt::kPick);   // the last stage is held through this: its device idles while the host samples
                 keep = pick(nw);

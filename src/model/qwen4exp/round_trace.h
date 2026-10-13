@@ -51,6 +51,7 @@ enum Site : int32_t
     kFrontDrain,  // prompt(): the front thread's final stream sync
     kMark,        // the harness's phase mark; aux = the tag
     kStats,       // what the trace failed to read; dur = records dropped, aux = segments left unread
+    kGpuSample,   // device work after a mid stamp (U2): what the pick's sync waits for beyond the queued layers/head
     kSiteCount
 };
 inline const char * site_name(int32_t s)
@@ -59,7 +60,7 @@ inline const char * site_name(int32_t s)
                                           "gpu work", "draft min_p sync", "draft end sync", "front-event wait",
                                           "pick", "pick sync", "pick sync (argmax q)", "single step sync",
                                           "prompt front", "prompt last", "give way", "front drain", "mark",
-                                          "stats" };
+                                          "stats", "gpu sampling" };
     return s >= 0 && s < kSiteCount ? n[s] : "?";
 }
 
@@ -173,6 +174,11 @@ struct StageState
     // One event pair per held section, three in rotation: the pair of a released section stays unread until some
     // thread finds its closing event complete, and with two the next-but-one acquire could come around to it.
     cudaEvent_t evA[3] = { nullptr, nullptr, nullptr }, evB[3] = { nullptr, nullptr, nullptr };
+    // An optional third stamp inside the section (U2): recorded without waiting, read by the next Wait, which then
+    // splits its segment in two - the work queued before the stamp and the work enqueued after it.
+    cudaEvent_t evM = nullptr;
+    bool has_m = false;
+    int64_t m_t = 0;            // host time of that stamp: where the first of the two segments ends
     int cur = 0;
     double cum = 0;             // ms of device work already accounted for in this section
     int64_t last_t = 0;         // host time of the stamp cum was taken at: where the next segment starts
@@ -205,12 +211,12 @@ struct DevGuard
 
 // The segment of device work between the stage's last stamp and this one, placed at the end of the segment.
 inline void push_work(double & cum, int64_t & t0, double ms, int64_t end_ns, int32_t stage, int32_t slot,
-                      int64_t round)
+                      int64_t round, int32_t site = kGpu)
 {
     const double d = ms - cum;
     cum = ms;
     t0 = end_ns;
-    if (d > 0.0) push({ end_ns - (int64_t) (d * 1e6), (int64_t) (d * 1e6), kGpu, slot, stage, kKindGpu, round });
+    if (d > 0.0) push({ end_ns - (int64_t) (d * 1e6), (int64_t) (d * 1e6), site, slot, stage, kKindGpu, round });
 }
 
 // A StageState lives inside an Impl. Unregister it before it dies: a later sweep - close(), or another stage's
@@ -226,6 +232,7 @@ inline StageState::~StageState()
         if (evA[p]) cudaEventDestroy(evA[p]);
         if (evB[p]) cudaEventDestroy(evB[p]);
     }
+    if (evM) cudaEventDestroy(evM);
 }
 
 // One stage's finished segments, read under its own mutex (H2). Never blocks on the device: a pair whose event is
@@ -281,10 +288,21 @@ inline void stage_begin(StageState & st, cudaStream_t s, int device, int stage)
     st.cum = 0;
     st.held = true;
     st.last_t = now();
+    st.has_m = false;
     DevGuard g(device);
     if (!st.evA[st.cur]) cudaEventCreate(&st.evA[st.cur]);
     if (!st.evB[st.cur]) cudaEventCreate(&st.evB[st.cur]);
     cudaEventRecord(st.evA[st.cur], s);
+}
+
+// A stamp inside the held section that the host does not wait for. The next Wait reads it; a section whose stamp is
+// never read costs nothing, because cum is untouched by it and the release segment still covers the whole section.
+inline void stamp_mid(StageState & st)
+{
+    if (!on() || !st.held) return;
+    DevGuard g(st.device);
+    if (!st.evM && cudaEventCreate(&st.evM) != cudaSuccess) return;
+    if (cudaEventRecord(st.evM, st.s) == cudaSuccess) st.m_t = now(), st.has_m = true;
 }
 
 // A host wait on this stage's own device, inside the held section: stamp before it, account the work after it.
@@ -309,8 +327,16 @@ struct Wait
         if (!st) return;
         float ms = 0.f;
         DevGuard g(st->device);
+        float mm = 0.f;
+        const bool split = st->has_m && cudaEventElapsedTime(&mm, st->evA[st->cur], st->evM) == cudaSuccess;
         if (cudaEventElapsedTime(&ms, st->evA[st->cur], st->evB[st->cur]) == cudaSuccess)
-            push_work(st->cum, st->last_t, ms, now(), st->stage, slot, round);
+        {
+            if (split && mm > st->cum)   // what was already queued, drained by this wait
+                push_work(st->cum, st->last_t, mm, st->m_t, st->stage, slot, round);
+            push_work(st->cum, st->last_t, ms, now(), st->stage, slot, round,
+                      split ? kGpuSample : kGpu);   // and what ran after the mid stamp
+        }
+        st->has_m = false;
     }
 };
 
