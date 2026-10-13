@@ -2292,7 +2292,10 @@ struct Forward::Impl {
         if (mtp) {
             load_layer(mst, q.mtpl);
             pending_h = q.pending_h;
-            if (q.dc_on) copy(small.res, q.res_keep, (size_t) q.dc_T * row);
+            if (q.dc_on) {   // flush_commit() reads res, which the other slot's last call may have left on the
+                copy(small.res, q.res_keep, (size_t) q.dc_T * row);   // stream buffer: the rows live in small
+                use(small);
+            }
         }
         has_pending = q.has_pending, dc_on = q.dc_on, mtp_ahead = q.mtp_ahead;
         dc_pos0 = q.dc_pos0, dc_T = q.dc_T, ahead_pos = q.ahead_pos, ahead_tok = q.ahead_tok, last_T = q.last_T;
@@ -2791,7 +2794,7 @@ void Forward::reset()
         std::fwrite(h, 4, 2, m_->route_trace);
     }
     each_stage([](Impl & m) { m.reset(); });
-    pos_ = 0;
+    pos_ = 0, seq_pos_[active_] = 0;   // the saved position belongs to the slot being reset, not to slot 0
 }
 
 void Forward::run(const int32_t * tokens, int T, const LayerHook & hook, const int32_t * next, int next_T)
