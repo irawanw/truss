@@ -19,6 +19,7 @@ round-gap clauses are appended at the END of the line, never before "prompt"). P
 usage: CUDA_VISIBLE_DEVICES=2 python3 -m server.app --model <gguf> --tokenizer <tokenizer.json> [--port 8080]
 """
 import argparse
+import atexit
 import json
 import os
 import threading
@@ -146,6 +147,10 @@ class Engine:
         self.init_sequences(a.chunk)   # one record per sequence + the two fair gates (see below)
         self.im_start = self.chat.token_id("<|im_start|>")
         self.think_close = self.chat.token_id("</think>")
+        # TRUSS_ROUND_TRACE (scripts/u_trace_report.py): flush the engine's interval log when the process exits, so
+        # a served run can be attributed the same way a bench run is. No effect when the variable is unset.
+        if os.environ.get("TRUSS_ROUND_TRACE") and hasattr(self.model, "trace_dump"):
+            atexit.register(self.model.trace_dump)
 
     def log(self, line: str):
         print(line, flush=True)
@@ -411,7 +416,7 @@ class Engine:
 
     def generate(self, prompt_ids, max_tokens, temperature, top_p, top_k, seed, stop_strings, min_p=0.0,
                  presence_penalty=0.0, frequency_penalty=0.0, repetition_penalty=1.0, penalty_last_n=64,
-                 think_open=False, note=""):
+                 think_open=False, note="", ignore_eos=False):
         """Yields (token id, text delta, finish reason or None); the last item has the finish reason.
         Penalties (sampled requests only; greedy ignores them): llama.cpp's formulas over the last penalty_last_n
         tokens of the sequence (prompt included, as llama-server and Strata count), or with penalty_last_n -1 over
@@ -533,7 +538,7 @@ class Engine:
                         # the reasoning block closed (the engine lifts the ban only inside the call that feeds
                         # </think>), or it ran so long that a stuck reply must still be able to end
                         sp.set_ban([])
-                    if tok in self.stop_ids:
+                    if tok in self.stop_ids and not ignore_eos:
                         finish = "stop"
                         self.log_stop(slot, tok, n_prompt, n_gen, rounds)
                         break
@@ -640,6 +645,9 @@ def make_app(engine: Engine) -> FastAPI:
                  # llama-server's names too
                  repetition_penalty=get("repetition_penalty", body.get("repeat_penalty") or 1.0, float),
                  penalty_last_n=get("penalty_last_n", body.get("repeat_last_n") or 64, int),
+                 # llama-server's ignore_eos: keep generating to max_tokens. Used by the decode-speed benches so that
+                 # two streams decode at the same time instead of one ending its turn early.
+                 ignore_eos=bool(body.get("ignore_eos", False)),
                  stop_strings=[stop] if isinstance(stop, str) else list(stop))
         # A repetition_penalty of 0 (or less) makes the engine's penalty divide by it, and it throws from inside the
         # first decode round - after the engine opened a verify window on this slot, which is the state review C2
@@ -714,9 +722,18 @@ def make_app(engine: Engine) -> FastAPI:
         tools = body.get("tools") or None
         if body.get("tool_choice") == "none":
             tools = None
-        prompt = await anyio.to_thread.run_sync(
-            lambda: engine.chat.prompt(normalize_messages(body["messages"]), tools=tools, template_kwargs=kw))
-        ids = await anyio.to_thread.run_sync(engine.chat.encode, prompt)
+        # vLLM-compatible `prompt`: an already-rendered prompt, as text or as token ids, bypasses the chat template.
+        # A client that owns its prompt (an agent that renders its own template, a bench replaying recorded ids)
+        # gets those exact tokens, which is what makes a served measurement comparable to an in-process one.
+        raw = body.get("prompt")
+        if isinstance(raw, list):
+            ids = [int(x) for x in raw]
+        elif raw is not None:
+            ids = await anyio.to_thread.run_sync(engine.chat.encode, raw)
+        else:
+            prompt = await anyio.to_thread.run_sync(
+                lambda: engine.chat.prompt(normalize_messages(body["messages"]), tools=tools, template_kwargs=kw))
+            ids = await anyio.to_thread.run_sync(engine.chat.encode, prompt)
         if (r := too_long(ids)) is not None:
             return r
         p = params(body)
