@@ -134,7 +134,8 @@ class Engine:
                                               (seed if seed is not None else np.random.SeedSequence().entropy) % (1 << 64),
                                               repetition_penalty, frequency_penalty, presence_penalty,
                                               PENALTY_CAP if penalty_last_n < 0 else penalty_last_n)
-            if sp is not None and think_open and self.think_close is not None and self.think_close >= 0:
+            if (sp is not None and think_open and BAN_EOS_IN_THINK and self.think_close is not None
+                    and self.think_close >= 0):
                 sp.set_ban(sorted(self.stop_ids), self.think_close)
 
             def counted():   # the tokens the penalties see, from the engine's own sequence
@@ -199,6 +200,10 @@ class Engine:
                         pending, nxt = emitted, after
                     tok = pending.pop(0) if spec else nxt
                     n_gen += 1
+                    if sp is not None and sp.n_ban and (tok == self.think_close or n_gen >= BAN_MAX_TOKENS):
+                        # the reasoning block closed (the engine lifts the ban only inside the call that feeds
+                        # </think>), or it ran so long that a stuck reply must still be able to end
+                        sp.set_ban([])
                     if tok in self.stop_ids:
                         finish = "stop"
                         break
@@ -233,6 +238,12 @@ class Engine:
                                                          repetition_penalty=repetition_penalty,
                                                          penalty_last_n=penalty_last_n))
             yield None, "", finish
+
+
+# TRUSS_BAN_EOS_IN_THINK=1: no end of turn inside an open reasoning block (off: it looped a reply that never fed
+# </think>, 10-13)
+BAN_EOS_IN_THINK = os.environ.get("TRUSS_BAN_EOS_IN_THINK", "1") == "1"
+BAN_MAX_TOKENS = 16384   # a reasoning block this long without </think> may end the turn after all
 
 
 def split_reasoning(text: str, thinking: bool):
