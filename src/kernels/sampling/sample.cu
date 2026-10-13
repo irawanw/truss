@@ -110,7 +110,20 @@ __global__ void __launch_bounds__(THREADS) sample_kernel(const float * xs, int n
     out[blockIdx.x] = i;
 }
 
+__global__ void ban_kernel(float * xs, int n, BanList b)
+{
+    const int i = threadIdx.x;
+    if (i < b.n && b.id[i] >= 0 && b.id[i] < n) xs[(size_t) blockIdx.x * n + b.id[i]] = BANNED;
+}
+
 }  // namespace
+
+void ban(float * x, int n, int rows, const BanList & b, cudaStream_t stream)
+{
+    if (rows <= 0 || b.n <= 0) return;
+    ban_kernel<<<rows, BAN_MAX, 0, stream>>>(x, n, b);
+    TRUSS_CUDA(cudaGetLastError());
+}
 
 void sample(const float * x, int n, int rows, const SampleParams & p, uint64_t counter, int * out, cudaStream_t stream)
 {

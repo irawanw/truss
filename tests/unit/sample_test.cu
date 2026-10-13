@@ -3,7 +3,7 @@
 // top-k / top-p / min-p set (total variation distance within sampling noise), no token outside the set is ever
 // drawn, and the same (seed, counter) draws the same token. sampling::penalize against a host reference: bit-exact
 // logits per row (each row its own history, -1 padding and out-of-range ids ignored), and the count scratch back to
-// zero afterwards.
+// zero afterwards. sampling::ban: banned ids are never drawn and the rest keep their exact distribution.
 #include "core/cuda_check.h"
 #include "kernels/sampling/penalty.cuh"
 #include "kernels/sampling/sample.cuh"
@@ -89,6 +89,52 @@ int run(int n, int rows, const sampling::SampleParams & p, std::mt19937 & rng, c
     return ok ? 0 : 1;
 }
 
+// sampling::ban then sample: the banned ids (the row's most likely tokens, the hardest case) are never drawn and the
+// rest follow the exact distribution of the row without them; rows past `banned_rows` are untouched.
+int run_ban(int n, int rows, int n_ban, const sampling::SampleParams & p, std::mt19937 & rng, const char * what)
+{
+    std::normal_distribution<float> nd(0.f, 2.f);
+    std::vector<float> x(n);
+    for (float & v : x) v = nd(rng);
+    std::vector<int> o(n);
+    std::iota(o.begin(), o.end(), 0);
+    std::sort(o.begin(), o.end(), [&](int a, int b) { return x[a] > x[b]; });
+    sampling::BanList b;
+    b.n = n_ban;
+    std::vector<float> xb(x);
+    for (int i = 0; i < n_ban; ++i) b.id[i] = o[i], xb[o[i]] = sampling::BANNED;
+    std::vector<float> xs((size_t) rows * n);
+    for (int r = 0; r < rows; ++r) std::copy(x.begin(), x.end(), xs.begin() + (size_t) r * n);
+    float * dx;
+    int * dout;
+    TRUSS_CUDA(cudaMalloc(&dx, xs.size() * 4));
+    TRUSS_CUDA(cudaMalloc(&dout, rows * 4));
+    TRUSS_CUDA(cudaMemcpy(dx, xs.data(), xs.size() * 4, cudaMemcpyHostToDevice));
+    const int banned_rows = rows - 1;   // the last row keeps its logits
+    sampling::ban(dx, n, banned_rows, b, nullptr);
+    std::vector<float> last(n);
+    TRUSS_CUDA(cudaMemcpy(last.data(), dx + (size_t) banned_rows * n, n * 4, cudaMemcpyDeviceToHost));
+    sampling::sample(dx, n, banned_rows, p, 2000, dout, nullptr);
+    std::vector<int> got(banned_rows);
+    TRUSS_CUDA(cudaMemcpy(got.data(), dout, banned_rows * 4, cudaMemcpyDeviceToHost));
+    const std::vector<double> q = exact(xb, p);
+    std::vector<double> f(n, 0.0);
+    long hit = 0;
+    for (int t : got) {
+        f[t] += 1.0 / banned_rows;
+        for (int i = 0; i < n_ban; ++i) hit += t == b.id[i];
+    }
+    double tv = 0, noise = 0;
+    for (int i = 0; i < n; ++i) tv += std::fabs(f[i] - q[i]) / 2, noise += std::sqrt(q[i] * (1 - q[i]) / banned_rows);
+    noise *= 0.5 * std::sqrt(2 / M_PI);
+    const bool untouched = last == x;
+    const bool ok = hit == 0 && untouched && tv <= 3 * noise + 1e-3;
+    std::printf("%-28s n %6d, %d banned, rows %6d: TV %.4f (noise %.4f), banned drawn %ld, last row untouched %s  %s\n",
+                what, n, n_ban, banned_rows, tv, noise, hit, untouched ? "yes" : "NO", ok ? "PASS" : "FAIL");
+    cudaFree(dx), cudaFree(dout);
+    return ok ? 0 : 1;
+}
+
 int run_penalty(int n, int rows, int h, const sampling::PenaltyParams & pp, std::mt19937 & rng, const char * what)
 {
     std::normal_distribution<float> nd(0.f, 3.f);
@@ -159,6 +205,12 @@ int main()
     p = {};
     p.seed = 9, p.temperature = 1.f, p.top_p = 0.95f;
     fails += run(248077, 4000, p, rng, "real vocab, top_p 0.95");
+    p = {};
+    p.seed = 11, p.temperature = 0.8f;
+    fails += run_ban(64, 200001, 3, p, rng, "ban top 3, T 0.8");
+    p.top_p = 0.95f, p.top_k = 40, p.min_p = 0.05f;   // the served defaults
+    fails += run_ban(512, 200001, 2, p, rng, "ban top 2, served filters");
+    fails += run_ban(248077, 4001, 3, p, rng, "ban, real vocab");
     sampling::PenaltyParams pp;
     pp.presence = 1.5f;
     fails += run_penalty(512, 4, 64, pp, rng, "presence 1.5");

@@ -29,17 +29,26 @@ class Sampling(ctypes.Structure):   # truss_sampling; penalties off unless set (
                 ("min_p", ctypes.c_float), ("seed", ctypes.c_uint64),
                 ("repetition_penalty", ctypes.c_float), ("frequency_penalty", ctypes.c_float),
                 ("presence_penalty", ctypes.c_float), ("penalty_last_n", ctypes.c_int),
-                ("history", ctypes.POINTER(ctypes.c_int32)), ("n_history", ctypes.c_int)]
+                ("history", ctypes.POINTER(ctypes.c_int32)), ("n_history", ctypes.c_int),
+                ("ban", ctypes.POINTER(ctypes.c_int32)), ("n_ban", ctypes.c_int), ("ban_lift", ctypes.c_int32)]
 
     def __init__(self, temperature, top_p, top_k, min_p, seed, repetition_penalty=1.0, frequency_penalty=0.0,
                  presence_penalty=0.0, penalty_last_n=64):
         super().__init__(temperature, top_p, top_k, min_p, seed, repetition_penalty, frequency_penalty,
-                         presence_penalty, penalty_last_n, None, 0)
+                         presence_penalty, penalty_last_n, None, 0, None, 0, -1)
         self._hist = None
+        self._ban = None
 
     @property
     def penalized(self) -> bool:
         return self.repetition_penalty != 1.0 or self.frequency_penalty != 0.0 or self.presence_penalty != 0.0
+
+    def set_ban(self, tokens, lift: int = -1):
+        """Tokens no sampled row may produce until `lift` has been fed (-1: every row); empty: off (truss.h)."""
+        tokens = list(tokens)[:8]
+        self._ban = np.ascontiguousarray(tokens, dtype=np.int32) if tokens else None
+        self.ban = self._ban.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)) if tokens else None
+        self.n_ban, self.ban_lift = len(tokens), lift
 
     def set_history(self, tokens):
         """The tokens the penalties count (the last PENALTY_CAP are kept); the array lives until the next call."""

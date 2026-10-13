@@ -24,4 +24,16 @@ struct SampleParams {
 void sample(const float * x, int n, int rows, const SampleParams & p, uint64_t counter, int * out,
             cudaStream_t stream);
 
+// Tokens a sampled row may not produce (the end-of-turn tokens inside an open reasoning block): x[r][id[i]] = BANNED
+// for r in [0, rows). A large finite logit, not -inf: sample() bisects between the row's min and max logit, and
+// exp(BANNED / T - max) is exactly 0 in fp32 for any sane temperature, so a banned token is never drawn and gets
+// probability 0 in probs_inplace (a draft of it is then always rejected by spec_accept).
+constexpr int BAN_MAX = 8;
+constexpr float BANNED = -1e4f;
+struct BanList {
+    int n = 0;
+    int id[BAN_MAX] = {};
+};
+void ban(float * x, int n, int rows, const BanList & b, cudaStream_t stream);
+
 }  // namespace truss::sampling

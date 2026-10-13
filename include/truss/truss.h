@@ -89,6 +89,13 @@ typedef struct truss_sampling {
     int penalty_last_n;
     const int32_t * history;
     int n_history;
+    /* Tokens no sampled row may produce (n_ban <= 8 ids, host memory, read during the call; 0: off), e.g. the
+       end-of-turn tokens while the reply's reasoning block is open. ban_lift >= 0 ends the ban at that token: a row
+       whose fed tokens (this call's, up to and including the row's own) contain ban_lift is not banned. -1: every
+       row. Zero-initialised callers (n_ban 0) are unaffected. */
+    const int32_t * ban;
+    int n_ban;
+    int32_t ban_lift;
 } truss_sampling;
 
 /* truss_eval, then a sample of the last token's next-token distribution in *next. The penalties count `history`

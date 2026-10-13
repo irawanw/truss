@@ -288,6 +288,22 @@ void penalize_rows(truss_model & m, const truss_sampling & sp, const int32_t * f
     TRUSS_CUDA(cudaMemcpyAsync(m.pen_hist, m.pen_host, sizeof(int) * rows * w, cudaMemcpyHostToDevice, m.fwd->stream()));
     sampling::penalize(m.logits, m.config.n_vocab, rows, m.pen_hist, w, pp, m.pen_cnt, m.fwd->stream());
 }
+// The ban (truss_sampling::ban) on rows [0, rows) of m->logits. Row r has been fed feed[0 .. r + nfeed - rows]
+// (a verify window feeds one token per row; truss_eval_sample feeds n tokens for its one row); the ban holds for the
+// rows before the first one whose fed tokens include ban_lift.
+void ban_rows(truss_model & m, const truss_sampling & sp, const int32_t * feed, int nfeed, int rows)
+{
+    if (!sp.ban || sp.n_ban <= 0) return;
+    if (sp.n_ban > sampling::BAN_MAX) throw std::invalid_argument("truss sampling: n_ban must be <= 8");
+    sampling::BanList b;
+    b.n = sp.n_ban;
+    for (int i = 0; i < b.n; ++i) b.id[i] = sp.ban[i];
+    int k = rows;   // rows [0, k) are banned
+    if (sp.ban_lift >= 0)
+        for (int t = 0; t < nfeed; ++t)
+            if (feed[t] == sp.ban_lift) { k = std::max(0, std::min(rows, t - (nfeed - rows))); break; }
+    sampling::ban(m.logits, m.config.n_vocab, k, b, m.fwd->stream());
+}
 }  // namespace
 
 int truss_eval_sample(truss_model * m, const int32_t * tokens, int n, const truss_sampling * sp, int32_t * next)
@@ -297,6 +313,7 @@ int truss_eval_sample(truss_model * m, const int32_t * tokens, int n, const trus
             const sampling::SampleParams p = params_of(sp);
             eval(*m, tokens, n);
             penalize_rows(*m, *sp, nullptr, 0, 1);
+            ban_rows(*m, *sp, tokens, n, 1);
             sampling::sample(m->logits, m->config.n_vocab, 1, p, m->sample_counter++, m->next, m->fwd->stream());
             TRUSS_CUDA(cudaMemcpyAsync(next, m->next, sizeof(int), cudaMemcpyDeviceToHost, m->fwd->stream()));
             TRUSS_CUDA(cudaStreamSynchronize(m->fwd->stream()));
@@ -317,6 +334,7 @@ int truss_spec_step_sampled(truss_model * m, int32_t next, const truss_sampling 
             if (nd < 1) {   // no room for a window: one plain step
                 eval(*m, &next, 1);
                 penalize_rows(*m, *sp, &next, 1, 1);
+                ban_rows(*m, *sp, &next, 1, 1);
                 sampling::sample(m->logits, V, 1, p, m->sample_counter++, m->next, m->fwd->stream());
                 TRUSS_CUDA(cudaMemcpyAsync(new_next, m->next, sizeof(int), cudaMemcpyDeviceToHost, m->fwd->stream()));
                 TRUSS_CUDA(cudaStreamSynchronize(m->fwd->stream()));
@@ -333,6 +351,7 @@ int truss_spec_step_sampled(truss_model * m, int32_t next, const truss_sampling 
                 m->fwd->verify(win, nw + 1);
                 m->fwd->head(0, nw + 1, m->logits);
                 penalize_rows(*m, *sp, win, nw + 1, nw + 1);
+                ban_rows(*m, *sp, win, nw + 1, nw + 1);
                 sampling::probs_inplace(m->logits, V, nw + 1, p, m->fwd->stream());
                 if (nw) TRUSS_CUDA(cudaMemcpyAsync(m->spec_drafts, win + 1, sizeof(int) * nw, cudaMemcpyHostToDevice,
                                                    m->fwd->stream()));
@@ -353,6 +372,7 @@ int truss_spec_step_sampled(truss_model * m, int32_t next, const truss_sampling 
             m->fwd->verify(win, nw + 1);
             m->fwd->head(0, nw + 1, m->logits);
             penalize_rows(*m, *sp, win, nw + 1, nw + 1);
+            ban_rows(*m, *sp, win, nw + 1, nw + 1);
             sampling::sample(m->logits, V, nw + 1, p, m->sample_counter, m->spec_next, m->fwd->stream());
             m->sample_counter += nw + 1;
             TRUSS_CUDA(cudaMemcpyAsync(m->spec_host, m->spec_next, sizeof(int) * (nw + 1), cudaMemcpyDeviceToHost,
