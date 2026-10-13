@@ -1,13 +1,13 @@
 # Serving PAW-125B-FLASH-NEXT-X3.1 with TRUSS (best settings)
 
 Model: [lackonendes/PAW-125B-FLASH-NEXT-X3.1](https://huggingface.co/lackonendes/PAW-125B-FLASH-NEXT-X3.1)
-(Qwen3.8-Flash-Next, 125B MoE). One 24 GB GPU plus CPU, 262,144-token context, OpenAI-compatible API.
+(Qwen3.8-Flash-Next, 125B MoE). One or two 24 GB GPUs plus CPU, 262,144-token context, OpenAI-compatible API.
 
 ## What you need
 
 | | |
 |---|---|
-| GPU | one 24 GB NVIDIA card, Ampere (sm_86). Tested on an RTX 3090 only. CUDA 12.x |
+| GPU | one 24 GB NVIDIA card, Ampere (sm_86), or two for about twice the speed. Tested on RTX 3090s. CUDA 12.x |
 | CPU | AVX2, 12+ cores (tested on a 24-core Threadripper 3960X) |
 | RAM | 64 GB. The server uses about 43 GB; leave room for the OS and your other programs |
 | Disk | 97 GB on **NVMe**. The 47.7 GiB n-gram table is read from disk on every step, so a spinning or USB disk is slow |
@@ -48,6 +48,24 @@ python3 -m server.app \
   --host 127.0.0.1 --port 8080
 ```
 
+### Two GPUs (layer split, about twice as fast)
+
+```sh
+MODEL_DIR=/nvme/flashnext TOKENIZER=/nvme/flashnext/tokenizer.json GPUS=0,1 PORT=8080 tools/serve/serve_flashnext_x31.sh
+```
+
+`GPUS=<a>,<b>` splits the model by layers: the first card runs layers 24-47, the output head and the MTP drafter, the
+second runs layers 0-23. No NVLink is needed; the cards hand one small activation buffer to each other per step.
+On top of the one-GPU settings the script sets:
+
+```sh
+export CUDA_VISIBLE_DEVICES=0,1
+export TRUSS_LAYER_SPLIT=24 TRUSS_LAYER_SPLIT_DEVICE=1   # layers 0-23 on the second card
+export TRUSS_HINT_MIN_ROWS=8                              # next-layer expert prefetch hints on full draft windows only
+export TRUSS_HC_SILU=1 TRUSS_HC_COLLAPSE=1 TRUSS_ROUTE_PUBLISH=1   # fused decode kernels (same output, fewer launches)
+# and --drafts 7 instead of 3: a longer draft window costs little when two cards share the work
+```
+
 Test it:
 
 ```sh
@@ -76,16 +94,18 @@ top_p 0.8, top_k 20`. Requests are handled one at a time.
 
 ## Memory at 262,144 context
 
-GPU about 23.6 GiB (dense weights 4.6, experts 13.5, KV and state 3.9, buffers). RAM about 43 GB. If the GPU is
+One GPU: about 23.6 GiB (dense weights 4.6, experts 13.5, KV and state 3.9, buffers). Two GPUs: about 23.5 GiB on
+each card, with 13,466 of the 24,576 routed experts resident on the GPUs. RAM about 43 GB. If the GPU is
 shared with a desktop or another job, lower `NCTX` (the KV cache shrinks) or the start may fail with an out-of-memory error.
 
-## Expected speed (RTX 3090, 250 W, Threadripper 3960X)
+## Expected speed (RTX 3090s, Threadripper 3960X)
 
-| | |
-|---|---:|
-| decode, short prompt | peak 80+ tok/s (best 87.5) |
-| decode, 150K-token context | 57-60 tok/s |
-| prefill, fresh 150K-token prompt | 2,170-2,270 tok/s |
+| | two RTX 3090s | one RTX 3090 (250 W) |
+|---|---:|---:|
+| decode, short prompt | not measured | peak 80+ tok/s (best 87.5) |
+| decode, 150K-token context (greedy) | 128 tok/s | 57-60 tok/s |
+| decode, real agent sessions (temperature 0.8, thinking, tools, up to 150K context) | 115-116 tok/s | - |
+| prefill, fresh 150K-token prompt | about 4,500 tok/s | 2,170-2,270 tok/s |
 
 Decode varies by about 10% on a busy machine. The CPU tier shares cores with whatever else is running, so close
 other heavy jobs for the best numbers.
@@ -93,6 +113,6 @@ other heavy jobs for the best numbers.
 ## Troubleshooting
 
 - **Slow decode:** check `TRUSS_CPU_THREADS` is set, nothing else is saturating the CPU, and the model files are on NVMe.
-- **Out of memory at start:** lower `--n-ctx`, or free the GPU.
+- **Out of memory at start:** lower `--n-ctx`, or free the GPU(s). With two GPUs both cards need about 23.5 GiB free.
 - **`build/libtruss.so` not found:** build first, or point `TRUSS_LIB` at the library.
 - **Greedy output differs slightly between runs:** expected; which experts run on the CPU or GPU depends on timing.

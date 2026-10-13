@@ -1,22 +1,25 @@
 # TRUSS (trellis-kernel)
 
-Our own inference engine for **trellis-quantized MoE models on one RTX 3090** (Ampere, sm_86). First model:
+Our own inference engine for **trellis-quantized MoE models on one or two RTX 3090s** (Ampere, sm_86). First model:
 **Qwen3.8 Flash-Next PAW X3.1** (qwen4exp, 48 layers, 512 experts), served through an OpenAI-compatible API.
 
-## Status (2026-10-07)
+## Status (2026-10-13)
 
 PAW-125B-FLASH-NEXT-X3.1 (Qwen3.8-Flash-Next, 125B MoE, 24,576 experts at 3.5 / 2.5 bit, Q8_0 dense, 47.7 GiB n-gram
-table read from NVMe) on one RTX 3090 at 250 W, Threadripper 3960X:
+table read from NVMe), full 262,144-token context, Threadripper 3960X:
 
-| | |
-|---|---|
-| decode, short prompt | peak 80+ tok/s |
-| decode, 150K-token context | 57-60 tok/s |
-| prefill, fresh 150K-token prompt | 2,170-2,270 tok/s |
-| context | 262,144 tokens |
-| memory | GPU 23.6 GiB, RAM 43 GB, NVMe 97 GB |
+| | two RTX 3090s (layer split) | one RTX 3090 (250 W) |
+|---|---:|---:|
+| decode, real agent sessions (temperature 0.8, thinking, tools, up to 150K context) | **115-116 tok/s** | - |
+| decode, 150K-token context (greedy) | **128 tok/s** | 57-60 tok/s |
+| decode, short prompt | not measured | peak 80+ tok/s |
+| prefill, fresh 150K-token prompt | **about 4,500 tok/s** | 2,170-2,270 tok/s |
+| memory | about 23.5 GiB per GPU, RAM 43 GB | GPU 23.6 GiB, RAM 43 GB |
 
-Decode varies by about 10% on a shared machine. Model card: [PAW-125B-FLASH-NEXT-X3.1](https://huggingface.co/lackonendes/PAW-125B-FLASH-NEXT-X3.1).
+NVMe 97 GB in both setups. Two GPUs split the model by layers (layers 0-23 on one card; layers 24-47, the output head
+and the MTP drafter on the other; prompt chunks pipelined across both, no NVLink): 55% of the routed experts fit on the
+GPUs instead of about a third, which is where most of the 2x comes from. Decode varies by a few percent on a shared
+machine. Model card: [PAW-125B-FLASH-NEXT-X3.1](https://huggingface.co/lackonendes/PAW-125B-FLASH-NEXT-X3.1).
 Every number has a row in TRACKER.md (kept locally, internal-only, not in this repo) with the command that produced it.
 
 ## Start here
@@ -32,12 +35,13 @@ Every number has a row in TRACKER.md (kept locally, internal-only, not in this r
 ## Quickstart
 
 Serve **PAW-125B-FLASH-NEXT-X3.1** ([model on Hugging Face](https://huggingface.co/lackonendes/PAW-125B-FLASH-NEXT-X3.1))
-on one 24 GB GPU plus CPU: **[docs/SERVING-FLASHNEXT-X31.md](docs/SERVING-FLASHNEXT-X31.md)** (install, download, the
-best settings, memory, expected speed). Short version:
+on one or two 24 GB GPUs plus CPU: **[docs/SERVING-FLASHNEXT-X31.md](docs/SERVING-FLASHNEXT-X31.md)** (install, download,
+the best settings, memory, expected speed). Short version:
 
 ```bash
 cmake -S . -B build -G Ninja && cmake --build build
-MODEL_DIR=/nvme/flashnext TOKENIZER=/nvme/flashnext/tokenizer.json GPU=0 tools/serve/serve_flashnext_x31.sh
+MODEL_DIR=/nvme/flashnext TOKENIZER=/nvme/flashnext/tokenizer.json GPUS=0,1 tools/serve/serve_flashnext_x31.sh   # two GPUs
+MODEL_DIR=/nvme/flashnext TOKENIZER=/nvme/flashnext/tokenizer.json GPU=0 tools/serve/serve_flashnext_x31.sh      # one GPU
 curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":64}'
 ```
