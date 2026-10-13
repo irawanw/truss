@@ -46,7 +46,9 @@ struct truss_model {
     // engine holds its last stage for one slot (Forward::prompt's after(), Forward::round's pick()).
     std::vector<uint64_t> counter;
     std::unique_ptr<std::atomic<int>[]> prog_done, prog_total;
-    int cur = 0;                             // truss_select(): the slot of the calls without one
+    // truss_select(): the slot of the calls without one. Another thread reads it (the legacy wrappers of a server
+    // running slots) while truss_select writes it (review H2).
+    std::atomic<int> cur{ 0 };
     int * pen_cnt = nullptr;                 // device [drafts + 1][n_vocab] penalty counts, zero between calls
     int * pen_hist = nullptr, * pen_host = nullptr;   // device / pinned [drafts + 1][TRUSS_PENALTY_CAP] row histories
     std::unique_ptr<q::Forward> fwd;         // last: its expert budget takes the memory left
@@ -67,6 +69,11 @@ struct truss_model {
 };
 
 namespace {
+
+// A verify window is `next` plus at most DRAFTS_MAX drafts, so the window buffers on the stack in the spec steps
+// have room for any configuration truss_open_params() accepts (the engine's own cap is moe::MAX_ROWS rows).
+constexpr int DRAFTS_MAX = 7;
+constexpr int WINDOW_ROWS = DRAFTS_MAX + 1;
 
 thread_local std::string last_error;
 
@@ -145,7 +152,8 @@ truss_model * truss_open_params(const char * gguf_path, const truss_params * p)
             if (p->expert_usage && *p->expert_usage)
                 o.expert_usage = runtime::ExpertStore::load_usage(p->expert_usage, m->config.n_layer, m->config.n_expert);
             if (p->mtp && *p->mtp) {
-                if (p->drafts < 1 || p->drafts > 7) throw std::invalid_argument("drafts must be 1..7");
+                if (p->drafts < 1 || p->drafts > DRAFTS_MAX)
+                    throw std::invalid_argument("drafts must be 1.." + std::to_string(DRAFTS_MAX));
                 m->mtp_file = gguf::File::open(p->mtp);
                 m->mtp = std::make_unique<q::Mtp>(q::bind_mtp(*m->mtp_file, m->config));
                 m->drafts = p->drafts;
@@ -349,6 +357,14 @@ namespace {
 sampling::SampleParams params_of(const truss_sampling * sp)
 {
     if (!sp || !(sp->temperature > 0.f)) throw std::invalid_argument("truss sampling: temperature must be > 0");
+    // Reject a penalty set that penalize_rows() would throw on, here, where no engine state is open yet. Its check
+    // stays (defense in depth), but from a spec step it would fire inside Forward::round's pick() - after the verify
+    // window is open - which is the state review C2 found the engine could not recover from (review R3: a request
+    // with repetition_penalty: 0 must fail, not poison the slot or the one next to it).
+    sampling::PenaltyParams pp;
+    pp.repeat = sp->repetition_penalty, pp.frequency = sp->frequency_penalty, pp.presence = sp->presence_penalty;
+    if (sampling::penalties_on(pp) && !(pp.repeat > 0.f))
+        throw std::invalid_argument("truss sampling: repetition_penalty must be > 0");
     sampling::SampleParams p;
     p.temperature = sp->temperature, p.top_p = sp->top_p, p.top_k = sp->top_k, p.min_p = sp->min_p, p.seed = sp->seed;
     return p;
@@ -431,7 +447,7 @@ int truss_spec_step_sampled_s(truss_model * m, int slot, int32_t next, const tru
                 emitted[0] = next, *n_emitted = 1;
                 return 0;
             }
-            int32_t win[8];
+            int32_t win[WINDOW_ROWS];
             if (m->spec_sample) {   // speculative sampling: lossless, accepts sum min(p, q) instead of p(argmax q)
                 float * qf = m->q_full[slot];
                 const uint64_t c0 = ctr;
@@ -497,7 +513,7 @@ int truss_spec_step_s(truss_model * m, int slot, int32_t next, int32_t * emitted
                 emitted[0] = next, *n_emitted = 1;
                 return 0;
             }
-            int32_t win[8];
+            int32_t win[WINDOW_ROWS];
             const int V = m->config.n_vocab;
             const int keep = m->fwd->round(slot, next, nd, win, m->logits, nullptr, 0, nullptr, [&](int nw) {
                 for (int r = 0; r <= nw; ++r)

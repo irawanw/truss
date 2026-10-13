@@ -285,10 +285,18 @@ private:
     std::vector<std::unique_ptr<Impl>> front_;   // a layer split's stages before the last (destroyed after m_)
     std::unique_ptr<Impl> m_;                    // the last stage (the whole model without a split)
     template <class F> void each_stage(F && f);  // every stage in layer order, its device current
+    // The same, with each stage held while f runs on it: for anything touching a buffer a chunk's kernels may still
+    // be writing (profile_routes() frees one, route_counts() reads one). Without the lock another slot's forward can
+    // be enqueued on that stage while it happens (review H3).
+    template <class F> void each_stage_locked(F && f) const;
     void construct(const Config & c, const Weights & w, int n_ctx, int max_chunk, const Options & o);
     std::vector<int> seq_pos_{ 0 };              // each slot's position
     std::unique_ptr<std::atomic<long long>[]> round_ns_;   // each slot's last round() end (steady clock ns)
-    int active_ = 0, seq_ctx_ = 0;
+    // The selected slot. Another thread's accept()/draft() read it while this thread is between select() and its
+    // work (review H2), so it is atomic; a call that uses it more than once snapshots it (the hazard is a change
+    // mid-call, not a torn read).
+    std::atomic<int> active_{ 0 };
+    int seq_ctx_ = 0;
 };
 
 }  // namespace truss::qwen4exp

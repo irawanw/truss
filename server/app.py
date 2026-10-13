@@ -30,7 +30,7 @@ import anyio
 import asyncio
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from server.chat import Chat, Detokenizer
@@ -51,7 +51,11 @@ class FairGate:
     streams means one of them freezes behind the other's prefill. Tickets go in a deque and only the head may take
     a permit. Not re-entrant (a request must never hold the engine lock while asking for it again)."""
 
-    def __init__(self, permits: int, name: str = "gate", thread_bound: bool = True):
+    def __init__(self, permits: int, name: str = "gate", thread_bound: bool = True, timeout=None):
+        # timeout (seconds): how long a waiter may queue before it is an error rather than a hung request. A request
+        # stuck behind an engine call that never returns holds its worker thread and its client's connection open
+        # forever (review H3); the engine's own waits are bounded the same way (TRUSS_SPIN_TIMEOUT_S).
+        self.timeout = timeout
         self.cv, self.permits, self.queue, self.name = threading.Condition(), permits, deque(), name
         self.holders = set()   # thread ids holding a permit, so a re-acquire raises instead of deadlocking
         # thread_bound False: a permit belongs to a request, not a thread (the slot gate: a streaming request's
@@ -59,8 +63,10 @@ class FairGate:
         # give it back on another, and one worker may serve two requests' steps). No holder bookkeeping then.
         self.thread_bound = thread_bound
 
-    def acquire(self):
+    def acquire(self, timeout=None):
         me, tid = object(), threading.get_ident()
+        limit = self.timeout if timeout is None else timeout
+        until = None if limit is None else time.monotonic() + limit
         with self.cv:
             if self.thread_bound and tid in self.holders:
                 raise RuntimeError(f"{self.name}: re-entrant acquire would deadlock; every engine call goes "
@@ -68,7 +74,10 @@ class FairGate:
             self.queue.append(me)
             try:
                 while not (self.permits and self.queue[0] is me):
-                    self.cv.wait()
+                    left = None if until is None else until - time.monotonic()
+                    if left is not None and left <= 0:
+                        raise TimeoutError(f"{self.name}: no permit within {limit:.0f} s")
+                    self.cv.wait(left)
             except BaseException:   # a cancelled wait must not leave its ticket at the head of the queue
                 if me in self.queue:
                     self.queue.remove(me)
@@ -155,7 +164,10 @@ class Engine:
         host-only tests call it on a bare Engine whose model is a fake."""
         self.n_slots = max(1, getattr(self.model, "slots", 1))   # truss_slots(), 1 without TRUSS_SLOTS
         self.slots = [Slot(i) for i in range(self.n_slots)]
-        self.lock = FairGate(1, "engine lock")        # one engine call; never held across a yield
+        # TRUSS_ENGINE_CALL_TIMEOUT: a request that cannot get the engine within this fails with 503 instead of
+        # hanging behind a wedged call (H3). Generous: the lock is held for one engine call, and a full-chunk prefill
+        # of a long prompt is the longest normal one.
+        self.lock = FairGate(1, "engine lock", timeout=float(os.environ.get("TRUSS_ENGINE_CALL_TIMEOUT", 600)))
         self.slot_gate = FairGate(self.n_slots, "slot gate", thread_bound=False)   # one permit per FREE slot: a 3rd request queues
         # TRUSS_PREFILL_PIECE: how big a prompt piece is while another stream decodes. It has to be a multiple of
         # --chunk: measured on the served model (GATE 2, reports/LOG.md), the same 25,170-token prompt cut at 4096
@@ -200,11 +212,14 @@ class Engine:
             out = getattr(self.model, fn.__name__ + "_s")(slot.idx, *args)
             slot.pos = self.model.position_s(slot.idx)
             return out
-        with self.lock:
-            self.model.select(slot.idx)
-            out = fn(*args)
-            slot.pos = self.model.position
-            return out
+        try:
+            with self.lock:
+                self.model.select(slot.idx)
+                out = fn(*args)
+                slot.pos = self.model.position
+                return out
+        except TimeoutError as e:
+            raise HTTPException(503, str(e))
 
     def other_busy(self, slot):
         """Another slot has a request in flight: the prompt read then goes in pieces so that stream keeps its rounds."""
@@ -617,15 +632,24 @@ def make_app(engine: Engine) -> FastAPI:
         def get(key, default, cast):
             v = body.get(key)
             return cast(default if v is None else v)
-        return dict(max_tokens=int(body.get("max_tokens") or body.get("max_completion_tokens") or engine.model.n_ctx),
-                    temperature=get("temperature", 0.8, float), top_p=get("top_p", 0.95, float),
-                    top_k=get("top_k", 40, int), min_p=get("min_p", 0.05, float), seed=body.get("seed"),
-                    presence_penalty=get("presence_penalty", 0.0, float),
-                    frequency_penalty=get("frequency_penalty", 0.0, float),
-                    # llama-server's names too
-                    repetition_penalty=get("repetition_penalty", body.get("repeat_penalty") or 1.0, float),
-                    penalty_last_n=get("penalty_last_n", body.get("repeat_last_n") or 64, int),
-                    stop_strings=[stop] if isinstance(stop, str) else list(stop))
+        p = dict(max_tokens=int(body.get("max_tokens") or body.get("max_completion_tokens") or engine.model.n_ctx),
+                 temperature=get("temperature", 0.8, float), top_p=get("top_p", 0.95, float),
+                 top_k=get("top_k", 40, int), min_p=get("min_p", 0.05, float), seed=body.get("seed"),
+                 presence_penalty=get("presence_penalty", 0.0, float),
+                 frequency_penalty=get("frequency_penalty", 0.0, float),
+                 # llama-server's names too
+                 repetition_penalty=get("repetition_penalty", body.get("repeat_penalty") or 1.0, float),
+                 penalty_last_n=get("penalty_last_n", body.get("repeat_last_n") or 64, int),
+                 stop_strings=[stop] if isinstance(stop, str) else list(stop))
+        # A repetition_penalty of 0 (or less) makes the engine's penalty divide by it, and it throws from inside the
+        # first decode round - after the engine opened a verify window on this slot, which is the state review C2
+        # found unrecoverable. Rejected here, as a 400 through the ValueError handler below, before a slot is taken or
+        # a response starts. 0 is never valid: any other penalty set is off only when repetition_penalty is 1 too.
+        if p["repetition_penalty"] <= 0:
+            raise ValueError("repetition_penalty must be > 0")
+        if p["penalty_last_n"] < -1:   # -1 means "the whole request" (llama-server); the engine clamps the rest
+            raise ValueError("penalty_last_n must be >= -1")
+        return p
 
     _END, KEEPALIVE = object(), object()
 
