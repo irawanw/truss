@@ -128,7 +128,7 @@ class Engine:
                          if i is not None and i >= 0}
         self.name, self.log_path, self.log_tag = a.name, a.log, a.log_tag
         self.dump_dir = a.dump_dir
-        self.init_sequences()   # one record per sequence + the two fair gates (see below)
+        self.init_sequences(a.chunk)   # one record per sequence + the two fair gates (see below)
         self.im_start = self.chat.token_id("<|im_start|>")
         self.think_close = self.chat.token_id("</think>")
 
@@ -144,15 +144,19 @@ class Engine:
 
     # ------------------------------------------------------------------ the sequences
 
-    def init_sequences(self):
+    def init_sequences(self, chunk=8192):
         """One record per engine sequence plus the two fair gates. __init__ calls it after the model loads; the
         host-only tests call it on a bare Engine whose model is a fake."""
         self.n_slots = max(1, getattr(self.model, "slots", 1))   # truss_slots(), 1 without TRUSS_SLOTS
         self.slots = [Slot(i) for i in range(self.n_slots)]
         self.lock = FairGate(1, "engine lock")        # one engine call; never held across a yield
         self.slot_gate = FairGate(self.n_slots, "slot gate")   # one permit per FREE slot: a 3rd request queues
-        # TRUSS_PREFILL_PIECE: how big a prompt piece is when another stream is decoding. 0 = never split (today).
-        self.prefill_piece = int(os.environ.get("TRUSS_PREFILL_PIECE", "4096"))
+        # TRUSS_PREFILL_PIECE: how big a prompt piece is while another stream decodes. It has to be a multiple of
+        # --chunk: measured on the served model (GATE 2, reports/LOG.md), the same 25,170-token prompt cut at 4096
+        # produced a different first generated token than one call did, while cut at 8192 or 16384 it produced the
+        # same 64 tokens — a piece smaller than an engine chunk moves the row-count boundaries the kernels tile on.
+        # 0 = never split, which is how it behaved before slots.
+        self.prefill_piece = int(os.environ.get("TRUSS_PREFILL_PIECE", chunk))
         self.last_rounds = 0
 
     @property
