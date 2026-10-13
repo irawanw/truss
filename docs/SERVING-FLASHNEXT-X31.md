@@ -66,6 +66,10 @@ export TRUSS_HC_SILU=1 TRUSS_HC_COLLAPSE=1 TRUSS_ROUTE_PUBLISH=1   # fused decod
 # and --drafts 7 instead of 3: a longer draft window costs little when two cards share the work
 ```
 
+With two GPUs the CPU expert tier is optional: `TRUSS_CPU_TRELLIS=0` sends every expert that is not on a GPU over
+PCIe instead. Decode is about 6% slower (8-token pass 36.2 ms instead of 34.0), but it frees the CPU cores and
+makes greedy output reproducible run to run. The experts that do not fit on the GPUs still live in RAM either way.
+
 Test it:
 
 ```sh
@@ -95,7 +99,8 @@ top_p 0.8, top_k 20`. Requests are handled one at a time.
 ## Memory at 262,144 context
 
 One GPU: about 23.6 GiB (dense weights 4.6, experts 13.5, KV and state 3.9, buffers). Two GPUs: about 23.5 GiB on
-each card, with 13,466 of the 24,576 routed experts resident on the GPUs. RAM about 43 GB. If the GPU is
+each card, with 13,466 of the 24,576 routed experts resident on the GPUs. RAM: about 43 GB resident with one GPU,
+about 25 GB with two (fewer experts live in RAM). If the GPU is
 shared with a desktop or another job, lower `NCTX` (the KV cache shrinks) or the start may fail with an out-of-memory error.
 
 ## Expected speed (RTX 3090s, Threadripper 3960X)

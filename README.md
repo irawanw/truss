@@ -14,7 +14,7 @@ table read from NVMe), full 262,144-token context, Threadripper 3960X:
 | decode, 150K-token context (greedy) | **128 tok/s** | 57-60 tok/s |
 | decode, short prompt | not measured | peak 80+ tok/s |
 | prefill, fresh 150K-token prompt | **about 4,500 tok/s** | 2,170-2,270 tok/s |
-| memory | about 23.5 GiB per GPU, RAM 43 GB | GPU 23.6 GiB, RAM 43 GB |
+| memory | about 23.5 GiB per GPU, RAM about 25 GB | GPU 23.6 GiB, RAM 43 GB |
 
 NVMe 97 GB in both setups. Two GPUs split the model by layers (layers 0-23 on one card; layers 24-47, the output head
 and the MTP drafter on the other; prompt chunks pipelined across both, no NVLink): 55% of the routed experts fit on the
