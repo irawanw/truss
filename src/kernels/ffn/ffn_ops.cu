@@ -67,11 +67,15 @@ __device__ __forceinline__ void topk_row(const float * l, int E, int k, int & my
     if (lane < k) my_w /= fmaxf(kept, 6.103515625e-5f);
 }
 
-// one warp per token
+// one warp per token. The row guard is not decoration: the grid is sized in warps (grid(T*32) blocks of THREADS),
+// so a launch at T=1 still runs 8 warps, and the seven past the end would top-k logits that are not theirs and
+// write ids/wts past the end of the T*K scratch - which is exactly how the driver came back with an expert id of
+// 1065353216 = 0x3F800000 = 1.0f, a neighbouring scratch float.
 template <int PER_LANE>
 __global__ void route_kernel(const float * logits, int T, int E, int k, int * ids, float * wts)
 {
     const int t = blockIdx.x * (THREADS / 32) + threadIdx.x / 32;
+    if (t >= T) return;
     int my_id;
     float my_w;
     topk_row<PER_LANE>(logits + (size_t) t * E, E, k, my_id, my_w);
