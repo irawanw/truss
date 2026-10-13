@@ -103,7 +103,7 @@ class Engine:
         except OSError as e:
             print(f"dump failed: {e}", flush=True)
 
-    def log_stop(self, tok, n_gen, rounds, spec, greedy, sp):
+    def log_stop(self, tok, n_prompt, n_gen, rounds):
         """A reply ended with an end-of-turn token: where it came from (the round's sampled first token, i.e. the
         previous round's verified sample, or an accepted draft) and the text before it, for stall diagnosis."""
         src = "plain step"
@@ -114,10 +114,10 @@ class Engine:
                 src = (f"round at gen {start}: emitted[{i}] of {len(emitted)} "
                        f"({'the verified sample fed as nxt' if i == 0 else 'an ACCEPTED DRAFT'})")
                 break
-        tail = self.chat.tok.decode(self.cached[-min(len(self.cached), n_gen + 1):][-40:], skip_special_tokens=False)
-        ban = f", ban n={sp.n_ban} lift={sp.ban_lift}" if sp is not None else ""
-        self.log(f"{self.log_tag}: STOP token {tok} at gen {n_gen}: {src}; {'greedy' if greedy else 'sampled'}"
-                 f"{ban}; tail {tail[-200:]!r}")
+        before = self.chat.tok.decode(self.cached[n_prompt:n_prompt + n_gen - 1][-40:], skip_special_tokens=False)
+        if before.rstrip().endswith("</tool_call>"):
+            return   # the normal end of an agent step: not logged
+        self.log(f"{self.log_tag}: STOP without a tool call at gen {n_gen} ({src}): ...{before[-120:]!r}")
 
     def save_request(self, prompt_ids, gen_ids, finish, n_gen, meta):
         """TRUSS_REQ_LOG_DIR: the last 12 requests as .npz (prompt ids, generated ids as held by the engine, meta),
@@ -298,7 +298,7 @@ class Engine:
                         sp.set_ban([])
                     if tok in self.stop_ids:
                         finish = "stop"
-                        self.log_stop(tok, n_gen, rounds, spec, greedy, sp)
+                        self.log_stop(tok, n_prompt, n_gen, rounds)
                         break
                     delta = detok.push(tok)
                     text += delta
