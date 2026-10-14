@@ -21,10 +21,12 @@ sigmoid + expert-bias router, renormalized, no shared expert); vocab 128,000, he
 
 `blocks/norm.h` (RmsNorm), `blocks/ffn_dense.h` (DenseFfn), `blocks/shortconv.*` (ShortConv, stateful: conv rows,
 window rollback by `spec::tail_rows`), `blocks/attn_gqa.*` (AttnGqa, positional K/V); kernels `norm/rms_norm`,
-`conv/short_conv`, `attn/gqa` (v1 CUDA-core tiles + split cells), `ffn/route_sigmoid`; `moe::Lfm2` shape.
+`conv/short_conv`, `attn/gqa` (v1 CUDA-core tiles for chunks; a decode kernel for T x G <= 16 rows: lane = cell, splits of 128
+cells, 10-15), `ffn/route_sigmoid`; `moe::Lfm2` shape.
 
 ## Tests
 
 `tests/layer/lfm2moe_parity.py`: TRUSS through the C API vs HF's Lfm2Moe layers on the same weights (Q8_0
 dequantized, trellis reconstructed by exllamav3). 4-layer K2 slice, prompts 120 / 128 / 200 + 6-8 decode steps:
-mean KL 2.3e-4 / 5.3e-4 / 5.4e-4 (gate 2e-3). Kernel tests: `gqa_attn_test`, `lfm_small_ops_test`.
+mean KL 2.3e-4 / 5.3e-4 / 5.4e-4 (gate 2e-3) with the old per-prefix reference; with the streamed causal
+reference (10-15) 4-layer slice 4.7e-7 / 6.1e-7 (full model: router near-tie flips, see the handover section 8). Kernel tests: `gqa_attn_test`, `lfm_small_ops_test`.

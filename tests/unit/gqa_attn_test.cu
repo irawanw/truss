@@ -67,7 +67,9 @@ int main()
     TRUSS_CUDA(cudaMalloc(&ws, std::max<size_t>(ws_bytes, 16)));
     int fails = 0;
     // chunks: (pos0, T); the long gap after 1000 is filled by an unchecked chunk so decode sees a 5K-cell cache
-    const int plan[][3] = { { 0, 600, 1 }, { 600, 400, 1 }, { 1000, 4096, 0 }, { 5096, 1, 1 }, { 5097, 1, 1 }, { 5098, 5, 1 } };
+    // decode kernel: T x G <= 16 (T <= 4 here): rows at 1 / 5 cells and at 5K cells (T 1, 2, 4); T 5 = the chunk kernel
+    const int plan[][3] = { { 0, 1, 1 }, { 1, 4, 1 }, { 5, 595, 1 }, { 600, 400, 1 }, { 1000, 4096, 0 }, { 5096, 1, 1 },
+                            { 5097, 2, 1 }, { 5099, 4, 1 }, { 5103, 5, 1 } };
     for (const auto & c : plan) {
         const int pos0 = c[0], T = c[1];
         const std::vector<float> q = randn((size_t) T * H * D, rng), k = randn((size_t) T * HKV * D, rng),

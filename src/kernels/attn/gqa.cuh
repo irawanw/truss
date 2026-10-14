@@ -7,8 +7,10 @@
 //             reads KV head h / (H / HKV)
 //
 // v1 (2026-10-14): CUDA-core tiles - a CTA takes BQ queries x one KV head (all its G query heads), K / V tiles of BC
-// cells through shared memory, online softmax. Short chunks (decode, verify windows) also split the cells across
-// CTAs (partial m / l / o in the workspace, merged by a combine kernel) so a decode step fills the GPU. Tensor-core
+// cells through shared memory, online softmax. Chunks of <= 32 rows split the cells across CTAs (one tile each;
+// partial m / l / o in the workspace, merged by a combine kernel). Decode (T x G <= 16 rows, 2026-10-15): its own
+// kernel - CTA = (KV head, split of 128 cells), lane = cell (K row in registers), warp softmax by shuffles, up to 256
+// splits (LFM K3.5 decode 117 -> 147 tok/s at 512 cells, 47 -> 112 at 32K). Tensor-core
 // tiles are the next step (kernels/trellis/mma.cuh fragments); the contract stays.
 #pragma once
 #include <cuda_fp16.h>

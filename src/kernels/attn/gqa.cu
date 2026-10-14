@@ -16,7 +16,8 @@ constexpr int R = 64;            // rows (query, head) per CTA
 constexpr int BC = 64;           // cells per K / V tile
 constexpr int THREADS = 256;     // 4 threads per row
 constexpr int KP = D + 8;        // padded smem row (halves) for K / V
-constexpr int MAX_SPLITS = 32;
+constexpr int MAX_SPLITS = 256;
+constexpr int MAX_PART_ROWS = 1024;   // splits x T bound: the partials workspace stays <= 1024 x H x (D + 2) floats
 constexpr int SPLIT_ROWS = 32;   // chunks up to this many rows split their cells across CTAs
 
 // ---- prepare: one warp per (row, head slot); slots [0, H) q, [H, H + HKV) k, [H + HKV, H + 2 HKV) v
@@ -147,14 +148,113 @@ __global__ void __launch_bounds__(THREADS) attn_kernel(GqaShape s, const half * 
     for (int i = 0; i < 16; ++i) pr[2 + pt * 16 + i] = o[i];
 }
 
+// ---- decode (T x G <= DEC_ROWS rows, e.g. T <= 4 at G = 4): the chunk kernel above keeps 16 of 256 threads busy at
+// T = 1 and fits one CTA per SM (51 KB smem). Here a CTA = (KV head, split) with DEC_WARPS warps; a warp takes 32
+// cells at a time, lane = cell: the lane holds its K row in registers and scores every row; online softmax per warp
+// (shuffles), P V with lane = 2 output dims (V rows read coalesced). Warps merge in smem; splits write the same
+// partials as attn_kernel (combine_kernel merges them).
+constexpr int DEC_ROWS = 16, DEC_WARPS = 4, DEC_CELLS = DEC_WARPS * 32;   // cells per CTA pass
+
+__global__ void __launch_bounds__(DEC_WARPS * 32) decode_kernel(GqaShape s, const half * __restrict__ q16,
+                                                               const half * __restrict__ kc, const half * __restrict__ vc,
+                                                               int pos0, int T, int splits, half * __restrict__ out16,
+                                                               float * __restrict__ part)
+{
+    __shared__ float sq[DEC_ROWS][D];
+    __shared__ float wm[DEC_WARPS][DEC_ROWS], wl[DEC_WARPS][DEC_ROWS];
+    __shared__ float wo[DEC_WARPS][DEC_ROWS][D];
+    const int G = s.H / s.HKV, rows = T * G, hk = blockIdx.x, split = blockIdx.y;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
+    const float scale = rsqrtf((float) D);
+    for (int i = threadIdx.x; i < rows * D; i += blockDim.x) {
+        const int r = i / D, d = i % D;
+        sq[r][d] = __half2float(q16[((size_t) (r / G) * s.H + hk * G + r % G) * D + d]) * scale;
+    }
+    __syncthreads();
+    const int n_cells = pos0 + T, per = (n_cells + splits - 1) / splits;
+    const int c_lo = split * per, c_hi = min(c_lo + per, n_cells);
+    float m[DEC_ROWS], l[DEC_ROWS], a[DEC_ROWS], b[DEC_ROWS];
+#pragma unroll
+    for (int r = 0; r < DEC_ROWS; ++r) m[r] = -INFINITY, l[r] = 0.f, a[r] = 0.f, b[r] = 0.f;
+    for (int c0 = c_lo + warp * 32; c0 < c_hi; c0 += DEC_CELLS) {
+        const int cell = c0 + lane;
+        const bool in = cell < c_hi;
+        uint4 kr[D / 8];
+#pragma unroll
+        for (int j = 0; j < D / 8; ++j)
+            kr[j] = in ? reinterpret_cast<const uint4 *>(kc + ((size_t) cell * s.HKV + hk) * D)[j] : make_uint4(0, 0, 0, 0);
+        const half2 * k2 = reinterpret_cast<const half2 *>(kr);
+        float p[DEC_ROWS];
+#pragma unroll
+        for (int r = 0; r < DEC_ROWS; ++r) {
+            if (r >= rows) break;
+            float acc = 0.f;
+#pragma unroll
+            for (int j = 0; j < D / 2; ++j) {
+                const float2 kk = __half22float2(k2[j]);
+                acc += sq[r][2 * j] * kk.x + sq[r][2 * j + 1] * kk.y;
+            }
+            float sc = in && cell <= pos0 + r / G ? acc : -INFINITY, mx = sc;
+#pragma unroll
+            for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            const float mn = fmaxf(m[r], mx);
+            const float corr = mn == -INFINITY ? 1.f : __expf(m[r] - mn);
+            p[r] = mn == -INFINITY ? 0.f : __expf(sc - mn);
+            float ps = p[r];
+#pragma unroll
+            for (int o = 16; o; o >>= 1) ps += __shfl_xor_sync(0xffffffffu, ps, o);
+            l[r] = l[r] * corr + ps, a[r] *= corr, b[r] *= corr, m[r] = mn;
+        }
+        const int n = min(32, c_hi - c0);
+        for (int j = 0; j < n; ++j) {
+            const half * vp = vc + ((size_t) (c0 + j) * s.HKV + hk) * D;
+            const float v0 = __half2float(vp[lane]), v1 = __half2float(vp[lane + 32]);
+#pragma unroll
+            for (int r = 0; r < DEC_ROWS; ++r) {
+                if (r >= rows) break;
+                const float pj = __shfl_sync(0xffffffffu, p[r], j);
+                a[r] += pj * v0, b[r] += pj * v1;
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < DEC_ROWS; ++r) {
+        if (r >= rows) break;
+        if (lane == 0) wm[warp][r] = m[r], wl[warp][r] = l[r];
+        wo[warp][r][lane] = a[r], wo[warp][r][lane + 32] = b[r];
+    }
+    __syncthreads();
+    for (int r = warp; r < rows; r += DEC_WARPS) {
+        float M = -INFINITY, L = 0.f, A = 0.f, B = 0.f;
+        for (int w = 0; w < DEC_WARPS; ++w) M = fmaxf(M, wm[w][r]);
+        for (int w = 0; w < DEC_WARPS; ++w) {
+            const float f = wm[w][r] == -INFINITY ? 0.f : __expf(wm[w][r] - M);
+            L += wl[w][r] * f, A += wo[w][r][lane] * f, B += wo[w][r][lane + 32] * f;
+        }
+        const int t = r / G, h = hk * G + r % G;
+        if (splits == 1) {
+            const float inv = L > 0.f ? 1.f / L : 0.f;
+            out16[((size_t) t * s.H + h) * D + lane] = __float2half(A * inv);
+            out16[((size_t) t * s.H + h) * D + lane + 32] = __float2half(B * inv);
+        } else {
+            float * pr = part + (((size_t) split * T + t) * s.H + h) * (D + 2);
+            if (lane == 0) pr[0] = M, pr[1] = L;
+            pr[2 + lane] = A, pr[2 + lane + 32] = B;
+        }
+    }
+}
+
 // merge the splits of each (row, head) in split order
 __global__ void combine_kernel(GqaShape s, int T, int splits, const float * __restrict__ part, half * __restrict__ out16)
 {
     const int w = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x & 31;
     if (w >= T * s.H) return;
     float m = -INFINITY;
-    for (int k = 0; k < splits; ++k) m = fmaxf(m, part[((size_t) k * T * s.H + w) * (D + 2)]);
+    for (int k = lane; k < splits; k += 32) m = fmaxf(m, part[((size_t) k * T * s.H + w) * (D + 2)]);
+#pragma unroll
+    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
     float l = 0.f, a = 0.f, b = 0.f;
+#pragma unroll 4
     for (int k = 0; k < splits; ++k) {
         const float * pr = part + ((size_t) k * T * s.H + w) * (D + 2);
         const float f = pr[0] == -INFINITY ? 0.f : __expf(pr[0] - m);
@@ -170,10 +270,15 @@ void check(const GqaShape & s)
     if (s.HKV <= 0 || s.H % s.HKV || R % (s.H / s.HKV)) throw std::invalid_argument("attn::gqa: H / HKV must divide 64");
 }
 
-int split_count(int T, int n_cells)
+bool decode_path(const GqaShape & s, int T) { return T * (s.H / s.HKV) <= DEC_ROWS; }
+
+int split_count(const GqaShape & s, int T, int n_cells)
 {
     if (T > SPLIT_ROWS) return 1;
-    return std::max(1, std::min(MAX_SPLITS, n_cells / 512));
+    if (decode_path(s, T))   // a CTA pass (DEC_CELLS) per split
+        return std::max(1, std::min({MAX_SPLITS, MAX_PART_ROWS / T, (n_cells + DEC_CELLS - 1) / DEC_CELLS}));
+    // a K/V tile per CTA (was cells / 512, at most 32: decode used 8 CTAs on 82 SMs)
+    return std::max(1, std::min({MAX_SPLITS, MAX_PART_ROWS / T, (n_cells + BC - 1) / BC}));
 }
 
 }  // namespace
@@ -191,7 +296,7 @@ void gqa_prepare(const GqaShape & s, const float * q, const float * k, const flo
 size_t gqa_workspace_bytes(const GqaShape & s, int max_T, int n_ctx)
 {
     const int T = std::min(max_T, SPLIT_ROWS);
-    return (size_t) split_count(T, n_ctx) * T * s.H * (s.D + 2) * sizeof(float);
+    return (size_t) split_count(s, T, n_ctx) * T * s.H * (s.D + 2) * sizeof(float);
 }
 
 void gqa_attention(const GqaShape & s, const half * q16, const half * k_cache, const half * v_cache, int pos0, int T,
@@ -200,16 +305,21 @@ void gqa_attention(const GqaShape & s, const half * q16, const half * k_cache, c
     check(s);
     if (T <= 0) return;
     const int G = s.H / s.HKV, BQ = R / G;
-    int splits = split_count(T, pos0 + T);
+    int splits = split_count(s, T, pos0 + T);
     while (splits > 1 && (size_t) splits * T * s.H * (D + 2) * sizeof(float) > ws_bytes) --splits;
     static bool attr = false;   // per process: one device type here (sm_86)
     if (!attr) {
         TRUSS_CUDA(cudaFuncSetAttribute(attn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem)));
         attr = true;
     }
-    const dim3 grid((T + BQ - 1) / BQ, s.HKV, splits);
-    attn_kernel<<<grid, THREADS, sizeof(Smem), stream>>>(s, q16, k_cache, v_cache, pos0, T, splits, out16,
-                                                         static_cast<float *>(ws));
+    if (decode_path(s, T)) {
+        decode_kernel<<<dim3(s.HKV, splits), DEC_WARPS * 32, 0, stream>>>(s, q16, k_cache, v_cache, pos0, T, splits, out16,
+                                                                          static_cast<float *>(ws));
+    } else {
+        const dim3 grid((T + BQ - 1) / BQ, s.HKV, splits);
+        attn_kernel<<<grid, THREADS, sizeof(Smem), stream>>>(s, q16, k_cache, v_cache, pos0, T, splits, out16,
+                                                             static_cast<float *>(ws));
+    }
     TRUSS_CUDA(cudaGetLastError());
     if (splits > 1) {
         combine_kernel<<<(T * s.H * 32 + 255) / 256, 256, 0, stream>>>(s, T, splits, static_cast<const float *>(ws), out16);
