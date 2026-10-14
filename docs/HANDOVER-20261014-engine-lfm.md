@@ -1,5 +1,8 @@
 # Handover 2026-10-14: engine split done, LFM2.5-24B-A2B X3.1 in progress
 
+**Continue from `docs/PLAN-20261015-lfm-speed.md`** (10-15: packs, KL vs bf16 and speed measured; coding evals
+dropped by the user; decode profile; speed plan P0-P7; data moved to HDD - see its section 4).
+
 Read first: `docs/ENGINE.md` (layout contract), `docs/CODE.md` (rules, no file over 500 lines), TRACKER.md rows
 #159-161 (local file, not in git) and its "Do not repeat" list. Branch: `refactor/engine-blocks` (not merged to
 main yet; see step 6).
