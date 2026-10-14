@@ -10,14 +10,21 @@ namespace {
 
 constexpr int THREADS = 256;
 
-__global__ void __launch_bounds__(THREADS) rms_kernel(const float * __restrict__ x, const float * __restrict__ w, int d,
-                                                      float eps, float * __restrict__ y32, half * __restrict__ y16)
+// a != nullptr: x += a first (the residual add, written back; each thread re-reads only what it wrote)
+__global__ void __launch_bounds__(THREADS) rms_kernel(float * __restrict__ x, const float * __restrict__ a,
+                                                      const float * __restrict__ w, int d, float eps,
+                                                      float * __restrict__ y32, half * __restrict__ y16)
 {
     const size_t row = blockIdx.x;
-    const float4 * xr = reinterpret_cast<const float4 *>(x + row * d);
+    float4 * xr = reinterpret_cast<float4 *>(x + row * d);
     float s = 0.f;
     for (int i = threadIdx.x; i < d / 4; i += THREADS) {
-        const float4 v = xr[i];
+        float4 v = xr[i];
+        if (a) {
+            const float4 b = reinterpret_cast<const float4 *>(a + row * d)[i];
+            v.x += b.x, v.y += b.y, v.z += b.z, v.w += b.w;
+            xr[i] = v;
+        }
         s += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
     }
     __shared__ float part[THREADS / 32];
@@ -61,7 +68,16 @@ void rms(const float * x, const float * w, int T, int d, float eps, float * y32,
 {
     if (d % 4) throw std::invalid_argument("norm::rms: d must be a multiple of 4");
     if (T <= 0) return;
-    rms_kernel<<<T, THREADS, 0, stream>>>(x, w, d, eps, y32, y16);
+    rms_kernel<<<T, THREADS, 0, stream>>>(const_cast<float *>(x), nullptr, w, d, eps, y32, y16);
+    TRUSS_CUDA(cudaGetLastError());
+}
+
+void add_rms(float * x, const float * a, const float * w, int T, int d, float eps, float * y32, half * y16,
+             cudaStream_t stream)
+{
+    if (d % 4) throw std::invalid_argument("norm::add_rms: d must be a multiple of 4");
+    if (T <= 0) return;
+    rms_kernel<<<T, THREADS, 0, stream>>>(x, a, w, d, eps, y32, y16);
     TRUSS_CUDA(cudaGetLastError());
 }
 

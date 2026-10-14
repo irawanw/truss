@@ -13,6 +13,12 @@ public:
     {
         norm::rms(x, lin_.f32(w_), T, d_, eps_, y32, y16, g.s);
     }
+    // x += a first (a == nullptr: plain forward), one launch
+    void forward_add(engine::Gpu & g, float * x, const float * a, int T, float * y32, half * y16) const
+    {
+        if (a) norm::add_rms(x, a, lin_.f32(w_), T, d_, eps_, y32, y16, g.s);
+        else forward(g, x, T, y32, y16);
+    }
 
 private:
     Linear & lin_;

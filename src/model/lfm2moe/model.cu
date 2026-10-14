@@ -63,7 +63,7 @@ std::vector<runtime::MoeLayer> StageModel::moe_layers() const
 size_t StageModel::scratch_bytes(int T) const
 {
     const size_t d = c_.d_model;
-    const size_t base = d * (4 + 4 + 2) + 4;   // op / ffn output, normed rows fp32 + fp16, ids
+    const size_t base = d * (4 + 4 + 4 + 2) + 4;   // two op / ffn outputs, normed rows fp32 + fp16, ids
     const size_t moe = blocks::MoeDims{ c_.d_model, c_.n_expert, c_.n_expert_used, 0 }.scratch_per_row();
     const size_t per_row = base + std::max({ blocks::ShortConv::scratch_per_row(c_.d_model),
                                              blocks::AttnGqa::scratch_per_row(gqa_shape(), c_.d_model),
@@ -116,23 +116,28 @@ void StageModel::layers(engine::Stage & st, const engine::Chunk & c, float * res
     engine::Gpu & g = st.gpu();
     Scratch & sc = *g.sc;
     const int T = c.T, d = c_.d_model;
+    // residual adds fused into the next RMSNorm (norm::add_rms): the op output into ffn_norm, the FFN output into the
+    // next layer's op_norm (plain add at the stage's last layer and when a hook reads res). Outputs alternate between
+    // two buffers so a pending one survives the next layer's scratch.
+    float * outs[2] = { sc.alloc((size_t) T * d), sc.alloc((size_t) T * d) };
     const size_t base = sc.mark();
+    const float * pend = nullptr;
     for (int l = lb_; l < le_; ++l) {
         sc.release(base);
         const int i = l - lb_;
-        float * x = sc.alloc((size_t) T * d), * out = sc.alloc((size_t) T * d);
+        float * x = sc.alloc((size_t) T * d), * out = outs[i & 1];
         half * x16 = sc.alloc<half>((size_t) T * d);
         st.prof().record(l, 0, g.s);
-        op_norm_[i]->forward(g, res, T, nullptr, x16);
+        op_norm_[i]->forward_add(g, res, pend, T, nullptr, x16);
         st.prof().record(l, 1, g.s);
         if (attn_[i]) attn_[i]->forward(g, c.slot, x16, c.pos0, T, out);
         else conv_[i]->forward(g, c.slot, x16, T, out, c.tentative);
-        ffn::add(res, out, T * d, g.s);
         st.prof().record(l, 2, g.s);
-        ffn_norm_[i]->forward(g, res, T, x, x16);   // fp32 for the router, fp16 for the projections
+        ffn_norm_[i]->forward_add(g, res, out, T, x, x16);   // fp32 for the router, fp16 for the projections
         if (moe_[i]) moe_[i]->forward(g, x, x16, T, out, c.stream, st.moe_ws(), st.moe_rows());
         else dense_[i]->forward(g, x16, T, out);
-        ffn::add(res, out, T * d, g.s);
+        pend = out;
+        if (hook || l + 1 == le_) ffn::add(res, out, T * d, g.s), pend = nullptr;
         st.prof().record(l, 6, g.s);
         if (hook) {
             g.sync();

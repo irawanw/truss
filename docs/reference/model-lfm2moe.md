@@ -15,7 +15,7 @@ sigmoid + expert-bias router, renormalized, no shared expert); vocab 128,000, he
 |---|---|
 | `config.h/.cc` | `Config::from_gguf` (llama.cpp `lfm2moe.*` keys; attention where `attention.head_count_kv[l] > 0`; checks `expert_gating_func` 2) |
 | `weights.h/.cc` | binding (`formats::Binder`): `attn_norm` = operator norm, `token_embd_norm` = final norm; experts as trellis tables; `exp_probs_b.bias` the router's selection bias |
-| `model.h/.cu` | `Family` (shape checks vs `moe::Lfm2`), `StageModel`: per layer `res += op(op_norm(res))` (ShortConv or AttnGqa), `res += ffn(ffn_norm(res))` (DenseFfn or Moe with `route_sigmoid_bias`); embed = Q8 rows; head = final norm + `Head` on token_embd. Store layers are the MoE layers only (`sl_`) |
+| `model.h/.cu` | `Family` (shape checks vs `moe::Lfm2`), `StageModel`: per layer `res += op(op_norm(res))` (ShortConv or AttnGqa), `res += ffn(ffn_norm(res))` (DenseFfn or Moe with `route_sigmoid_bias`); the adds run inside the next norm (`RmsNorm::forward_add`; two alternating output buffers, plain add at the stage's last layer or with a hook); embed = Q8 rows; head = final norm + `Head` on token_embd. Store layers are the MoE layers only (`sl_`) |
 
 ## Blocks and kernels it added (reusable)
 
