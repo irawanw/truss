@@ -157,8 +157,8 @@ tenants' processes - xmrig ~975% CPU, two ollama llama-server ~750% each - may s
 Reading: up to 11 layers TRUSS matches to ~1e-6. The slice-12 failure is **one row**: step 2 has KL 6.1e-2, the other
 16 rows ~5e-6. That row has the smallest router margin at layer 11 (4th vs 5th biased sigmoid score 1.8e-4; the other
 rows >= 7.7e-4): TRUSS's fp16 activations flip a near-tie expert choice. Not a bug. Ties are common in every MoE layer
-(~45 of 528 rows have margin < 1e-3; probe: residual / MoE-output range and margins per layer, scratch script
-`l11_probe.py`, logic easy to redo), so over 38 MoE layers about half the rows of the full model take at least one
+(~45 of 528 rows have margin < 1e-3; probe: residual / MoE-output range and margins per layer, `PROJ/scripts/d_router_probe.py <pack> <ids.pt>`),
+so over 38 MoE layers about half the rows of the full model take at least one
 flip -> full-model per-row KL is bimodal (~1e-6 or 1e-2..0.3) and its mean is dominated by flips.
 Also seen: layer 9's MoE writes an outlier channel (|x| 134, residual rms 0.01 -> 0.24); far from fp16 range, harmless.
 
