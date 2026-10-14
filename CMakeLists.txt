@@ -75,6 +75,8 @@ add_library(truss_engine STATIC
   src/blocks/ple.cu
   src/blocks/moe.cu
   src/runtime/expert_store.cu
+  src/runtime/expert_store_plan.cu
+  src/runtime/expert_store_ring.cu
   src/runtime/doorbell.cu
   src/runtime/moe_exec.cu
   src/runtime/moe_paths.cu
@@ -88,7 +90,7 @@ add_library(truss_engine STATIC
 target_link_libraries(truss_engine PUBLIC truss_models truss_kernels truss_cpu)
 
 # ---- public C API: libtruss.so (include/truss/truss.h), what server/ binds to
-add_library(truss SHARED src/api/truss_c.cu)
+add_library(truss SHARED src/api/truss_c.cu src/api/truss_sampling.cu)
 target_include_directories(truss PUBLIC include)
 target_link_libraries(truss PRIVATE truss_engine)
 set_target_properties(truss PROPERTIES CUDA_RUNTIME_LIBRARY Shared)

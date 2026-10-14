@@ -2,7 +2,7 @@
 
 ---
 
-## `src/runtime/expert_store.h`, `expert_store.cu` — which experts live where
+## `src/runtime/expert_store.h`, `expert_store.cu` (core, stream mode), `expert_store_plan.cu` (sizes, hot-set plan), `expert_store_ring.cu` (decode ring, fetch, admission), `expert_store_util.h` — which experts live where
 
 **Hot-set ranking (TRACKER #90).** `plan()` ranks by `usage / bytes^Sizes::plan_alpha` (default 0: by usage). Per byte
 (alpha 1, the old rule) is the knapsack optimum for the profile's own counts, but on real 256K routing that set covered
@@ -99,7 +99,7 @@ critical path (~9.5 ms per token at 94 misses). Next: MTP windows, a CPU tier fo
 
 ---
 
-## `include/truss/truss.h`, `src/api/truss_c.cu` — C API (`libtruss.so`)
+## `include/truss/truss.h`, `src/api/truss_c.cu` (open, eval, slots, checkpoints), `truss_sampling.cu` (sampling, spec steps), `api_internal.h` — C API (`libtruss.so`)
 
 One `truss_model` = one model file, one sequence, on the current CUDA device (`CUDA_VISIBLE_DEVICES` selects it).
 
@@ -127,6 +127,8 @@ dispatch on `general.architecture` inside `truss_open`.
 ---
 
 ## `server/` — OpenAI-compatible HTTP server (Python)
+
+Files: `app.py` (FastAPI routes, request parsing, `main`), `engine.py` (model + sequence slots + fair gates), `generate.py` (one request's prompt reuse and decode loop), `engine_debug.py` (dumps, stop logs, /debug/probe), `seq.py` (prefix matching, raw ids, `FairGate`, `Slot`), `reasoning.py` (think-block ban and splitting), `chat.py`, `tools.py`, `truss_ctypes.py`.
 
 | file | role |
 |---|---|
