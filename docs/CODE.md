@@ -11,6 +11,16 @@ value, and how to extend or replace it. **A change to a file updates its entry i
 an entry when it is created. The file's own header comment says what it is and why it is shaped that way; the
 reference page adds how it fits with the rest.
 
+## Size and ownership (2026-10-14, user: "maintainable, easy port, easy update, no big file")
+
+- **No big files.** A source file stays under 500 lines (kernels with many tile variants: 800); one responsibility per
+  file. A file that grows past it is split before the change that grew it is merged.
+- **Model code lives only in `src/model/<family>/`** and is composition: which block each layer uses. Engine,
+  blocks, runtime, API and server never name a model family (`docs/ENGINE.md`).
+- **Adding a model touches no file outside its folder** except one registry line (and a new block for a new layer
+  kind). If it must, fix the abstraction first, gated by `tests/golden/run.sh` (outputs of every other model
+  identical byte for byte).
+
 ## Where things go
 
 | what | where | example |
