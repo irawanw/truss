@@ -11,9 +11,10 @@ main yet; see step 6).
 | Engine split (engine / blocks / runtime / model folders) | **DONE**, committed | golden 10/10 byte-identical to the old engine; qwen4exp_forward short/stream/decode/checkpoint/cpu PASS |
 | No big files | **DONE** for engine, blocks, runtime, api, server, model; kernels <= 800 | `wc -l` audit in TRACKER #160 |
 | lfm2moe family on TRUSS | **DONE** (works), speed **untuned** | `tests/layer/lfm2moe_parity.py`: mean KL 2.3-5.4e-4 vs HF on the same weights (4-layer slice) |
-| LFM X3.1 encode, K 2 / 2.5 / 3 / 3.5 | **RUNNING** on GPU 2 since 15:58; ~9.3 min per layer, 38 MoE layers (2..39); ETA ~22:00 10-14 | `~/ML_projects/lfm24b/20261014_x31/data/work/logs/c_run.out` |
-| LFM packs (one GGUF per K) | TODO (after the encode) | step 2 |
-| LFM full-model quality (KL, coding evals) | TODO | steps 3-4 |
+| LFM X3.1 encode, K 2 / 2.5 / 3 / 3.5 | **DONE** 21:37 10-14 (C-RUN-DONE 2..39, 38 layers x 4 rates) | `~/ML_projects/lfm24b/20261014_x31/data/work/logs/c_run.out` |
+| LFM packs (one GGUF per K) | **DONE** 10-15 03:40: K2 6.89 GB, K2.5 8.32, K3 9.76, K3.5 11.19 (tensor data) | `PROJ/data/gguf/lfm25-24b-x31-k*.gguf`, `data/work/logs/c4_pack_all.log` |
+| LFM full-model parity | **FAIL, bug being bisected**: K2 mean KL 3.7e-2 (gate 2e-3); diverges in layer 10 or 11 | section 8 |
+| LFM full-model quality (KL, coding evals) | TODO (after parity) | step 4 |
 | LFM speed (GQA attention on tensor cores, MoE Tune for 2048/1536) | TODO | step 5 |
 
 ## 2. What is running and how to check it
@@ -50,8 +51,9 @@ CUDA_VISIBLE_DEVICES=2 ~/src/venvs/exl3new/bin/python tests/layer/lfm2moe_parity
   ~/ML_projects/lfm24b/20261014_x31/data/gguf/lfm25-24b-x31-k2.gguf build/libtruss.so \
   ~/ML_projects/lfm24b/20261014_x31/data/corpus/ids_code_heldout_1024.pt --steps 16 --prompt 512
 ```
-Gate: mean KL <= 2e-3 (it builds HF reference layers on GPU in fp32: all 40 layers need ~20 GB; run it when the
-encode is finished, or reduce `--prompt`).
+Gate: mean KL <= 2e-3. Run with `TRUSS_EXPERT_GB=7` (TRUSS otherwise takes 21 GB of experts and the reference OOMs).
+The old note "all 40 layers need ~20 GB" was wrong (fp32 experts are ~2.4 GB per layer, ~90 GB in all): the script
+now streams the reference one layer at a time (section 8).
 
 **Step 4 - quality per K** (the user's actual question: which rate is good enough):
 - KL vs the Q8_0 model: make the base with llama-paw (`~/llama-paw/build/bin/llama-perplexity -m
@@ -120,3 +122,50 @@ same pattern as the 10-04 self-optimization run:
 
 Watch it: `tmux attach -t lfmagent`, `tail agent/logs/loop_*.log`, `cat agent/notify.txt agent/LEDGER.tsv`.
 Stop it: `tmux kill-session -t lfmagent` (then `pm2 stop paw-brain-g2` to free GPU 2).
+
+**Status 10-15: the agent is STOPPED; the lead does the work directly.** What happened: the watcher gave up after
+900 s (the brain loads from HDD in ~20 min); the loop started by hand ran omp in print mode (`-p`, no interface), and
+the brain hung on the first 21,677-token prompt (0% GPU, no answer to a 4-token request for 90 s). `agent/scripts/
+interactive.sh` (interactive omp in tmux, waits for the brain) was added, then the user said to stop omp. The brain
+(`paw-brain-g2`) is stopped; GPU 2 is free. Not diagnosed: why the brain stalled in prefill (box load ~95 from other
+tenants' processes - xmrig ~975% CPU, two ollama llama-server ~750% each - may starve its HDD page cache).
+
+## 8. Full-model parity: what was found 10-15 (continue here)
+
+**Parity script fixes** (`tests/layer/lfm2moe_parity.py`, uncommitted on `refactor/engine-blocks`):
+- Reference streams layers: one causal forward over all ids (row m-1 = last row of the m-prefix), each layer built,
+  run, freed. Needs an explicit causal mask for the attention layers: HF eager attention applies NONE when
+  `attention_mask=None` (the old per-prefix recompute only read the last row, so it never showed); conv layers get
+  `None` (they read it as a padding mask).
+- Prints a noise floor: the same reference with the residual rounded to fp16 after every layer (KL vs fp32 per step).
+- With the fix the 4-layer slice gives mean KL 4.7e-7 (was 2-5e-4 with the old reference).
+
+**Results, K2, prompt 512, 16 decode steps** (logs `PROJ/data/work/logs/parity_*.log`; slices from
+`c4_pack.py 2 data/test/lfm-slice<N>-k2.gguf --layers N`):
+
+| layers | TRUSS mean KL | fp16-residual floor | top-1 |
+|---|---|---|---|
+| 4 | 8.5e-7 | 3.7e-7 | 17/17 PASS |
+| 8 | 2.3e-6 | 1.1e-7 | 17/17 PASS |
+| 10 | 2.4e-6 | 2.6e-7 | 17/17 PASS |
+| 12 | 3.6e-3 | 7.0e-7 | 16/17 FAIL |
+| 14 | 1.3e-2 | 3.6e-7 | 16/17 FAIL |
+| 16 | 1.2e-2 | 1.5e-3 | 16/17 FAIL |
+| 40 (full) | 3.7e-2 | 6.7e-3 | 17/17 FAIL |
+
+Reading: up to 10 layers TRUSS matches to ~1e-6. At 12 the floor is still 7e-7 but TRUSS is 3.6e-3, so this is a real
+TRUSS divergence in **layer 10 (attention, 3rd GQA layer) or layer 11 (conv + MoE)**, not model sensitivity. Layers
+2 and 6 (GQA) pass, so look for something layer-10-specific: activation magnitude (fp16 overflow / saturation in the
+residual, the q/k norms or the expert outputs), a routing tie, or a per-layer table index. Deeper layers also amplify
+noise (floor 1.5e-3 at 16, 6.7e-3 at 40), so the final full-model gate may need to be "close to the floor", not 2e-3.
+
+**Next:**
+1. Slice 11 (`--layers 11`) -> splits layer 10 vs 11.
+2. Dump TRUSS and reference hidden states after that layer (max |x|, which rows differ; is it every row or a few
+   = routing flips). Check fp16 range of the residual there.
+3. Fix, then rerun slices 12/16 and the four full packs; re-decide the gate against the floor.
+4. Then step 4 (KL vs Q8_0, coding evals), step 5 (speed).
+
+**Disk:** NVMe at ~45 GB free after the packs + slices (rule: keep >= 50 GB). Test slices
+`PROJ/data/test/lfm-slice{8,10,12,14,16}-k2.gguf` (~11 GB) are disposable; delete when the bisect is done.
+`d_parity_chain.sh` (`PROJ/scripts`) runs parity on all four packs in sequence (already has `TRUSS_EXPERT_GB=7`).

@@ -10,6 +10,7 @@ Checks, on a prompt of real tokens (the corpus held-out ids):
   prompt   the last row's logits after one prompt (TRUSS chunked by its max_chunk)        KL, top-1
   decode   N single-token steps after it (TRUSS decode path: gemv, moe_window, split attention)   KL per step
 Gate: mean KL <= 2e-3 (fp16 activations in TRUSS vs fp32 here). Top-1 is reported, not gated: over ~10 rows one
+The reference streams layers (one at a time, one causal forward over all ids) so it fits next to TRUSS; run with TRUSS_EXPERT_GB=7.
 near-tie flips it (2026-10-14, 4-layer K2 slice: prompts 120 / 128 / 200 -> mean KL 2.3e-4 / 5.3e-4 / 5.4e-4, top-1
 7/7, 8/9, 7/7; no step-dependent drift).
 
@@ -65,6 +66,30 @@ def experts(T, L, k_of):
     return torch.cat([out["gate"], out["up"]], dim=1), out["down"]
 
 
+def layer_weights(cfg, T, f, hkv, L, k_of):
+    """HF state dict of layer L from the pack."""
+    p = f"blk.{L}."
+    sd = {"operator_norm.weight": deq(T[p + "attn_norm.weight"]), "ffn_norm.weight": deq(T[p + "ffn_norm.weight"])}
+    if hkv[L]:
+        for hf, gg in (("q_proj", "attn_q"), ("k_proj", "attn_k"), ("v_proj", "attn_v"), ("out_proj", "attn_output")):
+            sd[f"self_attn.{hf}.weight"] = deq(T[p + gg + ".weight"])
+        sd["self_attn.q_layernorm.weight"] = deq(T[p + "attn_q_norm.weight"])
+        sd["self_attn.k_layernorm.weight"] = deq(T[p + "attn_k_norm.weight"])
+    else:
+        sd["conv.conv.weight"] = deq(T[p + "shortconv.conv.weight"]).unsqueeze(1)
+        sd["conv.in_proj.weight"] = deq(T[p + "shortconv.in_proj.weight"])
+        sd["conv.out_proj.weight"] = deq(T[p + "shortconv.out_proj.weight"])
+    if L < cfg.num_dense_layers:
+        for hf, gg in (("w1", "ffn_gate"), ("w3", "ffn_up"), ("w2", "ffn_down")):
+            sd[f"feed_forward.{hf}.weight"] = deq(T[p + gg + ".weight"])
+    else:
+        sd["feed_forward.gate.weight"] = deq(T[p + "ffn_gate_inp.weight"])
+        sd["feed_forward.expert_bias"] = deq(T[p + "exp_probs_b.bias"])
+        gu, dn = experts(T, L, k_of)
+        sd["feed_forward.experts.gate_up_proj"], sd["feed_forward.experts.down_proj"] = gu, dn
+    return sd
+
+
 def reference(pack, ids, n_steps):
     from transformers.models.lfm2_moe.configuration_lfm2_moe import Lfm2MoeConfig
     from transformers.models.lfm2_moe.modeling_lfm2_moe import Lfm2MoeDecoderLayer, Lfm2MoeRotaryEmbedding
@@ -87,43 +112,34 @@ def reference(pack, ids, n_steps):
                         use_expert_bias=True, norm_topk_prob=True)
     cfg._attn_implementation = "eager"
     k_of = lambda c: {25: 2.5, 35: 3.5}.get(c, c)
-    layers = []
-    for L in range(n_layer):
-        layer = Lfm2MoeDecoderLayer(cfg, L).float().cuda().eval()
-        p = f"blk.{L}."
-        sd = {"operator_norm.weight": deq(T[p + "attn_norm.weight"]), "ffn_norm.weight": deq(T[p + "ffn_norm.weight"])}
-        if hkv[L]:
-            for hf, gg in (("q_proj", "attn_q"), ("k_proj", "attn_k"), ("v_proj", "attn_v"), ("out_proj", "attn_output")):
-                sd[f"self_attn.{hf}.weight"] = deq(T[p + gg + ".weight"])
-            sd["self_attn.q_layernorm.weight"] = deq(T[p + "attn_q_norm.weight"])
-            sd["self_attn.k_layernorm.weight"] = deq(T[p + "attn_k_norm.weight"])
-        else:
-            sd["conv.conv.weight"] = deq(T[p + "shortconv.conv.weight"]).unsqueeze(1)
-            sd["conv.in_proj.weight"] = deq(T[p + "shortconv.in_proj.weight"])
-            sd["conv.out_proj.weight"] = deq(T[p + "shortconv.out_proj.weight"])
-        if L < cfg.num_dense_layers:
-            for hf, gg in (("w1", "ffn_gate"), ("w3", "ffn_up"), ("w2", "ffn_down")):
-                sd[f"feed_forward.{hf}.weight"] = deq(T[p + gg + ".weight"])
-        else:
-            sd["feed_forward.gate.weight"] = deq(T[p + "ffn_gate_inp.weight"])
-            sd["feed_forward.expert_bias"] = deq(T[p + "exp_probs_b.bias"])
-            gu, dn = experts(T, L, k_of)
-            sd["feed_forward.experts.gate_up_proj"], sd["feed_forward.experts.down_proj"] = gu, dn
-        layer.load_state_dict({k: v.cuda() for k, v in sd.items()}, strict=True)
-        layers.append(layer)
     emb, fnorm = deq(T["token_embd.weight"]).cuda(), deq(T["token_embd_norm.weight"]).cuda()
     rot = Lfm2MoeRotaryEmbedding(config=cfg).cuda()
-    out = []
+    n = len(ids)
+    # Causal: row n'-1 of one forward over all ids == the last row of the n'-prefix, so ONE pass gives every step's
+    # logits, and layers are built, run and freed one at a time (fp32 experts are ~2.4 GB per layer).
     with torch.inference_mode():
-        for n in range(len(ids) - n_steps, len(ids) + 1):   # the prompt, then one more token per step (full recompute)
-            x = emb[torch.tensor(ids[:n], device="cuda")].unsqueeze(0)
-            pos = torch.arange(n, device="cuda").unsqueeze(0)
-            pe = rot(x, pos)
-            for layer in layers:
-                x = layer(x, position_embeddings=pe, attention_mask=None, position_ids=pos, past_key_values=None)
-            h = x[0, -1]
-            h = h * torch.rsqrt(h.square().mean() + cfg.norm_eps) * fnorm
-            out.append((h @ emb.T).float().cpu())
+        x = emb[torch.tensor(ids, device="cuda")].unsqueeze(0)
+        xs = [x, x.clone()]   # [0] fp32 reference, [1] the same with the residual rounded to fp16 after every layer
+        pos = torch.arange(n, device="cuda").unsqueeze(0)
+        pe = rot(x, pos)
+        # eager attention adds attention_mask and applies NO causal mask of its own: every row needs one (conv layers
+        # read attention_mask as a padding mask: None there)
+        mask = torch.full((n, n), torch.finfo(torch.float32).min, device="cuda").triu(1)[None, None]
+        for L in range(n_layer):
+            layer = Lfm2MoeDecoderLayer(cfg, L).float().cuda().eval()
+            layer.load_state_dict({k: v.cuda() for k, v in layer_weights(cfg, T, f, hkv, L, k_of).items()}, strict=True)
+            for i in range(2):
+                xs[i] = layer(xs[i], position_embeddings=pe, attention_mask=mask if hkv[L] else None, position_ids=pos,
+                              past_key_values=None)
+            xs[1] = xs[1].half().float()
+            del layer
+            torch.cuda.empty_cache()
+        out = [[], []]
+        for i in range(2):
+            for m in range(n - n_steps, n + 1):
+                h = xs[i][0, m - 1]
+                h = h * torch.rsqrt(h.square().mean() + cfg.norm_eps) * fnorm
+                out[i].append((h @ emb.T).float().cpu())
     return out
 
 
@@ -161,18 +177,20 @@ def main():
     a = ap.parse_args()
     ids = torch.load(a.ids)[-1][: a.prompt + a.steps].tolist()
     got = truss(a.pack, a.lib, ids, a.steps)
-    ref = reference(a.pack, ids, a.steps)
-    kls, top1 = [], 0
-    for i, (g, r) in enumerate(zip(got, ref)):
-        kl = float(F.kl_div(F.log_softmax(g, -1), F.log_softmax(r, -1), log_target=True, reduction="sum"))
+    ref, ref16 = reference(a.pack, ids, a.steps)
+    kl = lambda g, r: float(F.kl_div(F.log_softmax(g, -1), F.log_softmax(r, -1), log_target=True, reduction="sum"))
+    kls, floor, top1 = [], [], 0
+    for i, (g, r, r16) in enumerate(zip(got, ref, ref16)):
+        kls.append(kl(g, r))
+        floor.append(kl(r16, r))
         same = int(g.argmax()) == int(r.argmax())
-        kls.append(kl)
         top1 += same
-        print(f"{'prompt' if i == 0 else f'step {i:2d}'}: KL {kl:.2e} top-1 {'same' if same else 'DIFF'} "
-              f"rel {float((g - r).norm() / r.norm()):.2e}")
-    mean_kl, frac = sum(kls) / len(kls), top1 / len(kls)
+        print(f"{'prompt' if i == 0 else f'step {i:2d}'}: KL {kls[-1]:.2e} (fp16-residual reference {floor[-1]:.2e}) "
+              f"top-1 {'same' if same else 'DIFF'} rel {float((g - r).norm() / r.norm()):.2e}")
+    mean_kl, mean_floor = sum(kls) / len(kls), sum(floor) / len(floor)
     ok = mean_kl <= 2e-3
-    print(f"mean KL {mean_kl:.2e}, top-1 {top1}/{len(kls)}  {'PASS' if ok else 'FAIL'}")
+    print(f"mean KL {mean_kl:.2e} (fp16-residual reference vs fp32: {mean_floor:.2e}), top-1 {top1}/{len(kls)}  "
+          f"{'PASS' if ok else 'FAIL'}")
     sys.exit(0 if ok else 1)
 
 
