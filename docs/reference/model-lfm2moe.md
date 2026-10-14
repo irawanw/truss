@@ -22,7 +22,8 @@ sigmoid + expert-bias router, renormalized, no shared expert); vocab 128,000, he
 `blocks/norm.h` (RmsNorm), `blocks/ffn_dense.h` (DenseFfn), `blocks/shortconv.*` (ShortConv, stateful: conv rows,
 window rollback by `spec::tail_rows`), `blocks/attn_gqa.*` (AttnGqa, positional K/V); kernels `norm/rms_norm`,
 `conv/short_conv`, `attn/gqa` (v1 CUDA-core tiles for chunks; a decode kernel for T x G <= 16 rows: lane = cell, splits of 128
-cells, 10-15), `ffn/route_sigmoid`; `moe::Lfm2` shape.
+cells, 10-15), `ffn/route_sigmoid`; `moe::Lfm2` shape with its own `Tune<Lfm2>` in `moe/moe_window.cu` (swept
+10-15: 1 block/SM, gate/up 8 k-warps x 4 tiles, down 8 k-warps x 128 columns; per-shape `GU_KSPLIT`).
 
 ## Tests
 

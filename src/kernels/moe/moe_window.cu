@@ -62,11 +62,13 @@ template <> struct Tune<FlashNext> {
     static constexpr int BLOCKS_PER_SM = 2;   // 3 measured worse: 4-tile warps -15%, 8-tile warps spill (TRACKER #28)
     using GateUp = Geom<8, 1, 2, 8>;       // 8 k-split warps x 8 tiles
     using Down = Geom<4, 2, 2, 8>;         // 4 k-split warps x 2 groups x 8 tiles
+    static constexpr int GU_KSPLIT = 1;    // 2 measured 5% slower (TRACKER #24)
 };
-template <> struct Tune<Lfm2> {            // Flash-Next's geometry (untuned for this shape: every tiling assert holds)
-    static constexpr int BLOCKS_PER_SM = 2;
-    using GateUp = Geom<8, 1, 2, 8>;
-    using Down = Geom<4, 2, 2, 8>;
+template <> struct Tune<Lfm2> {            // swept 10-15 (TRACKER #164): decode K3.5 window 75 -> ~45 us/layer
+    static constexpr int BLOCKS_PER_SM = 1;   // 2: -0.5 ms/token (fewer, longer-lived blocks drain the queue better)
+    using GateUp = Geom<8, 1, 2, 4>;       // 8 k-split warps x 4 tiles: 2x the items of 8 tiles (96 -> 192 at top-4)
+    using Down = Geom<8, 1, 2, 8>;         // 128 columns: 2x the down items (32 -> 64), 8 k-split warps over F = 1536
+    static constexpr int GU_KSPLIT = 1;    // 2 / 4: no gain
 };
 
 // Compile-time sizes of one shape
@@ -76,7 +78,7 @@ struct Plan {
     static constexpr int SLOTS = MAX_ROWS * TOPK;          // distinct experts a window can route to
     using GU = typename Tune<Shape>::GateUp;
     using DN = typename Tune<Shape>::Down;
-    static constexpr int GU_KSPLIT = 1;                     // K parts per gate/up item; 2 measured 5% slower (TRACKER #24)
+    static constexpr int GU_KSPLIT = Tune<Shape>::GU_KSPLIT;   // K parts per gate/up item
     static constexpr int GU_GROUPS = F / GU::BLOCK_COLS;   // column groups per (slot, proj)
     static constexpr int GU_ITEMS = 2 * GU_GROUPS * GU_KSPLIT;   // GU items per slot
     static constexpr int GU_KSLICES = D / 16 / GU_KSPLIT;   // k slices per GU item
