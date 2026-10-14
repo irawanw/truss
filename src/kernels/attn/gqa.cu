@@ -1,0 +1,220 @@
+#include "kernels/attn/gqa.cuh"
+
+#include "core/cuda_check.h"
+
+#include <algorithm>
+#include <cmath>
+#include <stdexcept>
+#include <string>
+
+namespace truss::attn {
+
+namespace {
+
+constexpr int D = 64;            // head dim (the kernels are written for 64: 2 values per lane, 4 threads x 16 per row)
+constexpr int R = 64;            // rows (query, head) per CTA
+constexpr int BC = 64;           // cells per K / V tile
+constexpr int THREADS = 256;     // 4 threads per row
+constexpr int KP = D + 8;        // padded smem row (halves) for K / V
+constexpr int MAX_SPLITS = 32;
+constexpr int SPLIT_ROWS = 32;   // chunks up to this many rows split their cells across CTAs
+
+// ---- prepare: one warp per (row, head slot); slots [0, H) q, [H, H + HKV) k, [H + HKV, H + 2 HKV) v
+__global__ void prepare_kernel(GqaShape s, const float * __restrict__ q, const float * __restrict__ k,
+                               const float * __restrict__ v, const float * __restrict__ qn, const float * __restrict__ kn,
+                               int pos0, int T, half * __restrict__ q16, half * __restrict__ kc, half * __restrict__ vc)
+{
+    const int slots = s.H + 2 * s.HKV;
+    const int w = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x & 31;
+    if (w >= T * slots) return;
+    const int t = w / slots, j = w % slots, pos = pos0 + t;
+    const float * src;
+    const float * nw = nullptr;
+    half * dst;
+    bool rope = true;
+    if (j < s.H) src = q + ((size_t) t * s.H + j) * D, nw = qn, dst = q16 + ((size_t) t * s.H + j) * D;
+    else if (j < s.H + s.HKV) {
+        const int hk = j - s.H;
+        src = k + ((size_t) t * s.HKV + hk) * D, nw = kn, dst = kc + ((size_t) pos * s.HKV + hk) * D;
+    } else {
+        const int hk = j - s.H - s.HKV;
+        src = v + ((size_t) t * s.HKV + hk) * D, dst = vc + ((size_t) pos * s.HKV + hk) * D, rope = false;
+    }
+    float a = src[lane], b = src[lane + 32];
+    if (nw) {
+        float ss = a * a + b * b;
+        for (int o = 16; o; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+        const float r = rsqrtf(ss / D + s.eps);
+        a *= r * nw[lane], b *= r * nw[lane + 32];
+    }
+    if (rope) {   // NEOX: pair (i, i + D/2), frequency base^(-2i/D), angle in fp64
+        const double ang = (double) pos * pow((double) s.rope_base, -2.0 * lane / D);
+        const float c = (float) cos(ang), sn = (float) sin(ang);
+        const float a2 = a * c - b * sn, b2 = b * c + a * sn;
+        a = a2, b = b2;
+    }
+    dst[lane] = __float2half(a), dst[lane + 32] = __float2half(b);
+}
+
+// ---- attention: CTA = (BQ queries x G heads of one KV head, split); 4 threads per row
+struct Smem {
+    float q[R][D];
+    half k[BC][KP], v[BC][KP];
+    float p[R][BC + 1];
+};
+
+__global__ void __launch_bounds__(THREADS) attn_kernel(GqaShape s, const half * __restrict__ q16,
+                                                       const half * __restrict__ kc, const half * __restrict__ vc,
+                                                       int pos0, int T, int splits, half * __restrict__ out16,
+                                                       float * __restrict__ part)
+{
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    Smem & sm = *reinterpret_cast<Smem *>(smem_raw);
+    const int G = s.H / s.HKV, BQ = R / G, hk = blockIdx.y, split = blockIdx.z;
+    const int tid = threadIdx.x, r = tid / 4, pt = tid % 4;   // this thread: row r, quarter pt (16 cells / 16 dims)
+    const int qi = r / G, g = r % G, t = blockIdx.x * BQ + qi, h = hk * G + g;
+    const bool valid = t < T;
+    const int qpos = pos0 + t;   // the last cell this row may see
+    // q tile, pre-scaled by 1/sqrt(D)
+    const float scale = rsqrtf((float) D);
+    for (int i = tid; i < R * D; i += THREADS) {
+        const int rr = i / D, d = i % D, tt = blockIdx.x * BQ + rr / G, hh = hk * G + rr % G;
+        sm.q[rr][d] = tt < T ? __half2float(q16[((size_t) tt * s.H + hh) * D + d]) * scale : 0.f;
+    }
+    // this split's cells: the chunk's visible range cut into `splits` equal pieces
+    const int n_cells = pos0 + T, per = (n_cells + splits - 1) / splits;
+    const int c_lo = split * per, cta_hi = min(pos0 + min(T, (int) (blockIdx.x + 1) * BQ), n_cells);
+    const int c_hi = min((split + 1) * per, cta_hi);
+    float m = -INFINITY, l = 0.f, o[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) o[i] = 0.f;
+    for (int c0 = c_lo; c0 < c_hi; c0 += BC) {
+        __syncthreads();   // the previous tile's p / v are consumed
+        for (int i = tid; i < BC * D / 8; i += THREADS) {   // 8 halves per load
+            const int cc = i / (D / 8), d8 = (i % (D / 8)) * 8, cell = c0 + cc;
+            uint4 kv = make_uint4(0, 0, 0, 0), vv = make_uint4(0, 0, 0, 0);
+            if (cell < c_hi) {
+                kv = *reinterpret_cast<const uint4 *>(kc + ((size_t) cell * s.HKV + hk) * D + d8);
+                vv = *reinterpret_cast<const uint4 *>(vc + ((size_t) cell * s.HKV + hk) * D + d8);
+            }
+            *reinterpret_cast<uint4 *>(&sm.k[cc][d8]) = kv;
+            *reinterpret_cast<uint4 *>(&sm.v[cc][d8]) = vv;
+        }
+        __syncthreads();
+        float sc[16], tmax = -INFINITY;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const int cc = pt * 16 + j, cell = c0 + cc;
+            float acc = 0.f;
+#pragma unroll 16
+            for (int d = 0; d < D; ++d) acc += sm.q[r][d] * __half2float(sm.k[cc][d]);
+            sc[j] = valid && cell < c_hi && cell <= qpos ? acc : -INFINITY;
+            tmax = fmaxf(tmax, sc[j]);
+        }
+        tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, 1));
+        tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, 2));
+        const float m_new = fmaxf(m, tmax);
+        const float corr = m_new == -INFINITY ? 1.f : __expf(m - m_new);
+        float psum = 0.f;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const float p = m_new == -INFINITY ? 0.f : __expf(sc[j] - m_new);
+            sm.p[r][pt * 16 + j] = p;
+            psum += p;
+        }
+        psum += __shfl_xor_sync(0xffffffffu, psum, 1);
+        psum += __shfl_xor_sync(0xffffffffu, psum, 2);
+        l = l * corr + psum, m = m_new;
+        __syncwarp();   // the 4 threads of a row are in one warp: their p row is complete
+#pragma unroll
+        for (int i = 0; i < 16; ++i) o[i] *= corr;
+        for (int cc = 0; cc < BC; ++cc) {
+            const float p = sm.p[r][cc];
+#pragma unroll
+            for (int i = 0; i < 16; ++i) o[i] += p * __half2float(sm.v[cc][pt * 16 + i]);
+        }
+    }
+    if (!valid) return;
+    if (splits == 1) {
+        const float inv = l > 0.f ? 1.f / l : 0.f;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) out16[((size_t) t * s.H + h) * D + pt * 16 + i] = __float2half(o[i] * inv);
+        return;
+    }
+    float * pr = part + (((size_t) split * T + t) * s.H + h) * (D + 2);
+    if (pt == 0) pr[0] = m, pr[1] = l;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) pr[2 + pt * 16 + i] = o[i];
+}
+
+// merge the splits of each (row, head) in split order
+__global__ void combine_kernel(GqaShape s, int T, int splits, const float * __restrict__ part, half * __restrict__ out16)
+{
+    const int w = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x & 31;
+    if (w >= T * s.H) return;
+    float m = -INFINITY;
+    for (int k = 0; k < splits; ++k) m = fmaxf(m, part[((size_t) k * T * s.H + w) * (D + 2)]);
+    float l = 0.f, a = 0.f, b = 0.f;
+    for (int k = 0; k < splits; ++k) {
+        const float * pr = part + ((size_t) k * T * s.H + w) * (D + 2);
+        const float f = pr[0] == -INFINITY ? 0.f : __expf(pr[0] - m);
+        l += pr[1] * f, a += pr[2 + lane] * f, b += pr[2 + lane + 32] * f;
+    }
+    const float inv = l > 0.f ? 1.f / l : 0.f;
+    out16[(size_t) w * D + lane] = __float2half(a * inv), out16[(size_t) w * D + lane + 32] = __float2half(b * inv);
+}
+
+void check(const GqaShape & s)
+{
+    if (s.D != D) throw std::invalid_argument("attn::gqa: head dim " + std::to_string(s.D) + " (only 64)");
+    if (s.HKV <= 0 || s.H % s.HKV || R % (s.H / s.HKV)) throw std::invalid_argument("attn::gqa: H / HKV must divide 64");
+}
+
+int split_count(int T, int n_cells)
+{
+    if (T > SPLIT_ROWS) return 1;
+    return std::max(1, std::min(MAX_SPLITS, n_cells / 512));
+}
+
+}  // namespace
+
+void gqa_prepare(const GqaShape & s, const float * q, const float * k, const float * v, const float * q_norm,
+                 const float * k_norm, int pos0, int T, half * q16, half * k_cache, half * v_cache, cudaStream_t stream)
+{
+    check(s);
+    if (T <= 0) return;
+    const int warps = T * (s.H + 2 * s.HKV);
+    prepare_kernel<<<(warps * 32 + 255) / 256, 256, 0, stream>>>(s, q, k, v, q_norm, k_norm, pos0, T, q16, k_cache, v_cache);
+    TRUSS_CUDA(cudaGetLastError());
+}
+
+size_t gqa_workspace_bytes(const GqaShape & s, int max_T, int n_ctx)
+{
+    const int T = std::min(max_T, SPLIT_ROWS);
+    return (size_t) split_count(T, n_ctx) * T * s.H * (s.D + 2) * sizeof(float);
+}
+
+void gqa_attention(const GqaShape & s, const half * q16, const half * k_cache, const half * v_cache, int pos0, int T,
+                   half * out16, void * ws, size_t ws_bytes, cudaStream_t stream)
+{
+    check(s);
+    if (T <= 0) return;
+    const int G = s.H / s.HKV, BQ = R / G;
+    int splits = split_count(T, pos0 + T);
+    while (splits > 1 && (size_t) splits * T * s.H * (D + 2) * sizeof(float) > ws_bytes) --splits;
+    static bool attr = false;   // per process: one device type here (sm_86)
+    if (!attr) {
+        TRUSS_CUDA(cudaFuncSetAttribute(attn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem)));
+        attr = true;
+    }
+    const dim3 grid((T + BQ - 1) / BQ, s.HKV, splits);
+    attn_kernel<<<grid, THREADS, sizeof(Smem), stream>>>(s, q16, k_cache, v_cache, pos0, T, splits, out16,
+                                                         static_cast<float *>(ws));
+    TRUSS_CUDA(cudaGetLastError());
+    if (splits > 1) {
+        combine_kernel<<<(T * s.H * 32 + 255) / 256, 256, 0, stream>>>(s, T, splits, static_cast<const float *>(ws), out16);
+        TRUSS_CUDA(cudaGetLastError());
+    }
+}
+
+}  // namespace truss::attn

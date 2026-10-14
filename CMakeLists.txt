@@ -116,6 +116,7 @@ add_library(truss_kernels STATIC
   src/kernels/ffn/route_sigmoid.cu
   src/kernels/norm/rms_norm.cu
   src/kernels/conv/short_conv.cu
+  src/kernels/attn/gqa.cu
   src/kernels/ple/ple_prefill.cu
   src/kernels/sampling/argmax.cu
   src/kernels/sampling/sample.cu
@@ -232,3 +233,8 @@ target_link_libraries(dsa_mq_bench PRIVATE truss_kernels)
 add_executable(engine_golden tests/golden/engine_golden.cc)
 target_include_directories(engine_golden PRIVATE include)
 target_link_libraries(engine_golden PRIVATE truss)
+# LFM2 ops: dense GQA attention; RMSNorm, short conv, sigmoid router (fp64 references)
+add_executable(gqa_attn_test tests/unit/gqa_attn_test.cu)
+target_link_libraries(gqa_attn_test PRIVATE truss_kernels truss_core)
+add_executable(lfm_small_ops_test tests/unit/lfm_small_ops_test.cu)
+target_link_libraries(lfm_small_ops_test PRIVATE truss_kernels truss_core)
