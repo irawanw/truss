@@ -83,4 +83,10 @@ Config Config::from_gguf(const gguf::File & f)
     return c;
 }
 
+blocks::PleDims Config::ple_dims() const
+{
+    return { d_model, hc, ple_head_dim, ple_conv, ple_ngram, ple_heads_per_ngram, ple_head_offsets, ple_head_vocab,
+             ple_multipliers, ple_eos, rms_eps };
+}
+
 }  // namespace truss::qwen4exp

@@ -20,7 +20,8 @@ way means reading and experimenting. Here the answer is written down next to the
 | [kernels-mixers.md](kernels-mixers.md) | `src/kernels/dsa/*` (sparse attention prefill/decode), `src/kernels/gdn/*` (gated delta net) |
 | [kernels-small.md](kernels-small.md) | `src/kernels/hc/*`, `src/kernels/ffn/*`, `src/kernels/ple/*`, `src/kernels/sampling/*` |
 | [kernels-reference.md](kernels-reference.md) | `src/kernels/reference/*` (slow exact fp32 definitions every fast kernel is tested against) |
-| [model-qwen4exp.md](model-qwen4exp.md) | `src/model/qwen4exp/*` (config, weight binding, PLE hashing, reference forward, the fast `Forward`) |
+| [engine-blocks.md](engine-blocks.md) | `src/engine/*` (Pipeline, Stage, slot state, options), `src/blocks/*` (Linear, Head, Hc, Gdn, Dsa, Ple, Moe), `src/runtime/moe_*` (routed-expert runtime) |
+| [model-qwen4exp.md](model-qwen4exp.md) | `src/model/qwen4exp/*` (config, weight binding, reference forward, the family's composition and MTP drafter) |
 | [runtime-api-server.md](runtime-api-server.md) | `src/runtime/*` (expert residency and streaming), `include/truss/truss.h` + `src/api/*` (C API), `server/*` (OpenAI server) |
 | [tests-tools.md](tests-tools.md) | `tests/*`, `tools/*`: what each checks, its gate, how to run it, which data it needs |
 
@@ -33,7 +34,7 @@ and measurement, numbered #1..; the "Do not repeat" list), `docs/06-truss.md` (d
 ```
  GGUF file(s) ──gguf::File (mmap)──► qwen4exp::Config + qwen4exp::Weights (host views, every tensor bound once)
                                             │
-                        qwen4exp::Forward (src/model/qwen4exp/forward.cu) builds, on one GPU:
+         engine::Pipeline (src/engine/) -> one Stage per device, each composed by the family (src/model/qwen4exp/):
                           • dense Q8_0 matrices repacked (dense::Q8Matrix), norms/F32/F16 tensors (DeviceTensors)
                           • runtime::ExpertStore: hot experts resident, cold experts pinned in host RAM
                           • per-layer state: DSA K/V + indexer caches, GDN recurrent state + conv rows, PLE history
@@ -41,13 +42,13 @@ and measurement, numbered #1..; the "Do not repeat" list), `docs/06-truss.md` (d
         truss C API (libtruss.so) ◄─────────┘        server/app.py (FastAPI, OpenAI API) ── ctypes ──► libtruss.so
 ```
 
-### One chunk through `Forward::run(tokens, T)` (prefill chunk or decode step; T = rows)
+### One chunk through `Pipeline::run(tokens, T)` on Flash-Next (prefill chunk or decode step; T = rows)
 
 | step | op (file) | shapes (Flash-Next) |
 |---|---|---|
 | embed | `dense::q8_rows` (kernels/dense) → `hc::expand` | token_embd Q8_0 [248320][2560] → res [T][4][2560] |
 | per layer l = 0..47: | | |
-| PLE (layer 1 only) | host `ple_rows` + `ple_gather` (model/qwen4exp/ple.cc) → 2 GEMMs → `ple::gate`, `ple::apply` | 16 rows × 160 from a 48 GiB int8 table |
+| PLE (layer 1 only) | host `ple_rows` + `ple_gather` (blocks/ple_hash.cc) → 2 GEMMs → `ple::gate`, `ple::apply` | 16 rows × 160 from a 48 GiB int8 table |
 | attention-side mix | `hc::norm` → GEMM down (10240→320) → `hc::silu` → GEMM up (320→10240) → `hc::collapse`; GEMM inject (10240→4) | mixed [T][2560] |
 | mixer GDN (36 layers) | GEMMs qkv/z/alpha/beta → `gdn::prepare` → `gdn::delta_rule` → `gdn::output_norm` → GEMM out | state [48][128][128] fp32 |
 | mixer DSA (12 layers) | GEMMs q/k/v/idx_q/idx_k → `dsa::rope_table`, `dsa::prepare_qkv`, `dsa::prepare_index` → `dsa::select` → `dsa::attention` → GEMM out | K/V cache fp16 [n_ctx][2][256] |
@@ -57,9 +58,9 @@ and measurement, numbered #1..; the "Do not repeat" list), `docs/06-truss.md` (d
 | routed experts | `ExpertStore` acquire → `moe::prefill` (T > 8) or `moe::window` (T ≤ 8) → release | trellis K1..K4 experts 2560×640 |
 | shared expert | GEMMs gate/up → `ffn::swiglu` → GEMM down; fp32 SGEMM gate → `ffn::shared_add` | |
 | combine | `hc::combine` | |
-| head (on request) | `Forward::head`: hc_head mix → output GEMM in vocab tiles | logits [n][248320] |
+| head (on request) | `Pipeline::head`: hc_head mix → output GEMM in vocab tiles | logits [n][248320] |
 
-Dense GEMMs: `Forward::lin` picks `dense::q8_gemv` (rows ≤ 8), `dense::q8_gemm` (Q8_1 activations, default) or
+Dense GEMMs: `blocks::Linear::lin` picks `dense::q8_gemv` (rows ≤ 8), `dense::q8_gemm` (Q8_1 activations, default) or
 `dense::q8_gemm_a16` (fp16 activations, option). Routed-expert residency: chunks of ≤ 32 rows fetch the cold experts
 they route to (`ExpertStore::fetch`); longer chunks stream whole layers ahead of compute (`ExpertStore::prefetch`).
 
@@ -103,7 +104,7 @@ The full list with gates and data: [tests-tools.md](tests-tools.md).
 | **PLE** | per-layer n-gram embedding: hashed rows of a 320M×160 int8 table mixed into the residual at layer 1 |
 | **hot / cold expert** | resident in VRAM / kept in pinned host RAM and copied over PCIe when needed |
 | **Q8_0 / Q8_1** | llama.cpp 8-bit blocks of 32 (weights with fp16 scale / activations quantized per 32-block) |
-| **chunk** | the tokens of one `Forward::run` call: a prompt piece (≤ max_chunk) or a decode step |
+| **chunk** | the tokens of one `Pipeline::run` call: a prompt piece (≤ max_chunk) or a decode step |
 | **slice** | an 8-layer cut of the model (tools/tk-parity/slice_gguf.py) that fits the GPU with llama-paw, for parity tests |
 
 ## Cookbook: common changes
@@ -112,7 +113,7 @@ The full list with gates and data: [tests-tools.md](tests-tools.md).
 |---|---|---|
 | add a trellis codec | new `src/kernels/trellis/codec_<name>.cuh` with the codec interface; a case in the rate dispatch; a row in `tools/tk-bench/ceiling.cu`; an encoder in `src/encode/` | kernels-trellis-moe.md |
 | retune a kernel | change its `Tune<Shape>` / constants (each names the TRACKER row it came from); rerun its unit test (gate + timing) | the kernel's page |
-| replace a dense GEMM | keep `dense::Q8Matrix` and the function contract; `Forward::lin` is the only caller | kernels-dense.md |
+| replace a dense GEMM | keep `dense::Q8Matrix` and the function contract; `blocks::Linear::lin` is the only caller | kernels-dense.md |
 | add a model family | `src/model/<family>/` (config, weights, reference, forward), shape structs for the ops it reuses, explicit template instantiations | model-qwen4exp.md |
 | change expert placement | `runtime::ExpertStore::plan` (the hot set) — nothing else reads placement | runtime-api-server.md |
 | serve a new API field | `server/app.py` (`params`, the endpoint); engine calls stay `Engine.generate` | runtime-api-server.md |

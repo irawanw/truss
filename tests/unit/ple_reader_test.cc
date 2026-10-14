@@ -3,7 +3,7 @@
 // and with a cache smaller than the working set (evictions). Also the time per row, cold and warm.
 // usage: ple_reader_test <model gguf (shard 1)>
 #include "formats/gguf.h"
-#include "model/qwen4exp/ple_reader.h"
+#include "blocks/ple_reader.h"
 
 #include <cuda_fp16.h>
 
@@ -42,7 +42,7 @@ int main(int argc, char ** argv)
     std::uniform_int_distribution<int64_t> any(0, n_rows - 1);
     int fails = 0;
     for (size_t cache : { (size_t) 1 << 20, (size_t) 64 }) {
-        qwen4exp::PleReader rd(*file, *table, *scale, rb, 16, cache);
+        blocks::PleReader rd(*file, *table, *scale, rb, 16, cache);
         for (int call = 0; call < 6; ++call) {
             std::vector<int32_t> rows;
             const int n = call % 2 ? 16 * 3 : 16 * 4096;   // a decode window / a prompt chunk
@@ -82,7 +82,7 @@ int main(int argc, char ** argv)
         }
         const auto want = mapped(rows);
         std::vector<half> got(rows.size() * rb);
-        qwen4exp::PleReader rd(*file, *table, *scale, rb, 16, (size_t) 1 << 20);
+        blocks::PleReader rd(*file, *table, *scale, rb, 16, (size_t) 1 << 20);
         for (int c = 0; c < 2; ++c) rd.collect(rd.issue(rows.data(), rows.size()), got.data());   // fill the cache
         for (int c = 0; c < 2; ++c) {   // parallel, mixed hits + misses
             const auto t0 = std::chrono::steady_clock::now();
@@ -93,7 +93,7 @@ int main(int argc, char ** argv)
             std::printf("parallel mixed call %d: %6zu rows in %8.0f us (%.3f us/row) %s\n", c, rows.size(), us,
                         us / rows.size(), same ? "identical" : "DIFFERENT");
         }
-        qwen4exp::PleReader fresh(*file, *table, *scale, rb, 16, (size_t) 1 << 20);
+        blocks::PleReader fresh(*file, *table, *scale, rb, 16, (size_t) 1 << 20);
         const auto t0 = std::chrono::steady_clock::now();
         fresh.collect(fresh.issue(rows.data(), rows.size(), false), got.data());   // parallel, all misses
         const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();

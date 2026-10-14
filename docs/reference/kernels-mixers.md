@@ -36,7 +36,7 @@ One warp per normalized row; element i of a row lives in lane i % 32, so the rot
 (`static_assert(ROPE_DIMS == 64)`).
 
 `carry_partial<Shape>(idx_k raw [T][ID], pos0, T, partial)`: the indexer's open-block rows for cells in the chunk
-(what `prepare_index` does at a chunk's end), used by `Forward::accept` over a restored snapshot.
+(what `prepare_index` does at a chunk's end), used by `blocks::Dsa::accept` over a restored snapshot.
 
 ## `src/kernels/dsa/dsa_prefill.{cuh,cu}` — selection and attention
 
@@ -108,7 +108,7 @@ out = RMSNorm_head(o) ⊙ γ ⊙ sigmoid(z)   → out projection
 `gdn::delta_rule(q, k, v, g, beta, state, out, T, Hk, Hv, stream)`: exact token-sequential recurrence (fp32), the
 contract of `ref::gated_delta_rule`; `state` [Hv][128][128] in/out (nullptr: zero start, discarded). Overload
 `delta_rule(..., state_in, state_out, ...)` reads one buffer and writes another (a verify window keeps the committed
-state; `Forward::accept`). Block = (value
+state; `blocks::Gdn::accept`). Block = (value
 head, 32 state columns) = 4 warps × 8 columns; a column is held by 4 lanes × 32 rows, so reductions are 2 shuffle
 levels. Per token: s·k and s·q reduce together, k·q is computed once per token at staging;
 o = a (s·q) + (k·q) δ. k/q/v/g/β are staged through shared memory in cp.async chunks of 8 tokens.

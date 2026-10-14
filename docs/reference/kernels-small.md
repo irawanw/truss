@@ -33,9 +33,9 @@ hc combine: res[c] += out ⊙ 2 sigmoid(inject[c] / 4)
 | `route(logits [T][E], T, E, k, ids [T][k], wts [T][k])` | softmax, top-k (ties: lower id), weights renormalized over the k with sum clamped ≥ 2^-14; ids in descending probability (the reference's `partial_sort`); one warp per token, E ≤ 1024 (16 or 32 per lane) |
 | `swiglu(g, u, n, mid16)` | silu(g)·u → fp16 (down projection input) |
 | `shared_add(routed, y, gate [T], T, d, out)` | out = routed + y·sigmoid(gate) |
-| `count(ids, n, counts)` | counts[ids[i]] += 1 (float atomics; `Forward::profile_routes`) |
+| `count(ids, n, counts)` | counts[ids[i]] += 1 (float atomics; `Pipeline::profile_routes`) |
 
-The router logits are fp32 (cuBLAS SGEMM, `Forward::lin32`): top-10 of 512 has near-ties, and rounding the router
+The router logits are fp32 (cuBLAS SGEMM, `blocks::Linear::lin32`): top-10 of 512 has near-ties, and rounding the router
 would flip them.
 
 ## `src/kernels/ple/ple_prefill.{cuh,cu}` — per-layer n-gram embedding block (layer 1)
@@ -105,7 +105,7 @@ jump at the layer or block that uses the op.
 
 `tail_rows(old [H][w], H, rows [n][w], n, w, out)`: out = the last H rows of concat(old, rows). Carried row histories
 (GDN conv rows, PLE conv history) after accepting n of a window's rows, from the pre-window snapshot and the saved
-window rows (`Forward::accept`). `out` must not alias the inputs.
+window rows (`Stage::accept` -> `blocks::Ple::accept`). `out` must not alias the inputs.
 
 ## `src/kernels/mtp/mtp_ops.{cuh,cu}` — MTP block input
 

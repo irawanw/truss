@@ -25,7 +25,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace truss::qwen4exp {
+namespace truss::blocks {
 
 class PleReader {
 public:
@@ -95,4 +95,4 @@ private:
     mutable Stats stats_;
 };
 
-}  // namespace truss::qwen4exp
+}  // namespace truss::blocks

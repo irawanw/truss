@@ -12,7 +12,8 @@
 #include <sys/prctl.h>
 #include "kernels/sampling/argmax.cuh"
 #include "model/qwen4exp/config.h"
-#include "model/qwen4exp/forward.h"
+#include "engine/model.h"
+#include "engine/pipeline.h"
 #include "model/qwen4exp/weights.h"
 #include "runtime/expert_store.h"
 
@@ -25,7 +26,6 @@
 #include <vector>
 
 using namespace truss;
-namespace q = truss::qwen4exp;
 
 namespace {
 
@@ -52,7 +52,7 @@ struct Greedy {   // argmax of logit rows on the device, copied back
         TRUSS_CUDA(cudaMalloc(&d_ids, sizeof(int) * 9));
         TRUSS_CUDA(cudaMallocHost(&h_ids, sizeof(int) * 9));
     }
-    void rows(q::Forward & f, int first, int n, int32_t * out)
+    void rows(engine::Pipeline & f, int first, int n, int32_t * out)
     {
         f.head(first, n, logits);
         for (int r = 0; r < n; ++r) sampling::argmax(logits + (size_t) r * vocab, vocab, d_ids + r, f.stream());
@@ -62,7 +62,7 @@ struct Greedy {   // argmax of logit rows on the device, copied back
     }
 };
 
-void prompt(q::Forward & f, const std::vector<int32_t> & tok, int chunk)
+void prompt(engine::Pipeline & f, const std::vector<int32_t> & tok, int chunk)
 {
     // chunks with the PLE lookahead (the following chunk's reads start during this one); a layer split runs its
     // stages a chunk apart
@@ -125,10 +125,6 @@ int main(int argc, char ** argv)
             file->overlay(ov);
             std::fprintf(stderr, "expert overlay %s: %zu tensors replaced\n", ov, file->overlaid());
         }
-        const auto mfile = gguf::File::open(argv[2]);
-        const q::Config c = q::Config::from_gguf(*file);
-        const q::Weights w = q::bind(*file, c);
-        const q::Mtp mtp = q::bind_mtp(*mfile, c);
         std::vector<std::vector<int32_t>> prompts;
         {
             const std::string list = argv[3];
@@ -146,8 +142,10 @@ int main(int argc, char ** argv)
         const std::string draft_vocab = argc > 9 && std::string(argv[9]) != "-" ? argv[9] : "";
         const float min_p = argc > 11 ? std::atof(argv[11]) : 0.f;
         const std::string cpu_dir = argc > 10 && std::string(argv[10]) != "-" ? argv[10] : "";
-        q::Forward::Options o;
-        o.mtp = &mtp;
+        engine::DrafterFiles df;   // filled below, then the family is opened with it
+        df.path = argv[2];
+        df.min_p = min_p;
+        engine::Options o;
         o.spec_rows = nd + 1;
         // the prompt path's VRAM is sized by the prompt, not by max_chunk: a chunk cap above the prompt's real
         // length holds cached experts out of the ring's spare region for the whole run (TRACKER #70)
@@ -157,27 +155,25 @@ int main(int argc, char ** argv)
             FILE * fv = std::fopen(draft_vocab.c_str(), "rb");
             if (!fv) throw std::runtime_error("cannot open " + draft_vocab);
             int32_t t;
-            while (std::fread(&t, 4, 1, fv) == 1) o.draft_vocab.push_back(t);
+            while (std::fread(&t, 4, 1, fv) == 1) df.vocab.push_back(t);
             std::fclose(fv);
         }
-        o.draft_min_p = min_p;
-        o.doorbell = !(argc > 12 && std::string(argv[12]) == "sync");
-        o.cpu_dir = cpu_dir;
-        o.ple_file = file.get();   // PLE rows by O_DIRECT reads (TRUSS_PLE_DIRECT=0: the mapping)
-        q::apply_env(o);   // TRUSS_CPU_*, TRUSS_PCIE_*, TRUSS_ADAPT_*, TRUSS_HINT_K, TRUSS_RING_GB, TRUSS_PREFILL_ROWS
+        const auto fam = engine::open_family(*file, df);
+        o.moe.doorbell = !(argc > 12 && std::string(argv[12]) == "sync");
+        o.moe.cpu_dir = cpu_dir;
+        engine::apply_env(o);   // TRUSS_CPU_*, TRUSS_PCIE_*, TRUSS_ADAPT_*, TRUSS_HINT_K, TRUSS_RING_GB, TRUSS_PREFILL_ROWS
         if (argc > 6 && std::string(argv[6]) != "-")
-            o.expert_usage = runtime::ExpertStore::load_usage(argv[6], c.n_layer, c.n_expert);   // MTP: Forward adds
+            o.expert_usage = runtime::ExpertStore::load_usage(argv[6], fam->n_layer(), fam->n_expert());   // the drafter: the stage adds
                                                                                                // the mean layer
         // Drop the shards the moment upload() is done: they peak near 47 GB resident, and load_cpu_tier()'s vector
         // would otherwise allocate on top of that and the kernel would OOM us (TRACKER #72).
-        o.after_upload = [&] { file->release_pages(); mfile->release_pages(); };
-        Greedy g(c.n_vocab);   // before the Forward: its expert budget takes the memory left
-        q::Forward f(c, w, n_ctx, chunk, o);
+        o.after_upload = [&] { file->release_pages(); };
+        Greedy g(fam->n_vocab());   // before the engine: its expert budget takes the memory left
+        engine::Pipeline f(*fam, n_ctx, chunk, o);
         f.wait_pinned();   // timed runs start with the cold copy page-locked, as before the background locking
         file->release_pages();
-        mfile->release_pages();
         std::printf("experts: %d resident, ring %.2f GB (a prompt chunk takes %.2f GB of it); drafts %d\n", f.hot_experts(),
-                    f.experts().ring_bytes() / 1e9, f.experts().stream_area() / 1e9, nd);
+                    f.experts()->ring_bytes() / 1e9, f.experts()->stream_area() / 1e9, nd);
 
         // per prompt: plain greedy (unless TRUSS_BENCH_PLAIN=0), then speculative; every counter below is read and
         // reset around the spec phase only, and summed over the prompts
@@ -220,7 +216,7 @@ int main(int argc, char ** argv)
             f.reset();
             double ple0;
             long pc0, pr0;
-            f.ple_host_ms(ple0, pc0, pr0, true);
+            f.table_stats(ple0, pc0, pr0, true);
             const auto tp = std::chrono::steady_clock::now();
             prompt(f, tok, step);
             g.rows(f, (int) (tok.size() - 1) % step, 1, &t);
@@ -228,7 +224,7 @@ int main(int argc, char ** argv)
             double pre_ple;   // the prompt's PLE host gather (synchronous table reads), part of `pre`
             double pre_wait = 0;   // of which: collect() blocked on the PleReader's SSD reads
             double pre_phase[3] = {};   // and collect's host phases: hits put / miss copy+put / miss map+insert
-            f.ple_host_ms(pre_ple, pc0, pr0, true, &pre_wait, pre_phase);
+            f.table_stats(pre_ple, pc0, pr0, true, &pre_wait, pre_phase);
             f.cpu_stats(true);
             f.cpu_shape_reset();
             double sect[6], m4[4], d3[3], pm;
@@ -236,12 +232,12 @@ int main(int argc, char ** argv)
             f.section_ms(sect, true);
             f.section_moe_ms(m4, true);
             f.driver_ms(d3, dn, true);
-            f.ple_host_ms(pm, pc, pr, true);
+            f.table_stats(pm, pc, pr, true);
             const long long item0 = f.cpu_item_us();
             long long ph0[4];
             f.cpu_phase_us(ph0);
             std::vector<int32_t> got;
-            const runtime::ExpertStore::Stats st0 = f.experts().stats();
+            const runtime::ExpertStore::Stats st0 = f.experts()->stats();
             int passes = 0;
             long drafted = 0, accepted = 0;
             // device-side time per section (events bracket device work; host waits excluded): splits GPU compute from
@@ -315,9 +311,9 @@ int main(int argc, char ** argv)
             S.accepted += accepted, S.ms_draft += ms_draft, S.ms_verify += ms_verify, S.ms_head += ms_head;
             if (do_plain) S.identical += same, S.compared += N;
             double pw = 0, pp[3] = {};
-            f.ple_host_ms(pm, pc, pr, true, &pw, pp);
+            f.table_stats(pm, pc, pr, true, &pw, pp);
             double sb = 0, sw = 0;
-            f.experts().stream_stats(sb, sw, true);
+            f.experts()->stream_stats(sb, sw, true);
             S.s_busy += sb, S.s_wait += sw;
             S.ple_wait += pw;
             for (int k = 0; k < 3; ++k) S.ple_phase[k] += pp[k];
@@ -335,7 +331,7 @@ int main(int argc, char ** argv)
             f.cpu_phase_us(ph);
             f.cpu_shape(sh);
             for (int k = 0; k < 4; ++k) S.ph[k] += ph[k] - ph0[k], S.sh[k] += sh[k];
-            const runtime::ExpertStore::Stats & st = f.experts().stats();
+            const runtime::ExpertStore::Stats & st = f.experts()->stats();
             S.asked += st.experts_asked - st0.experts_asked, S.misses += st.misses - st0.misses;
             S.hinted += st.hinted - st0.hinted;
             S.bytes += st.bytes - st0.bytes, S.hint_bytes += st.hint_bytes - st0.hint_bytes;
@@ -365,7 +361,7 @@ int main(int argc, char ** argv)
         }
         if (S.adm_n || S.adm_bytes)
             std::printf("       admission on the idle link: %.1f experts/pass issued (%.1f MB/pass), %ld landed in all\n",
-                        S.adm_n / passes, S.adm_bytes / 1e6 / passes, f.experts().admit_landed());
+                        S.adm_n / passes, S.adm_bytes / 1e6 / passes, f.experts()->admit_landed());
         if (S.cpu_waits) {
             std::printf("       CPU tier: %.2f ms/pass in wait over %ld waits (items sum %.2f ms/pass)\n",
                         S.cpu_wait_us / 1e3 / passes, S.cpu_waits, S.item_us / 1e3 / passes);

@@ -1,4 +1,4 @@
-#include "model/qwen4exp/ple_reader.h"
+#include "blocks/ple_reader.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -13,7 +13,7 @@
 #include <thread>
 #include <string>
 
-namespace truss::qwen4exp {
+namespace truss::blocks {
 namespace {
 
 constexpr uint64_t PAGE = 4096;
@@ -270,4 +270,4 @@ void PleReader::take_phase_ms(double out[3]) const
     for (int i = 0; i < 3; ++i) out[i] = stats_.phase_ms[i], stats_.phase_ms[i] = 0;
 }
 
-}  // namespace truss::qwen4exp
+}  // namespace truss::blocks

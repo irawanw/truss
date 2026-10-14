@@ -1,12 +1,13 @@
 // Routing profile for the expert hot set (the "calibration" step, like Strata's make_profile): runs each prompt
-// through qwen4exp::Forward and generates greedy tokens after it, counting every routed (layer, expert); writes the
+// through engine::Pipeline and generates greedy tokens after it, counting every routed (layer, expert); writes the
 // counts as the usage file ExpertStore::load_usage reads (n_layer x n_expert float32). Decode tokens are counted
 // too: they are what the hot set serves.
 // usage: tk-profile <model.gguf> <out.f32> <generate per prompt> @prompt1.i32 [@prompt2.i32 ...]
 #include "core/cuda_check.h"
 #include "kernels/sampling/argmax.cuh"
 #include "model/qwen4exp/config.h"
-#include "model/qwen4exp/forward.h"
+#include "engine/model.h"
+#include "engine/pipeline.h"
 #include "model/qwen4exp/weights.h"
 
 #include <algorithm>
@@ -17,7 +18,6 @@
 #include <vector>
 
 using namespace truss;
-namespace q = truss::qwen4exp;
 
 static std::vector<int32_t> read_ids(const char * arg)
 {
@@ -43,15 +43,14 @@ int main(int argc, char ** argv)
             file->overlay(ov);
             std::fprintf(stderr, "expert overlay %s: %zu tensors replaced\n", ov, file->overlaid());
         }
-        const q::Config c = q::Config::from_gguf(*file);
-        const q::Weights w = q::bind(*file, c);
+        const auto fam = engine::open_family(*file, {});
         const int gen = std::atoi(argv[3]), chunk = 8192;
         float * logits;
         int * next_d, * next_h;
-        TRUSS_CUDA(cudaMalloc(&logits, sizeof(float) * c.n_vocab));
+        TRUSS_CUDA(cudaMalloc(&logits, sizeof(float) * fam->n_vocab()));
         TRUSS_CUDA(cudaMalloc(&next_d, sizeof(int)));
         TRUSS_CUDA(cudaMallocHost(&next_h, sizeof(int)));
-        q::Forward f(c, w, 65536, chunk);
+        engine::Pipeline f(*fam, 65536, chunk, engine::Options{});
         f.profile_routes(true);
         long tokens = 0;
         for (int a = 4; a < argc; ++a) {
@@ -61,7 +60,7 @@ int main(int argc, char ** argv)
             for (int s = 0; s < n; s += chunk) f.run(tok.data() + s, std::min(chunk, n - s));
             f.head((n - 1) % chunk, 1, logits);
             for (int i = 0; i < gen; ++i) {
-                sampling::argmax(logits, c.n_vocab, next_d, f.stream());
+                sampling::argmax(logits, fam->n_vocab(), next_d, f.stream());
                 TRUSS_CUDA(cudaMemcpyAsync(next_h, next_d, 4, cudaMemcpyDeviceToHost, f.stream()));
                 TRUSS_CUDA(cudaStreamSynchronize(f.stream()));
                 const int32_t t = *next_h;

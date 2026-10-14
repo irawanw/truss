@@ -27,7 +27,7 @@
 #include <memory>
 #include <mutex>
 
-namespace truss::qwen4exp::rt
+namespace truss::engine::rt
 {
 enum Site : int32_t
 {
@@ -435,8 +435,8 @@ inline void close()
     if (const size_t d = T.dropped.load())
         std::fprintf(stderr, "TRUSS_ROUND_TRACE: ring full, %zu record(s) dropped\n", d);
 }
-}  // namespace truss::qwen4exp::rt
+}  // namespace truss::engine::rt
 
 #define TRUSS_RT_CAT2(a, b) rt_scope_##a##_##b
 #define TRUSS_RT_CAT(a, b) TRUSS_RT_CAT2(a, b)
-#define TRUSS_RT(site) ::truss::qwen4exp::rt::Scope TRUSS_RT_CAT(x, __LINE__)(site)
+#define TRUSS_RT(site) ::truss::engine::rt::Scope TRUSS_RT_CAT(x, __LINE__)(site)

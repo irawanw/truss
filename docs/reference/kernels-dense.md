@@ -3,7 +3,7 @@
 All non-expert matrices of Flash-Next are Q8_0 (llama.cpp: blocks of 32 int8 with one fp16 scale), ~3.3 GiB: the
 hyper-connection projections (10240→320, 320→10240, 10240→4), GDN qkv/z/alpha/beta/out, DSA q/k/v/idx/out, the
 shared expert, PLE key/value, token_embd and the output head. The router (2560→512) and the shared-expert gate
-(2560→1) are F32 and run as cuBLAS SGEMM in `Forward::lin32`, not here.
+(2560→1) are F32 and run as cuBLAS SGEMM in `blocks::Linear::lin32`, not here.
 
 ## Storage: `dense::Q8Matrix`
 
@@ -15,7 +15,7 @@ struct Q8Matrix { const int8_t * q;   // [out][in]      row o = output o, contig
 
 GGUF stores Q8_0 as interleaved 34-byte blocks (fp16 d + 32 int8), which cannot be read with 16-byte vector loads.
 `q8_repack` splits them once at load time into the aligned `q`/`d` arrays above. A contiguous run of rows is itself a
-`Q8Matrix` (`Forward::head` tiles the 248320-row output matrix this way).
+`Q8Matrix` (`blocks::Head::logits` tiles the 248320-row output matrix this way).
 
 ## Functions
 
@@ -27,12 +27,12 @@ GGUF stores Q8_0 as interleaved 34-byte blocks (fp16 d + 32 int8), which cannot 
 | `q8_gemv(W, xq, xd, rows ≤ GEMV_ROWS = 8, y, stream)` | same as q8_gemm for decode rows | same, only fp32 summation order differs (= q8_gemm to 1.8e-7) | 720–780 GB/s on the big shapes; hc down 7.0 µs, hc up 6.4 µs at 1 row (was ~10.6 / ~15, TRACKER #83) |
 | `q8_gemv_multi(W[], y[], n ≤ MULTI_MAX = 8, xq, xd, rows, stream)` | several matrices with the same `in` on the same activations, one launch | each matrix bit-identical to its own `q8_gemv` (mapping from `in` only) | 4 rows: hc down+inject 7.8 µs (2 launches 12.5), GDN inputs 58 µs (73), DSA inputs 51 µs (67), shared gate+up 6.7 µs (11.2) (`gemv_multi_test`) |
 | `f32_gemv_multi(W[], out[], y[], n, in, x, rows, stream)` | the same for fp32 weights | each bit-identical to `f32_gemv` | router + hint router + shared gate 17.8 µs (3 launches 45.2) |
-| `f32_gemv(W, in, out, x, rows, y, stream)` | fp32 W [out][in] · x for decode-sized rows (router, shared-expert gate) | `f32_gemv_multi` with one matrix: 1 or 2 warps per output (from `in`), fixed reduction order: row-invariant, unlike cuBLAS SGEMM, whose algorithm depends on the row count (it flipped near-tied experts: 1-token steps vs 4-token windows differed by 3% rel in logits, TRACKER #60) | `Forward::lin32` uses it for ≤ 32 rows, cuBLAS above |
+| `f32_gemv(W, in, out, x, rows, y, stream)` | fp32 W [out][in] · x for decode-sized rows (router, shared-expert gate) | `f32_gemv_multi` with one matrix: 1 or 2 warps per output (from `in`), fixed reduction order: row-invariant, unlike cuBLAS SGEMM, whose algorithm depends on the row count (it flipped near-tied experts: 1-token steps vs 4-token windows differed by 3% rel in logits, TRACKER #60) | `blocks::Linear::lin32` uses it for ≤ 32 rows, cuBLAS above |
 | `q8_gemm_a16(W, x_half, rows, y, w16, cublas, stream)` | fp16 activations: dequantize W to `w16` (scratch, in·out halfs) then `cublasGemmEx` fp16 in / fp32 accumulate | one fp16 rounding of each weight (≤ 2^-12 rel); no activation quantization | 47–71 TFLOPS (TRACKER #44) |
 | `q8_gather(W, ids, n, q, d, stream)` | rows `ids` of W copied in Q8Matrix layout (q int8 [n][in], d fp16 [n][in/32]) into a new matrix: the MTP draft head over `Options::draft_vocab` (40,525 of 248,320 rows, 16% of the head's bytes) | exact | load time only |
 | `q8_rows(W, ids, n, out, stream)` | out fp32 [n][in] = rows `ids` of W (token embedding) | exact | — |
 
-## Which one runs (`Forward::lin`)
+## Which one runs (`blocks::Linear::lin`)
 
 - `Activations::Q8_1` (default): `q8_quantize_act` (from the fp16 GEMM input), then `q8_gemv` if rows ≤ 8, else
   `q8_gemm`. Full-model KL to llama-paw's logits 0.0131 = llama's own run-to-run floor (TRACKER #53).
@@ -77,5 +77,5 @@ a16 prefix variance printed; timing for all paths.
 ## Change it
 
 A faster dense path (e.g. a Q8 GEMM with fp16 activations on int8 tensor cores, or FP8): keep `Q8Matrix` and the
-function contract, add the new function here, route to it in `Forward::lin`, and gate it in `q8_gemm_test` against
+function contract, add the new function here, route to it in `blocks::Linear::lin`, and gate it in `q8_gemm_test` against
 the matching `ref::linear` numerics.

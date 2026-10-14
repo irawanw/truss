@@ -2,6 +2,7 @@
 // attention) or DSA (full attention with a sparse indexer); every layer has hyper-connections around the mixer and
 // the MoE; a few layers add the n-gram PLE block.
 #pragma once
+#include "blocks/ple_hash.h"
 #include "formats/gguf.h"
 
 #include <cstdint>
@@ -48,6 +49,7 @@ struct Config {
 
     // Throws if the architecture is not qwen4exp or a key is missing or inconsistent.
     static Config from_gguf(const gguf::File & f);
+    blocks::PleDims ple_dims() const;   // the PLE block's view of these hyperparameters
 };
 
 }  // namespace truss::qwen4exp

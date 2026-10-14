@@ -14,7 +14,7 @@
 #include "core/scratch.h"
 #include "kernels/moe/moe_window.cuh"
 #include "model/qwen4exp/config.h"
-#include "model/qwen4exp/ple.h"
+#include "blocks/ple_hash.h"
 #include "model/qwen4exp/reference.h"
 #include "model/qwen4exp/weights.h"
 #include "tests/layer/dump.h"
@@ -133,8 +133,8 @@ int main(int argc, char ** argv)
                     const int E = c.ple_heads() * c.ple_head_dim;
                     std::vector<int32_t> rows((size_t) T * c.ple_heads());
                     std::vector<float> emb((size_t) T * E);
-                    q::ple_rows(c, tok.data(), T, rows.data());
-                    q::ple_gather(c, w, rows.data(), T, emb.data());
+                    blocks::ple_rows(c.ple_dims(), tok.data(), T, rows.data());
+                    blocks::ple_gather(c.ple_dims(), w.ple_table, w.ple_scale, rows.data(), T, emb.data());
                     DevBuf d_emb(emb.size()), gate((size_t) T * c.hc), gated((size_t) T * c.hc_dim()),
                         conv((size_t) T * c.hc_dim());
                     TRUSS_CUDA(cudaMemcpy(d_emb.p, emb.data(), emb.size() * 4, cudaMemcpyHostToDevice));

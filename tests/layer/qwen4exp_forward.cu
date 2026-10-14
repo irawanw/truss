@@ -1,4 +1,4 @@
-// qwen4exp::Forward (the fast layer chain) on the 8-layer slice. The short and long checks against the fp32
+// engine::Pipeline on qwen4exp (the fast layer chain) on the 8-layer slice. The short and long checks against the fp32
 // reference run the engine with Activations::FP16 (the same math); the default Q8_1 activations are llama-paw's
 // rounding, checked by q8_gemm_test and the full-model KL (tk-parity-kl).
 //   short <dump>  12-token llama dump: after every layer, the residual vs llama's l_last and vs the fp32 reference
@@ -17,8 +17,9 @@
 #include "core/device_tensors.h"
 #include "core/scratch.h"
 #include "model/qwen4exp/config.h"
-#include "model/qwen4exp/ple.h"
-#include "model/qwen4exp/forward.h"
+#include "blocks/ple_hash.h"
+#include "engine/pipeline.h"
+#include "model/qwen4exp/model.h"
 #include "model/qwen4exp/reference.h"
 #include "model/qwen4exp/weights.h"
 #include "tests/layer/dump.h"
@@ -52,7 +53,7 @@ std::vector<float> host(const float * d, size_t n)
 // driver's cuEventRecord blocks on a read of the same lock (host futex) and the GPU spins on its go word:
 // a three-way deadlock. Like the production C API (src/api/truss_c.cu), move with an async copy on the
 // engine's stream plus a stream-scoped sync, never a legacy blocking call.
-void dtoh_sync(q::Forward & p, void * h, const void * d, size_t bytes)
+void dtoh_sync(engine::Pipeline & p, void * h, const void * d, size_t bytes)
 {
     TRUSS_CUDA(cudaMemcpyAsync(h, d, bytes, cudaMemcpyDeviceToHost, p.stream()));
     TRUSS_CUDA(cudaStreamSynchronize(p.stream()));
@@ -74,7 +75,7 @@ std::string at(const char * base, int l, const char * suffix = "")
 }
 
 // every layer's residual of one prompt through the engine, in chunks of `chunk`
-std::vector<std::vector<float>> run_engine(q::Forward & p, const std::vector<int32_t> & tok, int chunk, int n_layer,
+std::vector<std::vector<float>> run_engine(engine::Pipeline & p, const std::vector<int32_t> & tok, int chunk, int n_layer,
                                            size_t row, double * seconds)
 {
     std::vector<std::vector<float>> out(n_layer, std::vector<float>(tok.size() * row));
@@ -129,8 +130,8 @@ std::vector<std::vector<float>> reference_chain(const q::Config & c, const q::We
         if (c.is_ple(l)) {
             std::vector<int32_t> rows((size_t) T * c.ple_heads());
             std::vector<float> emb((size_t) T * c.ple_heads() * c.ple_head_dim);
-            q::ple_rows(c, tok.data(), T, rows.data());
-            q::ple_gather(c, w, rows.data(), T, emb.data());
+            blocks::ple_rows(c.ple_dims(), tok.data(), T, rows.data());
+            blocks::ple_gather(c.ple_dims(), w.ple_table, w.ple_scale, rows.data(), T, emb.data());
             float * d_emb = scratch.alloc(emb.size());
             TRUSS_CUDA(cudaMemcpy(d_emb, emb.data(), emb.size() * 4, cudaMemcpyHostToDevice));
             q::reference::ple(x, L.ple, d_emb, res, T);
@@ -156,7 +157,7 @@ std::vector<const gguf::Tensor *> all_but_ple_table(const gguf::File & f, const 
     return up;
 }
 
-double run_timed(q::Forward & p, const std::vector<int32_t> & tok, int chunk)
+double run_timed(engine::Pipeline & p, const std::vector<int32_t> & tok, int chunk)
 {
     const auto t0 = std::chrono::steady_clock::now();
     for (size_t s = 0; s < tok.size(); s += chunk) p.run(tok.data() + s, (int) std::min<size_t>(chunk, tok.size() - s));
@@ -181,8 +182,14 @@ int main(int argc, char ** argv)
     }
     try {
         const auto file = gguf::File::open(argv[1]);
-        const q::Config c = q::Config::from_gguf(*file);
-        const q::Weights w = q::bind(*file, c);
+        const q::Family fam(*file, {});
+        const q::Config & c = fam.config();
+        const q::Weights & w = fam.weights();
+        auto fp16 = [] {
+            engine::Options o;
+            o.act = blocks::Activations::FP16;
+            return o;
+        };
         const std::string mode = argv[2];
         const test::Dump dump(argv[3]);
         const std::vector<int32_t> tok = dump.tokens();
@@ -193,7 +200,7 @@ int main(int argc, char ** argv)
         if (mode == "short") {
             std::vector<std::vector<float>> eng;
             {
-                q::Forward p(c, w, 512, 512, { 0, q::Activations::FP16 });
+                engine::Pipeline p(fam, 512, 512, fp16());
                 double sec;
                 eng = run_engine(p, tok, 512, c.n_layer, row, &sec);
             }
@@ -233,10 +240,10 @@ int main(int argc, char ** argv)
             std::vector<std::vector<float>> all;
             std::vector<float> all_logits;
             for (int pass = 0; pass < 3; ++pass) {
-                q::Forward::Options o;
-                if (pass) o.expert_budget = 3ull << 30, o.ring_bytes = 1ull << 30;
-                if (pass == 2) o.expert_usage = usage, o.ring_bytes = 0;
-                q::Forward p(c, w, T, chunk, o);
+                engine::Options o;
+                if (pass) o.moe.expert_budget = 3ull << 30, o.moe.ring_bytes = 1ull << 30;
+                if (pass == 2) o.expert_usage = usage, o.moe.ring_bytes = 0;
+                engine::Pipeline p(fam, T, chunk, o);
                 double t;
                 const std::vector<int32_t> prompt(tok.begin(), tok.begin() + P);
                 std::vector<std::vector<float>> got = run_engine(p, prompt, chunk, c.n_layer, row, &t);
@@ -255,11 +262,11 @@ int main(int argc, char ** argv)
                 for (int l = 0; l < c.n_layer; ++l)
                     for (size_t i = 0; i < all[l].size(); ++i) diff += all[l][i] != got[l][i];
                 for (size_t i = 0; i < logits.size(); ++i) ldiff += logits[i] != all_logits[i];
-                const runtime::ExpertStore::Stats & st = p.experts().stats();
+                const runtime::ExpertStore::Stats & st = p.experts()->stats();
                 fails += diff != 0 || ldiff != 0;
                 std::printf("3 GiB budget, %s hot set, ring %.2f GB: %d experts resident, %.2f GB streamed per chunk, "
                             "decode fetched %ld experts: %ld residual and %ld logit values differ  %s\n",
-                            pass == 1 ? "index-order" : "usage-ranked", p.experts().ring_bytes() / 1e9, p.hot_experts(),
+                            pass == 1 ? "index-order" : "usage-ranked", p.experts()->ring_bytes() / 1e9, p.hot_experts(),
                             p.cold_bytes() / 1e9, st.misses, diff, ldiff, diff || ldiff ? "FAIL" : "PASS");
             }
             cudaFree(d_logits);
@@ -278,7 +285,7 @@ int main(int argc, char ** argv)
             TRUSS_CUDA(cudaMalloc(&d_logits, (size_t) n_dec * V * 4));
             std::vector<float> ref((size_t) n_dec * V), step((size_t) n_dec * V), win((size_t) n_dec * V);
             {
-                q::Forward p(c, w, T, (T + 3) / 4 * 4);   // all resident: the prompt, then the 16 rows as one chunk
+                engine::Pipeline p(fam, T, (T + 3) / 4 * 4, engine::Options{});   // all resident: the prompt, then the 16 rows as one chunk
                 p.run(tok.data(), P);
                 p.run(tok.data() + P, n_dec);
                 p.head(0, n_dec, d_logits);
@@ -286,16 +293,16 @@ int main(int argc, char ** argv)
             }
             std::vector<float> chunk4((size_t) n_dec * V);
             for (int pass = 0; pass < 3; ++pass) {   // 1-token steps, verify windows of 4, plain 4-token runs
-                q::Forward::Options o;
-                o.expert_budget = 3ull << 30, o.ring_bytes = 0, o.expert_usage = usage;
+                engine::Options o;
+                o.moe.expert_budget = 3ull << 30, o.moe.ring_bytes = 0, o.expert_usage = usage;
                 // argv[4] = "trellis": the CPU computes from the pinned pack bytes (Options::cpu_trellis): same weights
                 // as the GPU, so the KL vs all-resident must be at the level of summation order, far below q4s's
                 if (!getenv("TRUSS_TEST_NO_CPU")) {
-                    if (std::string(argv[4]) == "trellis") o.cpu_trellis = true;
-                    else o.cpu_dir = argv[4];
+                    if (std::string(argv[4]) == "trellis") o.moe.cpu_trellis = true;
+                    else o.moe.cpu_dir = argv[4];
                 }
-                o.spec_rows = 4, o.cpu_threads = 8;
-                q::Forward p(c, w, T, 64, o);
+                o.spec_rows = 4, o.moe.cpu_threads = 8;
+                engine::Pipeline p(fam, T, 64, o);
                 for (int s0 = 0; s0 < P; s0 += 64) p.run(tok.data() + s0, std::min(64, P - s0));
                 std::vector<float> & out = pass == 2 ? chunk4 : pass ? win : step;
                 for (int i = 0; i < n_dec;) {
@@ -357,7 +364,7 @@ int main(int argc, char ** argv)
             require_tokens(T, n_dec + 1);
             float * d_logits;
             TRUSS_CUDA(cudaMalloc(&d_logits, (size_t) V * 4));
-            q::Forward p(c, w, T + 64, 2048);
+            engine::Pipeline p(fam, T + 64, 2048);
             auto continuation = [&](std::vector<float> & out) {
                 out.resize((size_t) n_dec * V);
                 for (int i = 0; i < n_dec; ++i) {
@@ -393,7 +400,7 @@ int main(int argc, char ** argv)
             TRUSS_CUDA(cudaMalloc(&d_logits, (size_t) n_dec * V * 4));
             std::vector<float> one((size_t) n_dec * V), dec((size_t) n_dec * V);
             {
-                q::Forward p(c, w, T, (T + 3) / 4 * 4);
+                engine::Pipeline p(fam, T, (T + 3) / 4 * 4, engine::Options{});
                 p.run(tok.data(), T);
                 p.head(P, n_dec, d_logits);
                 TRUSS_CUDA(cudaMemcpy(one.data(), d_logits, one.size() * 4, cudaMemcpyDeviceToHost));
@@ -401,7 +408,7 @@ int main(int argc, char ** argv)
             double step_ms = 0;
             int steps = 0;
             {
-                q::Forward p(c, w, T, 2048);
+                engine::Pipeline p(fam, T, 2048);
                 for (int s0 = 0; s0 < P; s0 += 2048) p.run(tok.data() + s0, std::min(2048, P - s0));
                 for (int i = P; i < T;) {
                     const int n = i == P + 10 ? 3 : 1;   // one 3-token step (a verify window)
@@ -440,11 +447,11 @@ int main(int argc, char ** argv)
             std::vector<std::vector<float>> one, two;
             double t_one, t_two;
             {
-                q::Forward p(c, w, T, (T + 3) / 4 * 4, { 0, q::Activations::FP16 });
+                engine::Pipeline p(fam, T, (T + 3) / 4 * 4, fp16());
                 one = run_engine(p, tok, T, c.n_layer, row, &t_one);
             }
             {
-                q::Forward p(c, w, T, chunk, { 0, q::Activations::FP16 });
+                engine::Pipeline p(fam, T, chunk, fp16());
                 two = run_engine(p, tok, chunk, c.n_layer, row, &t_two);
             }
             const DeviceTensors dev(all_but_ple_table(*file, w));
@@ -479,12 +486,12 @@ int main(int argc, char ** argv)
             }
             std::printf("time with per-layer copies: one chunk %.3f s, chunked %.3f s\n", t_one, t_two);
             {
-                q::Forward p(c, w, T, chunk);
+                engine::Pipeline p(fam, T, chunk);
                 run_timed(p, tok, chunk);   // warm-up (cuBLAS heuristics, first-touch)
             }
             for (int ch : { 1024, 2048, 4096 }) {
                 const int mc = std::min(ch, (T + 3) / 4 * 4);
-                q::Forward p(c, w, T, mc);
+                engine::Pipeline p(fam, T, mc);
                 const double sec = run_timed(p, tok, mc);
                 std::printf("prefill %d tokens in chunks of %d: %.1f ms = %.0f tok/s on %d layers (%.1f us/token/layer)\n",
                             T, mc, sec * 1e3, T / sec, c.n_layer, sec * 1e6 / T / c.n_layer);

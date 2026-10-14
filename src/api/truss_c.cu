@@ -1,5 +1,5 @@
-// The C API (include/truss/truss.h) over qwen4exp::Forward. The only architecture today is qwen4exp; a second one
-// becomes a dispatch on general.architecture here, behind the same functions.
+// The C API (include/truss/truss.h) over engine::Pipeline. Model-agnostic: the family comes from the file's
+// general.architecture (src/model/registry.cc), and nothing here names one.
 #include "truss/truss.h"
 
 #include "core/cuda_check.h"
@@ -8,10 +8,10 @@
 #include "kernels/sampling/penalty.cuh"
 #include "kernels/sampling/sample.cuh"
 #include "kernels/sampling/spec.cuh"
-#include "model/qwen4exp/config.h"
-#include "model/qwen4exp/forward.h"
-#include "model/qwen4exp/round_trace.h"
-#include "model/qwen4exp/weights.h"
+#include "engine/model.h"
+#include "engine/options.h"
+#include "engine/pipeline.h"
+#include "engine/round_trace.h"
 #include "runtime/expert_store.h"
 
 #include <atomic>
@@ -27,18 +27,17 @@
 #include <vector>
 
 using namespace truss;
-namespace q = truss::qwen4exp;
+namespace rt = truss::engine::rt;
 
 struct truss_model {
-    std::unique_ptr<gguf::File> file, mtp_file;
-    std::unique_ptr<q::Mtp> mtp;
+    std::unique_ptr<gguf::File> file;
+    std::unique_ptr<engine::Family> family;
     int drafts = 0;
     int * spec_next = nullptr, * spec_host = nullptr;   // device / pinned argmax of each verify row
     bool spec_sample = false;                // TRUSS_SPEC_SAMPLE=1: sampled drafts + min(1, p/q) acceptance
     std::vector<float *> q_full;             // per slot, device [drafts][n_vocab]: the sampled drafts' q
     int * spec_drafts = nullptr;             // device [drafts]: the window's guesses (used under the last stage's hold)
-    q::Config config;
-    q::Weights weights;
+    int n_vocab = 0;
     float * logits = nullptr;                // device [n_vocab]
     int * next = nullptr;                    // device, argmax
     int n_ctx = 0, max_chunk = 0;
@@ -52,7 +51,7 @@ struct truss_model {
     std::atomic<int> cur{ 0 };
     int * pen_cnt = nullptr;                 // device [drafts + 1][n_vocab] penalty counts, zero between calls
     int * pen_hist = nullptr, * pen_host = nullptr;   // device / pinned [drafts + 1][TRUSS_PENALTY_CAP] row histories
-    std::unique_ptr<q::Forward> fwd;         // last: its expert budget takes the memory left
+    std::unique_ptr<engine::Pipeline> fwd;         // last: its expert budget takes the memory left
 
     ~truss_model()
     {
@@ -106,7 +105,7 @@ void eval(truss_model & m, int slot, const int32_t * tokens, int n, const std::f
     // A short prompt runs as decode-sized chunks (fetch path: only the experts its rows route to move), not as a
     // prompt chunk that streams every cold expert layer (~2.3 s at 256K whatever the length; TRACKER #89).
     const int fetch_max = std::getenv("TRUSS_FETCH_PROMPT") ? std::atoi(std::getenv("TRUSS_FETCH_PROMPT")) : 0;
-    int step = n <= fetch_max ? std::min(m.max_chunk, q::Forward::fetch_rows()) : m.max_chunk;
+    int step = n <= fetch_max ? std::min(m.max_chunk, engine::Pipeline::fetch_rows()) : m.max_chunk;
     if (step_max > 0) step = std::min(step, std::max(4, step_max / 4 * 4));   // a smaller chunk (truss_eval_step_s)
     m.prog_done[slot] = 0, m.prog_total[slot] = n;
     // in chunks with the PLE lookahead (the next chunk's trigram rows are read while this chunk computes); a layer
@@ -142,48 +141,45 @@ truss_model * truss_open_params(const char * gguf_path, const truss_params * p)
                 m->file->overlay(ov);
                 std::fprintf(stderr, "expert overlay %s: %zu tensors replaced\n", ov, m->file->overlaid());
             }
-            if (m->file->get_string("general.architecture") != "qwen4exp")
-                throw std::runtime_error("unsupported architecture " + m->file->get_string("general.architecture"));
-            m->config = q::Config::from_gguf(*m->file);
-            m->weights = q::bind(*m->file, m->config);
-            m->n_ctx = p->n_ctx;
-            m->max_chunk = p->max_chunk / 4 * 4;
-            if (m->max_chunk <= 0 || m->n_ctx <= 0) throw std::invalid_argument("n_ctx and max_chunk must be positive");
-            q::Forward::Options o;
-            if (p->expert_usage && *p->expert_usage)
-                o.expert_usage = runtime::ExpertStore::load_usage(p->expert_usage, m->config.n_layer, m->config.n_expert);
+            engine::DrafterFiles df;
             if (p->mtp && *p->mtp) {
                 if (p->drafts < 1 || p->drafts > DRAFTS_MAX)
                     throw std::invalid_argument("drafts must be 1.." + std::to_string(DRAFTS_MAX));
-                m->mtp_file = gguf::File::open(p->mtp);
-                m->mtp = std::make_unique<q::Mtp>(q::bind_mtp(*m->mtp_file, m->config));
-                m->drafts = p->drafts;
-                o.mtp = m->mtp.get();
-                o.spec_rows = p->drafts + 1;
-                o.draft_min_p = p->draft_min_p;
+                df.path = p->mtp;
+                df.min_p = p->draft_min_p;
                 if (p->draft_vocab && *p->draft_vocab) {
                     FILE * f = std::fopen(p->draft_vocab, "rb");
                     if (!f) throw std::runtime_error(std::string("cannot open ") + p->draft_vocab);
                     int32_t t;
-                    while (std::fread(&t, 4, 1, f) == 1) o.draft_vocab.push_back(t);
+                    while (std::fread(&t, 4, 1, f) == 1) df.vocab.push_back(t);
                     std::fclose(f);
                 }
             }
-            if (p->cpu_dir && *p->cpu_dir) {
-                o.cpu_dir = p->cpu_dir;
-                o.cpu_share = p->cpu_share;
-                o.cpu_threads = p->cpu_threads;
+            m->family = engine::open_family(*m->file, df);
+            m->n_vocab = m->family->n_vocab();
+            m->n_ctx = p->n_ctx;
+            m->max_chunk = p->max_chunk / 4 * 4;
+            if (m->max_chunk <= 0 || m->n_ctx <= 0) throw std::invalid_argument("n_ctx and max_chunk must be positive");
+            engine::Options o;
+            if (p->expert_usage && *p->expert_usage)
+                o.expert_usage = runtime::ExpertStore::load_usage(p->expert_usage, m->family->n_layer(), m->family->n_expert());
+            if (m->family->has_drafter()) {
+                m->drafts = p->drafts;
+                o.spec_rows = p->drafts + 1;
             }
-            o.ple_file = m->file.get();   // PLE rows by O_DIRECT reads (TRUSS_PLE_DIRECT=0: the mapping)
-            o.act = q::Activations::FP16;   // served default: 16-bit dense activations (KL 0.040 vs 0.065); TRUSS_ACT=q8 for the old 8-bit path
-            q::apply_env(o);   // the bench's decode-tier knobs (TRUSS_CPU_TRELLIS, TRUSS_PCIE_FRAC, TRUSS_HINT_K, ...)
+            if (p->cpu_dir && *p->cpu_dir) {
+                o.moe.cpu_dir = p->cpu_dir;
+                o.moe.cpu_share = p->cpu_share;
+                o.moe.cpu_threads = p->cpu_threads;
+            }
+            o.act = blocks::Activations::FP16;   // served default: 16-bit dense activations (KL 0.040 vs 0.065); TRUSS_ACT=q8 for the old 8-bit path
+            engine::apply_env(o);   // the bench's decode-tier knobs (TRUSS_CPU_TRELLIS, TRUSS_PCIE_FRAC, TRUSS_HINT_K, ...)
             // drop the shards' file pages once the weights are on the device (a ~47 GB resident peak otherwise, TRACKER #72)
             o.after_upload = [&] {
                 m->file->release_pages();
-                if (m->mtp_file) m->mtp_file->release_pages();
             };
             // device buffers before the engine: its expert budget takes the memory left
-            TRUSS_CUDA(cudaMalloc(&m->logits, sizeof(float) * m->config.n_vocab * (m->drafts + 1)));
+            TRUSS_CUDA(cudaMalloc(&m->logits, sizeof(float) * m->n_vocab * (m->drafts + 1)));
             TRUSS_CUDA(cudaMalloc(&m->next, sizeof(int)));
             TRUSS_CUDA(cudaMalloc(&m->spec_next, sizeof(int) * (m->drafts + 1)));
             TRUSS_CUDA(cudaMallocHost(&m->spec_host, sizeof(int) * (m->drafts + 1)));
@@ -191,15 +187,15 @@ truss_model * truss_open_params(const char * gguf_path, const truss_params * p)
             const int n_slots = std::max(1, std::getenv("TRUSS_SLOTS") ? std::atoi(std::getenv("TRUSS_SLOTS")) : 1);
             if (m->spec_sample) {   // 3 MB a slot at 3 drafts
                 m->q_full.assign(n_slots, nullptr);
-                for (float *& qf : m->q_full) TRUSS_CUDA(cudaMalloc(&qf, sizeof(float) * m->config.n_vocab * m->drafts));
+                for (float *& qf : m->q_full) TRUSS_CUDA(cudaMalloc(&qf, sizeof(float) * m->n_vocab * m->drafts));
                 TRUSS_CUDA(cudaMalloc(&m->spec_drafts, sizeof(int) * m->drafts));
             }
             const size_t rows = m->drafts + 1;   // penalties: 4 MB of counts at 3 drafts
-            TRUSS_CUDA(cudaMalloc(&m->pen_cnt, sizeof(int) * rows * m->config.n_vocab));
-            TRUSS_CUDA(cudaMemset(m->pen_cnt, 0, sizeof(int) * rows * m->config.n_vocab));
+            TRUSS_CUDA(cudaMalloc(&m->pen_cnt, sizeof(int) * rows * m->n_vocab));
+            TRUSS_CUDA(cudaMemset(m->pen_cnt, 0, sizeof(int) * rows * m->n_vocab));
             TRUSS_CUDA(cudaMalloc(&m->pen_hist, sizeof(int) * rows * TRUSS_PENALTY_CAP));
             TRUSS_CUDA(cudaMallocHost(&m->pen_host, sizeof(int) * rows * TRUSS_PENALTY_CAP));
-            m->fwd = std::make_unique<q::Forward>(m->config, m->weights, m->n_ctx, m->max_chunk, o);
+            m->fwd = std::make_unique<engine::Pipeline>(*m->family, m->n_ctx, m->max_chunk, o);
             m->n_ctx = m->fwd->seq_ctx();   // TRUSS_SLOTS: every limit below is per sequence
             const int ns = m->fwd->slots();
             if (m->spec_sample && ns != n_slots) throw std::logic_error("TRUSS_SLOTS: slot count mismatch");
@@ -224,7 +220,7 @@ void truss_close(truss_model * m) { delete m; }
 
 const char * truss_last_error(void) { return last_error.c_str(); }
 
-int truss_n_vocab(const truss_model * m) { return m->config.n_vocab; }
+int truss_n_vocab(const truss_model * m) { return m->n_vocab; }
 
 int truss_n_ctx(const truss_model * m) { return m->n_ctx; }
 
@@ -278,7 +274,7 @@ int truss_eval_s(truss_model * m, int slot, const int32_t * tokens, int n, float
     return guarded(
         [&] {
             eval(*m, slot, tokens, n, [&] {
-                if (logits) TRUSS_CUDA(cudaMemcpyAsync(logits, m->logits, sizeof(float) * m->config.n_vocab,
+                if (logits) TRUSS_CUDA(cudaMemcpyAsync(logits, m->logits, sizeof(float) * m->n_vocab,
                                                        cudaMemcpyDeviceToHost, m->fwd->stream()));
                 sync(*m);
             });
@@ -294,7 +290,7 @@ int truss_eval_step_s(truss_model * m, int slot, const int32_t * tokens, int n, 
     return guarded(
         [&] {
             eval(*m, slot, tokens, n, [&] {
-                if (logits) TRUSS_CUDA(cudaMemcpyAsync(logits, m->logits, sizeof(float) * m->config.n_vocab,
+                if (logits) TRUSS_CUDA(cudaMemcpyAsync(logits, m->logits, sizeof(float) * m->n_vocab,
                                                        cudaMemcpyDeviceToHost, m->fwd->stream()));
                 sync(*m);
             }, step);
@@ -308,7 +304,7 @@ int truss_eval_argmax_s(truss_model * m, int slot, const int32_t * tokens, int n
     return guarded(
         [&] {
             eval(*m, slot, tokens, n, [&] {
-                sampling::argmax(m->logits, m->config.n_vocab, m->next, m->fwd->stream());
+                sampling::argmax(m->logits, m->n_vocab, m->next, m->fwd->stream());
                 TRUSS_CUDA(cudaMemcpyAsync(next, m->next, sizeof(int), cudaMemcpyDeviceToHost, m->fwd->stream()));
                 sync(*m);
             });
@@ -330,8 +326,8 @@ void truss_lock_ms(truss_model * m, double * out4, int reset) { m->fwd->lock_ms(
 
 /* TRUSS_ROUND_TRACE=<file> (track U): the interval log is process-global. dump flushes what is buffered; mark
    records a phase boundary (the tag is the harness's). Both do nothing when the variable is unset. */
-void truss_round_trace_dump(void) { q::rt::dump(); }
-void truss_round_trace_mark(int tag) { q::rt::mark(tag); }
+void truss_round_trace_dump(void) { rt::dump(); }
+void truss_round_trace_mark(int tag) { rt::mark(tag); }
 
 int truss_select(truss_model * m, int slot)
 {
@@ -388,7 +384,7 @@ void penalize_rows(truss_model & m, const truss_sampling & sp, const int32_t * f
     const int nh = sp.history ? std::max(0, sp.n_history) : 0;
     sampling::penalty_rows(sp.history, nh, feed, nfeed, rows, w, m.pen_host);
     TRUSS_CUDA(cudaMemcpyAsync(m.pen_hist, m.pen_host, sizeof(int) * rows * w, cudaMemcpyHostToDevice, m.fwd->stream()));
-    sampling::penalize(m.logits, m.config.n_vocab, rows, m.pen_hist, w, pp, m.pen_cnt, m.fwd->stream());
+    sampling::penalize(m.logits, m.n_vocab, rows, m.pen_hist, w, pp, m.pen_cnt, m.fwd->stream());
 }
 // The ban (truss_sampling::ban) on rows [0, rows) of m->logits. Row r has been fed feed[0 .. r + nfeed - rows]
 // (a verify window feeds one token per row; truss_eval_sample feeds n tokens for its one row); the ban holds for the
@@ -404,7 +400,7 @@ void ban_rows(truss_model & m, const truss_sampling & sp, const int32_t * feed, 
     if (sp.ban_lift >= 0)
         for (int t = 0; t < nfeed; ++t)
             if (feed[t] == sp.ban_lift) { k = std::max(0, std::min(rows, t - (nfeed - rows))); break; }
-    sampling::ban(m.logits, m.config.n_vocab, k, b, m.fwd->stream());
+    sampling::ban(m.logits, m.n_vocab, k, b, m.fwd->stream());
 }
 }  // namespace
 
@@ -417,7 +413,7 @@ int truss_eval_sample_s(truss_model * m, int slot, const int32_t * tokens, int n
             eval(*m, slot, tokens, n, [&] {
                 penalize_rows(*m, *sp, nullptr, 0, 1);
                 ban_rows(*m, *sp, tokens, n, 1);
-                sampling::sample(m->logits, m->config.n_vocab, 1, p, m->counter[slot]++, m->next, m->fwd->stream());
+                sampling::sample(m->logits, m->n_vocab, 1, p, m->counter[slot]++, m->next, m->fwd->stream());
                 TRUSS_CUDA(cudaMemcpyAsync(next, m->next, sizeof(int), cudaMemcpyDeviceToHost, m->fwd->stream()));
                 sync(*m);
             });
@@ -439,7 +435,7 @@ int truss_spec_step_sampled_s(truss_model * m, int slot, int32_t next, const tru
             if (!m->drafts) throw std::logic_error("truss_spec_step_sampled: opened without an MTP block");
             check_slot(*m, slot);
             const sampling::SampleParams p = params_of(sp);
-            const int V = m->config.n_vocab;
+            const int V = m->n_vocab;
             const int nd = std::min(m->drafts, m->n_ctx - m->fwd->position(slot) - 1);
             uint64_t & ctr = m->counter[slot];
             if (nd < 1) {   // no room for a window: one plain step
@@ -448,7 +444,7 @@ int truss_spec_step_sampled_s(truss_model * m, int slot, int32_t next, const tru
                     ban_rows(*m, *sp, &next, 1, 1);
                     sampling::sample(m->logits, V, 1, p, ctr++, m->next, m->fwd->stream());
                     TRUSS_CUDA(cudaMemcpyAsync(new_next, m->next, sizeof(int), cudaMemcpyDeviceToHost, m->fwd->stream()));
-                    { TRUSS_RT(q::rt::kPlainSync); q::rt::Wait w(*m->fwd->rt_last_stage()); sync(*m); }
+                    { TRUSS_RT(rt::kPlainSync); rt::Wait w(*m->fwd->rt_last_stage()); sync(*m); }
                 });
                 emitted[0] = next, *n_emitted = 1;
                 return 0;
@@ -457,7 +453,7 @@ int truss_spec_step_sampled_s(truss_model * m, int slot, int32_t next, const tru
             if (m->spec_sample) {   // speculative sampling: lossless, accepts sum min(p, q) instead of p(argmax q)
                 float * qf = m->q_full[slot];
                 const uint64_t c0 = ctr;
-                const int keep = m->fwd->round(slot, next, nd, win, m->logits, &p, c0, qf, [&](int nw) {
+                const int keep = m->fwd->round(slot, next, nd, win, m->logits, engine::Drafter::Sampling{ &p, c0, qf }, [&](int nw) {
                     ctr = c0 + nd;
                     penalize_rows(*m, *sp, win, nw + 1, nw + 1);
                     ban_rows(*m, *sp, win, nw + 1, nw + 1);
@@ -469,7 +465,7 @@ int truss_spec_step_sampled_s(truss_model * m, int slot, int32_t next, const tru
                     ctr += nw + 1;
                     TRUSS_CUDA(cudaMemcpyAsync(m->spec_host, m->spec_next, sizeof(int) * 2, cudaMemcpyDeviceToHost,
                                                m->fwd->stream()));
-                    { TRUSS_RT(q::rt::kPickSync); q::rt::Wait w(*m->fwd->rt_last_stage());   // the sampled token: the
+                    { TRUSS_RT(rt::kPickSync); rt::Wait w(*m->fwd->rt_last_stage());   // the sampled token: the
                       sync(*m); }                                                             // last stage held through it
                     *new_next = m->spec_host[1];
                     return m->spec_host[0] + 1;
@@ -478,14 +474,14 @@ int truss_spec_step_sampled_s(truss_model * m, int slot, int32_t next, const tru
                 *n_emitted = keep;
                 return 0;
             }
-            const int keep = m->fwd->round(slot, next, nd, win, m->logits, nullptr, 0, nullptr, [&](int nw) {
+            const int keep = m->fwd->round(slot, next, nd, win, m->logits, engine::Drafter::Sampling{}, [&](int nw) {
                 penalize_rows(*m, *sp, win, nw + 1, nw + 1);
                 ban_rows(*m, *sp, win, nw + 1, nw + 1);
                 sampling::sample(m->logits, V, nw + 1, p, ctr, m->spec_next, m->fwd->stream());
                 ctr += nw + 1;
                 TRUSS_CUDA(cudaMemcpyAsync(m->spec_host, m->spec_next, sizeof(int) * (nw + 1), cudaMemcpyDeviceToHost,
                                            m->fwd->stream()));
-                { TRUSS_RT(q::rt::kPickSyncQ); q::rt::Wait w(*m->fwd->rt_last_stage()); sync(*m); }
+                { TRUSS_RT(rt::kPickSyncQ); rt::Wait w(*m->fwd->rt_last_stage()); sync(*m); }
                 int j = 0;
                 while (j < nw && m->spec_host[j] == win[j + 1]) ++j;
                 *new_next = m->spec_host[j];
@@ -513,7 +509,7 @@ int truss_spec_step_s(truss_model * m, int slot, int32_t next, int32_t * emitted
             const int nd = std::min(m->drafts, m->n_ctx - m->fwd->position(slot) - 1);
             if (nd < 1) {   // no room for a window: one plain step
                 eval(*m, slot, &next, 1, [&] {
-                    sampling::argmax(m->logits, m->config.n_vocab, m->next, m->fwd->stream());
+                    sampling::argmax(m->logits, m->n_vocab, m->next, m->fwd->stream());
                     TRUSS_CUDA(cudaMemcpyAsync(new_next, m->next, sizeof(int), cudaMemcpyDeviceToHost, m->fwd->stream()));
                     sync(*m);
                 });
@@ -521,8 +517,8 @@ int truss_spec_step_s(truss_model * m, int slot, int32_t next, int32_t * emitted
                 return 0;
             }
             int32_t win[WINDOW_ROWS];
-            const int V = m->config.n_vocab;
-            const int keep = m->fwd->round(slot, next, nd, win, m->logits, nullptr, 0, nullptr, [&](int nw) {
+            const int V = m->n_vocab;
+            const int keep = m->fwd->round(slot, next, nd, win, m->logits, engine::Drafter::Sampling{}, [&](int nw) {
                 for (int r = 0; r <= nw; ++r)
                     sampling::argmax(m->logits + (size_t) r * V, V, m->spec_next + r, m->fwd->stream());
                 TRUSS_CUDA(cudaMemcpyAsync(m->spec_host, m->spec_next, sizeof(int) * (nw + 1), cudaMemcpyDeviceToHost,

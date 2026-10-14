@@ -37,7 +37,8 @@ sampling, run-to-run spread 1.2%):
 
 - **[docs/reference/](docs/reference/README.md)** — every source file: what it computes, API and shapes, layouts,
   numerics, invariants, tests, tunables, how to change it. Start with its README (data flow of one forward pass).
-- [docs/CODE.md](docs/CODE.md) — code rules: where files go, extension points, kernel and test rules.
+- **[docs/ENGINE.md](docs/ENGINE.md)** — the engine / blocks / model split, and how to add a model (a folder, one registry line).
+- [docs/CODE.md](docs/CODE.md) — code rules: where files go, extension points, kernel and test rules, no file over 500 lines.
 - **[docs/PLAN-20261003-x31-tg140-pp4000.md](docs/PLAN-20261003-x31-tg140-pp4000.md)** — current plan: X3.1 weights that stop the thinking loops (no K1 holes, rates from agent traffic), 1 GPU + 64 GB RAM, decode 140 / prefill 4,000 tok/s at 256K (budgets, phases A-D, gates, kill rules).
 - [docs/PLAN-20261002-tg100-pp3000.md](docs/PLAN-20261002-tg100-pp3000.md) — previous plan (decode 100 / prefill 3,000; its §5 results are the new plan's starting point).
 - TRACKER.md (kept locally, internal-only — not in this repo) — every experiment and measurement, checkpoints (CP0–CP9), the "Do not repeat" list.
@@ -86,8 +87,11 @@ include/truss/truss.h      C API (libtruss.so)
 src/formats/               GGUF reader, trellis expert tables
 src/core/                  device tensors, scratch, error checks
 src/kernels/<op>/          fast kernels (trellis, moe, dense, dsa, gdn, hc, ffn, ple, sampling) + reference/
-src/model/qwen4exp/        config, weight binding, PLE hashing, reference forward, fast Forward
-src/runtime/               expert residency and PCIe streaming
+src/engine/                model-agnostic engine: Pipeline (sequences, slots, spec rounds, layer split), Stage, options
+src/blocks/                reusable layer blocks (Linear, Head, Hc, Gdn, Dsa, Ple, Moe) with per-slot state
+src/model/<family>/        THE ONLY MODEL CODE: config, weight binding, composition of blocks (qwen4exp today)
+src/model/registry.cc      general.architecture -> family
+src/runtime/               routed-expert runtime: residency, PCIe streaming, doorbell driver, CPU tier
 src/api/                   C API implementation
 src/encode/                pack-time trellis encoders
 server/                    OpenAI-compatible server (Python, ctypes)

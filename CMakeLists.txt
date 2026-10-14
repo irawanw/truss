@@ -41,9 +41,9 @@ target_link_libraries(truss_reference PUBLIC truss_core)
 
 # ---- models: hyperparameters, weight binding, reference forward per architecture
 add_library(truss_models STATIC
+  src/blocks/ple_hash.cc
+  src/blocks/ple_reader.cc
   src/model/qwen4exp/config.cc
-  src/model/qwen4exp/ple.cc
-  src/model/qwen4exp/ple_reader.cc
   src/model/qwen4exp/weights.cc
   src/model/qwen4exp/reference.cu)
 target_link_libraries(truss_models PUBLIC truss_formats truss_reference)
@@ -57,10 +57,34 @@ target_include_directories(truss_cpu PUBLIC src)
 target_compile_options(truss_cpu PRIVATE -O3 -mavx2 -mfma -mf16c)
 target_link_libraries(truss_cpu PUBLIC Threads::Threads)
 
+# ---- engine (docs/ENGINE.md): model-agnostic runtime, blocks, the expert runtime, and the model families
 add_library(truss_engine STATIC
+  src/engine/util.cc
+  src/engine/options.cc
+  src/engine/profile.cc
+  src/engine/stage.cu
+  src/engine/stage_seq.cu
+  src/engine/pipeline.cu
+  src/engine/pipeline_slots.cu
+  src/engine/pipeline_stats.cu
+  src/blocks/linear.cu
+  src/blocks/head.cu
+  src/blocks/hc.cu
+  src/blocks/gdn.cu
+  src/blocks/attn_dsa.cu
+  src/blocks/ple.cu
+  src/blocks/moe.cu
   src/runtime/expert_store.cu
   src/runtime/doorbell.cu
-  src/model/qwen4exp/forward.cu)
+  src/runtime/moe_exec.cu
+  src/runtime/moe_paths.cu
+  src/runtime/moe_driver.cu
+  src/runtime/moe_serve.cu
+  src/runtime/cpu_tier.cc
+  src/model/qwen4exp/model.cu
+  src/model/qwen4exp/mtp.cu
+  src/model/qwen4exp/mtp_draft.cu
+  src/model/registry.cc)
 target_link_libraries(truss_engine PUBLIC truss_models truss_kernels truss_cpu)
 
 # ---- public C API: libtruss.so (include/truss/truss.h), what server/ binds to

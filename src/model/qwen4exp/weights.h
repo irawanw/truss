@@ -4,38 +4,21 @@
 #pragma once
 #include "formats/gguf.h"
 #include "formats/trellis_table.h"
+#include "blocks/weights.h"
 #include "model/qwen4exp/config.h"
 
 #include <vector>
 
 namespace truss::qwen4exp {
 
-using T = const gguf::Tensor *;            // nullptr = not present in this layer
+using T = blocks::T;                       // nullptr = not present in this layer
 
-struct HyperConnection {                   // norm [hc_dim], down [hc_dim -> rank], up [rank -> hc_dim], inject [hc_dim -> hc]
-    T norm = nullptr, down = nullptr, up = nullptr, inject = nullptr;
-};
-
-struct Gdn {
-    T qkv = nullptr, gate = nullptr, conv1d = nullptr, dt_bias = nullptr, a = nullptr, beta = nullptr,
-      alpha = nullptr, norm = nullptr, out = nullptr;
-};
-
-struct Dsa {
-    T q = nullptr, k = nullptr, v = nullptr, out = nullptr, q_norm = nullptr, k_norm = nullptr;
-    T idx_q = nullptr, idx_k = nullptr, idx_q_norm = nullptr, idx_k_norm = nullptr;
-};
-
-struct Ple {
-    T key = nullptr, value = nullptr, norm_key = nullptr, norm_query = nullptr, norm_conv = nullptr,
-      conv1d = nullptr;
-};
-
-struct Moe {
-    T router = nullptr;                    // [d_model -> n_expert]
-    formats::ExpertTable gate, up, down;   // routed experts, trellis
-    T shexp_gate_inp = nullptr, shexp_gate = nullptr, shexp_up = nullptr, shexp_down = nullptr;
-};
+// the blocks' weight views (src/blocks/), named as this family's binding names them
+using HyperConnection = blocks::HcWeights;   // norm [hc_dim], down [hc_dim -> rank], up [rank -> hc_dim], inject
+using Gdn = blocks::GdnWeights;
+using Dsa = blocks::DsaWeights;
+using Ple = blocks::PleWeights;
+using Moe = blocks::MoeWeights;              // router fp32, routed experts trellis, gated shared expert
 
 struct Layer {
     Mixer mixer;

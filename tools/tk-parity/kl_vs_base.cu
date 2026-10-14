@@ -1,4 +1,4 @@
-// Full-model logits of qwen4exp::Forward vs a llama-perplexity --kl-divergence-base file (the Q8 teacher's
+// Full-model logits of engine::Pipeline vs a llama-perplexity --kl-divergence-base file (the Q8 teacher's
 // log-probs), with llama-perplexity's own formulas: per chunk of n_ctx tokens (a fresh sequence each, no BOS for
 // qwen4exp), positions n_ctx/2 .. n_ctx-2 predict the next token; KL(base || ours) over the base's tokens with log
 // prob > -16, top-1 agreement, and both perplexities.
@@ -7,12 +7,13 @@
 // position nv = 2 ((n_vocab + 1) / 2) + 4 uint16: float scale, float min_log_prob, n_vocab quantized log probs.
 // usage: tk-parity-kl <model.gguf> <base.logits> [chunks=8] [first chunk=0] [q8|fp16] [step=0] [usage|-] [cpu dir|-]
 //   step > 0: the first half of each chunk as one prompt, then the scored half in runs of `step` tokens (<= 32: the
-//   decode path, with expert fetch, the ring and the CPU tier); usage / cpu dir as Forward::Options.
+//   decode path, with expert fetch, the ring and the CPU tier); usage / cpu dir as engine::Options.
 // TRUSS_KL_MAKE_BASE=<tokens.i32> writes <base.logits> from this engine's own log probs instead (a self-reference:
 // chunk ch = tokens [ch * n_ctx, (ch + 1) * n_ctx), n_ctx from TRUSS_KL_CTX, default 2048).
 #include "core/cuda_check.h"
 #include "model/qwen4exp/config.h"
-#include "model/qwen4exp/forward.h"
+#include "engine/model.h"
+#include "engine/pipeline.h"
 #include "model/qwen4exp/weights.h"
 #include "runtime/expert_store.h"
 
@@ -29,7 +30,6 @@
 #include <vector>
 
 using namespace truss;
-namespace q = truss::qwen4exp;
 
 namespace {
 
@@ -95,7 +95,7 @@ int main(int argc, char ** argv)
             n_ctx = std::getenv("TRUSS_KL_CTX") ? std::atoi(std::getenv("TRUSS_KL_CTX")) : 2048;
             n_chunk = std::min<int>(tokens.size() / n_ctx, argc > 3 ? std::atoi(argv[3]) : 8);
             tokens.resize((size_t) n_chunk * n_ctx);
-            n_vocab = q::Config::from_gguf(*gguf::File::open(argv[1])).n_vocab;
+            n_vocab = engine::open_family(*gguf::File::open(argv[1]), {})->n_vocab();
             out.open(argv[2], std::ios::binary);
             out.write("_logits_", 8);
             out.write((char *) &n_ctx, 4), out.write((char *) &n_vocab, 4), out.write((char *) &n_chunk, 4);
@@ -111,30 +111,28 @@ int main(int argc, char ** argv)
         }
         const int first_chunk = argc > 4 ? std::atoi(argv[4]) : 0;
         const int chunks = std::min(n_chunk - first_chunk, argc > 3 ? std::atoi(argv[3]) : 8);
-        const q::Activations act = argc > 5 && std::string(argv[5]) == "fp16" ? q::Activations::FP16 : q::Activations::Q8_1;
+        const blocks::Activations act = argc > 5 && std::string(argv[5]) == "fp16" ? blocks::Activations::FP16 : blocks::Activations::Q8_1;
         const int first = n_ctx / 2, n_scored = n_ctx - 1 - first;
         const size_t nv = 2 * ((n_vocab + 1) / 2) + 4;
         std::printf("base: n_ctx %d, n_vocab %d, %d chunks in file, scoring %d\n", n_ctx, n_vocab, n_chunk, chunks);
 
         const auto file = gguf::File::open(argv[1]);
-        const q::Config c = q::Config::from_gguf(*file);
-        const q::Weights w = q::bind(*file, c);
-        if (c.n_vocab != n_vocab) throw std::runtime_error("vocabulary size differs from the base file");
+        const auto fam = engine::open_family(*file, {});
+        if (fam->n_vocab() != n_vocab) throw std::runtime_error("vocabulary size differs from the base file");
         float * d_logits;   // before the engine, whose expert budget takes the memory left
         TRUSS_CUDA(cudaMalloc(&d_logits, (size_t) n_scored * n_vocab * 4));
         const int step = argc > 6 ? std::atoi(argv[6]) : 0;
-        q::Forward::Options o;
+        engine::Options o;
         o.act = act;
-        if (argc > 7 && std::string(argv[7]) != "-") o.expert_usage = runtime::ExpertStore::load_usage(argv[7], c.n_layer, c.n_expert);
-        if (argc > 8 && std::string(argv[8]) != "-") o.cpu_dir = argv[8];
+        if (argc > 7 && std::string(argv[7]) != "-") o.expert_usage = runtime::ExpertStore::load_usage(argv[7], fam->n_layer(), fam->n_expert());
+        if (argc > 8 && std::string(argv[8]) != "-") o.moe.cpu_dir = argv[8];
         // the served path: CPU tier, dynamic split, hints, KV int8 etc. from TRUSS_* (as tk-bench-spec), PLE by reads
-        o.ple_file = file.get();
         o.prefill_rows = first;
-        q::apply_env(o);
-        q::Forward p(c, w, n_ctx, (n_ctx + 3) / 4 * 4, o);
+        engine::apply_env(o);
+        engine::Pipeline p(*fam, n_ctx, (n_ctx + 3) / 4 * 4, o);
         file->release_pages();
         std::fflush(stdout);
-        std::printf("experts: %d of %d resident, %.2f GB streamed per chunk\n", p.hot_experts(), c.n_expert * c.n_layer,
+        std::printf("experts: %d of %d resident, %.2f GB streamed per chunk\n", p.hot_experts(), fam->n_expert() * fam->n_layer(),
                     p.cold_bytes() / 1e9);
         std::vector<float> logits((size_t) n_scored * n_vocab);
         std::vector<uint16_t> base((size_t) n_scored * nv);

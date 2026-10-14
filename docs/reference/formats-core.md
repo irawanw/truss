@@ -86,10 +86,10 @@ which live in the `ExpertStore`), the reference forward and parity tests (everyt
 
 **What.** One device buffer; `alloc<T>(count)` hands out 256-byte-aligned pieces; `reset()` frees all;
 `mark()` / `release(mark)` free everything allocated after a mark. Throws `"Scratch: out of space"` when full (sizes
-are computed up front: `Forward::Impl::scratch_bytes`), never grows.
+are computed up front: `StageModel::scratch_bytes` of the family), never grows.
 
 **Why it is safe to reuse memory right after release.** All users run on one stream: a kernel that reuses freed
 space is ordered after the kernels that used it.
 
-**Change it.** If a new op needs more temporaries, add its per-token bytes to `Forward::Impl::scratch_bytes`; an
+**Change it.** If a new op needs more temporaries, add its per-token bytes to its block's `scratch_per_row` and the family's `scratch_bytes`; an
 under-estimate shows up as the exception above (it happened once: the embedding buffer was missing, TRACKER #52).
