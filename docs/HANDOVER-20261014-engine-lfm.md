@@ -103,3 +103,20 @@ model-agnostic):
   Move them back to `~/ML_projects/flashnext/20261003_x31/data/` with `~/ML_projects/_shared/scripts/storage_move.py`
   (needs ~98 GB free on NVMe) before restarting :8113 - after the LFM bf16 (48 GB) moves to HDD.
 - `~/ML_projects/flashnext/20261012_q4tier` moved to `/mnt/hdd/ml/flashnext/20261012_q4tier` (finished experiment).
+
+## 7. Who continues: the PAW agent (set up 10-14 16:50)
+
+PAW-125B Flash-Next X3.1 (served by TRUSS on GPU 2 from the HDD pack) continues steps 2-5 as an `omp` agent, the
+same pattern as the 10-04 self-optimization run:
+
+| piece | where |
+|---|---|
+| brief (its work order and rules) | `~/ML_projects/lfm24b/20261014_x31/agent/AGENT_BRIEF.md` |
+| its memory / results | `agent/NOTES.md`, `agent/LEDGER.tsv`, `agent/notify.txt` (RESULT / DECISION / STUCK for humans) |
+| its code | worktree `agent/wt`, branch `agent/lfm24b` (from `refactor/engine-blocks`) |
+| its brain | pm2 `paw-brain-g2` (`agent/scripts/brain.sh`, :8113), omp profile `lfmwork` |
+| GPU access | `agent/scripts/gpurun` only: stops the brain, runs one job (<= 25 min) on GPU 2, restarts it (`agent/runs/gpurun.tsv`) |
+| start | `agent/scripts/start_after_encode.sh` (nohup, running): when the encode prints C-RUN-DONE it starts the brain, then `agent/scripts/loop.sh 24 120` in tmux `lfmagent` |
+
+Watch it: `tmux attach -t lfmagent`, `tail agent/logs/loop_*.log`, `cat agent/notify.txt agent/LEDGER.tsv`.
+Stop it: `tmux kill-session -t lfmagent` (then `pm2 stop paw-brain-g2` to free GPU 2).
