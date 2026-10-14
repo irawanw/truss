@@ -16,7 +16,8 @@ main yet; see step 6).
 | LFM full-model parity | **implementation OK** (exact to ~1e-6 per row); full-model mean KL 3.7e-2 is routing near-tie flips, not a bug; gate to redefine | section 8 | section 8 |
 | LFM KL vs bf16 | **DONE** 10-15: K3.5 0.063, K3 0.082, K2.5 0.114, K2 0.166 (Q8_0 alone 0.033) | `PROJ/reports/RESULTS.md` |
 | LFM coding evals | TODO | step 4 |
-| LFM speed (GQA attention on tensor cores, MoE Tune for 2048/1536) | TODO | step 5 |
+| LFM speed, measured | 10-15, one 3090: prefill 6.6-6.7K tok/s at 4K, 3.5K at 16K; decode 117-121 tok/s; ~same for every K | `PROJ/reports/RESULTS.md` |
+| LFM speed work (GQA on tensor cores, decode fixed cost, MoE Tune for 2048/1536) | TODO | step 5 |
 
 ## 2. What is running and how to check it
 
