@@ -105,8 +105,10 @@ add_library(truss_kernels STATIC
   src/kernels/moe/moe_window.cu
   src/kernels/moe/moe_prefill.cu
   src/kernels/dense/q8_gemm.cu
+  src/kernels/dense/q8_gemv.cu
   src/kernels/gdn/gdn_prefill.cu
   src/kernels/dsa/dsa_prefill.cu
+  src/kernels/dsa/dsa_select.cu
   src/kernels/dsa/dsa_prepare.cu
   src/kernels/gdn/gdn_prepare.cu
   src/kernels/hc/hc_prefill.cu

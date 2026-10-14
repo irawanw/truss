@@ -1,4 +1,4 @@
-# Dense projections: kernels/dense/q8_gemm.{cuh,cu}
+# Dense projections: kernels/dense/q8_gemm.cuh, q8_gemm.cu (prompt GEMMs, repack, quantize, rows), q8_gemv.cu (decode GEMVs)
 
 All non-expert matrices of Flash-Next are Q8_0 (llama.cpp: blocks of 32 int8 with one fp16 scale), ~3.3 GiB: the
 hyper-connection projections (10240→320, 320→10240, 10240→4), GDN qkv/z/alpha/beta/out, DSA q/k/v/idx/out, the

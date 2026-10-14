@@ -38,7 +38,7 @@ One warp per normalized row; element i of a row lives in lane i % 32, so the rot
 `carry_partial<Shape>(idx_k raw [T][ID], pos0, T, partial)`: the indexer's open-block rows for cells in the chunk
 (what `prepare_index` does at a chunk's end), used by `blocks::Dsa::accept` over a restored snapshot.
 
-## `src/kernels/dsa/dsa_prefill.{cuh,cu}` — selection and attention
+## `src/kernels/dsa/dsa_prefill.cuh`, `dsa_select.cu` (scores + top blocks), `dsa_prefill.cu` (attention) — selection and attention
 
 `dsa::FlashNext { H = 24, HKV = 2, D = 256, IH = 4, ID = 128, RATIO = 4, TOP_BLOCKS = 512, ROPE_DIMS = 64 }`.
 
