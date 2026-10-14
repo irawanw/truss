@@ -37,6 +37,7 @@ sampling, run-to-run spread 1.2%):
 
 - **[docs/reference/](docs/reference/README.md)** — every source file: what it computes, API and shapes, layouts,
   numerics, invariants, tests, tunables, how to change it. Start with its README (data flow of one forward pass).
+- **[docs/HANDOVER-20261014-engine-lfm.md](docs/HANDOVER-20261014-engine-lfm.md)** — current state, what is running, next steps in order.
 - **[docs/ENGINE.md](docs/ENGINE.md)** — the engine / blocks / model split, and how to add a model (a folder, one registry line).
 - [docs/CODE.md](docs/CODE.md) — code rules: where files go, extension points, kernel and test rules, no file over 500 lines.
 - **[docs/PLAN-20261003-x31-tg140-pp4000.md](docs/PLAN-20261003-x31-tg140-pp4000.md)** — current plan: X3.1 weights that stop the thinking loops (no K1 holes, rates from agent traffic), 1 GPU + 64 GB RAM, decode 140 / prefill 4,000 tok/s at 256K (budgets, phases A-D, gates, kill rules).
