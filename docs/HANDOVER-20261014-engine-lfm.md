@@ -166,6 +166,6 @@ noise (floor 1.5e-3 at 16, 6.7e-3 at 40), so the final full-model gate may need 
 3. Fix, then rerun slices 12/16 and the four full packs; re-decide the gate against the floor.
 4. Then step 4 (KL vs Q8_0, coding evals), step 5 (speed).
 
-**Disk:** NVMe at ~45 GB free after the packs + slices (rule: keep >= 50 GB). Test slices
-`PROJ/data/test/lfm-slice{8,10,12,14,16}-k2.gguf` (~11 GB) are disposable; delete when the bisect is done.
+**Disk:** NVMe at 54 GB free after the packs + slices (rule: keep >= 50 GB). Test slices
+`PROJ/data/test/lfm-slice{4,8,10,12}-k2.gguf` (~6 GB; 14/16/24 already deleted) are disposable; delete when the bisect is done.
 `d_parity_chain.sh` (`PROJ/scripts`) runs parity on all four packs in sequence (already has `TRUSS_EXPERT_GB=7`).
