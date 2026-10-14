@@ -55,6 +55,7 @@ MoeExec::MoeExec(engine::Gpu & g, const MoeKernels & k, std::vector<MoeLayer> la
         cpu_tier_->pool_mu = pool_mu;
     }
     engine::load_mark("CPU tier");
+    all_resident_ = n_hot_ == n_store() * E_ && !cpu_tier_;
     cpu_dynamic_ = o_.cpu_dynamic && cpu_tier_ && o_.doorbell;
     pcie_ms_byte_ = 1.0 / (o_.pcie_gbps * 1e6);
     if (o_.adapt_every > 0) route_usage_.assign((size_t) n_store() * E_, 0.f);
@@ -137,7 +138,10 @@ void MoeExec::run(const Call & c)
 {
     const int T = c.T, l = c.sl;
     const bool hint = c.pred_logits != nullptr;   // the block asked wants_hint() and computed them
-    const bool door = !c.stream && o_.doorbell && T <= cpu::MAX_ROWS;   // no host sync: the driver serves this FFN
+    // all resident (a model that fits the card, e.g. LFM2.5-24B on 24 GB): nothing to copy or plan, the window kernel
+    // runs straight after the routing (no publish / plan wait / hint: -0.4 ms per LFM decode step, TRACKER #165)
+    const bool resident = !c.stream && all_resident_ && T <= moe::MAX_ROWS;
+    const bool door = !resident && !c.stream && o_.doorbell && T <= cpu::MAX_ROWS;   // no host sync: the driver serves this FFN
     const bool cpu_on = cpu_tier_ && layers_[l].cpu_ok;
     static const bool route_publish = [] { const char * e = std::getenv("TRUSS_ROUTE_PUBLISH"); return e && std::atoi(e); }();
     const bool fused = door && route_publish && c.fused_route_ok;
@@ -150,7 +154,9 @@ void MoeExec::run(const Call & c)
     };
     const int ml = layers_[l].model_layer;
     engine::Profile * const pf = layers_[l].profiled ? prof_ : nullptr;
-    if (door) {
+    if (resident) {
+        k_.window(store_->weights(l), c.x, c.ids, c.wts, T, c.routed, window_ws_, g_.s);
+    } else if (door) {
         run_doorbell(c, cpu_on, fused, hint);
         shared_done = true;   // run_doorbell ran it between the publish and the plan wait
     } else if (!c.stream) {

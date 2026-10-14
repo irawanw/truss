@@ -60,7 +60,7 @@ moe_kernels.h) and router outputs, never a model.
 | file | content |
 |---|---|
 | `moe_exec.h` | `MoeOptions`, `MoeLayer` (tables, model layer, `cpu_ok`, `next_in_stage`, `profiled`), `MoeExec` |
-| `moe_exec.cu` | construction (budget, hot-set plan, store, CPU tier, route trace, doorbells), `run()` dispatch + stream path + joins, adaptive tier, routing profile, E6 lending, stats |
+| `moe_exec.cu` | construction (budget, hot-set plan, store, CPU tier, route trace, doorbells), `run()` dispatch (all-resident path: every expert on the device and no CPU tier -> the window kernel right after the routing, no doorbell / plan wait / hint; 10-15) + stream path + joins, adaptive tier, routing profile, E6 lending, stats |
 | `moe_paths.cu` | doorbell path (publish, job, shared expert while the driver plans, plan wait, window), fetch path (one sync, CPU split, fetch + hint), split path (E7) |
 | `moe_driver.cu` | `setup_doorbells`, the driver thread loop, watchdog (`TRUSS_DRIVER_DEBUG`) |
 | `moe_serve.cu` | `serve()` (static / dynamic CPU split, copies, plan, hints, idle-link admission, `TRUSS_DRIVER_TS`), `fit_cpu_cost` |

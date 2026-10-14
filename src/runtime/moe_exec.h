@@ -109,7 +109,7 @@ public:
     // whether the block should compute pred_logits (the next layer's router on this input) for this call
     bool wants_hint(int sl, int T, bool stream) const
     {
-        return !stream && o_.hint_k > 0 && layers_[sl].next_in_stage && T >= o_.hint_min_rows;
+        return !stream && !all_resident_ && o_.hint_k > 0 && layers_[sl].next_in_stage && T >= o_.hint_min_rows;
     }
 
     // between passes
@@ -174,6 +174,7 @@ private:
     engine::Profile * prof_;
     std::unique_ptr<ExpertStore> store_;
     int n_hot_ = 0;
+    bool all_resident_ = false;   // every expert of the stage on the device, no CPU tier: decode needs no copy plan
     void * window_ws_ = nullptr;
     int * ids_host_ = nullptr;                  // pinned: routing + prediction of a fetch chunk
     int cpu_rows_ = 0;                          // rows of the CPU tier call in flight
