@@ -1,11 +1,30 @@
 # Handover 2026-10-14: engine split done, LFM2.5-24B-A2B X3.1 in progress
 
-**Continue from `docs/PLAN-20261015-lfm-speed.md`** (10-15: packs, KL vs bf16 and speed measured; coding evals
-dropped by the user; decode profile; speed plan P0-P7; data moved to HDD - see its section 4).
+## 0. LATEST (10-15 06:40) - the next agent starts here
 
-Read first: `docs/ENGINE.md` (layout contract), `docs/CODE.md` (rules, no file over 500 lines), TRACKER.md rows
-#159-161 (local file, not in git) and its "Do not repeat" list. Branch: `refactor/engine-blocks` (not merged to
-main yet; see step 6).
+**Goal now (user): make TRUSS faster than llama.cpp on LFM2.5-24B-A2B.** Work order: `docs/PLAN-20261015-lfm-speed.md`
+**section 5** (numbers to beat, decode profile, steps B1-B6, gates, traps). Sections 1-8 below are history.
+
+State:
+- Branch `refactor/engine-blocks` == GitHub `main` (irawanw/truss) at the last commit; build dir `build/` is current.
+- Packs `~/ML_projects/lfm24b/20261014_x31/data/gguf/lfm25-24b-x31-k{2,2.5,3,3.5}.gguf`; results and the comparison
+  with LiquidAI's official GGUFs: `~/ML_projects/lfm24b/20261014_x31/reports/RESULTS.md`.
+- TRUSS K3.5: KL vs bf16 0.063 (official QAD-Q4_0 0.0965, Q4_K_M 0.109) at 11.2 GB; decode 203 tok/s vs llama 282;
+  prefill 4K 6.5K vs 5.5K (ours faster), 16K 3.5K vs 5.2K.
+- GPU 2 is free (no brain, no agent; the PAW omp agent was retired 10-15).
+
+Open task besides speed - **Hugging Face upload** (user named the repo `lackonendes/PAW-24B-X3.1`, public):
+- Token: `HF_TOKEN` in `~/ML_projects/.env` (the CLI login on the box cannot create repos; this one can).
+- `~/ML_projects/lfm24b/20261014_x31/scripts/g_upload.py` (run with the .env loaded: `set -a; . ~/ML_projects/.env;
+  set +a; python3 scripts/g_upload.py`) creates the repo and uploads `PAW-24B-X3.1-K{2,2.5,3,3.5}.gguf`. Started 06:20
+  10-15, log `data/work/logs/g_upload.log`; upload speed dropped to ~3 MB/s - check whether all four finished
+  (`HfApi().list_repo_files("lackonendes/PAW-24B-X3.1")`), rerun for missing files (upload_file re-sends the file).
+- **Model card not written yet.** Write `README.md` in the style of `lackonendes/PAW-125B-FLASH-NEXT-X3.1`'s card
+  (license: `other`, `license_name: lfm1.0`, base_model `LiquidAI/LFM2.5-24B-A2B`; "follow @nawariokra on X" line;
+  "stock llama.cpp cannot read this file, it needs TRUSS https://github.com/irawanw/truss"). Content: the RESULTS.md
+  tables (KL vs bf16 per K and vs the official GGUFs, speed), how it was made (X3.1 trellis experts at uniform K,
+  code-262k calibration, everything else Q8_0), the serve command (above), and the honest speed statement: llama.cpp's
+  official Q4 files decode faster today; ours win on quality per GB and 4K prefill. Upload with `HfApi().upload_file`.
 
 ## 1. Where things stand
 
