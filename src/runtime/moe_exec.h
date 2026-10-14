@@ -86,12 +86,15 @@ public:
     // router on the same input, or nullptr (pre-gating hint, TRACKER #58); ids/wts [T][K] scratch the routing goes
     // to; routed [T][d] gets the expert sum; shared() runs the block's shared expert (may be empty); moe_ws/moe_rows:
     // the prefill workspace of the buffers in use; route(): the router's top-k (the block's routing rule).
-    using RouteFn = void (*)(const float * logits, int T, int E, int K, int * ids, float * wts, cudaStream_t);
+    // the routing rule: logits [T][E] (+ a per-expert selection bias, may be nullptr) -> ids, weights [T][K]
+    using RouteFn = void (*)(const float * logits, const float * bias, int T, int E, int K, int * ids, float * wts,
+                             cudaStream_t);
     struct Call {
         int sl;                                 // store layer
         const float * x;                        // [T][d] FFN input rows
         int T;
         const float * logits, * pred_logits;
+        const float * bias, * pred_bias;        // the router's selection bias (and the next layer's), or nullptr
         int * ids;
         float * wts;
         float * routed;

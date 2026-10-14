@@ -35,7 +35,7 @@ void MoeExec::run_doorbell(const Call & c, bool cpu_on, bool fused, bool hint)
         if (hint) {
             float * pw = g_.sc->alloc((size_t) T * K_);
             pred = g_.sc->alloc<int>((size_t) T * K_);
-            c.route(c.pred_logits, T, E_, K_, pred, pw, g_.s);
+            c.route(c.pred_logits, c.pred_bias, T, E_, K_, pred, pw, g_.s);
         }
         runtime::publish(c.ids, pred, c.wts, T * K_, c.x, n_x, b.ids, b.pred, b.w, b.x, b.doorbell, seq, g_.s);
     }
@@ -68,7 +68,7 @@ void MoeExec::run_fetch(const Call & c, bool hint)
     if (hint) {
         float * pw = g_.sc->alloc((size_t) T * K_);
         int * pred = g_.sc->alloc<int>((size_t) T * K_);
-        c.route(c.pred_logits, T, E_, K_, pred, pw, g_.s);
+        c.route(c.pred_logits, c.pred_bias, T, E_, K_, pred, pw, g_.s);
         TRUSS_CUDA(cudaMemcpyAsync(ids_host_ + T * K_, pred, sizeof(int) * T * K_, cudaMemcpyDeviceToHost, g_.s));
     }
     // the CPU tier serves windows of up to cpu::MAX_ROWS rows: decode steps, verify windows, drafter commits

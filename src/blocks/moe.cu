@@ -6,9 +6,21 @@
 
 namespace truss::blocks {
 
+void route_softmax(const float * logits, const float *, int T, int E, int K, int * ids, float * wts, cudaStream_t s)
+{
+    ffn::route(logits, T, E, K, ids, wts, s);
+}
+
+void route_sigmoid_bias(const float * logits, const float * bias, int T, int E, int K, int * ids, float * wts,
+                        cudaStream_t s)
+{
+    ffn::route_sigmoid(logits, bias, T, E, K, true, 1.f, ids, wts, s);
+}
+
 void Moe::add_tensors(Linear & lin, const MoeWeights & w)
 {
     lin.add(w.router), lin.add(w.shexp_gate_inp), lin.add(w.shexp_gate), lin.add(w.shexp_up), lin.add(w.shexp_down);
+    lin.add(w.exp_bias);
 }
 
 void Moe::forward(engine::Gpu & g, const float * in, const half * in16, int T, float * out, bool stream, void * moe_ws,
@@ -35,15 +47,17 @@ void Moe::forward(engine::Gpu & g, const float * in, const half * in16, int T, f
     };
     // the router, the next layer's router on this input (pre-gating hint) and the shared-expert gate read the same
     // fp32 rows: one launch at decode sizes
-    const bool hint = next_router_ && exec_.wants_hint(sl_, T, stream);
+    const bool hint = next_ && exec_.wants_hint(sl_, T, stream);
     float * pl = hint ? sc.alloc((size_t) T * E) : nullptr;
     {
         std::vector<Linear::Proj> ps{ { w_.router, logits } };
         if (has_shared) ps.push_back({ w_.shexp_gate_inp, sg });
-        if (hint) ps.push_back({ next_router_, pl });
+        if (hint) ps.push_back({ next_->router, pl });
         lin_.lin32_multi(ps, in, T);
     }
-    runtime::MoeExec::Call c{ sl_, in, T, logits, pl, ids, wts, has_shared ? routed : out, stream, moe_ws, moe_rows,
+    const float * bias = w_.exp_bias ? lin_.f32(w_.exp_bias) : nullptr;
+    const float * pbias = hint && next_->exp_bias ? lin_.f32(next_->exp_bias) : nullptr;
+    runtime::MoeExec::Call c{ sl_, in, T, logits, pl, bias, pbias, ids, wts, has_shared ? routed : out, stream, moe_ws, moe_rows,
                               route_, softmax_, has_shared ? std::function<void()>(shared) : std::function<void()>() };
     exec_.run(c);
     if (has_shared) ffn::shared_add(routed, y, sg, T, dm, out, g.s);

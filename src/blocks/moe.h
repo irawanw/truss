@@ -18,13 +18,19 @@ struct MoeDims {
     }
 };
 
+// routing rules (moe.cu): softmax top-k renormalized (Flash-Next); sigmoid + selection bias top-k renormalized (LFM2)
+void route_softmax(const float * logits, const float * bias, int T, int E, int K, int * ids, float * wts, cudaStream_t s);
+void route_sigmoid_bias(const float * logits, const float * bias, int T, int E, int K, int * ids, float * wts,
+                        cudaStream_t s);
+
 class Moe {
 public:
-    // sl: its store layer in the stage's MoeExec; next_router: the next layer's router on this stage (the pre-gating
-    // hint, TRACKER #58), or nullptr; softmax_route: route is the softmax top-k (the fused route+publish may replace it)
+    // sl: its store layer in the stage's MoeExec; next: the next layer's MoE weights on this stage (its router is the
+    // pre-gating hint, TRACKER #58), or nullptr; softmax_route: route is the softmax top-k (the fused route+publish
+    // may replace it)
     Moe(Linear & lin, runtime::MoeExec & exec, int sl, int model_layer, const MoeWeights & w, const MoeDims & d,
-        T next_router, runtime::MoeExec::RouteFn route, bool softmax_route, engine::Profile * prof)
-        : lin_(lin), exec_(exec), sl_(sl), ml_(model_layer), w_(w), d_(d), next_router_(next_router), route_(route),
+        const MoeWeights * next, runtime::MoeExec::RouteFn route, bool softmax_route, engine::Profile * prof)
+        : lin_(lin), exec_(exec), sl_(sl), ml_(model_layer), w_(w), d_(d), next_(next), route_(route),
           softmax_(softmax_route), prof_(prof)
     {
     }
@@ -39,7 +45,7 @@ private:
     const int sl_, ml_;
     const MoeWeights & w_;
     const MoeDims d_;
-    const T next_router_;
+    const MoeWeights * next_;
     const runtime::MoeExec::RouteFn route_;
     const bool softmax_;
     engine::Profile * prof_;

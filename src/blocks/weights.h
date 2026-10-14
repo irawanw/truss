@@ -30,6 +30,7 @@ struct MoeWeights {
     T router = nullptr;                    // [d_model -> n_expert], fp32
     formats::ExpertTable gate, up, down;   // routed experts, trellis
     T shexp_gate_inp = nullptr, shexp_gate = nullptr, shexp_up = nullptr, shexp_down = nullptr;   // optional
+    T exp_bias = nullptr;                  // [n_expert] fp32 selection bias (sigmoid routers), optional
 };
 
 }  // namespace truss::blocks

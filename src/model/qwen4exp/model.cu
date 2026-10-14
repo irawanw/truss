@@ -134,8 +134,8 @@ void StageModel::bind_experts(engine::Stage & st)
     const blocks::MoeDims md{ c_.d_model, c_.n_expert, c_.n_expert_used, c_.d_ff_shexp };
     for (int l = lb_; l < le_; ++l)
         moe_.push_back(std::make_unique<blocks::Moe>(st.lin(), *st.moe(), l - lb_, l, w_.layers[l].moe, md,
-                                                     l + 1 < le_ ? w_.layers[l + 1].moe.router : nullptr, &ffn::route,
-                                                     true, &st.prof()));
+                                                     l + 1 < le_ ? &w_.layers[l + 1].moe : nullptr,
+                                                     &blocks::route_softmax, true, &st.prof()));
     if (drafter_) drafter_->bind_experts(st);
 }
 

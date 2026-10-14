@@ -17,6 +17,11 @@ namespace truss::ffn {
 // logits [T][E] -> ids, wts [T][k]. E % 32 == 0, E <= 1024, k <= 32.
 void route(const float * logits, int T, int E, int k, int * ids, float * wts, cudaStream_t stream);
 
+// sigmoid router with a selection bias (route_sigmoid.cu): top k of sigmoid(logit) + bias (nullptr: none), weights the
+// chosen sigmoids, / (sum + 1e-6) when renorm, x scale. LFM2-MoE, DeepSeek-V3-style routing.
+void route_sigmoid(const float * logits, const float * bias, int T, int E, int k, bool renorm, float scale, int * ids,
+                   float * wts, cudaStream_t stream);
+
 // The publish of a doorbell decode FFN folded into its routing (runtime/doorbell.cuh's publish, three launches
 // today): one kernel computes this layer's top-k into ids/wts (device) and the next layer's predicted top-k
 // (pred_logits, null without the pre-gating hint), writes ids/weights/prediction to the mapped host buffers

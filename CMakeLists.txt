@@ -113,6 +113,9 @@ add_library(truss_kernels STATIC
   src/kernels/gdn/gdn_prepare.cu
   src/kernels/hc/hc_prefill.cu
   src/kernels/ffn/ffn_ops.cu
+  src/kernels/ffn/route_sigmoid.cu
+  src/kernels/norm/rms_norm.cu
+  src/kernels/conv/short_conv.cu
   src/kernels/ple/ple_prefill.cu
   src/kernels/sampling/argmax.cu
   src/kernels/sampling/sample.cu

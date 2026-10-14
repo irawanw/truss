@@ -1,4 +1,4 @@
-// Rollback helpers for speculative verify windows (qwen4exp::Forward::verify / accept).
+// Rollback helpers for speculative verify windows (engine::Stage::accept -> the blocks' accept()).
 //
 // Carried row histories (GDN conv rows, PLE conv history) hold the last H rows of a stream. A verify window appends
 // T rows; if only the first n are accepted, the history must be the last H rows of [before-window history | rows

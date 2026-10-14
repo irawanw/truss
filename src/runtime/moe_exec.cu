@@ -141,7 +141,7 @@ void MoeExec::run(const Call & c)
     const bool cpu_on = cpu_tier_ && layers_[l].cpu_ok;
     static const bool route_publish = [] { const char * e = std::getenv("TRUSS_ROUTE_PUBLISH"); return e && std::atoi(e); }();
     const bool fused = door && route_publish && c.fused_route_ok;
-    if (!fused) c.route(c.logits, T, E_, K_, c.ids, c.wts, g_.s);   // the fused launch does the top-k itself
+    if (!fused) c.route(c.logits, c.bias, T, E_, K_, c.ids, c.wts, g_.s);   // the fused launch does the top-k itself
     if (route_counts_) ffn::count(c.ids, T * K_, route_counts_ + (size_t) l * E_, g_.s);
     bool shared_done = false;
     auto shared = [&] {

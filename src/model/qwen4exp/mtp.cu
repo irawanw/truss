@@ -47,7 +47,7 @@ void MtpDrafter::bind_experts(engine::Stage & st)
 {
     const blocks::MoeDims md{ c_.d_model, c_.n_expert, c_.n_expert_used, c_.d_ff_shexp };
     moe_ = std::make_unique<blocks::Moe>(st.lin(), *st.moe(), st.moe()->n_store() - 1, c_.n_layer, m_.layer.moe, md,
-                                         nullptr, &ffn::route, true, nullptr);
+                                         nullptr, &blocks::route_softmax, true, nullptr);
 }
 
 void MtpDrafter::alloc_slots(engine::Stage & st, int n_slots, int seq_ctx, int spec_rows)
