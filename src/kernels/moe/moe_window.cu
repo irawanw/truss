@@ -63,6 +63,11 @@ template <> struct Tune<FlashNext> {
     using GateUp = Geom<8, 1, 2, 8>;       // 8 k-split warps x 8 tiles
     using Down = Geom<4, 2, 2, 8>;         // 4 k-split warps x 2 groups x 8 tiles
 };
+template <> struct Tune<Lfm2> {            // Flash-Next's geometry (untuned for this shape: every tiling assert holds)
+    static constexpr int BLOCKS_PER_SM = 2;
+    using GateUp = Geom<8, 1, 2, 8>;
+    using Down = Geom<4, 2, 2, 8>;
+};
 
 // Compile-time sizes of one shape
 template <class Shape>
@@ -608,5 +613,9 @@ template size_t workspace_bytes<FlashNext>();
 template void workspace_init<FlashNext>(void *, cudaStream_t);
 template void window<FlashNext>(const Weights &, const float *, const int *, const float *, int, float *, void *,
                                 cudaStream_t, TraceEvent *);
+template size_t workspace_bytes<Lfm2>();
+template void workspace_init<Lfm2>(void *, cudaStream_t);
+template void window<Lfm2>(const Weights &, const float *, const int *, const float *, int, float *, void *,
+                           cudaStream_t, TraceEvent *);
 
 }  // namespace truss::moe

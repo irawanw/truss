@@ -482,5 +482,8 @@ void prefill(const Weights & W, const float * x, const int * ids, const float * 
 template size_t prefill_workspace_bytes<FlashNext>(int);
 template void prefill<FlashNext>(const Weights &, const float *, const int *, const float *, int, float *, void *,
                                  int, cudaStream_t);
+template size_t prefill_workspace_bytes<Lfm2>(int);
+template void prefill<Lfm2>(const Weights &, const float *, const int *, const float *, int, float *, void *, int,
+                            cudaStream_t);
 
 }  // namespace truss::moe

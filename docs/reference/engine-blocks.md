@@ -41,6 +41,10 @@ drafter defers its commit to the next `draft()`. `select()` inside the last stag
 | `ple.h/.cu` | `PleTable` (stage: n-gram window, reader, lookahead) and `Ple` (layer: key/value, gate, conv history) | token window; history + snapshot |
 | `ple_hash.h/.cc` | `PleDims`, `ple_rows` (n-gram hash), `ple_gather` (mapping path) | - |
 | `ple_reader.h/.cc` | `PleReader`: rows by parallel reads + row cache (TRACKER #88) | - |
+| `norm.h` | `RmsNorm`: row RMSNorm (fp32 / fp16 out) | - |
+| `ffn_dense.h` | `DenseFfn`: SwiGLU (gate + up in one launch at decode rows) | - |
+| `shortconv.h/.cu` | `ShortConv`: in_proj -> B*x causal depthwise conv -> C* -> out_proj | conv rows; snapshot + window rows (`tail_rows`) |
+| `attn_gqa.h/.cu` | `AttnGqa`: q/k/v, per-head norm + rope + cache write, dense causal GQA (kernels/attn/gqa) | K/V (positional) |
 | `moe.h/.cu` | `Moe`: router (fp32) + routed experts through `runtime::MoeExec` + optional gated shared expert; routing rule (`RouteFn`) and shared expert are parameters | - (residency is the runtime's) |
 
 **Adding a block** (a new layer kind: GQA attention, short conv, Mamba-2, dense FFN): a class with a dims struct,

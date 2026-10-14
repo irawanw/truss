@@ -93,3 +93,9 @@ space is ordered after the kernels that used it.
 
 **Change it.** If a new op needs more temporaries, add its per-token bytes to its block's `scratch_per_row` and the family's `scratch_bytes`; an
 under-estimate shows up as the exception above (it happened once: the embedding buffer was missing, TRACKER #52).
+
+## `src/formats/binder.h` — binding a file's tensors to a family's weight views
+
+`Binder(file, family)`: `need(name, dims)` (shape checked, ggml order, trailing 1s ignored), `maybe(...)`,
+`experts(prefix, in, out, n_expert)` (trellis table read and checked), `check_all_used()` (every tensor in the file
+bound exactly once). Every family's `weights.cc` uses it; errors name the family and the tensor.

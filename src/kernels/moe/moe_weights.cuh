@@ -10,6 +10,9 @@ namespace truss::moe {
 struct FlashNext {                         // Qwen3.8 Flash-Next: 512 experts, top-10
     static constexpr int D_MODEL = 2560, D_FF = 640, TOPK = 10;
 };
+struct Lfm2 {                              // LFM2.5-24B-A2B: 64 experts, top-4
+    static constexpr int D_MODEL = 2048, D_FF = 1536, TOPK = 4;
+};
 
 struct ProjView {                          // one projection (gate, up or down) of all experts of a layer
     const uint16_t * trellis;              // base of the tiles

@@ -2,6 +2,8 @@
 // (contiguous dimension first) as stored in the file.
 #include "model/qwen4exp/weights.h"
 
+#include "formats/binder.h"
+
 #include <algorithm>
 #include <initializer_list>
 #include <stdexcept>
@@ -12,59 +14,7 @@ namespace truss::qwen4exp {
 
 namespace {
 
-class Binder {
-public:
-    explicit Binder(const gguf::File & f) : f_(f) {}
-
-    // the tensor, checked against `dims` (trailing 1s ignored on both sides)
-    T need(const std::string & name, std::initializer_list<int64_t> dims)
-    {
-        const gguf::Tensor & t = f_.at(name);
-        std::vector<int64_t> want(dims), have(t.shape);
-        while (want.size() > 1 && want.back() == 1) want.pop_back();
-        while (have.size() > 1 && have.back() == 1) have.pop_back();
-        if (want != have) throw std::runtime_error("qwen4exp: " + name + " has shape " + str(have) + ", expected " +
-                                                   str(want));
-        use(name);
-        return &t;
-    }
-
-    formats::ExpertTable experts(const std::string & prefix, int64_t in, int64_t out, int n_expert)
-    {
-        formats::ExpertTable e = formats::read_expert_table(f_, prefix);
-        if (e.in != in || e.out != out || e.n_expert != n_expert)
-            throw std::runtime_error("qwen4exp: " + prefix + " is " + std::to_string(e.n_expert) + " x " +
-                                     std::to_string(e.out) + "x" + std::to_string(e.in) + ", expected " +
-                                     std::to_string(n_expert) + " x " + std::to_string(out) + "x" + std::to_string(in));
-        for (const char * s : { ".m3_trellis", ".m3_meta", ".m3_suh", ".m3_svh" }) use(prefix + s);
-        return e;
-    }
-
-    void check_all_used() const
-    {
-        std::string unused;
-        int n = 0;
-        for (const gguf::Tensor & t : f_.tensors())
-            if (!used_.count(t.name) && n++ < 8) unused += " " + t.name;
-        if (n) throw std::runtime_error("qwen4exp: " + std::to_string(n) + " tensors not bound:" + unused);
-    }
-
-private:
-    void use(const std::string & name)
-    {
-        if (!used_.insert(name).second) throw std::runtime_error("qwen4exp: " + name + " bound twice");
-    }
-
-    static std::string str(const std::vector<int64_t> & v)
-    {
-        std::string s = "[";
-        for (size_t i = 0; i < v.size(); ++i) s += (i ? ", " : "") + std::to_string(v[i]);
-        return s + "]";
-    }
-
-    const gguf::File & f_;
-    std::unordered_set<std::string> used_;
-};
+using formats::Binder;
 
 HyperConnection bind_hc(Binder & b, const std::string & p, const Config & c, bool inject)
 {
@@ -137,7 +87,7 @@ Layer bind_layer(Binder & b, const Config & c, int l, Mixer mixer, bool ple)
 
 Weights bind(const gguf::File & f, const Config & c)
 {
-    Binder b(f);
+    Binder b(f, "qwen4exp");
     Weights w;
     const int64_t d = c.d_model;
     w.token_embd = b.need("token_embd.weight", { d, c.n_vocab });
@@ -163,7 +113,7 @@ Weights bind(const gguf::File & f, const Config & c)
 
 Mtp bind_mtp(const gguf::File & f, const Config & c)
 {
-    Binder b(f);
+    Binder b(f, "qwen4exp");
     Mtp m;
     const int l = c.n_layer;
     const std::string p = "blk." + std::to_string(l) + ".";

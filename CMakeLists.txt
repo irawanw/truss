@@ -45,7 +45,9 @@ add_library(truss_models STATIC
   src/blocks/ple_reader.cc
   src/model/qwen4exp/config.cc
   src/model/qwen4exp/weights.cc
-  src/model/qwen4exp/reference.cu)
+  src/model/qwen4exp/reference.cu
+  src/model/lfm2moe/config.cc
+  src/model/lfm2moe/weights.cc)
 target_link_libraries(truss_models PUBLIC truss_formats truss_reference)
 target_compile_options(truss_models PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra>)
 
@@ -74,6 +76,8 @@ add_library(truss_engine STATIC
   src/blocks/attn_dsa.cu
   src/blocks/ple.cu
   src/blocks/moe.cu
+  src/blocks/shortconv.cu
+  src/blocks/attn_gqa.cu
   src/runtime/expert_store.cu
   src/runtime/expert_store_plan.cu
   src/runtime/expert_store_ring.cu
@@ -86,6 +90,7 @@ add_library(truss_engine STATIC
   src/model/qwen4exp/model.cu
   src/model/qwen4exp/mtp.cu
   src/model/qwen4exp/mtp_draft.cu
+  src/model/lfm2moe/model.cu
   src/model/registry.cc)
 target_link_libraries(truss_engine PUBLIC truss_models truss_kernels truss_cpu)
 
