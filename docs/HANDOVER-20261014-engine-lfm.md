@@ -14,7 +14,8 @@ main yet; see step 6).
 | LFM X3.1 encode, K 2 / 2.5 / 3 / 3.5 | **DONE** 21:37 10-14 (C-RUN-DONE 2..39, 38 layers x 4 rates) | `~/ML_projects/lfm24b/20261014_x31/data/work/logs/c_run.out` |
 | LFM packs (one GGUF per K) | **DONE** 10-15 03:40: K2 6.89 GB, K2.5 8.32, K3 9.76, K3.5 11.19 (tensor data) | `PROJ/data/gguf/lfm25-24b-x31-k*.gguf`, `data/work/logs/c4_pack_all.log` |
 | LFM full-model parity | **implementation OK** (exact to ~1e-6 per row); full-model mean KL 3.7e-2 is routing near-tie flips, not a bug; gate to redefine | section 8 | section 8 |
-| LFM full-model quality (KL, coding evals) | TODO (after parity) | step 4 |
+| LFM KL vs bf16 | **DONE** 10-15: K3.5 0.063, K3 0.082, K2.5 0.114, K2 0.166 (Q8_0 alone 0.033) | `PROJ/reports/RESULTS.md` |
+| LFM coding evals | TODO | step 4 |
 | LFM speed (GQA attention on tensor cores, MoE Tune for 2048/1536) | TODO | step 5 |
 
 ## 2. What is running and how to check it
@@ -56,7 +57,10 @@ The old note "all 40 layers need ~20 GB" was wrong (fp32 experts are ~2.4 GB per
 now streams the reference one layer at a time (section 8).
 
 **Step 4 - quality per K** (the user's actual question: which rate is good enough):
-- KL vs the Q8_0 model: make the base with llama-paw (`~/llama-paw/build/bin/llama-perplexity -m
+- **DONE 10-15, KL vs the bf16 model** (user: "kl against fp16", not Q8_0): `PROJ/scripts/e_bf16_base.py` (HF, fp32
+  math, layers streamed) writes the base, `e_kl_chain.sh` scores the packs, `e_q8_ref.sh` the Q8_0 GGUF. Table in
+  `PROJ/reports/RESULTS.md`. tk-parity-kl on LFM needs `TRUSS_PREFILL_ROWS=1024` (n_ctx 1024 in one run).
+- (old plan, superseded) KL vs the Q8_0 model: make the base with llama-paw (`~/llama-paw/build/bin/llama-perplexity -m
   data/gguf/lfm25-24b-q8_0.gguf --kl-divergence-base base.logits` on held-out code text), then
   `build/tk-parity-kl <pack> base.logits 8 0 fp16` per K (tk-parity-kl is model-agnostic now).
 - Coding evals: serve each pack with the TRUSS server (`python3 -m server.app --model <pack> --tokenizer
