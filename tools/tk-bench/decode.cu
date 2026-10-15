@@ -71,11 +71,14 @@ int main(int argc, char ** argv)
         if (use_graph) gs = std::make_unique<engine::GraphStep>(f, fam->n_vocab());
         for (int pass = 0; pass < 2; ++pass) {
             f.reset();
+            const auto p0 = std::chrono::steady_clock::now();
             for (int s = 0; s < n; s += chunk) f.run(tok.data() + s, std::min(chunk, n - s));
             f.head((n - 1) % chunk, 1, logits);   // the prompt's last row, in the last chunk
             sampling::argmax(logits, fam->n_vocab(), next_d, f.stream());
             TRUSS_CUDA(cudaMemcpyAsync(next_h, next_d, 4, cudaMemcpyDeviceToHost, f.stream()));
             TRUSS_CUDA(cudaStreamSynchronize(f.stream()));
+            const double pms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - p0).count();
+            std::printf("  prefill %d tokens: %.0f ms (%.0f tok/s)\n", n, pms, 1e3 * n / pms);
             const runtime::ExpertStore::Stats st0 = f.experts()->stats();
             std::vector<double> ms;
             int pos = n;
