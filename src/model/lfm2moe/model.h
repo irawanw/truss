@@ -53,6 +53,7 @@ public:
     void layers(engine::Stage & st, const engine::Chunk & c, float * res, const engine::LayerHook & hook) override;
     void head(engine::Stage & st, const float * rows, int n, float * logits, bool draft) override;
     std::vector<engine::Stateful *> states() override;
+    engine::StageModel::GraphInfo graph_info() const override;   // B1: GQA prepare/decode take pos0 (TRACKER #168)
 
 private:
     attn::GqaShape gqa_shape() const;

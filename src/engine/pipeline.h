@@ -41,6 +41,9 @@ public:
     void select(int k);
     int slot() const { return active_; }
     int position() const { return seq_pos_[active_]; }
+    // B1: re-align the host cursor with the device state (graph mode runs no host code per step, so the cursor
+    // goes stale; the next capture must bake the device's position). Only between steps, never in a verify window.
+    void set_position(int pos) { seq_pos_[active_] = pos; }
 
     // ---- slot calls (different slots may run on different threads at once)
     // prompt(): tokens [0, n) appended to `slot` in chunks of `step`; with logits, the last row's logits go there and
@@ -78,6 +81,10 @@ public:
     void split_stats(long long out[3]) const;
     size_t kv_lent() const;
     const runtime::ExpertStore * experts() const;   // the last stage's (a drafter's layer is its last store layer)
+    // B1: graph-mode requirements and the model's position-dependent kernels
+    bool split() const { return !front_.empty(); }
+    bool all_resident() const { return m_->moe() && m_->moe()->all_resident(); }
+    StageModel::GraphInfo graph_info() const { return m_->model().graph_info(); }
     void profile_routes(bool on);
     std::vector<float> route_counts() const;        // [layer][expert], the drafter's layer last
     static int fetch_rows();

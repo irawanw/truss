@@ -69,6 +69,7 @@ add_library(truss_engine STATIC
   src/engine/pipeline.cu
   src/engine/pipeline_slots.cu
   src/engine/pipeline_stats.cu
+  src/engine/graph_step.cu
   src/blocks/linear.cu
   src/blocks/head.cu
   src/blocks/hc.cu

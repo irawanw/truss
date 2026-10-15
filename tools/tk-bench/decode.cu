@@ -7,6 +7,7 @@
 #include "core/cuda_check.h"
 #include "kernels/sampling/argmax.cuh"
 #include "model/qwen4exp/config.h"
+#include "engine/graph_step.h"
 #include "engine/model.h"
 #include "engine/pipeline.h"
 #include "model/qwen4exp/weights.h"
@@ -16,6 +17,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -63,6 +65,10 @@ int main(int argc, char ** argv)
         engine::Pipeline f(*fam, n_ctx, chunk, o);
         std::printf("experts: %d of %d resident (%s), ring %.2f GB\n", f.hot_experts(), fam->n_expert() * fam->n_layer(),
                     o.expert_usage.empty() ? "index order" : "usage-ranked", f.experts()->ring_bytes() / 1e9);
+        // TRUSS_DECODE_GRAPH=1: B1 CUDA-graph decode (one graph per 128-block, pos0 refreshed per step)
+        const bool use_graph = std::getenv("TRUSS_DECODE_GRAPH") && std::atoi(std::getenv("TRUSS_DECODE_GRAPH"));
+        std::unique_ptr<engine::GraphStep> gs;
+        if (use_graph) gs = std::make_unique<engine::GraphStep>(f, fam->n_vocab());
         for (int pass = 0; pass < 2; ++pass) {
             f.reset();
             for (int s = 0; s < n; s += chunk) f.run(tok.data() + s, std::min(chunk, n - s));
@@ -72,14 +78,18 @@ int main(int argc, char ** argv)
             TRUSS_CUDA(cudaStreamSynchronize(f.stream()));
             const runtime::ExpertStore::Stats st0 = f.experts()->stats();
             std::vector<double> ms;
+            int pos = n;
             for (int i = 0; i < steps; ++i) {
                 const auto t0 = std::chrono::steady_clock::now();
                 const int32_t t = *next_h;
-                f.run(&t, 1);
-                f.head(0, 1, logits);
-                sampling::argmax(logits, fam->n_vocab(), next_d, f.stream());
-                TRUSS_CUDA(cudaMemcpyAsync(next_h, next_d, 4, cudaMemcpyDeviceToHost, f.stream()));
-                TRUSS_CUDA(cudaStreamSynchronize(f.stream()));
+                if (use_graph) *next_h = gs->step(pos++, t, logits, next_d);
+                else {
+                    f.run(&t, 1);
+                    f.head(0, 1, logits);
+                    sampling::argmax(logits, fam->n_vocab(), next_d, f.stream());
+                    TRUSS_CUDA(cudaMemcpyAsync(next_h, next_d, 4, cudaMemcpyDeviceToHost, f.stream()));
+                    TRUSS_CUDA(cudaStreamSynchronize(f.stream()));
+                }
                 ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
             }
             std::vector<double> sorted = ms;

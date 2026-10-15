@@ -33,4 +33,8 @@ size_t gqa_workspace_bytes(const GqaShape & s, int max_T, int n_ctx);   // the s
 void gqa_attention(const GqaShape & s, const half * q16, const half * k_cache, const half * v_cache, int pos0, int T,
                    half * out16, void * ws, size_t ws_bytes, cudaStream_t stream);
 
+// B1: function addresses of the kernels taking pos0/splits by value (CUDA-graph per-step node updates)
+struct GqaKernelFns { void * prepare, * attn, * decode, * combine; };
+GqaKernelFns gqa_kernel_fns();
+
 }  // namespace truss::attn

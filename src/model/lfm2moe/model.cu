@@ -1,6 +1,7 @@
 #include "model/lfm2moe/model.h"
 
 #include "engine/stage.h"
+#include "kernels/attn/gqa.cuh"
 #include "kernels/dense/q8_gemm.cuh"
 #include "kernels/ffn/ffn_ops.cuh"
 
@@ -164,6 +165,17 @@ std::vector<engine::Stateful *> StageModel::states()
         if (attn_[i]) out.push_back(attn_[i].get());
     }
     return out;
+}
+
+// B1: GQA prepare (arg 6 of 11) and attention (arg 4 of 9) take pos0 by value; decode splits change every 128
+// cells, so a capture is optimal for its own 128-block (stale splits stay correct, TRACKER #168)
+engine::StageModel::GraphInfo StageModel::graph_info() const
+{
+    const attn::GqaKernelFns kf = attn::gqa_kernel_fns();
+    engine::StageModel::GraphInfo gi;
+    gi.pos_funcs = { { kf.prepare, 6, 11 }, { kf.decode, 4, 9 }, { kf.attn, 4, 9 } };
+    gi.epoch = [](int pos) { return pos / 128; };
+    return gi;
 }
 
 }  // namespace truss::lfm2moe

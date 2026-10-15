@@ -327,4 +327,16 @@ void gqa_attention(const GqaShape & s, const half * q16, const half * k_cache, c
     }
 }
 
+// B1 (TRACKER #167): addresses for graph-node identification (which nodes take pos0 by value). LFM-only file;
+// gated by gqa_attn_test. The kernels live in the anonymous namespace above; this accessor is in the same TU.
+GqaKernelFns gqa_kernel_fns()
+{
+    GqaKernelFns f;
+    f.prepare = (void *) prepare_kernel;
+    f.attn = (void *) attn_kernel;
+    f.decode = (void *) decode_kernel;
+    f.combine = (void *) combine_kernel;
+    return f;
+}
+
 }  // namespace truss::attn

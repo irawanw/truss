@@ -80,6 +80,7 @@ public:
     ExpertStore & store() { return *store_; }
     const ExpertStore & store() const { return *store_; }
     int n_hot() const { return n_hot_; }
+    bool all_resident() const { return all_resident_; }   // B1: every expert on the device, no CPU tier
     void * spare() { return store_->spare(); }
 
     // One MoE layer. logits [T][E] router output (the block computed it); pred_logits [T][E] the next store layer's

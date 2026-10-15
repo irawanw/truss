@@ -1,9 +1,12 @@
 // B1 probe: can one all-resident decode step (run T=1 + head + argmax + token copy-back) be captured as a
-// CUDA graph, replayed bit-for-bit vs eager, and how much faster is the replay? The graph replays the same step
-// (same pos0, same token-buffer address); multi-step replay with a new pos/token needs kernel-node param updates
-// (the follow-up). Pinned token/next buffers: the embed H2D node re-reads the pinned token at each launch.
+// CUDA graph and replayed bit-for-bit vs eager, and how much faster is it? Phase 1 captures raw and checks one
+// replay; phase 2 runs N steps through the engine's GraphStep (per-step pos0 refresh, token rewrite, re-capture
+// on epoch change) and requires token-identity with eager. Pinned token/next buffers: the embed H2D node re-reads
+// the pinned token at each launch. NOTE: use cudaGraphInstantiateWithFlags (the legacy 3-arg call segfaults in
+// libcuda on this box's cudart-11.0/lib setup, TRACKER #169).
 // usage: tk-bench-graph <model.gguf> [prompt=512] [steps=64] [n_ctx=65536] [chunk=8192]
 #include "core/cuda_check.h"
+#include "engine/graph_step.h"
 #include "kernels/sampling/argmax.cuh"
 #include "model/qwen4exp/config.h"
 #include "engine/model.h"
@@ -86,6 +89,7 @@ int main(int argc, char ** argv)
         f.restore();
         cudaGraph_t g;
         size_t nn = 0;
+        const double t_cap0 = now_ms();
         TRUSS_CUDA(cudaStreamBeginCapture(f.stream(), cudaStreamCaptureModeThreadLocal));
         f.run(tok_pinned, 1);
         f.head(0, 1, logits);
@@ -122,7 +126,9 @@ int main(int argc, char ** argv)
             std::printf("graph nodes: %zu (%ld kernel, %ld memcpy, %ld other)\n", nn, nker, nmem, nother);
         }
         cudaGraphExec_t e = nullptr;
-        TRUSS_CUDA(cudaGraphInstantiate(&e, g, 0));
+        const double t_inst0 = now_ms();
+        TRUSS_CUDA(cudaGraphInstantiateWithFlags(&e, g, 0));   // never the legacy 3-arg call (see header)
+        std::printf("capture %.1f ms, instantiate %.1f ms\n", t_inst0 - t_cap0, now_ms() - t_inst0);
         std::printf("captured %zu nodes (host pos now %d, device still at the checkpoint)\n", nn, f.position());
         f.restore();   // host position back to the checkpoint; the capture never executed on the device
         // replay once with the same token the capture ran with, compare bit-for-bit
@@ -144,38 +150,64 @@ int main(int argc, char ** argv)
         std::printf("eager next %d, graph next %d; logits words differ %zu/%d, max abs diff %g -> %s\n", tok_eager,
                     tok_graph, ndiff, vocab, maxabs, (tok_graph == tok_eager && ndiff == 0) ? "BIT-EXACT" : "MISMATCH");
         if (tok_graph != tok_eager || ndiff != 0) return 1;
-        // timing: eager steps (fresh states each pass) vs graph replays of the same baked step
-        std::vector<double> ms;
-        for (int pass = 0; pass < 3; ++pass) {
-            f.restore();
-            ms.clear();
-            for (int i = 0; i < steps; ++i) {
-                const double t0 = now_ms();
-                eager_step(f, tok_pinned, logits, vocab, next_d, next_h);
-                ms.push_back(now_ms() - t0);
-                *tok_pinned = *next_h;
-            }
-            std::sort(ms.begin(), ms.end());
-            double sum = 0;
-            for (double x : ms) sum += x;
-            std::printf("eager pass %d: mean %.3f ms (%.1f tok/s), median %.3f\n", pass, sum / steps,
-                        1e3 * steps / sum, ms[steps / 2]);
+        // Phase 2: the engine's GraphStep over N steps - exercises capture, per-step pos refresh, token rewrite
+        // and re-capture across the 128-block boundary. Token-identity with eager required in-block; past the
+        // boundary (stale splits stay correct but round differently) only the token sequence must match.
+        const int P = n;   // capture position (prompt length); block boundary above it
+        const int boundary = (P / 128 + 1) * 128;
+        const int N = steps;
+        // eager reference sequence
+        f.restore();
+        std::vector<int> tok_ref;
+        *tok_pinned = tok0;
+        double t_eager = 0;
+        for (int i = 0; i < N; ++i) {
+            const double t0 = now_ms();
+            eager_step(f, tok_pinned, logits, vocab, next_d, next_h);
+            t_eager += now_ms() - t0;
+            tok_ref.push_back(*next_h);
+            *tok_pinned = *next_h;
         }
-        for (int pass = 0; pass < 3; ++pass) {
-            f.restore();
-            ms.clear();
-            for (int i = 0; i < steps; ++i) {
-                const double t0 = now_ms();
-                TRUSS_CUDA(cudaGraphLaunch(e, f.stream()));
-                TRUSS_CUDA(cudaStreamSynchronize(f.stream()));
-                ms.push_back(now_ms() - t0);
-            }
-            std::sort(ms.begin(), ms.end());
-            double sum = 0;
-            for (double x : ms) sum += x;
-            std::printf("graph pass %d: mean %.3f ms (%.1f tok/s), median %.3f\n", pass, sum / steps,
-                        1e3 * steps / sum, ms[steps / 2]);
+        TRUSS_CUDA(cudaMemcpy(logits_eager.data(), logits, sizeof(float) * vocab, cudaMemcpyDeviceToHost));
+        // graph sequence through the engine class (device back at P via restore)
+        f.restore();
+        engine::GraphStep gs(f, vocab);
+        std::vector<int> tok_g2;
+        int tnext = tok0;
+        double t_graph = 0;
+        for (int i = 0; i < N; ++i) {
+            const double t0 = now_ms();
+            tnext = gs.step(P + i, tnext, logits, next_d);
+            t_graph += now_ms() - t0;
+            tok_g2.push_back(tnext);
         }
+        TRUSS_CUDA(cudaMemcpy(logits_graph.data(), logits, sizeof(float) * vocab, cudaMemcpyDeviceToHost));
+        int first_tok_diff = -1, n_tok_diff = 0, n_tok_diff_inblock = 0;
+        for (int i = 0; i < N; ++i) {
+            if (tok_g2[i] != tok_ref[i]) {
+                if (first_tok_diff < 0) first_tok_diff = i;
+                ++n_tok_diff;
+                if (P + i < boundary) ++n_tok_diff_inblock;
+            }
+        }
+        size_t ndiff2 = 0;
+        float maxabs2 = 0;
+        for (int i = 0; i < vocab; ++i) {
+            if (std::memcmp(&logits_graph[i], &logits_eager[i], 4)) {
+                ++ndiff2;
+                maxabs2 = std::max(maxabs2, std::abs(logits_graph[i] - logits_eager[i]));
+            }
+        }
+        std::printf("multi-step %d (pos %d..%d, boundary %d): tokens differ %d (in-block %d, first at step %d); "
+                    "final logits words differ %zu/%d maxabs %g\n",
+                    N, P, P + N - 1, boundary, n_tok_diff, n_tok_diff_inblock, first_tok_diff, ndiff2, vocab, maxabs2);
+        std::printf("eager %.3f ms/step, graph %.3f ms/step (%d captures)\n", t_eager / N, t_graph / N,
+                    gs.captures());
+        if (n_tok_diff_inblock != 0) {
+            std::printf("MISMATCH inside the capture block\n");
+            return 1;
+        }
+        std::printf("MULTI-STEP OK\n");
         TRUSS_CUDA(cudaGraphExecDestroy(e));
         TRUSS_CUDA(cudaGraphDestroy(g));
         return 0;

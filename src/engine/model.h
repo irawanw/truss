@@ -56,6 +56,15 @@ public:
 class StageModel {
 public:
     virtual ~StageModel() = default;
+    // B1: CUDA-graph decode support. A family whose decode kernels take position-dependent values (pos0, splits)
+    // by value describes them here; the engine's GraphStep captures one T=1 step and refreshes the values per
+    // call. Empty pos_funcs: graph mode unsupported (the caller runs eager).
+    struct GraphInfo {
+        struct PosFunc { void * func; int arg, nargs; };   // a kernel taking pos0 by value (arg-th of nargs args)
+        std::vector<PosFunc> pos_funcs;
+        std::function<int64_t(int pos)> epoch;   // re-capture when epoch(pos) changes (nullptr: capture once)
+    };
+    virtual GraphInfo graph_info() const { return {}; }
     // tensors to upload (stage.lin().add) and the ones linear's a16 scratch is not sized for; host_rows: a table kept
     // in pinned host memory (an untied embedding), nullptr: none
     virtual void add_tensors(Stage &) = 0;

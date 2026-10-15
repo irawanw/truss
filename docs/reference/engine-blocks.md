@@ -8,10 +8,11 @@ unchanged byte for byte (`tests/golden/`, 10 engine configurations, TRACKER #160
 
 | file | what |
 |---|---|
-| `model.h` | the family interface: `Family` (hyperparameters the engine needs, `stage(lb, le, n_ctx)`), `StageModel` (one stage's blocks: `add_tensors`, `moe_layers`, `scratch_bytes`, `build`, `bind_experts`, `embed`, `layers`, `head`, `states`, `table_stats`), `Drafter` (speculative drafts on the last stage), `Chunk`, `DrafterFiles`, `open_family()` (src/model/registry.cc) |
+| `model.h` | the family interface: `Family` (hyperparameters the engine needs, `stage(lb, le, n_ctx)`), `StageModel` (one stage's blocks: `add_tensors`, `moe_layers`, `scratch_bytes`, `build`, `bind_experts`, `embed`, `layers`, `head`, `states`, `table_stats`, `graph_info` (B1: the decode kernels taking pos0 by value + the re-capture epoch)), `Drafter` (speculative drafts on the last stage), `Chunk`, `DrafterFiles`, `open_family()` (src/model/registry.cc) |
 | `block.h` | `Stateful`: a block's per-slot state - `alloc_slots`, `reset`, `accept(slot, n, window)`, `commit(tokens)`, `ck_buffers` / `ck_save` / `ck_load`, `positional` (E6 lending) |
 | `stage.h`, `stage.cu`, `stage_seq.cu` | `Stage`: one device's layer range. Construction = the memory plan (dense weights, small buffers, blocks and their slot states, then the expert store takes the VRAM left, then the prompt buffers carved from its spare region). `run_chunk`, `head`, `accept`, `checkpoint` / `restore` / `reset`, `select` / `settle`, the stage lock and the layer-split hand-off |
-| `pipeline.h`, `pipeline.cu`, `pipeline_slots.cu`, `pipeline_stats.cu` | `Pipeline`: the public engine (one stage or a layer split). Selected-slot calls (`run`, `head`, `verify`/`accept`, `draft`, `reset`, `checkpoint`/`restore`), the concurrent slot calls `prompt()` (first stage a chunk ahead on its own thread, decode share) and `round()` (drafts, verify window over both stages, pick, accept; unwind on a throw), diagnostics summed over stages |
+| `pipeline.h`, `pipeline.cu`, `pipeline_slots.cu`, `pipeline_stats.cu` | `Pipeline`: the public engine (one stage or a layer split). Selected-slot calls (`run`, `head`, `verify`/`accept`, `draft`, `reset`, `checkpoint`/`restore`, `set_position` (B1: re-align the host cursor, graph mode)), the concurrent slot calls `prompt()` (first stage a chunk ahead on its own thread, decode share) and `round()` (drafts, verify window over both stages, pick, accept; unwind on a throw), diagnostics summed over stages (`split`, `all_resident`, `graph_info` for B1) |
+| `graph_step.h`, `graph_step.cu` | `GraphStep` (B1): one all-resident T=1 decode step (run + head + greedy argmax + token copy-back) as a reusable CUDA graph; per step refreshes pos0 in the model's pos-taking nodes (`cudaGraphExecKernelNodeSetParams`), rewrites the pinned token, launches + syncs; re-captures on the model's epoch change; requires no split, all experts resident, same logits/next_d addresses; always `cudaGraphInstantiateWithFlags` (the legacy 3-arg call segfaults, TRACKER #169) |
 | `options.h`, `options.cc` | `Options` (every engine knob, `MoeOptions` inside) and `apply_env` (all `TRUSS_*` knobs: one place) |
 | `gpu.h` | `Gpu`: a stage's device, stream, cuBLAS handle, current scratch, owned allocations |
 | `limits.h` | `FETCH_ROWS` (32): fetch vs stream chunks, row-invariant fp32 gemv size |
@@ -59,7 +60,7 @@ moe_kernels.h) and router outputs, never a model.
 
 | file | content |
 |---|---|
-| `moe_exec.h` | `MoeOptions`, `MoeLayer` (tables, model layer, `cpu_ok`, `next_in_stage`, `profiled`), `MoeExec` |
+| `moe_exec.h` | `MoeOptions`, `MoeLayer` (tables, model layer, `cpu_ok`, `next_in_stage`, `profiled`), `MoeExec`, `all_resident()` (B1) |
 | `moe_exec.cu` | construction (budget, hot-set plan, store, CPU tier, route trace, doorbells), `run()` dispatch (all-resident path: every expert on the device and no CPU tier -> the window kernel right after the routing, no doorbell / plan wait / hint; 10-15) + stream path + joins, adaptive tier, routing profile, E6 lending, stats |
 | `moe_paths.cu` | doorbell path (publish, job, shared expert while the driver plans, plan wait, window), fetch path (one sync, CPU split, fetch + hint), split path (E7) |
 | `moe_driver.cu` | `setup_doorbells`, the driver thread loop, watchdog (`TRUSS_DRIVER_DEBUG`) |
