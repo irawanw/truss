@@ -103,7 +103,8 @@ public:
         void * moe_ws;
         int moe_rows;
         RouteFn route;
-        bool fused_route_ok;                    // route == softmax top-k: the fused route_publish may replace it
+        bool fused_route_ok;                    // route == softmax top-k: the fused route+publish may replace it
+        bool pre_routed = false;                // the block already routed (a fused projection+route): skip route()
         std::function<void()> shared;
     };
     void run(const Call & c);
@@ -112,6 +113,9 @@ public:
     {
         return !stream && !all_resident_ && o_.hint_k > 0 && layers_[sl].next_in_stage && T >= o_.hint_min_rows;
     }
+    // B2: one zeroed device word for the fused lone-router kernel's CTA counter (same-stream launches share it by
+    // ordering; the kernel resets it, so it is graph-safe)
+    unsigned * route_arrive() { return route_arrive_; }
 
     // between passes
     void begin_ring() { store_->begin_ring(); }
@@ -177,6 +181,7 @@ private:
     int n_hot_ = 0;
     bool all_resident_ = false;   // every expert of the stage on the device, no CPU tier: decode needs no copy plan
     void * window_ws_ = nullptr;
+    unsigned * route_arrive_ = nullptr;   // B2: the fused lone-router kernel's self-resetting CTA counter
     int * ids_host_ = nullptr;                  // pinned: routing + prediction of a fetch chunk
     int cpu_rows_ = 0;                          // rows of the CPU tier call in flight
     // a split's stages share the CPU pool and may run prompt chunks at once: one call at a time, held from start()

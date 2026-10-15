@@ -49,7 +49,14 @@ void Moe::forward(engine::Gpu & g, const float * in, const half * in16, int T, f
     // fp32 rows: one launch at decode sizes
     const bool hint = next_ && exec_.wants_hint(sl_, T, stream);
     float * pl = hint ? sc.alloc((size_t) T * E) : nullptr;
-    {
+    // B2: the lone-router fast path (one T == 1 row, nothing batched with it): projection + route in one launch,
+    // bit-identical logits/ids/wts. Anything else (shared gate, hint, prefill/verify rows) keeps the old path.
+    const bool fuse_route = T == 1 && !has_shared && !hint && dm >= 2048 && dm % 128 == 0 && E % 32 == 0 && E <= 1024
+                            && K <= 32 && K <= E && route_ == route_sigmoid_bias;
+    if (fuse_route) {
+        ffn::route_sigmoid_gemv(lin_.f32(w_.router), dm, w_.exp_bias ? lin_.f32(w_.exp_bias) : nullptr, in, E, K,
+                                logits, ids, wts, exec_.route_arrive(), g.s);
+    } else {
         std::vector<Linear::Proj> ps{ { w_.router, logits } };
         if (has_shared) ps.push_back({ w_.shexp_gate_inp, sg });
         if (hint) ps.push_back({ next_->router, pl });
@@ -58,7 +65,7 @@ void Moe::forward(engine::Gpu & g, const float * in, const half * in16, int T, f
     const float * bias = w_.exp_bias ? lin_.f32(w_.exp_bias) : nullptr;
     const float * pbias = hint && next_->exp_bias ? lin_.f32(next_->exp_bias) : nullptr;
     runtime::MoeExec::Call c{ sl_, in, T, logits, pl, bias, pbias, ids, wts, has_shared ? routed : out, stream, moe_ws, moe_rows,
-                              route_, softmax_, has_shared ? std::function<void()>(shared) : std::function<void()>() };
+                              route_, softmax_, fuse_route, has_shared ? std::function<void()>(shared) : std::function<void()>() };
     exec_.run(c);
     if (has_shared) ffn::shared_add(routed, y, sg, T, dm, out, g.s);
     sc.release(m);

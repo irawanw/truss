@@ -22,6 +22,13 @@ void route(const float * logits, int T, int E, int k, int * ids, float * wts, cu
 void route_sigmoid(const float * logits, const float * bias, int T, int E, int k, bool renorm, float scale, int * ids,
                    float * wts, cudaStream_t stream);
 
+// The lone-router fast path (route_sigmoid.cu): W [E][in] fp32 router x row x [in] plus the route_sigmoid tail in
+// one launch (T == 1, in >= 2048 and a multiple of 128, same E / k gate as route_sigmoid). Logits, ids, wts are
+// bit-identical to f32_gemv + route_sigmoid(true, 1). arrive is a zeroed device word, one per caller, reset by the
+// kernel (route_publish's pattern); shared across same-stream launches by ordering.
+void route_sigmoid_gemv(const float * W, int in, const float * bias, const float * x, int E, int k, float * logits,
+                        int * ids, float * wts, unsigned * arrive, cudaStream_t stream);
+
 // The publish of a doorbell decode FFN folded into its routing (runtime/doorbell.cuh's publish, three launches
 // today): one kernel computes this layer's top-k into ids/wts (device) and the next layer's predicted top-k
 // (pred_logits, null without the pre-gating hint), writes ids/weights/prediction to the mapped host buffers

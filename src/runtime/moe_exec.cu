@@ -23,6 +23,7 @@ MoeExec::MoeExec(engine::Gpu & g, const MoeKernels & k, std::vector<MoeLayer> la
     require(k_.topk == K_, "expert kernels' top-k differs from the model's");
     (void) max_rows;
     window_ws_ = g_.alloc<unsigned char>(k_.window_ws());
+    route_arrive_ = g_.alloc<unsigned>(1);   // B2: the fused lone-router kernel's self-resetting CTA counter (zeroed)
     k_.window_init(window_ws_, g_.s);
     TRUSS_CUDA(cudaMallocHost(&ids_host_, sizeof(int) * 2 * std::max(engine::FETCH_ROWS, o_.split_rows) * K_));
     std::vector<ExpertLayer> tables;
@@ -145,7 +146,7 @@ void MoeExec::run(const Call & c)
     const bool cpu_on = cpu_tier_ && layers_[l].cpu_ok;
     static const bool route_publish = [] { const char * e = std::getenv("TRUSS_ROUTE_PUBLISH"); return e && std::atoi(e); }();
     const bool fused = door && route_publish && c.fused_route_ok;
-    if (!fused) c.route(c.logits, c.bias, T, E_, K_, c.ids, c.wts, g_.s);   // the fused launch does the top-k itself
+    if (!fused && !c.pre_routed) c.route(c.logits, c.bias, T, E_, K_, c.ids, c.wts, g_.s);   // fused launches do it
     if (route_counts_) ffn::count(c.ids, T * K_, route_counts_ + (size_t) l * E_, g_.s);
     bool shared_done = false;
     auto shared = [&] {

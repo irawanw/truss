@@ -10,7 +10,10 @@ NEOX rope base 1e7); d_model 2048; layers 0-1 dense SwiGLU (11,776), layers 2-39
 sigmoid + expert-bias router, renormalized, no shared expert); vocab 128,000, head tied to token_embd; RMSNorm eps 1e-5.
 One rope table per `layers()` call (B2): `attn::gqa_rope_table` builds the chunk's [T][32] (cos, sin) once in fp64 and
 every attention layer's prepare reads it instead of its own inline trig (bit-identical); `graph_info()` names the four
-pos-taking node kinds (prepare arg 6/12, rope_table 1/4, decode/attn 4/9, epoch pos/128).
+pos-taking node kinds (prepare arg 6/12, rope_table 1/4, decode/attn 4/9, epoch pos/128). Lone-router fast path (B2):
+`ffn::route_sigmoid_gemv` (the f32 projection + the sigmoid/bias/top-4/renorm tail in one launch, last-CTA epilogue on
+a self-resetting word from `MoeExec::route_arrive()`), used by `blocks::Moe` for a single T == 1 row with nothing
+batched with it; `MoeExec::Call::pre_routed` tells the runtime the route is done. Bit-identical logits/ids/wts.
 
 ## Files
 

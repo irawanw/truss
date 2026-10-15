@@ -5,6 +5,7 @@
 //   ffn::route_sigmoid (64 experts, top 4, bias; ids exact, weights rel 1e-6)
 // Outputs NaN-filled before each call. usage: lfm_small_ops_test
 #include "kernels/conv/short_conv.cuh"
+#include "kernels/dense/q8_gemm.cuh"
 #include "kernels/ffn/ffn_ops.cuh"
 #include "kernels/norm/rms_norm.cuh"
 
@@ -13,6 +14,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <numeric>
 #include <random>
 #include <vector>
@@ -165,6 +167,40 @@ void test_route()
     report("ffn::route_sigmoid weights", rel(rw, gws), 1e-6);
 }
 
+// B2: route_sigmoid_gemv (fused lone-router projection + route, T == 1) must be bit-identical to f32_gemv +
+// route_sigmoid: the same WPO=2 arithmetic, the same tail. Words compared exactly (routing flips on last bits).
+void test_route_fused()
+{
+    const int cases[][2] = { { 64, 2048 }, { 256, 2048 } };
+    for (const auto & c : cases) {
+        const int E = c[0], in = c[1], k = 4;
+        const float *dW = up(randn((size_t) E * in)), *dbias = up(randn(E)), *dx = up(randn(in));
+        float *lg_a = nanbuf<float>(E), *lg_b = nanbuf<float>(E);
+        int *ida = nanbuf<int>(k), *idb = nanbuf<int>(k);
+        float *wta = nanbuf<float>(k), *wtb = nanbuf<float>(k);
+        unsigned * arrive;
+        TRUSS_CUDA(cudaMalloc(&arrive, sizeof(unsigned)));
+        TRUSS_CUDA(cudaMemset(arrive, 0, sizeof(unsigned)));
+        truss::dense::f32_gemv(dW, in, E, dx, 1, lg_a, nullptr);
+        truss::ffn::route_sigmoid(lg_a, dbias, 1, E, k, true, 1.f, ida, wta, nullptr);
+        truss::ffn::route_sigmoid_gemv(dW, in, dbias, dx, E, k, lg_b, idb, wtb, arrive, nullptr);
+        TRUSS_CUDA(cudaDeviceSynchronize());
+        const std::vector<float> ga = down(lg_a, E), gb = down(lg_b, E);
+        const std::vector<int> ia = down(ida, k), ib = down(idb, k);
+        const std::vector<float> wa = down(wta, k), wb = down(wtb, k);
+        size_t nd = 0;
+        for (int i = 0; i < E; ++i) nd += std::memcmp(&ga[i], &gb[i], 4) != 0;
+        for (int i = 0; i < k; ++i)
+            nd += std::memcmp(&ia[i], &ib[i], 4) != 0 || std::memcmp(&wa[i], &wb[i], 4) != 0;
+        char name[64];
+        std::snprintf(name, sizeof name, "ffn::route_sigmoid_gemv E %d words differ", E);
+        std::printf("%-44s %zu  %s\n", name, nd, nd ? "FAIL" : "PASS");
+        fails += nd != 0;
+        cudaFree((void *) dW), cudaFree((void *) dbias), cudaFree((void *) dx);
+        cudaFree(lg_a), cudaFree(lg_b), cudaFree(ida), cudaFree(idb), cudaFree(wta), cudaFree(wtb), cudaFree(arrive);
+    }
+}
+
 }  // namespace
 
 int main()
@@ -172,6 +208,7 @@ int main()
     test_rms();
     test_conv();
     test_route();
+    test_route_fused();
     std::printf("%s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
 }
