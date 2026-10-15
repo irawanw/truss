@@ -1,7 +1,7 @@
 // Timeline of one MoE window launch from the kernel's own trace (truss::moe::TraceEvent): where the time goes
 // between dependency waits, the three item kinds, and the tail. Random trellis weights; correctness is the unit
 // test's job (tests/unit/moe_window_test).
-// usage: tk-bench-moe-trace [n_rows] [K: 0 = mixed 1..4]
+// usage: tk-bench-moe-trace [n_rows] [K: 0 = mixed 1..4] [shape: 0 = FlashNext, 1 = Lfm2]
 #include "kernels/moe/moe_window.cuh"
 
 #include <algorithm>
@@ -13,7 +13,6 @@
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { printf("CUDA %s at %d\n", cudaGetErrorString(e_), __LINE__); exit(1); } } while (0)
 
-using Shape = truss::moe::FlashNext;
 using truss::moe::TraceEvent;
 
 __global__ void fill_random(uint32_t * p, size_t n, uint32_t seed)
@@ -31,32 +30,47 @@ __global__ void fill_scale(half * p, size_t n)
         p[i] = __float2half((i & 1) ? 0.03f : -0.04f);
 }
 
-int main(int argc, char ** argv)
+template <class Shape> int run(int n_rows, int kfix, int E, int flush_mb)
 {
-    const int n_rows = argc > 1 ? atoi(argv[1]) : 4, kfix = argc > 2 ? atoi(argv[2]) : 2;
-    const int D = Shape::D_MODEL, F = Shape::D_FF, TOPK = Shape::TOPK, E = 512;
-    truss::moe::Weights W;
-    W.n_expert = E;
+    const int D = Shape::D_MODEL, F = Shape::D_FF, TOPK = Shape::TOPK;
+    // B3: cycle weight copies (default ~96 MB total): one copy stays L2-hot like a microbench; cycling > L2 streams
+    // from VRAM like a full-model decode step (each layer's experts evict the last). argv[4] = MB, 0 = one copy.
+    struct ProjCopy { uint16_t * tr; int32_t * dm; half *suh, *svh; };
+    std::vector<std::vector<int32_t>> metas(3);
+    size_t copy_bytes = 0;
     for (int p = 0; p < 3; ++p) {
         const int in = p == 2 ? F : D, out = p == 2 ? D : F;
-        std::vector<int32_t> meta(2 * E);
+        metas[p].resize(2 * E);
         size_t words = 0;
         for (int e = 0; e < E; ++e) {
-            meta[2 * e] = kfix ? kfix : 1 + (e + p) % 4;
-            meta[2 * e + 1] = (int32_t) words;
-            words += (size_t) in * out * meta[2 * e] / 16;
+            metas[p][2 * e] = kfix ? kfix : 1 + (e + p) % 4;
+            metas[p][2 * e + 1] = (int32_t) words;
+            words += (size_t) in * out * metas[p][2 * e] / 16;
         }
-        uint16_t * tr; int32_t * dm; half *suh, *svh;
-        CK(cudaMalloc(&tr, words * 2));
-        fill_random<<<1024, 256>>>((uint32_t *) tr, words / 2, 17u + p);
-        CK(cudaMalloc(&dm, meta.size() * 4));
-        CK(cudaMemcpy(dm, meta.data(), meta.size() * 4, cudaMemcpyHostToDevice));
-        CK(cudaMalloc(&suh, (size_t) E * in * 2));
-        CK(cudaMalloc(&svh, (size_t) E * out * 2));
-        fill_scale<<<1024, 256>>>(suh, (size_t) E * in);
-        fill_scale<<<1024, 256>>>(svh, (size_t) E * out);
-        W.proj[p] = { tr, dm, suh, svh };
+        copy_bytes += words * 2 + metas[p].size() * 4 + (size_t) E * in * 2 + (size_t) E * out * 2;
     }
+    const int copies = flush_mb <= 0 ? 1 : std::max(2, (int) ((size_t) flush_mb * 1048576 / copy_bytes + 1));
+    std::vector<truss::moe::Weights> Wc(copies);
+    for (int c = 0; c < copies; ++c) {
+        Wc[c].n_expert = E;
+        for (int p = 0; p < 3; ++p) {
+            const int in = p == 2 ? F : D, out = p == 2 ? D : F;
+            size_t words = 0;
+            for (int e = 0; e < E; ++e)
+                words += (size_t) in * out * (kfix ? kfix : 1 + (e + p) % 4) / 16;
+            uint16_t * tr; int32_t * dm; half *suh, *svh;
+            CK(cudaMalloc(&tr, words * 2));
+            fill_random<<<1024, 256>>>((uint32_t *) tr, words / 2, 17u + p);
+            CK(cudaMalloc(&dm, metas[p].size() * 4));
+            CK(cudaMemcpy(dm, metas[p].data(), metas[p].size() * 4, cudaMemcpyHostToDevice));
+            CK(cudaMalloc(&suh, (size_t) E * in * 2));
+            CK(cudaMalloc(&svh, (size_t) E * out * 2));
+            fill_scale<<<1024, 256>>>(suh, (size_t) E * in);
+            fill_scale<<<1024, 256>>>(svh, (size_t) E * out);
+            Wc[c].proj[p] = { tr, dm, suh, svh };
+        }
+    }
+    truss::moe::Weights & W0 = Wc[0];
     // routing like a verify window: distinct experts per row, some reuse of the previous row
     std::mt19937 rng(4321);
     std::vector<int> ids(n_rows * TOPK);
@@ -80,18 +94,18 @@ int main(int argc, char ** argv)
     CK(cudaMalloc(&d_tr, sizeof(TraceEvent) * truss::moe::MAX_TRACE_EVENTS));
     truss::moe::workspace_init<Shape>(ws, 0);
 
-    // warm, then time untraced and traced launches
-    for (int r = 0; r < 20; ++r) truss::moe::window<Shape>(W, d_x, d_ids, d_w, n_rows, d_out, ws, 0);
+    // warm, then time untraced and traced launches (timing cycles the copies: VRAM-streaming like decode)
+    for (int r = 0; r < 20; ++r) truss::moe::window<Shape>(Wc[r % copies], d_x, d_ids, d_w, n_rows, d_out, ws, 0);
     cudaEvent_t e0, e1;
     CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
     CK(cudaEventRecord(e0));
-    for (int r = 0; r < 100; ++r) truss::moe::window<Shape>(W, d_x, d_ids, d_w, n_rows, d_out, ws, 0);
+    for (int r = 0; r < 100; ++r) truss::moe::window<Shape>(Wc[r % copies], d_x, d_ids, d_w, n_rows, d_out, ws, 0);
     CK(cudaEventRecord(e1));
     CK(cudaEventSynchronize(e1));
     float ms;
     CK(cudaEventElapsedTime(&ms, e0, e1));
     CK(cudaMemset(d_tr, 0, sizeof(TraceEvent) * truss::moe::MAX_TRACE_EVENTS));
-    truss::moe::window<Shape>(W, d_x, d_ids, d_w, n_rows, d_out, ws, 0, d_tr);
+    truss::moe::window<Shape>(W0, d_x, d_ids, d_w, n_rows, d_out, ws, 0, d_tr);
     CK(cudaDeviceSynchronize());
     std::vector<TraceEvent> tr(truss::moe::MAX_TRACE_EVENTS);
     CK(cudaMemcpy(tr.data(), d_tr, sizeof(TraceEvent) * tr.size(), cudaMemcpyDeviceToHost));
@@ -142,4 +156,12 @@ int main(int argc, char ** argv)
     printf("  blocks %d: busy %.0f%% of span; block finish times p10 %.1f, p50 %.1f, p90 %.1f, max %.1f us\n", nb,
            100.0 * busy / (nb * (t1 - t0) / 1e3), ends[nb / 10], ends[nb / 2], ends[nb * 9 / 10], ends.back());
     return 0;
+}
+
+int main(int argc, char ** argv)
+{
+    const int n_rows = argc > 1 ? atoi(argv[1]) : 4, kfix = argc > 2 ? atoi(argv[2]) : 2;
+    const int flush_mb = argc > 4 ? atoi(argv[4]) : 96;
+    if (argc > 3 && atoi(argv[3]) == 1) return run<truss::moe::Lfm2>(n_rows, kfix, 64, flush_mb);
+    return run<truss::moe::FlashNext>(n_rows, kfix, 512, flush_mb);
 }

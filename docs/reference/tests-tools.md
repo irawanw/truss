@@ -18,7 +18,7 @@ BASE = /mnt/hdd/ml/flashnext/20260920_dense_codec_requant/data/20260923_q4k_rete
 
 | binary | checks | gate | run |
 |---|---|---|---|
-| `moe_window_test` | `moe::window` vs llama-paw's unfused PAW X3 chain, random trellis weights (all K or `TRUSS_KFIX`); timing in a CUDA graph | rel within llama's own rounding | `moe_window_test [rows...]` |
+| `moe_window_test` | `moe::window` vs llama-paw's unfused PAW X3 chain, random trellis weights (all K or `TRUSS_KFIX`); Flash-Next rows plus Lfm2 rows (B3: the Lfm2 shape had no coverage); timing in a CUDA graph | rel within llama's own rounding | `moe_window_test [rows...]` |
 | `moe_prefill_test` | `moe::prefill` vs `moe::window` 8 rows at a time; row prefix invariance; TFLOPS | rel ≤ 5e-3, worst token ≤ 2e-2, prefix bit-identical | `moe_prefill_test [T...]` (default 64 512 2048 8192) |
 | `q8_gemm_test` | 8 dense shapes: q8_gemm vs ref LLAMA, a16 vs ref FP32, gemv vs q8_gemm; a16 prefix variance; timings | 1e-5 / 3e-4 / 1e-6 | `q8_gemm_test [timing rows]` |
 | `gdn_prefill_test` | `gdn::delta_rule` vs `ref::gated_delta_rule` (outputs and final state) | 1e-5 | `gdn_prefill_test [T...]` |
@@ -57,7 +57,7 @@ BASE = /mnt/hdd/ml/flashnext/20260920_dense_codec_requant/data/20260923_q4k_rete
 | `tk-profile` (`tools/tk-bench/profile.cu`) | routing profile for the hot set (the calibration step): prompts (`@ids.i32`) + greedy generated tokens through the engine, counts every routed (layer, expert), writes the usage file | `tk-profile $M out.f32 256 @p0.i32 @p1.i32 ...` (profile prompts: `20260930_truss_tg/data/profile_prompts/`, held out from the bench) |
 | `tk-bench-spec` (`tools/tk-bench/spec.cu`) | MTP speculative greedy decode vs plain greedy on the full model: token sequences must be identical (exit 1 otherwise); tok/s both ways, tokens per pass, drafts accepted, experts fetched per pass; env `TRUSS_CPU_TRELLIS`, `TRUSS_CPU_DYNAMIC`, `TRUSS_CPU_THREADS`, `TRUSS_CPU_SHARE`, `TRUSS_PCIE_GBPS`, `TRUSS_RING_GB`, `TRUSS_HINT_K` (pre-gated prefetch width) | `tk-bench-spec $M $MTP @prompt.i32 [tokens=128] [drafts=3] [usage\|-]`; MTP = `20260930_truss_tg/data/mtp_x3/flashnext-mtp-x3k3.gguf` |
 | `tk-bench-ceiling` |
-| `tk-bench-moe-trace` | timeline of one `moe::window` launch from the kernel's own trace | `tk-bench-moe-trace [rows] [K]` |
+| `tk-bench-moe-trace` | timeline of one `moe::window` launch from the kernel's own trace (B3: shape 0 = FlashNext / 1 = Lfm2; K = rate incl. frac 25/35; 4th arg = weight-copy MB cycled so launches stream from VRAM like decode) | `tk-bench-moe-trace [rows] [K] [shape] [MB]` |
 | `tk-parity-kl` (`tools/tk-parity/kl_vs_base.cu`) | full-model KL / top-1 / perplexity vs a llama-perplexity `--kl-divergence-base` file; `step` > 0 scores the second half of each chunk in runs of `step` tokens (≤ 32: the decode path with fetch, ring and CPU tier) | `tk-parity-kl $M $BASE [chunks] [first] [q8\|fp16] [step] [usage\|-] [cpu dir\|-]` (~8 s per 2048-token chunk) |
 | `tk-parity-llama-dump` | llama-paw activations for parity (one ubatch, every row an output) from a prompt or `@ids.i32` | `tk-parity-llama-dump $S out_dir "<prompt>"` or `@file.i32` |
 | `slice_gguf.py` | cut an N-layer slice of a GGUF (hard-links the PLE shard) | `python3 tools/tk-parity/slice_gguf.py ...` |

@@ -1,6 +1,7 @@
 // truss::moe::window: correctness vs llama-paw's unfused PAW_X3 chain (mm_id gate/up -> swiglu -> mm_id down ->
 // moe_reduce) on the same random trellis weights, and timing inside a CUDA graph.
-// Shape: Flash-Next layer (2560 x 640, 512 experts, top-10). Env: TRUSS_KFIX (0 = mixed 1..4), TRUSS_REPS.
+// Shapes: Flash-Next layer (2560 x 640, 512 experts, top-10) and Lfm2 (2048 x 1536, 64 experts, top-4, B3: covers
+// the per-128-column mid pieces at decode rows). Env: TRUSS_KFIX (0 = mixed 1..4), TRUSS_REPS.
 // usage: moe_window_test [n_rows ...]
 #include "kernels/moe/moe_window.cuh"
 
@@ -17,14 +18,16 @@
 #include <string>
 #include <vector>
 
-using Shape = truss::moe::FlashNext;
+using truss::moe::FlashNext;
+using truss::moe::Lfm2;
 
 static int64_t env_int(const char * n, int64_t d) { const char * e = getenv(n); return e ? atoll(e) : d; }
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { printf("CUDA %s at %d\n", cudaGetErrorString(e_), __LINE__); exit(1); } } while (0)
 
-static int run_case(ggml_backend_t backend, int64_t n_tokens, std::mt19937 & rng, void * ws)
+template <class Shape>
+static int run_shape(ggml_backend_t backend, int64_t n_tokens, int64_t n_expert, std::mt19937 & rng, void * ws)
 {
-    const int64_t n_embd = Shape::D_MODEL, n_ff = Shape::D_FF, n_expert = 512, n_used = Shape::TOPK;
+    const int64_t n_embd = Shape::D_MODEL, n_ff = Shape::D_FF, n_used = Shape::TOPK;
     ggml_init_params ip = { ggml_tensor_overhead() * 64 + ggml_graph_overhead() * 3, NULL, true };
     ggml_context * ctx = ggml_init(ip);
 
@@ -191,10 +194,14 @@ int main(int argc, char ** argv)
     if (rows.empty()) rows = { 1, 2, 4, 5, 8 };
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     void * ws;
-    CK(cudaMalloc(&ws, truss::moe::workspace_bytes<Shape>()));
+    CK(cudaMalloc(&ws, std::max(truss::moe::workspace_bytes<FlashNext>(), truss::moe::workspace_bytes<Lfm2>())));
     std::mt19937 rng(4321);
     int fails = 0;
-    for (int64_t n : rows) fails += run_case(backend, n, rng, ws);
+    for (int64_t n : rows) fails += run_shape<FlashNext>(backend, n, 512, rng, ws);
+    for (int64_t n : rows) {
+        if (n > truss::moe::MAX_ROWS) continue;
+        fails += run_shape<Lfm2>(backend, n, 64, rng, ws);
+    }
     printf("%s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
 }
