@@ -27,14 +27,18 @@ struct GqaShape {   // runtime shape; D must be 64 (static_assert in the kernels
 
 // k_cache / v_cache [n_ctx][HKV][D] fp16
 void gqa_prepare(const GqaShape & s, const float * q, const float * k, const float * v, const float * q_norm,
-                 const float * k_norm, int pos0, int T, half * q16, half * k_cache, half * v_cache, cudaStream_t stream);
+                 const float * k_norm, int pos0, int T, half * q16, half * k_cache, half * v_cache, cudaStream_t stream,
+                 const float2 * tab = nullptr);   // tab [T][32] (cos, sin) per row: skips the fp64 trig (B2)
+
+// [T][32] (cos, sin) of NEOX angles in fp64, bit-identical to prepare's inline computation (B2)
+void gqa_rope_table(float rope_base, int pos0, int T, float2 * tab, cudaStream_t stream);
 
 size_t gqa_workspace_bytes(const GqaShape & s, int max_T, int n_ctx);   // the split-cells partials (0 if none)
 void gqa_attention(const GqaShape & s, const half * q16, const half * k_cache, const half * v_cache, int pos0, int T,
                    half * out16, void * ws, size_t ws_bytes, cudaStream_t stream);
 
 // B1: function addresses of the kernels taking pos0/splits by value (CUDA-graph per-step node updates)
-struct GqaKernelFns { void * prepare, * attn, * decode, * combine; };
+struct GqaKernelFns { void * prepare, * attn, * decode, * combine, * rope_table; };
 GqaKernelFns gqa_kernel_fns();
 
 }  // namespace truss::attn

@@ -33,8 +33,10 @@ public:
         return qd * (4 + 2 + 2) + kd * 8 + (size_t) (d + d / 16) * 2;
     }
     static size_t scratch_fixed(const attn::GqaShape & s, int T, int n_ctx) { return attn::gqa_workspace_bytes(s, T, n_ctx); }
-    // in16 [T][d] (normed) at positions pos0 .. -> out [T][d]
-    void forward(engine::Gpu & g, int slot, const half * in16, int pos0, int T, float * out);
+    // in16 [T][d] (normed) at positions pos0 .. -> out [T][d]; tab [T][32]: the shared rope table (B2),
+    // or nullptr for the inline trig
+    void forward(engine::Gpu & g, int slot, const half * in16, int pos0, int T, float * out,
+                 const float2 * tab = nullptr);
 
     void alloc_slots(engine::Stage & st, int n_slots, int seq_ctx, int spec_rows) override;
     void positional(std::vector<Positional> & out) const override;

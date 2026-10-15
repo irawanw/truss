@@ -9,6 +9,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -131,6 +132,48 @@ int main()
         fails += !ok;
         std::printf("pos0 %5d T %4d: rel %.2e %s, %.3f ms  %s\n", pos0, T, rel, nan ? "(NaN!)" : "", ms, ok ? "PASS" : "FAIL");
         cudaFree(dq), cudaFree(dk), cudaFree(dv), cudaFree(q16), cudaFree(out16);
+    }
+    // B2: the rope-table path must be bit-identical to the inline trig (same fp64 expression, computed once)
+    const int tab_cases[][2] = { { 5096, 1 }, { 5097, 4 } };
+    for (const auto & c : tab_cases) {
+        const int pos0 = c[0], T = c[1];
+        const std::vector<float> q = randn((size_t) T * H * D, rng), k = randn((size_t) T * HKV * D, rng),
+                                 v = randn((size_t) T * HKV * D, rng);
+        float * dq = up(q), * dk = up(k), * dv = up(v);
+        half * q16a, * q16b, * kca, * kcb, * vca, * vcb;
+        float2 * tab;
+        TRUSS_CUDA(cudaMalloc(&q16a, sizeof(half) * T * H * D));
+        TRUSS_CUDA(cudaMalloc(&q16b, sizeof(half) * T * H * D));
+        TRUSS_CUDA(cudaMalloc(&kca, sizeof(half) * n_ctx * HKV * D));
+        TRUSS_CUDA(cudaMalloc(&kcb, sizeof(half) * n_ctx * HKV * D));
+        TRUSS_CUDA(cudaMalloc(&vca, sizeof(half) * n_ctx * HKV * D));
+        TRUSS_CUDA(cudaMalloc(&vcb, sizeof(half) * n_ctx * HKV * D));
+        TRUSS_CUDA(cudaMalloc(&tab, sizeof(float2) * T * 32));
+        TRUSS_CUDA(cudaMemset(kca, 0, sizeof(half) * n_ctx * HKV * D));
+        TRUSS_CUDA(cudaMemset(kcb, 0, sizeof(half) * n_ctx * HKV * D));
+        TRUSS_CUDA(cudaMemset(vca, 0, sizeof(half) * n_ctx * HKV * D));
+        TRUSS_CUDA(cudaMemset(vcb, 0, sizeof(half) * n_ctx * HKV * D));
+        truss::attn::gqa_prepare(s, dq, dk, dv, d_qn, d_kn, pos0, T, q16a, kca, vca, nullptr);
+        truss::attn::gqa_rope_table(1e7f, pos0, T, tab, nullptr);
+        truss::attn::gqa_prepare(s, dq, dk, dv, d_qn, d_kn, pos0, T, q16b, kcb, vcb, nullptr, tab);
+        TRUSS_CUDA(cudaDeviceSynchronize());
+        std::vector<half> ga((size_t) T * H * D), gb((size_t) T * H * D);
+        TRUSS_CUDA(cudaMemcpy(ga.data(), q16a, ga.size() * sizeof(half), cudaMemcpyDeviceToHost));
+        TRUSS_CUDA(cudaMemcpy(gb.data(), q16b, gb.size() * sizeof(half), cudaMemcpyDeviceToHost));
+        const size_t cells = (size_t) T * HKV * D;
+        std::vector<half> ka(cells), kb(cells), va(cells), vb(cells);
+        TRUSS_CUDA(cudaMemcpy(ka.data(), kca + (size_t) pos0 * HKV * D, cells * sizeof(half), cudaMemcpyDeviceToHost));
+        TRUSS_CUDA(cudaMemcpy(kb.data(), kcb + (size_t) pos0 * HKV * D, cells * sizeof(half), cudaMemcpyDeviceToHost));
+        TRUSS_CUDA(cudaMemcpy(va.data(), vca + (size_t) pos0 * HKV * D, cells * sizeof(half), cudaMemcpyDeviceToHost));
+        TRUSS_CUDA(cudaMemcpy(vb.data(), vcb + (size_t) pos0 * HKV * D, cells * sizeof(half), cudaMemcpyDeviceToHost));
+        size_t nd = 0;
+        for (size_t i = 0; i < ga.size(); ++i) nd += std::memcmp(&ga[i], &gb[i], 2) != 0;
+        for (size_t i = 0; i < cells; ++i)
+            nd += std::memcmp(&ka[i], &kb[i], 2) != 0 || std::memcmp(&va[i], &vb[i], 2) != 0;
+        std::printf("rope-tab pos0 %d T %d: %zu words differ -> %s\n", pos0, T, nd, nd ? "FAIL" : "PASS");
+        fails += nd != 0;
+        cudaFree(dq), cudaFree(dk), cudaFree(dv);
+        cudaFree(q16a), cudaFree(q16b), cudaFree(kca), cudaFree(kcb), cudaFree(vca), cudaFree(vcb), cudaFree(tab);
     }
     std::printf("%s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;

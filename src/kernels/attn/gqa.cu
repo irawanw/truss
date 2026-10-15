@@ -21,9 +21,11 @@ constexpr int MAX_PART_ROWS = 1024;   // splits x T bound: the partials workspac
 constexpr int SPLIT_ROWS = 32;   // chunks up to this many rows split their cells across CTAs
 
 // ---- prepare: one warp per (row, head slot); slots [0, H) q, [H, H + HKV) k, [H + HKV, H + 2 HKV) v
+// tab [T][32]: the row's (cos, sin) per lane, built once per step for all layers (B2); nullptr: compute inline
 __global__ void prepare_kernel(GqaShape s, const float * __restrict__ q, const float * __restrict__ k,
                                const float * __restrict__ v, const float * __restrict__ qn, const float * __restrict__ kn,
-                               int pos0, int T, half * __restrict__ q16, half * __restrict__ kc, half * __restrict__ vc)
+                               int pos0, int T, half * __restrict__ q16, half * __restrict__ kc, half * __restrict__ vc,
+                               const float2 * __restrict__ tab)
 {
     const int slots = s.H + 2 * s.HKV;
     const int w = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x & 31;
@@ -49,8 +51,14 @@ __global__ void prepare_kernel(GqaShape s, const float * __restrict__ q, const f
         a *= r * nw[lane], b *= r * nw[lane + 32];
     }
     if (rope) {   // NEOX: pair (i, i + D/2), frequency base^(-2i/D), angle in fp64
-        const double ang = (double) pos * pow((double) s.rope_base, -2.0 * lane / D);
-        const float c = (float) cos(ang), sn = (float) sin(ang);
+        float c, sn;
+        if (tab) {
+            const float2 cs = tab[(size_t) t * 32 + lane];
+            c = cs.x, sn = cs.y;
+        } else {
+            const double ang = (double) pos * pow((double) s.rope_base, -2.0 * lane / D);
+            c = (float) cos(ang), sn = (float) sin(ang);
+        }
         const float a2 = a * c - b * sn, b2 = b * c + a * sn;
         a = a2, b = b2;
     }
@@ -284,12 +292,30 @@ int split_count(const GqaShape & s, int T, int n_cells)
 }  // namespace
 
 void gqa_prepare(const GqaShape & s, const float * q, const float * k, const float * v, const float * q_norm,
-                 const float * k_norm, int pos0, int T, half * q16, half * k_cache, half * v_cache, cudaStream_t stream)
+                 const float * k_norm, int pos0, int T, half * q16, half * k_cache, half * v_cache, cudaStream_t stream,
+                 const float2 * tab)
 {
     check(s);
     if (T <= 0) return;
     const int warps = T * (s.H + 2 * s.HKV);
-    prepare_kernel<<<(warps * 32 + 255) / 256, 256, 0, stream>>>(s, q, k, v, q_norm, k_norm, pos0, T, q16, k_cache, v_cache);
+    prepare_kernel<<<(warps * 32 + 255) / 256, 256, 0, stream>>>(s, q, k, v, q_norm, k_norm, pos0, T, q16, k_cache,
+                                                                v_cache, tab);
+    TRUSS_CUDA(cudaGetLastError());
+}
+
+// B2: one thread per (row, lane): the exact fp64 expression prepare_kernel uses inline (bit-identical)
+__global__ void rope_table_kernel(float rope_base, int pos0, int T, float2 * __restrict__ tab)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x, t = tid / 32, lane = tid % 32;
+    if (t >= T) return;
+    const double ang = (double) (pos0 + t) * pow((double) rope_base, -2.0 * lane / D);
+    tab[(size_t) t * 32 + lane] = make_float2((float) cos(ang), (float) sin(ang));
+}
+
+void gqa_rope_table(float rope_base, int pos0, int T, float2 * tab, cudaStream_t stream)
+{
+    if (T <= 0) return;
+    rope_table_kernel<<<(T * 32 + 255) / 256, 256, 0, stream>>>(rope_base, pos0, T, tab);
     TRUSS_CUDA(cudaGetLastError());
 }
 
@@ -336,6 +362,7 @@ GqaKernelFns gqa_kernel_fns()
     f.attn = (void *) attn_kernel;
     f.decode = (void *) decode_kernel;
     f.combine = (void *) combine_kernel;
+    f.rope_table = (void *) rope_table_kernel;
     return f;
 }
 

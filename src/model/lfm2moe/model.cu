@@ -121,6 +121,11 @@ void StageModel::layers(engine::Stage & st, const engine::Chunk & c, float * res
     // next layer's op_norm (plain add at the stage's last layer and when a hook reads res). Outputs alternate between
     // two buffers so a pending one survives the next layer's scratch.
     float * outs[2] = { sc.alloc((size_t) T * d), sc.alloc((size_t) T * d) };
+    // B2: one rope table per chunk for all attention layers; the per-lane fp64 trig is identical to prepare's
+    // inline computation, so the layers read bit-identical angles. Allocated before the per-layer mark: the loop's
+    // release(base) must not free it. Even the largest prefill chunk needs only T * 256 B (1 MB at T = 4096).
+    float2 * tab = sc.alloc<float2>((size_t) T * 32);
+    attn::gqa_rope_table(c_.rope_base, c.pos0, T, tab, g.s);
     const size_t base = sc.mark();
     const float * pend = nullptr;
     for (int l = lb_; l < le_; ++l) {
@@ -131,7 +136,7 @@ void StageModel::layers(engine::Stage & st, const engine::Chunk & c, float * res
         st.prof().record(l, 0, g.s);
         op_norm_[i]->forward_add(g, res, pend, T, nullptr, x16);
         st.prof().record(l, 1, g.s);
-        if (attn_[i]) attn_[i]->forward(g, c.slot, x16, c.pos0, T, out);
+        if (attn_[i]) attn_[i]->forward(g, c.slot, x16, c.pos0, T, out, tab);
         else conv_[i]->forward(g, c.slot, x16, T, out, c.tentative);
         st.prof().record(l, 2, g.s);
         ffn_norm_[i]->forward_add(g, res, out, T, x, x16);   // fp32 for the router, fp16 for the projections
@@ -173,7 +178,7 @@ engine::StageModel::GraphInfo StageModel::graph_info() const
 {
     const attn::GqaKernelFns kf = attn::gqa_kernel_fns();
     engine::StageModel::GraphInfo gi;
-    gi.pos_funcs = { { kf.prepare, 6, 11 }, { kf.decode, 4, 9 }, { kf.attn, 4, 9 } };
+    gi.pos_funcs = { { kf.prepare, 6, 12 }, { kf.rope_table, 1, 4 }, { kf.decode, 4, 9 }, { kf.attn, 4, 9 } };
     gi.epoch = [](int pos) { return pos / 128; };
     return gi;
 }

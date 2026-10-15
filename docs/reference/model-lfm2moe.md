@@ -8,6 +8,9 @@ server/**: three files here, one registry line, new blocks for the new layer kin
 40 layers: 30 short-conv (L 3), 10 GQA attention (layers 2, 6, ..., 38; 32 q / 8 kv heads, head dim 64, q/k RMSNorm,
 NEOX rope base 1e7); d_model 2048; layers 0-1 dense SwiGLU (11,776), layers 2-39 MoE (64 experts, top 4, d_ff 1536,
 sigmoid + expert-bias router, renormalized, no shared expert); vocab 128,000, head tied to token_embd; RMSNorm eps 1e-5.
+One rope table per `layers()` call (B2): `attn::gqa_rope_table` builds the chunk's [T][32] (cos, sin) once in fp64 and
+every attention layer's prepare reads it instead of its own inline trig (bit-identical); `graph_info()` names the four
+pos-taking node kinds (prepare arg 6/12, rope_table 1/4, decode/attn 4/9, epoch pos/128).
 
 ## Files
 

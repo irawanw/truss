@@ -13,7 +13,8 @@ void AttnGqa::alloc_slots(engine::Stage & st, int n_slots, int seq_ctx, int)
     for (int i = 0; i < n_slots; ++i) sl_[i] = { k + (size_t) i * seq_ctx * row, v + (size_t) i * seq_ctx * row };
 }
 
-void AttnGqa::forward(engine::Gpu & g, int slot, const half * in16, int pos0, int T, float * out)
+void AttnGqa::forward(engine::Gpu & g, int slot, const half * in16, int pos0, int T, float * out,
+                       const float2 * tab)
 {
     const Slot & L = sl_[slot];
     Scratch & sc = *g.sc;
@@ -24,7 +25,7 @@ void AttnGqa::forward(engine::Gpu & g, int slot, const half * in16, int pos0, in
     const Linear::Act a = lin_.quant(in16, T, d_);
     lin_.lin_multi({ { w_.q, q }, { w_.k, k }, { w_.v, v } }, a, T);
     attn::gqa_prepare(s_, q, k, v, w_.q_norm ? lin_.f32(w_.q_norm) : nullptr, w_.k_norm ? lin_.f32(w_.k_norm) : nullptr,
-                      pos0, T, q16, L.k, L.v, g.s);
+                      pos0, T, q16, L.k, L.v, g.s, tab);
     const size_t ws_bytes = attn::gqa_workspace_bytes(s_, T, pos0 + T);
     void * ws = ws_bytes ? sc.alloc<unsigned char>(ws_bytes) : nullptr;
     attn::gqa_attention(s_, q16, L.k, L.v, pos0, T, att16, ws, ws_bytes, g.s);
