@@ -205,3 +205,31 @@ and move on.
   ~/ML_projects/flashnext/20261014_engine_refactor/golden/old_a <dir>`; ~12 min).
 - Serve check: `python3 -m server.app --model <pack> --tokenizer /mnt/hdd/ml/models/lfm/LFM2.5-24B-A2B/tokenizer.json
   --n-ctx 32768 --chunk 2048 --port <p>` works (10-15: thinking + answer correct, 191.8 tok/s served on K3.5).
+
+### 5.5 Why llama.cpp is ahead: its own decode profile (measured 10-15 evening, llama-paw 873c8b4f5 of 09-29, QAD-Q4_0)
+
+`llama-bench -fa on -d 512 -n 128`: 284 tok/s with CUDA graphs ON (3.52 ms/token), 245 OFF (4.08 ms): graphs are worth
++16% to llama. nsys with `--cuda-graph-trace=node` (profile slows the wall to 4.46 ms; kernel busy 3.31 ms, 857
+launches/step, ~0.2 ms gaps):
+
+| llama kernel | us/step | n | ours (K3.5 eager, 4.7 ms) |
+|---|---|---|---|
+| `mul_mat_vec_q` (experts AND all dense matmuls: 114 expert + 67 dense launches) | **2,029** | 181 | window 1,818 + gemv_multi 1,539 + f32 router 206 = **3,563** |
+| `rms_norm_f32` | 250 | 81 | 202 (add fused) |
+| `quantize_q8_1` | 240 | 181 | 118 |
+| `k_bin_bcast` (adds, muls) | 206 | 128 | 0 (fused) |
+| topk / weighted-reduction / get_rows / rope / conv / copies | ~420 | | ~570 (route 130, prepare 120, conv 130, attn 230) |
+| flash_attn | 73 | 20 | 226 (decode_kernel + combine) |
+
+**The whole gap is the matmul kernels: 2.0 ms for llama vs 3.5 ms for us.** Everything else is equal or better here.
+Bytes read per token (approx.): llama ~1.4 GB (experts Q4_0 4.5 bit = 0.81 GB, dense Q4_0 ~0.6 GB) at 2.0 ms = ~700 GB/s
+(75% of the 3090's 936). Ours 1.6 GB (experts K3.5 0.63 GB + dense Q8_0 ~1.0 GB) at 3.5 ms = ~460 GB/s.
+- **Experts**: our window takes 1.8 ms for 0.63 GB = 350 GB/s, and barely drops with fewer bytes (K2 only -0.27 ms/step vs
+  K3.5): it is not bandwidth-bound but ALU / dependency bound (trellis decode + Hadamard per weight, gate/up -> down
+  hand-off). llama's Q4_0 expert gemv is a plain dp4a stream at ~600 GB/s. => B3 (window internals), target <= 1.1 ms.
+- **Dense**: Q8_0 moves twice the bytes of llama's Q4_0 (our 1.54 ms is already ~650 GB/s). The only way down is fewer
+  bytes (B4: trellis K4 / lower-bit dense) or a faster stream (ceiling ~1.2 ms at 850 GB/s).
+- **Graphs**: llama has them; ours exist only in `tk-bench-decode` (`TRUSS_DECODE_GRAPH=1`: 209.7 -> 226.4 tok/s at 512).
+  The server does NOT use GraphStep yet - wiring it into `Pipeline`/the C API is worth ~+8% for served decode.
+- Budget to beat llama at 3.5 ms/token: window 1.8 -> 1.1 (-0.7), dense 1.54 -> 0.9 via B4 (-0.6), server graphs
+  (-0.35), small ops already at parity. 4.7 -> 3.05 ms = ~330 tok/s on paper.
