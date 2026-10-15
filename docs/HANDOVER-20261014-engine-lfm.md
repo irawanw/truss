@@ -13,18 +13,20 @@ State:
   prefill 4K 6.5K vs 5.5K (ours faster), 16K 3.5K vs 5.2K.
 - GPU 2 is free (no brain, no agent; the PAW omp agent was retired 10-15).
 
-Open task besides speed - **Hugging Face upload** (user named the repo `lackonendes/PAW-24B-X3.1`, public):
-- Token: `HF_TOKEN` in `~/ML_projects/.env` (the CLI login on the box cannot create repos; this one can).
-- `~/ML_projects/lfm24b/20261014_x31/scripts/g_upload.py` (run with the .env loaded: `set -a; . ~/ML_projects/.env;
-  set +a; python3 scripts/g_upload.py`) creates the repo and uploads `PAW-24B-X3.1-K{2,2.5,3,3.5}.gguf`. Started 06:20
-  10-15, log `data/work/logs/g_upload.log`; upload speed dropped to ~3 MB/s - check whether all four finished
-  (`HfApi().list_repo_files("lackonendes/PAW-24B-X3.1")`), rerun for missing files (upload_file re-sends the file).
-- **Model card not written yet.** Write `README.md` in the style of `lackonendes/PAW-125B-FLASH-NEXT-X3.1`'s card
-  (license: `other`, `license_name: lfm1.0`, base_model `LiquidAI/LFM2.5-24B-A2B`; "follow @nawariokra on X" line;
-  "stock llama.cpp cannot read this file, it needs TRUSS https://github.com/irawanw/truss"). Content: the RESULTS.md
-  tables (KL vs bf16 per K and vs the official GGUFs, speed), how it was made (X3.1 trellis experts at uniform K,
-  code-262k calibration, everything else Q8_0), the serve command (above), and the honest speed statement: llama.cpp's
-  official Q4 files decode faster today; ours win on quality per GB and 4K prefill. Upload with `HfApi().upload_file`.
+**Hugging Face: DONE 10-15** - https://huggingface.co/lackonendes/PAW-24B-X3.1 (public): the four packs as
+`PAW-24B-X3.1-K{2,2.5,3,3.5}.gguf` + `README.md` (model card: `~/ML_projects/lfm24b/20261014_x31/reports/HF_README.md`).
+When the numbers change (a faster build, a new pack), update the card's speed table and re-upload it:
+`set -a; . ~/ML_projects/.env; set +a; python3 -c "from huggingface_hub import HfApi; HfApi().upload_file(
+path_or_fileobj='HF_README.md', path_in_repo='README.md', repo_id='lackonendes/PAW-24B-X3.1')"`.
+Upload trap: the xet backend stalls at ~95% of each file with the line idle (twice); use
+`HF_HUB_DISABLE_XET=1` and `scripts/g_upload.py` (`upload_large_folder` over symlinks in `data/hf_stage`): 36 GB in
+10 minutes at 480 Mbit/s. Token: `HF_TOKEN` in `~/ML_projects/.env` (the CLI login cannot create repos).
+
+Optional quality experiment (from a tip pasted by the user: do not quantize the MoE routers): routers and their bias
+are already F32 in our packs and in the official GGUFs, so that is not the cause of Q8_0's KL 0.033. To test whether
+the Q8_0 attention / conv / dense projections cost quality: build a pack variant with those in F16 (c4_pack.py copies
+tensors from the Q8 GGUF; make an F16-projection source with llama-paw's convert) and re-measure KL; ship only if the
+gain is large for ~+0.5 GB read per token.
 
 ## 1. Where things stand
 
