@@ -2,6 +2,7 @@
 
 #include "kernels/ffn/ffn_ops.cuh"
 
+#include <stdexcept>
 #include <vector>
 
 namespace truss::blocks {
@@ -15,6 +16,12 @@ void route_sigmoid_bias(const float * logits, const float * bias, int T, int E, 
                         cudaStream_t s)
 {
     ffn::route_sigmoid(logits, bias, T, E, K, true, 1.f, ids, wts, s);
+}
+
+void route_sqrtsoftplus_bias(const float * logits, const float * bias, int T, int E, int K, int * ids, float * wts,
+                             cudaStream_t s)
+{
+    ffn::route_biased(logits, bias, T, E, K, ffn::Score::SqrtSoftplus, true, 1e-20f, 1.f, ids, wts, s);
 }
 
 void Moe::add_tensors(Linear & lin, const MoeWeights & w)
@@ -35,13 +42,14 @@ void Moe::forward(engine::Gpu & g, const float * in, const half * in16, int T, f
     int * ids = sc.alloc<int>((size_t) T * K);
     float * routed = sc.alloc((size_t) T * dm), * y = sc.alloc((size_t) T * dm);
     float * gu = has_shared ? sc.alloc((size_t) T * F) : nullptr, * uu = has_shared ? sc.alloc((size_t) T * F) : nullptr;
-    float * sg = has_shared ? sc.alloc(T) : nullptr;
+    const bool gated = has_shared && w_.shexp_gate_inp;
+    float * sg = gated ? sc.alloc(T) : nullptr;
     half * mid16 = has_shared ? sc.alloc<half>((size_t) T * F) : nullptr;
     auto shared = [&] {   // y = shared expert (sg, its gate, comes with the router)
         const size_t m2 = sc.mark();
         const Linear::Act ia = lin_.quant(in16, T, dm);
         lin_.lin_multi({ { w_.shexp_gate, gu }, { w_.shexp_up, uu } }, ia, T);
-        ffn::swiglu(gu, uu, T * F, mid16, g.s);
+        ffn::swiglu(gu, uu, T * F, mid16, g.s, d_.swiglu_limit);
         lin_.lin(w_.shexp_down, mid16, T, y);
         sc.release(m2);
     };
@@ -58,16 +66,20 @@ void Moe::forward(engine::Gpu & g, const float * in, const half * in16, int T, f
                                 logits, ids, wts, exec_.route_arrive(), g.s);
     } else {
         std::vector<Linear::Proj> ps{ { w_.router, logits } };
-        if (has_shared) ps.push_back({ w_.shexp_gate_inp, sg });
+        if (gated) ps.push_back({ w_.shexp_gate_inp, sg });
         if (hint) ps.push_back({ next_->router, pl });
         lin_.lin32_multi(ps, in, T);
     }
     const float * bias = w_.exp_bias ? lin_.f32(w_.exp_bias) : nullptr;
     const float * pbias = hint && next_->exp_bias ? lin_.f32(next_->exp_bias) : nullptr;
-    runtime::MoeExec::Call c{ sl_, in, T, logits, pl, bias, pbias, ids, wts, has_shared ? routed : out, stream, moe_ws, moe_rows,
-                              route_, softmax_, fuse_route, has_shared ? std::function<void()>(shared) : std::function<void()>() };
+    const bool scaled = d_.route_scale != 1.f;
+    if (gated && scaled) throw std::runtime_error("Moe: a gated shared expert with a routed scale is not wired");
+    runtime::MoeExec::Call c{ sl_, in, T, logits, pl, bias, pbias, ids, wts, has_shared || scaled ? routed : out, stream,
+                              moe_ws, moe_rows, route_, softmax_, fuse_route,
+                              has_shared ? std::function<void()>(shared) : std::function<void()>() };
     exec_.run(c);
-    if (has_shared) ffn::shared_add(routed, y, sg, T, dm, out, g.s);
+    if (gated) ffn::shared_add(routed, y, sg, T, dm, out, g.s);
+    else if (has_shared || scaled) ffn::scaled_add(routed, d_.route_scale, has_shared ? y : nullptr, T, dm, out, g.s);
     sc.release(m);
 }
 

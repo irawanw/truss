@@ -147,6 +147,20 @@ __global__ void swiglu_kernel(const float * g, const float * u, int n, half * mi
     if (i < n) mid16[i] = __float2half(g[i] * sigmoid(g[i]) * u[i]);
 }
 
+__global__ void swiglu_clamp_kernel(const float * g, const float * u, int n, float L, half * mid16)
+{
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float a = fminf(g[i], L), b = fminf(fmaxf(u[i], -L), L);
+    mid16[i] = __float2half(a * sigmoid(a) * b);
+}
+
+__global__ void scaled_add_kernel(const float * routed, float scale, const float * y, int64_t n, float * out)
+{
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = scale * routed[i] + (y ? y[i] : 0.f);
+}
+
 __global__ void shared_add_kernel(const float * routed, const float * y, const float * gate, int T, int d, float * out)
 {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -226,9 +240,18 @@ void route_publish(const float * logits, const float * pred_logits, int T, int E
     TRUSS_CUDA(cudaGetLastError());
 }
 
-void swiglu(const float * g, const float * u, int n, half * mid16, cudaStream_t stream)
+void swiglu(const float * g, const float * u, int n, half * mid16, cudaStream_t stream, float limit)
 {
-    swiglu_kernel<<<grid(n), THREADS, 0, stream>>>(g, u, n, mid16);
+    if (limit > 0.f) swiglu_clamp_kernel<<<grid(n), THREADS, 0, stream>>>(g, u, n, limit, mid16);
+    else swiglu_kernel<<<grid(n), THREADS, 0, stream>>>(g, u, n, mid16);
+    TRUSS_CUDA(cudaGetLastError());
+}
+
+void scaled_add(const float * routed, float scale, const float * y, int T, int d, float * out, cudaStream_t stream)
+{
+    const int64_t n = (int64_t) T * d;
+    if (n <= 0) return;
+    scaled_add_kernel<<<grid(n), THREADS, 0, stream>>>(routed, scale, y, n, out);
     TRUSS_CUDA(cudaGetLastError());
 }
 

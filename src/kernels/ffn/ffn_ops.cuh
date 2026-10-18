@@ -49,12 +49,15 @@ void route_publish(const float * logits, const float * pred_logits, int T, int E
 // not the CTA count, is the ceiling, and extra CTAs each pay a system fence.
 int publish_ctas(int n_x);
 
-// g, u [n] -> mid16 [n]
-void swiglu(const float * g, const float * u, int n, half * mid16, cudaStream_t stream);
+// g, u [n] -> mid16 [n]; limit > 0: gate clamped to <= limit and up to [-limit, limit] first (DeepSeek-V4)
+void swiglu(const float * g, const float * u, int n, half * mid16, cudaStream_t stream, float limit = 0.f);
 
 // out [T][d] = routed + y * sigmoid(gate [T])
 void shared_add(const float * routed, const float * y, const float * gate, int T, int d, float * out,
                 cudaStream_t stream);
+
+// out [T][d] = scale * routed (+ y when y != nullptr): an ungated shared expert, a routed scale (DeepSeek-V4 x1.5)
+void scaled_add(const float * routed, float scale, const float * y, int T, int d, float * out, cudaStream_t stream);
 
 // y [n] += x [n]
 void add(float * y, const float * x, int n, cudaStream_t stream);

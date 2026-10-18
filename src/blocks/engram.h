@@ -38,11 +38,11 @@ public:
     // table: blk.<L>.engram_embd.q4 (I8 [144][rows]) in a mapped GGUF
     Engram(Linear & lin, const EngramWeights & w, const EngramDims & d, const gguf::Tensor & table, int threads = 16);
     ~Engram() override;
-    static void add_tensors(Linear & lin, const EngramWeights & w) { lin.add(w.wkv), lin.add(w.q), lin.add(w.k); }
+    static void add_tensors(Linear & lin, const EngramWeights & w) { lin.add(w.wkv), lin.add(w.q), lin.add(w.k); }   // not the table
     static size_t scratch_per_row(const EngramDims & d);
     void build(engine::Gpu & g);   // after upload: the q * k product
-    // res [T][hc][d] in place, tokens (host) of the chunk at positions pos0 ..
-    void forward(engine::Gpu & g, int slot, const int32_t * tokens, int pos0, int T, float * res);
+    // res [T][hc][d] in place (rows res_ld floats apart), tokens (host) of the chunk at positions pos0 ..
+    void forward(engine::Gpu & g, int slot, const int32_t * tokens, int pos0, int T, float * res, int res_ld);
     // the row ids of a chunk (host; exposed for the hash test)
     void hash(int slot, const int32_t * tokens, int pos0, int T, int32_t * ids) const;
 

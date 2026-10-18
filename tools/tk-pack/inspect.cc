@@ -153,9 +153,14 @@ int main(int argc, char ** argv)
     }
     try {
         const auto f = File::open(argv[1]);
-        if (const char * ov = std::getenv("TRUSS_EXPERT_OVERLAY")) {
-            f->overlay(ov);
-            std::printf("overlay %s: %zu tensors replaced\n", ov, f->overlaid());
+        if (const char * ov = std::getenv("TRUSS_EXPERT_OVERLAY")) {   // a comma list, as the C API reads it
+            for (std::string rest = ov; !rest.empty();) {
+                const size_t comma = rest.find(',');
+                const std::string path = rest.substr(0, comma);
+                rest = comma == std::string::npos ? "" : rest.substr(comma + 1);
+                if (!path.empty()) f->overlay(path);
+            }
+            std::printf("overlays %s: %zu tensors replaced\n", ov, f->overlaid());
         }
         if (argc > 2 && std::strcmp(argv[2], "list") == 0) {
             list(*f);

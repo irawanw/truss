@@ -29,9 +29,16 @@ truss_model * truss_open_params(const char * gguf_path, const truss_params * p)
         [&]() -> truss_model * {
             auto m = std::make_unique<truss_model>();
             m->file = gguf::File::open(gguf_path);
-            if (const char * ov = std::getenv("TRUSS_EXPERT_OVERLAY")) {   // X3.1 experts over the served GGUF (#118)
-                m->file->overlay(ov);
-                std::fprintf(stderr, "expert overlay %s: %zu tensors replaced\n", ov, m->file->overlaid());
+            // X3.1 experts over the served GGUF (#118); a comma list adds more files (deepseek41: experts, Engram tables)
+            if (const char * ov = std::getenv("TRUSS_EXPERT_OVERLAY")) {
+                for (std::string rest = ov; !rest.empty();) {
+                    const size_t comma = rest.find(',');
+                    const std::string path = rest.substr(0, comma);
+                    rest = comma == std::string::npos ? "" : rest.substr(comma + 1);
+                    if (path.empty()) continue;
+                    m->file->overlay(path);
+                    std::fprintf(stderr, "overlay %s: %zu tensors replaced so far\n", path.c_str(), m->file->overlaid());
+                }
             }
             engine::DrafterFiles df;
             if (p->mtp && *p->mtp) {

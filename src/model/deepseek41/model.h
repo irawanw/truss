@@ -1,0 +1,81 @@
+// deepseek41 as an engine family: the composition of its blocks (docs/ENGINE.md; math dsref/model.py Transformer).
+//
+// Residual row = hc copies of d_model, then the (2 + hc) hc coef of the next collapse (res_width = hc d + 24): the
+// mix a sub-block computes feeds the NEXT sub-block's collapse, and keeping it in the row carries it across a layer
+// split like the residual itself. Per layer:
+//   [Engram]  res += gated n-gram lookup (layers 1, 14)
+//   attn      A = mix_attn(res); y = collapse(res, row coef); res = post_A(res, attn(attn_norm(y)))
+//   ffn       F = mix_ffn(res);  y = collapse(res, A);        res = post_F(res, moe(ffn_norm(y)));  row coef = F
+// Embedding rows into every copy with a one-hot coef; head = collapse(res, row coef) -> norm -> output (Q8_0).
+// MoE: sqrt(softplus) + bias top-6 of the pack's 256 experts, renormalized, x1.5; ungated shared expert; SwiGLU
+// clamp 10 (moe::DsV41). The CPU expert tier is not used (its kernels are Flash-Next-shaped): misses stream by PCIe.
+// A stage boundary must fall on an attention source layer (blocks/attn_ds41.h).
+#pragma once
+#include "blocks/attn_ds41.h"
+#include "blocks/engram.h"
+#include "blocks/hc_sinkhorn.h"
+#include "blocks/head.h"
+#include "blocks/moe.h"
+#include "blocks/norm.h"
+#include "engine/model.h"
+#include "kernels/moe/moe_weights.cuh"
+#include "model/deepseek41/config.h"
+#include "model/deepseek41/weights.h"
+
+#include <memory>
+#include <vector>
+
+namespace truss::deepseek41 {
+
+using MoeShape = moe::DsV41;
+
+class Family : public engine::Family {
+public:
+    Family(const gguf::File & f, const engine::DrafterFiles & d);
+    int n_layer() const override { return c_.n_layer; }
+    int n_vocab() const override { return c_.n_vocab; }
+    int n_expert() const override { return c_.n_expert; }
+    int res_width() const override { return c_.hc * c_.d_model + (2 + c_.hc) * c_.hc; }
+    std::unique_ptr<engine::StageModel> stage(int lb, int le, int n_ctx) const override;
+    const Config & config() const { return c_; }
+    const Weights & weights() const { return w_; }
+
+private:
+    Config c_;
+    Weights w_;
+};
+
+class StageModel : public engine::StageModel {
+public:
+    StageModel(const Family & fam, int lb, int le, int n_ctx);
+    ~StageModel() override;
+    void add_tensors(engine::Stage & st) override;
+    std::vector<const gguf::Tensor *> no_w16() const override { return { w_.token_embd, w_.output }; }
+    std::vector<runtime::MoeLayer> moe_layers() const override;
+    runtime::MoeKernels moe_kernels() const override { return runtime::MoeKernels::of<MoeShape>(); }
+    size_t scratch_bytes(int T) const override;
+    void build(engine::Stage & st) override;
+    void bind_experts(engine::Stage & st) override;
+    void embed(engine::Stage & st, const engine::Chunk & c, float * res) override;
+    void layers(engine::Stage & st, const engine::Chunk & c, float * res, const engine::LayerHook & hook) override;
+    void head(engine::Stage & st, const float * rows, int n, float * logits, bool draft) override;
+    std::vector<engine::Stateful *> states() override;
+
+private:
+    blocks::Ds41AttnDims attn_dims(int l) const;
+    hc::SkDims sk_dims() const;
+    const Config & c_;
+    const Weights & w_;
+    const int lb_, le_, n_ctx_;
+    float * inv_freq_plain_ = nullptr, * inv_freq_comp_ = nullptr;   // device rope tables (window-only / compressing)
+    std::vector<std::unique_ptr<blocks::RmsNorm>> attn_norm_, ffn_norm_;    // [l - lb]
+    std::vector<std::unique_ptr<blocks::HcSinkhorn>> hc_attn_, hc_ffn_;
+    std::vector<std::unique_ptr<blocks::AttnDs41>> attn_;
+    std::vector<std::unique_ptr<blocks::Engram>> engram_;                  // null off the Engram layers
+    std::vector<std::unique_ptr<blocks::Moe>> moe_;
+    std::unique_ptr<blocks::RmsNorm> final_norm_;
+    std::unique_ptr<blocks::HcSinkhorn> head_hc_;                           // collapse only (no weights read)
+    std::unique_ptr<blocks::Head> head_;
+};
+
+}  // namespace truss::deepseek41

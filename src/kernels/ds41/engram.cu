@@ -37,12 +37,12 @@ __device__ float block_sum(float v, float * red)
     return s;
 }
 
-__global__ void __launch_bounds__(GT) gate_kernel(float * res, const float * __restrict__ kv,
+__global__ void __launch_bounds__(GT) gate_kernel(float * res, int res_ld, const float * __restrict__ kv,
                                                   const float * __restrict__ qk, int hc, int d, float eps)
 {
     __shared__ float red[GT / 32];
     const int t = blockIdx.x / hc, c = blockIdx.x % hc;
-    float * h = res + ((size_t) t * hc + c) * d;
+    float * h = res + (size_t) t * res_ld + (size_t) c * d;
     const float * key = kv + (size_t) t * (hc + 1) * d + (size_t) c * d;
     const float * val = kv + (size_t) t * (hc + 1) * d + (size_t) hc * d;
     const float * w = qk + (size_t) c * d;
@@ -75,10 +75,11 @@ void engram_dequant_q4(const uint8_t * rows, int n, half * out, cudaStream_t str
     TRUSS_CUDA(cudaGetLastError());
 }
 
-void engram_gate(float * res, const float * kv, const float * qk, int T, int hc, int d, float eps, cudaStream_t stream)
+void engram_gate(float * res, int res_ld, const float * kv, const float * qk, int T, int hc, int d, float eps,
+                 cudaStream_t stream)
 {
     if (T <= 0) return;
-    gate_kernel<<<(unsigned) T * hc, GT, 0, stream>>>(res, kv, qk, hc, d, eps);
+    gate_kernel<<<(unsigned) T * hc, GT, 0, stream>>>(res, res_ld, kv, qk, hc, d, eps);
     TRUSS_CUDA(cudaGetLastError());
 }
 

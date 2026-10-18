@@ -35,7 +35,6 @@ constexpr int RG = 8;                   // 8-row groups per warp (all 64 rows of
 constexpr int ROUTE_CHUNK = 2048;       // pairs per routing warp
 constexpr int MAX_EXPERTS = 1024;
 
-__device__ __forceinline__ float silu(float x) { return x / (1.0f + __expf(-x)); }
 
 __device__ __forceinline__ float4 h4_to_f4(uint2 v)
 {
@@ -316,10 +315,10 @@ __global__ __launch_bounds__(THREADS) void gate_up_kernel(Weights W, const half 
             const uint2 sd = *(const uint2 *) (W.proj[2].suh + (size_t) it.e * F + fc);
             had4x32(g.x, g.y, g.z, g.w, lane);
             had4x32(u.x, u.y, u.z, u.w, lane);
-            const half2 p01 = __hmul2(__floats2half2_rn(silu(g.x * fg.x) * (u.x * fu.x), silu(g.y * fg.y) * (u.y * fu.y)),
-                                      *(const half2 *) &sd.x);
-            const half2 p23 = __hmul2(__floats2half2_rn(silu(g.z * fg.z) * (u.z * fu.z), silu(g.w * fg.w) * (u.w * fu.w)),
-                                      *(const half2 *) &sd.y);
+            const half2 p01 = __hmul2(__floats2half2_rn(swiglu<Shape>(g.x * fg.x, u.x * fu.x),
+                                                        swiglu<Shape>(g.y * fg.y, u.y * fu.y)), *(const half2 *) &sd.x);
+            const half2 p23 = __hmul2(__floats2half2_rn(swiglu<Shape>(g.z * fg.z, u.z * fu.z),
+                                                        swiglu<Shape>(g.w * fg.w, u.w * fu.w)), *(const half2 *) &sd.y);
             float h0 = __low2float(p01), h1 = __high2float(p01), h2 = __low2float(p23), h3 = __high2float(p23);
             had4x32(h0, h1, h2, h3, lane);
             half2 * o = (half2 *) (A_d + (size_t) (it.pair0 + row) * F + fc);
@@ -485,5 +484,8 @@ template void prefill<FlashNext>(const Weights &, const float *, const int *, co
 template size_t prefill_workspace_bytes<Lfm2>(int);
 template void prefill<Lfm2>(const Weights &, const float *, const int *, const float *, int, float *, void *, int,
                             cudaStream_t);
+template size_t prefill_workspace_bytes<DsV41>(int);
+template void prefill<DsV41>(const Weights &, const float *, const int *, const float *, int, float *, void *, int,
+                             cudaStream_t);
 
 }  // namespace truss::moe

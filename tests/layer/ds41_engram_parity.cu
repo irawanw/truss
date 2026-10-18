@@ -76,7 +76,7 @@ int main(int argc, char ** argv)
         std::vector<int32_t> ids((size_t) n * B);
         eng.hash(0, tok.data() + pos0, pos0, n, ids.data());
         for (size_t i = 0; i < ids.size(); ++i) bad_ids += ids[i] != ref_ids[(size_t) pos0 * B + i];
-        eng.forward(g, 0, tok.data() + pos0, pos0, n, res + (size_t) pos0 * hc * d);
+        eng.forward(g, 0, tok.data() + pos0, pos0, n, res + (size_t) pos0 * hc * d, hc * d);
         eng.commit_tokens(0, tok.data() + pos0, n);
     }
     TRUSS_CUDA(cudaDeviceSynchronize());

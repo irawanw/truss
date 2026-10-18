@@ -186,6 +186,26 @@ int test_hc(int T)
         want_pre[(size_t) t * NM] = 1.0;
     }
     fails += report("hc sk_expand", T, std::max(rel(ex, want_ex), rel(pre, want_pre)), 0);
+
+    // the same ops on residual rows of hc d + 24 floats with the coef in each row's tail (deepseek41's layout):
+    // results must equal the contiguous ones exactly
+    truss::hc::SkDims ks = k;
+    ks.res_ld = HCD + NM, ks.coef_ld = HCD + NM;
+    std::vector<float> rs((size_t) T * ks.res_ld, 0.f);
+    for (int t = 0; t < T; ++t) std::copy(res.begin() + (size_t) t * HCD, res.begin() + (size_t) (t + 1) * HCD,
+                                          rs.begin() + (size_t) t * ks.res_ld);
+    float * d_rs = up(rs);
+    truss::hc::sk_mix(d_rs, up(fn), up(scale), up(base), T, ks, ws, d_rs + HCD, 0);
+    auto rs_out = down(d_rs, rs.size());
+    double worst = 0;
+    for (int t = 0; t < T; ++t)
+        for (int j = 0; j < NM; ++j) worst = std::max(worst, (double) std::fabs(rs_out[(size_t) t * ks.res_ld + HCD + j] -
+                                                                            coef[(size_t) t * NM + j]));
+    float * d_y2 = nan_buf<float>((size_t) T * D);
+    truss::hc::sk_collapse(d_rs, d_rs + HCD, T, ks, d_y2, nullptr, 0);
+    auto y2 = down(d_y2, (size_t) T * D);
+    for (size_t i = 0; i < y2.size(); ++i) worst = std::max(worst, (double) std::fabs(y2[i] - y[i]));
+    fails += report("hc strided", T, worst, 0);
     return fails;
 }
 

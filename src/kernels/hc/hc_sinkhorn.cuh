@@ -10,6 +10,7 @@
 //   post      res'[j][d] = post[j] * x[d] + sum_i comb[i][j] * res[i][d]
 // The pre a sub-block's mix produces is used by the NEXT sub-block's collapse (the model keeps two coef buffers).
 // coef layout per token: [pre hc][post hc][comb hc x hc] (row i = source copy, column j = destination copy).
+// Rows of res are res_ld floats apart, rows of coef coef_ld apart (SkDims), so the coef may live inside residual rows.
 // Deterministic (fixed split and reduction order). The projection is split over SPLIT-float chunks of the stream so a
 // single decode row spreads over many SMs; partial sums go through a workspace, summed in chunk order.
 #pragma once
@@ -24,8 +25,11 @@ struct SkDims {
     int hc, d;
     float norm_eps, hc_eps;
     int iters;
+    int res_ld = 0;    // floats between residual rows (0: hc * d); a model may keep more per row (deepseek41: the coef)
+    int coef_ld = 0;   // floats between coef rows (0: n_mix)
     int n_mix() const { return (2 + hc) * hc; }
-    int coef() const { return (2 + hc) * hc; }   // floats of coef per token (same as n_mix)
+    int rld() const { return res_ld ? res_ld : hc * d; }
+    int cld() const { return coef_ld ? coef_ld : n_mix(); }
 };
 
 // workspace for sk_mix of up to T rows

@@ -24,6 +24,20 @@ struct DsV41 {                             // DeepSeek-V4.1-Flash-1017: 384 expe
     static constexpr float SWIGLU_LIMIT = 10.0f;   // config swiglu_limit (routed and shared experts)
 };
 
+#ifdef __CUDACC__
+// silu(g) * u with the shape's SwiGLU clamp (none at SWIGLU_LIMIT 0; folded away at compile time), as both MoE ops
+// compute their mid
+template <class Shape> __device__ __forceinline__ float swiglu(float g, float u)
+{
+    constexpr float L = Shape::SWIGLU_LIMIT;
+    if constexpr (L > 0.0f) {
+        g = fminf(g, L);
+        u = fminf(fmaxf(u, -L), L);
+    }
+    return g / (1.0f + __expf(-g)) * u;
+}
+#endif
+
 struct ProjView {                          // one projection (gate, up or down) of all experts of a layer
     const uint16_t * trellis;              // base of the tiles
     const int32_t * meta;                  // [n_expert][2] = (K, offset): expert e at trellis + (offset << shift) words

@@ -44,18 +44,7 @@ __device__ __forceinline__ unsigned long long now_ns()
     return t;
 }
 
-__device__ __forceinline__ float silu(float x) { return x / (1.0f + __expf(-x)); }
 
-// silu(g) * u with the shape's SwiGLU clamp (none at SWIGLU_LIMIT 0; folded away at compile time)
-template <class Shape> __device__ __forceinline__ float swiglu(float g, float u)
-{
-    constexpr float L = Shape::SWIGLU_LIMIT;
-    if constexpr (L > 0.0f) {
-        g = fminf(g, L);
-        u = fminf(fmaxf(u, -L), L);
-    }
-    return silu(g) * u;
-}
 
 // GEMV geometry: a block is WK x WG warps; WK warps split the k slices, WG column groups of WNT 16-column tiles;
 // PF = k slices in flight per warp (loads ring).

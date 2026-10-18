@@ -47,8 +47,8 @@ struct Ds41AttnWeights {   // DeepSeek-V4.1 attention (blocks/attn_ds41): q / kv
 };
 
 struct EngramWeights {   // DeepSeek Engram: wkv [buckets head_dim -> (hc + 1) d], q / k gate weights [hc][d]; the
-                         // hash table itself is host-side (its own file)
-    T wkv = nullptr, q = nullptr, k = nullptr;
+                         // hash table (int4 rows, its own overlay file) is read on the host, never uploaded
+    T wkv = nullptr, q = nullptr, k = nullptr, table = nullptr;
 };
 
 }  // namespace truss::blocks

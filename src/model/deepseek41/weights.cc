@@ -62,6 +62,8 @@ Weights bind(const gguf::File & f, const Config & c)
             L.engram.wkv = b.need(p + "engram_wkv.weight", { nb, H * (HC + 1) });
             L.engram.q = b.need(p + "engram_q.weight", { H, HC });
             L.engram.k = b.need(p + "engram_k.weight", { H, HC });
+            const int64_t rows = c.engram.table_rows[c.engram.index(l)];
+            L.engram.table = b.maybe(p + "engram_embd.q4", { 144, rows });   // its own file (tools/tk-pack/ds41_engram.py)
         }
         w.layers.push_back(L);
     }

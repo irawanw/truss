@@ -96,6 +96,7 @@ add_library(truss_engine STATIC
   src/model/qwen4exp/mtp.cu
   src/model/qwen4exp/mtp_draft.cu
   src/model/lfm2moe/model.cu
+  src/model/deepseek41/model.cu
   src/model/registry.cc)
 target_link_libraries(truss_engine PUBLIC truss_models truss_kernels truss_cpu)
 

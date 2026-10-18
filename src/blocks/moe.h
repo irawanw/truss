@@ -1,5 +1,5 @@
 // MoE FFN block: router (fp32 projection, so routing keeps full precision), routed experts through the stage's
-// runtime::MoeExec, an optional gated shared expert, and the sum. The routing rule is a parameter (softmax top-k for
+// runtime::MoeExec, an optional shared expert (gated when shexp_gate_inp is present, else plain), and the sum. The routing rule is a parameter (softmax top-k for
 // Flash-Next; LFM's sigmoid + expert-bias top-k is another RouteFn), so is the presence of the shared expert.
 #pragma once
 #include "blocks/weights.h"
@@ -12,6 +12,8 @@ namespace truss::blocks {
 
 struct MoeDims {
     int d_model, n_expert, topk, d_ff_shexp;   // d_ff_shexp 0: no shared expert
+    float swiglu_limit = 0.f;                  // shared expert SwiGLU clamp (the routed one is the kernel shape's)
+    float route_scale = 1.f;                   // routed output x this (DeepSeek-V4 routed_scaling_factor)
     size_t scratch_per_row() const
     {
         return (size_t) n_expert * 4 + topk * 12 + (size_t) d_model * 12 + (size_t) d_ff_shexp * 10 + 4;
@@ -22,6 +24,9 @@ struct MoeDims {
 void route_softmax(const float * logits, const float * bias, int T, int E, int K, int * ids, float * wts, cudaStream_t s);
 void route_sigmoid_bias(const float * logits, const float * bias, int T, int E, int K, int * ids, float * wts,
                         cudaStream_t s);
+// sqrt(softplus) + selection bias top-k renormalized with eps 1e-20 (DeepSeek-V4; its x1.5 is MoeDims::route_scale)
+void route_sqrtsoftplus_bias(const float * logits, const float * bias, int T, int E, int K, int * ids, float * wts,
+                             cudaStream_t s);
 
 class Moe {
 public:

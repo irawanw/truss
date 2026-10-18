@@ -20,6 +20,7 @@ The engine reads the experts as an overlay (`TRUSS_EXPERT_OVERLAY`, `gguf::File:
 | file | what |
 |---|---|
 | `config.{h,cc}` | `Config::from_gguf`: dims, rope (YaRN), mHC, indexer, candidates, compress ratios, source lists (`kv_source_of`, `index_source_of`: the last source at or before a layer), SwiGLU clamp (one value; the kernel shape carries it), Engram layout. Throws on inconsistent metadata |
+| `model.{h,cu}` | `Family` (shape checks vs `moe::DsV41`, Engram tables present, stage boundaries on attention sources) and `StageModel`: residual row = 4 x 5120 + the 24-float next-collapse coef; per layer [Engram] -> mHC mix / collapse -> attn_norm -> `AttnDs41` -> post -> mHC mix / collapse -> ffn_norm -> `Moe` (sqrt-softplus route, plain shared expert, clamp 10, x1.5) -> post -> coef into the row; head = collapse -> norm -> `Head`. No CPU expert tier (`MoeLayer::cpu_ok = false`: the pool is Flash-Next-shaped) |
 | `weights.{h,cc}` | `bind`: every tensor checked (ggml shapes from mmnga's `Model::validate`) and used once; compressor / index-key tensors on KV sources, index-query tensors on index sources, Engram on its layers |
 
 **Tested.** `tk-pack-inspect` binds the pack (`TRUSS_EXPERT_OVERLAY=<experts>`); blocks: `ds41_ops_test` (router,

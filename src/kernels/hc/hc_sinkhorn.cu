@@ -14,11 +14,11 @@ constexpr int HC = 4, NMIX = (2 + HC) * HC, SPLIT = 1024, THREADS = 256;   // on
 
 // part[t][chunk][0..NMIX) = chunk's dot products, [NMIX] = chunk's sum of squares
 __global__ void __launch_bounds__(THREADS) sk_part_kernel(const float * __restrict__ res, const float * __restrict__ fn,
-                                                         int hcd, float * __restrict__ part)
+                                                         int hcd, int rld, float * __restrict__ part)
 {
     const int chunk = blockIdx.x, t = blockIdx.y, n_chunk = gridDim.x, lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     const size_t off = (size_t) chunk * SPLIT + threadIdx.x * 4;
-    const float4 x = *(const float4 *) (res + (size_t) t * hcd + off);
+    const float4 x = *(const float4 *) (res + (size_t) t * rld + off);
     float acc[NMIX + 1];
 #pragma unroll
     for (int j = 0; j < NMIX; ++j) {
@@ -46,7 +46,7 @@ __device__ __forceinline__ float sigm(float x) { return 1.f / (1.f + expf(-x)); 
 // one thread per token: chunk sums in order, then the split + Sinkhorn of hc_split_sinkhorn
 __global__ void sk_final_kernel(const float * __restrict__ part, int n_chunk, int T, int hcd,
                                 const float * __restrict__ scale, const float * __restrict__ base, float norm_eps,
-                                float hc_eps, int iters, float * __restrict__ coef)
+                                float hc_eps, int iters, int cld, float * __restrict__ coef)
 {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= T) return;
@@ -55,7 +55,7 @@ __global__ void sk_final_kernel(const float * __restrict__ part, int n_chunk, in
     for (int c = 0; c < n_chunk; ++c)
         for (int j = 0; j <= NMIX; ++j) m[j] += part[((size_t) t * n_chunk + c) * (NMIX + 1) + j];
     const float r = rsqrtf(m[NMIX] / hcd + norm_eps);
-    float * o = coef + (size_t) t * NMIX;
+    float * o = coef + (size_t) t * cld;
     const float s0 = scale[0], s1 = scale[1], s2 = scale[2];
     for (int c = 0; c < HC; ++c) {
         o[c] = sigm(m[c] * r * s0 + base[c]) + hc_eps;
@@ -92,17 +92,17 @@ __global__ void sk_final_kernel(const float * __restrict__ part, int n_chunk, in
         for (int j = 0; j < HC; ++j) o[2 * HC + i * HC + j] = cm[i][j];
 }
 
-__global__ void sk_collapse_kernel(const float * __restrict__ res, const float * __restrict__ coef, int T, int d,
-                                   float * __restrict__ y, half * __restrict__ y16)
+__global__ void sk_collapse_kernel(const float * __restrict__ res, const float * __restrict__ coef, int T, int d, int rld,
+                                   int cld, float * __restrict__ y, half * __restrict__ y16)
 {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x, n4 = (size_t) T * d / 4;
     if (i >= n4) return;
     const int t = (int) (i * 4 / d), c4 = (int) (i * 4 % d);
-    const float * p = coef + (size_t) t * NMIX;
+    const float * p = coef + (size_t) t * cld;
     float4 a = make_float4(0.f, 0.f, 0.f, 0.f);
 #pragma unroll
     for (int c = 0; c < HC; ++c) {
-        const float4 r = *(const float4 *) (res + ((size_t) t * HC + c) * d + c4);
+        const float4 r = *(const float4 *) (res + (size_t) t * rld + (size_t) c * d + c4);
         const float w = p[c];
         a.x += w * r.x; a.y += w * r.y; a.z += w * r.z; a.w += w * r.w;
     }
@@ -115,15 +115,15 @@ __global__ void sk_collapse_kernel(const float * __restrict__ res, const float *
 }
 
 __global__ void sk_post_kernel(const float * res, const float * __restrict__ x, const float * __restrict__ coef, int T,
-                               int d, float * out)
+                               int d, int rld, int cld, float * out)
 {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x, n4 = (size_t) T * d / 4;
     if (i >= n4) return;
     const int t = (int) (i * 4 / d), c4 = (int) (i * 4 % d);
-    const float * p = coef + (size_t) t * NMIX;
+    const float * p = coef + (size_t) t * cld;
     float4 r[HC];
 #pragma unroll
-    for (int c = 0; c < HC; ++c) r[c] = *(const float4 *) (res + ((size_t) t * HC + c) * d + c4);
+    for (int c = 0; c < HC; ++c) r[c] = *(const float4 *) (res + (size_t) t * rld + (size_t) c * d + c4);
     const float4 xv = *(const float4 *) (x + (size_t) t * d + c4);
 #pragma unroll
     for (int j = 0; j < HC; ++j) {
@@ -134,26 +134,27 @@ __global__ void sk_post_kernel(const float * res, const float * __restrict__ x, 
             const float w = p[2 * HC + c * HC + j];
             a.x += w * r[c].x; a.y += w * r[c].y; a.z += w * r[c].z; a.w += w * r[c].w;
         }
-        *(float4 *) (out + ((size_t) t * HC + j) * d + c4) = a;
+        *(float4 *) (out + (size_t) t * rld + (size_t) j * d + c4) = a;
     }
 }
 
-__global__ void sk_expand_kernel(const float * __restrict__ emb, int T, int d, float * __restrict__ res,
-                                 float * __restrict__ coef)
+__global__ void sk_expand_kernel(const float * __restrict__ emb, int T, int d, int rld, int cld,
+                                 float * __restrict__ res, float * __restrict__ coef)
 {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x, n4 = (size_t) T * d / 4;
     if (i < n4) {
         const int t = (int) (i * 4 / d), c4 = (int) (i * 4 % d);
         const float4 e = *(const float4 *) (emb + (size_t) t * d + c4);
 #pragma unroll
-        for (int c = 0; c < HC; ++c) *(float4 *) (res + ((size_t) t * HC + c) * d + c4) = e;
+        for (int c = 0; c < HC; ++c) *(float4 *) (res + (size_t) t * rld + (size_t) c * d + c4) = e;
     }
-    if (i < (size_t) T * NMIX) coef[i] = i % NMIX == 0 ? 1.f : 0.f;
+    if (i < (size_t) T * NMIX) coef[i / NMIX * cld + i % NMIX] = i % NMIX == 0 ? 1.f : 0.f;
 }
 
 void check(const SkDims & k)
 {
     if (k.hc != HC || k.d % SPLIT) throw std::invalid_argument("hc::sk_*: needs hc == 4 and d % 1024 == 0");
+    if (k.rld() < k.hc * k.d || k.rld() % 4 || k.cld() < NMIX) throw std::invalid_argument("hc::sk_*: row strides");
 }
 
 unsigned blocks4(int T, int d) { return (unsigned) (((size_t) T * d / 4 + 255) / 256); }
@@ -172,9 +173,9 @@ void sk_mix(const float * res, const float * fn, const float * scale, const floa
     if (T <= 0) return;
     if (T > 65535) throw std::invalid_argument("hc::sk_mix: T > 65535");
     const int hcd = k.hc * k.d, n_chunk = hcd / SPLIT;
-    sk_part_kernel<<<dim3(n_chunk, T), THREADS, 0, stream>>>(res, fn, hcd, (float *) ws);
+    sk_part_kernel<<<dim3(n_chunk, T), THREADS, 0, stream>>>(res, fn, hcd, k.rld(), (float *) ws);
     sk_final_kernel<<<(T + 127) / 128, 128, 0, stream>>>((const float *) ws, n_chunk, T, hcd, scale, base, k.norm_eps,
-                                                         k.hc_eps, k.iters, coef);
+                                                         k.hc_eps, k.iters, k.cld(), coef);
     TRUSS_CUDA(cudaGetLastError());
 }
 
@@ -183,7 +184,7 @@ void sk_collapse(const float * res, const float * coef, int T, const SkDims & k,
 {
     check(k);
     if (T <= 0) return;
-    sk_collapse_kernel<<<blocks4(T, k.d), 256, 0, stream>>>(res, coef, T, k.d, y, y16);
+    sk_collapse_kernel<<<blocks4(T, k.d), 256, 0, stream>>>(res, coef, T, k.d, k.rld(), k.cld(), y, y16);
     TRUSS_CUDA(cudaGetLastError());
 }
 
@@ -192,7 +193,7 @@ void sk_post(const float * res, const float * x, const float * coef, int T, cons
 {
     check(k);
     if (T <= 0) return;
-    sk_post_kernel<<<blocks4(T, k.d), 256, 0, stream>>>(res, x, coef, T, k.d, res_out);
+    sk_post_kernel<<<blocks4(T, k.d), 256, 0, stream>>>(res, x, coef, T, k.d, k.rld(), k.cld(), res_out);
     TRUSS_CUDA(cudaGetLastError());
 }
 
@@ -201,7 +202,7 @@ void sk_expand(const float * emb, int T, const SkDims & k, float * res, float * 
     check(k);
     if (T <= 0) return;
     const size_t n = std::max((size_t) T * k.d / 4, (size_t) T * NMIX);
-    sk_expand_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, stream>>>(emb, T, k.d, res, coef_pre);
+    sk_expand_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, stream>>>(emb, T, k.d, k.rld(), k.cld(), res, coef_pre);
     TRUSS_CUDA(cudaGetLastError());
 }
 

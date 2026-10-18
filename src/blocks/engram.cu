@@ -138,7 +138,7 @@ void Engram::read_rows(const int32_t * ids, size_t n, uint8_t * dst)
     done_cv_.wait(l, [&] { return done_ == n_jobs_; });
 }
 
-void Engram::forward(engine::Gpu & g, int slot, const int32_t * tokens, int pos0, int T, float * res)
+void Engram::forward(engine::Gpu & g, int slot, const int32_t * tokens, int pos0, int T, float * res, int res_ld)
 {
     const int B = d_.buckets(), D = d_.d_model, hc = d_.hc;
     const size_t n = (size_t) T * B, RB = ds41::ENGRAM_Q4_ROW;
@@ -160,7 +160,7 @@ void Engram::forward(engine::Gpu & g, int slot, const int32_t * tokens, int pos0
     TRUSS_CUDA(cudaMemcpyAsync(drows, pinned_, n * RB, cudaMemcpyHostToDevice, g.s));
     ds41::engram_dequant_q4(drows, (int) n, x16, g.s);
     lin_.lin(w_.wkv, x16, T, kv);
-    ds41::engram_gate(res, kv, qk_, T, hc, D, d_.eps, g.s);
+    ds41::engram_gate(res, res_ld, kv, qk_, T, hc, D, d_.eps, g.s);
     sc.release(m);
 }
 

@@ -21,7 +21,7 @@ way means reading and experimenting. Here the answer is written down next to the
 | [kernels-small.md](kernels-small.md) | `src/kernels/hc/*`, `src/kernels/ffn/*`, `src/kernels/ple/*`, `src/kernels/sampling/*` |
 | [kernels-reference.md](kernels-reference.md) | `src/kernels/reference/*` (slow exact fp32 definitions every fast kernel is tested against) |
 | [engine-blocks.md](engine-blocks.md) | `src/engine/*` (Pipeline, Stage, slot state, options), `src/blocks/*` (Linear, Head, Hc, Gdn, Dsa, Ple, Moe), `src/runtime/moe_*` (routed-expert runtime) |
-| [model-deepseek41.md](model-deepseek41.md) | `src/model/deepseek41/*` (DeepSeek-V4.1-Flash-1017: config, binding; composition in progress), `tools/tk-pack/ds41_*.py` (pack) |
+| [model-deepseek41.md](model-deepseek41.md) | `src/model/deepseek41/*` (DeepSeek-V4.1-Flash-1017: config, binding, composition), `tools/tk-pack/ds41_*.py` (pack) |
 | [model-lfm2moe.md](model-lfm2moe.md) | `src/model/lfm2moe/*` (LFM2 / LFM2.5 MoE: config, binding, composition) |
 | [model-qwen4exp.md](model-qwen4exp.md) | `src/model/qwen4exp/*` (config, weight binding, reference forward, the family's composition and MTP drafter) |
 | [runtime-api-server.md](runtime-api-server.md) | `src/runtime/*` (expert residency and streaming), `include/truss/truss.h` + `src/api/*` (C API), `server/*` (OpenAI server) |
