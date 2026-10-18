@@ -118,6 +118,7 @@ add_library(truss_kernels STATIC
   src/kernels/dsa/dsa_prepare.cu
   src/kernels/gdn/gdn_prepare.cu
   src/kernels/hc/hc_prefill.cu
+  src/kernels/hc/hc_sinkhorn.cu
   src/kernels/ffn/ffn_ops.cu
   src/kernels/ffn/route_sigmoid.cu
   src/kernels/norm/rms_norm.cu
@@ -161,6 +162,8 @@ add_executable(ple_reader_test tests/unit/ple_reader_test.cc)
 target_link_libraries(ple_reader_test PRIVATE truss_models)
 add_executable(gemv_multi_test tests/unit/gemv_multi_test.cu)
 target_link_libraries(gemv_multi_test PRIVATE truss_kernels)
+add_executable(ds41_ops_test tests/unit/ds41_ops_test.cu)
+target_link_libraries(ds41_ops_test PRIVATE truss_kernels)
 add_executable(hc_fuse_test tests/unit/hc_fuse_test.cu)
 target_link_libraries(hc_fuse_test PRIVATE truss_kernels)
 

@@ -26,11 +26,26 @@ hc combine: res[c] += out ⊙ 2 sigmoid(inject[c] / 4)
 | `collapse(res, rstd, gamma, gate, T, hc, d, mixed, mixed16)` | recomputes xn from res·rstd·γ in fp32; mixed16 nullable |
 | `combine(res, out, inject, T, hc, d)` | in place |
 
+## `src/kernels/hc/hc_sinkhorn.{cuh,cu}` — DeepSeek-V4 hyper-connections (mHC)
+
+**What.** The residual is hc = 4 copies of d. Per sub-block: `sk_mix` (one fp32 projection fn [24][4d] of the flat
+stream × rsqrt(mean² + norm_eps) → pre = sigmoid + hc_eps, post = 2 sigmoid, comb = row softmax + hc_eps, column
+normalized, then `iters - 1` rounds of row / column normalization; scale [3], base [24]), `sk_collapse`
+(y = Σ_c pre[c] res[c], fp32 + optional fp16), `sk_post` (res'[j] = post[j] x + Σ_i comb[i][j] res[i], in place
+allowed), `sk_expand` (embedding into all copies, one-hot pre on copy 0). The pre a mix produces feeds the NEXT
+sub-block's collapse. coef layout per token `[pre 4][post 4][comb 4×4]` (row = source copy).
+**Shape / split.** hc == 4, d % 1024 == 0. `sk_mix` = partial kernel over (4d / 1024 chunks, T) blocks of 256 threads
+(one float4 per thread; 25 sums incl. the sum of squares, warp xor + warps in order) into a workspace
+(`sk_mix_ws_bytes(T)`), then one thread per token sums chunks in order and runs the Sinkhorn. Deterministic.
+**Tested.** `ds41_ops_test` vs an fp64 transcription of `dsref` `hc_split_sinkhorn` / `hc_pre` / `hc_post` (rel ≤ 1e-7,
+TRACKER #176). **Change it.** Prefill could run the projection as a GEMM; the elementwise parts are memory-bound.
+
 ## `src/kernels/ffn/ffn_ops.{cuh,cu}` — router and shared-expert elementwise
 
 | function | contract |
 |---|---|
 | `route(logits [T][E], T, E, k, ids [T][k], wts [T][k])` | softmax, top-k (ties: lower id), weights renormalized over the k with sum clamped ≥ 2^-14; ids in descending probability (the reference's `partial_sort`); one warp per token, E ≤ 1024 (16 or 32 per lane) |
+| `route_biased(logits, bias, T, E, k, score, renorm, eps, scale, ids, wts)` (`route_sigmoid.cu`) | s = score(logit): `Score::Sigmoid` (LFM2, DeepSeek-V3) or `Score::SqrtSoftplus` (DeepSeek-V4: sqrt(torch softplus, threshold 20)); top-k of s + bias choose (ties: lower id), chosen s weigh, / (sum + eps) when renorm, × scale; one warp per token, E % 32 == 0, E ≤ 1024. `route_sigmoid` = Sigmoid with eps 1e-6 (bit-identical to before, lfm_small_ops_test). DeepSeek: eps 1e-20, scale 1.5 (`ds41_ops_test`, #176) |
 | `swiglu(g, u, n, mid16)` | silu(g)·u → fp16 (down projection input) |
 | `shared_add(routed, y, gate [T], T, d, out)` | out = routed + y·sigmoid(gate) |
 | `count(ids, n, counts)` | counts[ids[i]] += 1 (float atomics; `Pipeline::profile_routes`) |

@@ -1,6 +1,6 @@
-// Sigmoid router with a selection bias (HF Lfm2MoeTopKRouter, DeepSeek-V3-style "aux-loss-free" routing):
-//   s = sigmoid(logit); the top k of s + bias choose the experts (ties: the lower id); the weights are the chosen s,
-//   divided by (their sum + 1e-6) when renorm, times scale.
+// Biased routers (HF Lfm2MoeTopKRouter, DeepSeek-V3/V4-style "aux-loss-free" routing):
+//   s = score(logit) (sigmoid, or DeepSeek-V4's sqrt(softplus)); the top k of s + bias choose the experts (ties: the
+//   lower id); the weights are the chosen s, divided by (their sum + eps) when renorm, times scale.
 // One warp per row; ids / weights in descending selection key, as ffn::route.
 #include "kernels/ffn/ffn_ops.cuh"
 
@@ -13,9 +13,16 @@ namespace truss::ffn {
 
 namespace {
 
-template <int PER_LANE>
-__global__ void route_sigmoid_kernel(const float * logits, const float * bias, int T, int E, int k, bool renorm,
-                                     float scale, int * ids, float * wts)
+template <Score SC>
+__device__ __forceinline__ float score(float x)
+{
+    if constexpr (SC == Score::Sigmoid) return 1.f / (1.f + expf(-x));
+    else return sqrtf(x > 20.f ? x : log1pf(expf(x)));        // torch softplus (beta 1, threshold 20), then sqrt
+}
+
+template <int PER_LANE, Score SC>
+__global__ void route_biased_kernel(const float * logits, const float * bias, int T, int E, int k, bool renorm,
+                                    float eps, float scale, int * ids, float * wts)
 {
     const int t = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
     if (t >= T) return;
@@ -24,7 +31,7 @@ __global__ void route_sigmoid_kernel(const float * logits, const float * bias, i
 #pragma unroll
     for (int j = 0; j < PER_LANE; ++j) {
         const int e = 32 * j + lane;
-        s[j] = e < E ? 1.f / (1.f + expf(-l[e])) : 0.f;
+        s[j] = e < E ? score<SC>(l[e]) : 0.f;
         key[j] = e < E ? s[j] + (bias ? bias[e] : 0.f) : -INFINITY;
     }
     int my_id = -1;
@@ -54,22 +61,36 @@ __global__ void route_sigmoid_kernel(const float * logits, const float * bias, i
     }
     if (lane < k) {
         ids[(size_t) t * k + lane] = my_id;
-        wts[(size_t) t * k + lane] = (renorm ? my_s / (sum + 1e-6f) : my_s) * scale;
+        wts[(size_t) t * k + lane] = (renorm ? my_s / (sum + eps) : my_s) * scale;
     }
+}
+
+template <Score SC>
+void launch_biased(const float * logits, const float * bias, int T, int E, int k, bool renorm, float eps, float scale,
+                   int * ids, float * wts, cudaStream_t stream)
+{
+    const int warps = 8, blocks = (T + warps - 1) / warps;
+    if (E <= 128) route_biased_kernel<4, SC><<<blocks, 32 * warps, 0, stream>>>(logits, bias, T, E, k, renorm, eps, scale, ids, wts);
+    else if (E <= 512) route_biased_kernel<16, SC><<<blocks, 32 * warps, 0, stream>>>(logits, bias, T, E, k, renorm, eps, scale, ids, wts);
+    else route_biased_kernel<32, SC><<<blocks, 32 * warps, 0, stream>>>(logits, bias, T, E, k, renorm, eps, scale, ids, wts);
+    TRUSS_CUDA(cudaGetLastError());
 }
 
 }  // namespace
 
+void route_biased(const float * logits, const float * bias, int T, int E, int k, Score sc, bool renorm, float eps,
+                  float scale, int * ids, float * wts, cudaStream_t stream)
+{
+    if (E % 32 || E > 1024 || k > 32 || k > E) throw std::invalid_argument("ffn::route_biased: unsupported E / k");
+    if (T <= 0) return;
+    if (sc == Score::Sigmoid) launch_biased<Score::Sigmoid>(logits, bias, T, E, k, renorm, eps, scale, ids, wts, stream);
+    else launch_biased<Score::SqrtSoftplus>(logits, bias, T, E, k, renorm, eps, scale, ids, wts, stream);
+}
+
 void route_sigmoid(const float * logits, const float * bias, int T, int E, int k, bool renorm, float scale, int * ids,
                    float * wts, cudaStream_t stream)
 {
-    if (E % 32 || E > 1024 || k > 32 || k > E) throw std::invalid_argument("ffn::route_sigmoid: unsupported E / k");
-    if (T <= 0) return;
-    const int warps = 8, blocks = (T + warps - 1) / warps;
-    if (E <= 128) route_sigmoid_kernel<4><<<blocks, 32 * warps, 0, stream>>>(logits, bias, T, E, k, renorm, scale, ids, wts);
-    else if (E <= 512) route_sigmoid_kernel<16><<<blocks, 32 * warps, 0, stream>>>(logits, bias, T, E, k, renorm, scale, ids, wts);
-    else route_sigmoid_kernel<32><<<blocks, 32 * warps, 0, stream>>>(logits, bias, T, E, k, renorm, scale, ids, wts);
-    TRUSS_CUDA(cudaGetLastError());
+    route_biased(logits, bias, T, E, k, Score::Sigmoid, renorm, 1e-6f, scale, ids, wts, stream);
 }
 
 // The lone-router fast path (B2): this file's route_sigmoid tail folded into the f32 router projection, one launch.

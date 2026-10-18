@@ -17,8 +17,12 @@ namespace truss::ffn {
 // logits [T][E] -> ids, wts [T][k]. E % 32 == 0, E <= 1024, k <= 32.
 void route(const float * logits, int T, int E, int k, int * ids, float * wts, cudaStream_t stream);
 
-// sigmoid router with a selection bias (route_sigmoid.cu): top k of sigmoid(logit) + bias (nullptr: none), weights the
-// chosen sigmoids, / (sum + 1e-6) when renorm, x scale. LFM2-MoE, DeepSeek-V3-style routing.
+// biased router (route_sigmoid.cu): s = score(logit); top k of s + bias (nullptr: none) choose, the chosen s weigh,
+// / (sum + eps) when renorm, x scale. Sigmoid: LFM2-MoE / DeepSeek-V3; SqrtSoftplus: DeepSeek-V4 (eps 1e-20, x1.5).
+enum class Score { Sigmoid, SqrtSoftplus };
+void route_biased(const float * logits, const float * bias, int T, int E, int k, Score score, bool renorm, float eps,
+                  float scale, int * ids, float * wts, cudaStream_t stream);
+// route_biased with Score::Sigmoid, eps 1e-6 (LFM2-MoE)
 void route_sigmoid(const float * logits, const float * bias, int T, int E, int k, bool renorm, float scale, int * ids,
                    float * wts, cudaStream_t stream);
 
