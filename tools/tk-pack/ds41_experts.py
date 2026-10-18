@@ -99,7 +99,8 @@ def pack_layer(f, L, ids, where, metas, kmap, roots):
             raise SystemExit(f"L{L}: kept expert {e} missing or at a K other than the kmap's ({kmap[L, e]})")
     for p, fin, fout in PROJ:
         b = f"blk.{L}.ffn_{p}_exps."
-        tr = {k: np.load(f"{d}/trellis_{p}.npy", mmap_mode="r") for k, d in groups.items()}
+        # whole files, read sequentially (mmap + per-expert reads alternate between the K files: HDD seeks, ~22 MB/s)
+        tr = {k: np.load(f"{d}/trellis_{p}.npy") for k, d in groups.items()}
         su = {k: np.load(f"{d}/suh_{p}.npy", mmap_mode="r") for k, d in groups.items()}
         sv = {k: np.load(f"{d}/svh_{p}.npy", mmap_mode="r") for k, d in groups.items()}
         o, n = where[b + "m3_trellis"]

@@ -78,3 +78,4 @@ counters without root); label estimates as *(est.)*.
 | `tools/tk-parity/ds41_attn_ref.py` | reference attention dumps for `ds41_attn_parity` | see the file |
 | `tools/tk-pack/ds41_engram.py` | Engram table -> int4 rows GGUF (`blk.L.engram_embd.q4`, I8 [144][rows]) streamed over HTTP in resumable 512K-row ranges, 8 streams | `ds41_engram.py --model-dir ... --layer L --out ...` |
 | `tools/tk-parity/ds41_engram_ref.py` | Engram parity data (sparse table + reference) | see the file |
+| `ds41_kl` (`tools/tk-parity/ds41_kl.cu`) | DeepSeek-V4.1 whole-model KL(ref || TRUSS) per token over the full vocab (a5_stream's definition), top-1 agreement, vs one or more raw bf16 logit files [n_seq][ctx][vocab] | `TRUSS_EXPERT_OVERLAY=<experts>,<engram L1>,<engram L14> ds41_kl <dense.gguf> <ids.i32> <n_seq> <ctx> <ref.bf16> [...]` |
