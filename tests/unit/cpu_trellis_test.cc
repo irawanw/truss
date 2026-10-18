@@ -134,6 +134,69 @@ void expert_exact(const TrellisExpert & e, const float * xf, bool act16, double 
     proj_exact(e.down, g.data(), act16, y);
 }
 
+// ExpertPool (trellis path) on another expert shape vs fp64: y = sum w * down(swiglu_clamped(gate x, up x)) with
+// the fp16 activations the GPU uses; DeepSeek-V4.1 is 5120 x 2304 with clamp 10 (inputs scaled so it is hit)
+bool pool_shape(int dm, int dff, float limit, int threads, std::mt19937 & g)
+{
+    const int n_exp = 2, R = 3;
+    std::vector<std::vector<uint32_t>> bufs;
+    std::vector<std::vector<uint16_t>> sc;
+    std::vector<TrellisExpert> ex(n_exp);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    auto mat = [&] (int K, int in, int out) {
+        const size_t words = (size_t) in / 16 * (out / 16) * (truss::formats::k_tile_u16(K) / 2);
+        bufs.emplace_back(words);
+        for (auto & w : bufs.back()) w = g();
+        sc.emplace_back(in), sc.emplace_back(out);
+        for (auto & v : sc[sc.size() - 2]) v = _cvtss_sh(0.5f + 0.5f * (g() % 1000) / 1000.f, 0);
+        for (auto & v : sc[sc.size() - 1]) v = _cvtss_sh(0.02f * (0.5f + (g() % 1000) / 1000.f), 0);
+        return TrellisMat{ bufs.back().data(), K, in, out, sc[sc.size() - 2].data(), sc[sc.size() - 1].data() };
+    };
+    bufs.reserve(3 * n_exp), sc.reserve(6 * n_exp);
+    for (int e = 0; e < n_exp; ++e) {
+        const int K = e ? 25 : 2;
+        ex[e].gate = mat(K, dm, dff), ex[e].up = mat(K, dm, dff), ex[e].down = mat(K, dff, dm);
+    }
+    std::vector<float> x((size_t) R * dm), y((size_t) R * dm, 0.f);
+    for (auto & v : x) v = 30.f * nd(g);
+    std::vector<Slot> slots;
+    for (int r = 0; r < R; ++r)
+        for (int e = 0; e < n_exp; ++e) slots.push_back({ r, nullptr, 0.3f + 0.2f * e, &ex[e] });
+    ExpertPool pool(threads, dm, dff, limit);
+    pool.run(x.data(), R, slots, y.data());
+    double num = 0, den = 0;
+    long clamped = 0;
+    for (int r = 0; r < R; ++r) {
+        std::vector<double> want(dm, 0.0);
+        for (const Slot & s : slots) {
+            if (s.row != r) continue;
+            std::vector<double> xd(x.begin() + (size_t) r * dm, x.begin() + (size_t) (r + 1) * dm), gg(dff), uu(dff),
+                o(dm);
+            proj_exact(s.t->gate, xd.data(), true, gg.data());
+            proj_exact(s.t->up, xd.data(), true, uu.data());
+            for (int j = 0; j < dff; ++j) {
+                double a = gg[j], b = uu[j];
+                if (limit > 0) {
+                    clamped += a > limit || std::fabs(b) > limit;
+                    a = std::min(a, (double) limit), b = std::min(std::max(b, -(double) limit), (double) limit);
+                }
+                gg[j] = a / (1.0 + std::exp(-a)) * b;
+            }
+            proj_exact(s.t->down, gg.data(), true, o.data());
+            for (int j = 0; j < dm; ++j) want[j] += s.w * o[j];
+        }
+        for (int j = 0; j < dm; ++j) {
+            const double d = y[(size_t) r * dm + j] - want[j];
+            num += d * d, den += want[j] * want[j];
+        }
+    }
+    const double rel = std::sqrt(num / std::max(den, 1e-300));
+    const bool ok = rel < 5e-3;
+    std::printf("pool %d x %d clamp %.0f: rel err %.2e vs fp64 (fp16 activations), %ld of %d gate/up pairs clamped  %s\n",
+                dm, dff, limit, rel, clamped, R * n_exp * dff, ok ? "ok" : "FAIL");
+    return ok;
+}
+
 double ms_since(std::chrono::steady_clock::time_point t0)
 {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -191,6 +254,8 @@ int main(int argc, char ** argv)
         std::printf("K %4.1f fixture: trellis_weight_ref vs exllamav3 reconstruct: %ld of 81920 differ  %s\n",
                     truss::formats::k_bits(K), bad, bad ? "FAIL" : "ok");
     }
+
+    ok &= pool_shape(5120, 2304, 10.f, threads, g);   // DeepSeek-V4.1 (moe::DsV41)
 
     // speed: N experts of random K-bit tiles (the bytes are what matters; values are random)
     const int n_exp = 256;   // 256 x 1.6-6.6 MB > 128 MB L3

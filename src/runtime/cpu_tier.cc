@@ -3,7 +3,8 @@
 //           non-resident experts up to cpu_share of the layer's non-resident routing mass
 //   trellis (Options::cpu_trellis): the pack's own trellis bytes, from the ExpertStore's pinned cold copy (no extra
 //           RAM; TRACKER #73); static set as above, or every cold expert with cpu_dynamic
-// The CPU kernels exist for one expert shape today (cpu::D_MODEL / D_FF): another shape fails loudly here.
+// The trellis tier takes any expert shape (the pool is sized from MoeKernels); the q4s copies exist for the Flash-Next
+// shape (cpu::D_MODEL / D_FF) only and fail loudly for another.
 #include "runtime/moe_exec_state.h"
 
 #include "engine/limits.h"
@@ -18,7 +19,6 @@ using engine::require;
 void MoeExec::load_cpu_tier_trellis(const ExpertStore::HotSet & hot, const std::vector<float> & usage)
 {
     require(!usage.empty() || o_.cpu_dynamic, "the static CPU tier needs expert_usage (it picks the rarest)");
-    require(k_.d_model == cpu::D_MODEL && k_.d_ff == cpu::D_FF, "CPU tier shape");
     auto t = std::make_unique<CpuTier>();
     t->trellis = true;
     const int E = E_;

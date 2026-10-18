@@ -62,7 +62,9 @@ struct Slot {
 
 class ExpertPool {
 public:
-    explicit ExpertPool(int threads);
+    // the routed-expert shape (trellis path: any multiple-of-128 d_model / d_ff; the q4s path: the Flash-Next shape
+    // only) and its SwiGLU clamp (0: none; DeepSeek-V4: 10)
+    explicit ExpertPool(int threads, int d_model = D_MODEL, int d_ff = D_FF, float swiglu_limit = 0.f);
     ~ExpertPool();
     ExpertPool(const ExpertPool &) = delete;
     ExpertPool & operator=(const ExpertPool &) = delete;
@@ -120,6 +122,8 @@ private:
     void item_trellis(int i, int phase);
     void finish();
 
+    const int dm_, dff_;
+    const float limit_;
     std::vector<std::thread> workers_;
     std::vector<int> cpus_;
     std::vector<pid_t> tids_;

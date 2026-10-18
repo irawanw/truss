@@ -173,7 +173,8 @@ static std::vector<int> physical_cores()
     return out;
 }
 
-ExpertPool::ExpertPool(int threads)
+ExpertPool::ExpertPool(int threads, int d_model, int d_ff, float swiglu_limit)
+    : dm_(d_model), dff_(d_ff), limit_(swiglu_limit)
 {
     // Pinning (TRUSS_CPU_PIN=1): worker i on its own physical core, skipping core 0 (the driver thread's), as Strata
     // does. Off by default: the renters' threads float over every core, and pinning measured ~40% slower at loadavg
@@ -243,6 +244,8 @@ void ExpertPool::start(const float * x, int T, const std::vector<Slot> & slots, 
         }
         slot_g_[i] = g, slot_k_[i] = k;
     }
+    if (!trellis_ && (dm_ != D_MODEL || dff_ != D_FF || limit_ != 0.f))
+        throw std::invalid_argument("cpu::ExpertPool: the q4s path exists for the Flash-Next shape only");
     if (!trellis_) {
         xq_.resize((size_t) T * D_MODEL);
         xd_.resize((size_t) T * D_MODEL / BLOCK);
@@ -257,15 +260,15 @@ void ExpertPool::start(const float * x, int T, const std::vector<Slot> & slots, 
     if (hd_.size() < G * MAX_ROWS * D_FF / BLOCK) hd_.resize(G * MAX_ROWS * D_FF / BLOCK);
     if (out_.size() < G * MAX_ROWS * D_MODEL) out_.resize(G * MAX_ROWS * D_MODEL);
     if (trellis_) {   // 0: gate/up partials per input block, 1: down partials per (h block, column range)
-        if (D_MODEL % tr_gu_in() || tr_gu_in() % 128 || D_MODEL % tr_dn_cols() || tr_dn_cols() % 128)
+        if (dm_ % tr_gu_in() || tr_gu_in() % 128 || dm_ % tr_dn_cols() || tr_dn_cols() % 128)
             throw std::invalid_argument("cpu::ExpertPool: TRUSS_CPU_TR_GU_IN / TR_DN_COLS");
-        const size_t nbg = D_MODEL / tr_gu_in(), nbd = D_FF / TR_DN_IN;
-        if (pg_.size() < G * 2 * nbg * MAX_ROWS * D_FF) pg_.resize(G * 2 * nbg * MAX_ROWS * D_FF);
-        if (pd_.size() < G * nbd * MAX_ROWS * D_MODEL) pd_.resize(G * nbd * MAX_ROWS * D_MODEL);
+        const size_t nbg = dm_ / tr_gu_in(), nbd = dff_ / TR_DN_IN;
+        if (pg_.size() < G * 2 * nbg * MAX_ROWS * dff_) pg_.resize(G * 2 * nbg * MAX_ROWS * dff_);
+        if (pd_.size() < G * nbd * MAX_ROWS * dm_) pd_.resize(G * nbd * MAX_ROWS * dm_);
         n_phases_ = 3;
         phase_items_[0] = (int) (G * 2 * nbg);
-        phase_items_[1] = (int) (G * nbd * (D_MODEL / tr_dn_cols()));
-        phase_items_[2] = D_MODEL / TR_OUT_COLS;
+        phase_items_[1] = (int) (G * nbd * (dm_ / tr_dn_cols()));
+        phase_items_[2] = dm_ / TR_OUT_COLS;
     } else {
         n_phases_ = 2;
         phase_items_[0] = (int) G * (D_FF / gu_chunk());
@@ -305,21 +308,21 @@ void ExpertPool::item_trellis(int i, int phase)
 {
     const auto t0 = std::chrono::steady_clock::now();
     thread_local std::vector<float> P;   // the item's prepared rows
-    const int nbg = D_MODEL / tr_gu_in(), nbd = D_FF / TR_DN_IN;
+    const int nbg = dm_ / tr_gu_in(), nbd = dff_ / TR_DN_IN;
     if (phase == 2) {
         const int c0 = i * TR_OUT_COLS;
-        for (int t = 0; t < T_; ++t) std::fill(y_ + (size_t) t * D_MODEL + c0, y_ + (size_t) t * D_MODEL + c0 + TR_OUT_COLS, 0.f);
+        for (int t = 0; t < T_; ++t) std::fill(y_ + (size_t) t * dm_ + c0, y_ + (size_t) t * dm_ + c0 + TR_OUT_COLS, 0.f);
         alignas(32) float c[TR_OUT_COLS], o[TR_OUT_COLS];
         for (size_t si = 0; si < slots_.size(); ++si) {
             const int gi = slot_g_[si], k = slot_k_[si];
             std::fill(c, c + TR_OUT_COLS, 0.f);
             for (int b = 0; b < nbd; ++b) {   // block order
-                const float * p = &pd_[(((size_t) gi * nbd + b) * MAX_ROWS + k) * D_MODEL + c0];
+                const float * p = &pd_[(((size_t) gi * nbd + b) * MAX_ROWS + k) * dm_ + c0];
                 for (int j = 0; j < TR_OUT_COLS; j += 8)
                     _mm256_store_ps(c + j, _mm256_add_ps(_mm256_load_ps(c + j), _mm256_loadu_ps(p + j)));
             }
             trellis_out(groups_[gi].t->down, c, 1, TR_OUT_COLS, c0, c0 + TR_OUT_COLS, o, TR_OUT_COLS);
-            float * y = y_ + (size_t) slots_[si].row * D_MODEL + c0;
+            float * y = y_ + (size_t) slots_[si].row * dm_ + c0;
             const __m256 w = _mm256_set1_ps(slots_[si].w);
             for (int j = 0; j < TR_OUT_COLS; j += 8) _mm256_storeu_ps(y + j, _mm256_fmadd_ps(w, _mm256_load_ps(o + j), _mm256_loadu_ps(y + j)));
         }
@@ -331,11 +334,11 @@ void ExpertPool::item_trellis(int i, int phase)
         const TrellisMat W = trellis_inputs(up ? gr.t->up : gr.t->gate, b * IN, (b + 1) * IN);
         const size_t step = (size_t) trellis_prep_floats(IN, 1);
         if (P.size() < step * MAX_ROWS) P.resize(step * MAX_ROWS);
-        for (int k = 0; k < R; ++k) trellis_prep(W, x_ + (size_t) gr.rows[k] * D_MODEL + b * IN, D_MODEL, 1, &P[k * step]);
-        trellis_gemv_raw(W, P.data(), R, 0, D_FF, &pg_[(((size_t) gi * 2 + up) * nbg + b) * MAX_ROWS * D_FF], D_FF);
+        for (int k = 0; k < R; ++k) trellis_prep(W, x_ + (size_t) gr.rows[k] * dm_ + b * IN, dm_, 1, &P[k * step]);
+        trellis_gemv_raw(W, P.data(), R, 0, dff_, &pg_[(((size_t) gi * 2 + up) * nbg + b) * MAX_ROWS * dff_], dff_);
         gate_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
     } else {
-        const int ncr = D_MODEL / tr_dn_cols(), per = nbd * ncr, gi = i / per, b = (i % per) / ncr, cr = (i % per) % ncr;
+        const int ncr = dm_ / tr_dn_cols(), per = nbd * ncr, gi = i / per, b = (i % per) / ncr, cr = (i % per) % ncr;
         const Group & gr = groups_[gi];
         const int R = (int) gr.rows.size(), j0 = b * TR_DN_IN;
         alignas(32) float g[MAX_ROWS][TR_DN_IN], u[MAX_ROWS][TR_DN_IN], h[MAX_ROWS][TR_DN_IN];
@@ -344,20 +347,24 @@ void ExpertPool::item_trellis(int i, int phase)
                 float * a = up ? u[k] : g[k];
                 std::fill(a, a + TR_DN_IN, 0.f);
                 for (int bb = 0; bb < nbg; ++bb) {   // block order
-                    const float * p = &pg_[((((size_t) gi * 2 + up) * nbg + bb) * MAX_ROWS + k) * D_FF + j0];
+                    const float * p = &pg_[((((size_t) gi * 2 + up) * nbg + bb) * MAX_ROWS + k) * dff_ + j0];
                     for (int j = 0; j < TR_DN_IN; j += 8)
                         _mm256_store_ps(a + j, _mm256_add_ps(_mm256_load_ps(a + j), _mm256_loadu_ps(p + j)));
                 }
                 trellis_out(up ? gr.t->up : gr.t->gate, a, 1, TR_DN_IN, j0, j0 + TR_DN_IN, a, TR_DN_IN);
             }
-            for (int j = 0; j < TR_DN_IN; ++j) h[k][j] = g[k][j] / (1.f + std::exp(-g[k][j])) * u[k][j];
+            for (int j = 0; j < TR_DN_IN; ++j) {
+                float a = g[k][j], b = u[k][j];
+                if (limit_ > 0.f) a = std::min(a, limit_), b = std::min(std::max(b, -limit_), limit_);   // DeepSeek-V4
+                h[k][j] = a / (1.f + std::exp(-a)) * b;
+            }
         }
         const TrellisMat W = trellis_inputs(gr.t->down, j0, j0 + TR_DN_IN);
         const size_t step = (size_t) trellis_prep_floats(TR_DN_IN, 1);
         if (P.size() < step * MAX_ROWS) P.resize(step * MAX_ROWS);
         for (int k = 0; k < R; ++k) trellis_prep(W, h[k], TR_DN_IN, 1, &P[k * step]);
         const int c0 = cr * tr_dn_cols();
-        trellis_gemv_raw(W, P.data(), R, c0, c0 + tr_dn_cols(), &pd_[((size_t) gi * nbd + b) * MAX_ROWS * D_MODEL + c0], D_MODEL);
+        trellis_gemv_raw(W, P.data(), R, c0, c0 + tr_dn_cols(), &pd_[((size_t) gi * nbd + b) * MAX_ROWS * dm_ + c0], dm_);
         down_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
     }
     const long long ius = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();

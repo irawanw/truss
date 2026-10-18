@@ -243,7 +243,7 @@ nibble of byte i for i < 16, the high nibble of byte i − 16 otherwise; value (
 block (chosen by squared error among amax/7 × {0.85 … 1.1}). Expert = gate q, gate d, up q, up d (640 × 2560), down
 q, down d (2560 × 640).
 
-**API.** `expert_view(bytes)` → `Q4Expert`; `ExpertPool(threads)`; `start(x [T][2560], T ≤ 8, slots {row, expert,
+**API.** `expert_view(bytes)` → `Q4Expert`; `ExpertPool(threads, d_model = 2560, d_ff = 640, swiglu_limit = 0)` (trellis path: any shape, sized from `MoeKernels`; q4s: Flash-Next only); `start(x [T][2560], T ≤ 8, slots {row, expert,
 w}, y [T][2560])` returns at once, `wait()` blocks (the caller works on items meanwhile); `run` = both.
 
 **Work split.** Slots are grouped by expert. Phase 0 items: an expert's gate and up rows in chunks of 64 (10 per

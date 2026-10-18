@@ -16,6 +16,7 @@ namespace truss::runtime {
 
 struct MoeKernels {
     int d_model = 0, d_ff = 0, topk = 0;
+    float swiglu_limit = 0.f;   // the CPU tier's clamp (the GPU kernels carry it in the shape)
     size_t (*window_ws)() = nullptr;
     void (*window_init)(void * ws, cudaStream_t) = nullptr;
     void (*window)(const moe::Weights &, const float * x, const int * ids, const float * wts, int n_rows, float * out,
@@ -27,7 +28,7 @@ struct MoeKernels {
     template <class Shape> static MoeKernels of()
     {
         MoeKernels k;
-        k.d_model = Shape::D_MODEL, k.d_ff = Shape::D_FF, k.topk = Shape::TOPK;
+        k.d_model = Shape::D_MODEL, k.d_ff = Shape::D_FF, k.topk = Shape::TOPK, k.swiglu_limit = Shape::SWIGLU_LIMIT;
         k.window_ws = &moe::workspace_bytes<Shape>;
         k.window_init = &moe::workspace_init<Shape>;
         k.window = [](const moe::Weights & W, const float * x, const int * ids, const float * wts, int n, float * out,

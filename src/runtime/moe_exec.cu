@@ -52,7 +52,7 @@ MoeExec::MoeExec(engine::Gpu & g, const MoeKernels & k, std::vector<MoeLayer> la
     else if (o_.cpu_trellis) load_cpu_tier_trellis(hot, usage);
     if (cpu_tier_) {
         if (pool) cpu_tier_->pool = pool;
-        else cpu_tier_->pool = std::make_shared<cpu::ExpertPool>(o_.cpu_threads);
+        else cpu_tier_->pool = std::make_shared<cpu::ExpertPool>(o_.cpu_threads, k_.d_model, k_.d_ff, k_.swiglu_limit);
         cpu_tier_->pool_mu = pool_mu;
     }
     engine::load_mark("CPU tier");
