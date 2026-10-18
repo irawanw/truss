@@ -82,6 +82,7 @@ add_library(truss_engine STATIC
   src/blocks/shortconv.cu
   src/blocks/attn_gqa.cu
   src/blocks/attn_ds41.cu
+  src/blocks/engram.cu
   src/runtime/expert_store.cu
   src/runtime/expert_store_plan.cu
   src/runtime/expert_store_ring.cu
@@ -125,6 +126,7 @@ add_library(truss_kernels STATIC
   src/kernels/ds41/attn_ops.cu
   src/kernels/ds41/indexer.cu
   src/kernels/ds41/sparse_attn.cu
+  src/kernels/ds41/engram.cu
   src/kernels/ffn/ffn_ops.cu
   src/kernels/ffn/route_sigmoid.cu
   src/kernels/norm/rms_norm.cu
@@ -193,6 +195,9 @@ target_link_libraries(qwen4exp_parity PRIVATE truss_models truss_kernels)
 add_executable(ds41_attn_parity tests/layer/ds41_attn_parity.cu)
 target_include_directories(ds41_attn_parity PRIVATE .)
 target_link_libraries(ds41_attn_parity PRIVATE truss_engine)
+add_executable(ds41_engram_parity tests/layer/ds41_engram_parity.cu)
+target_include_directories(ds41_engram_parity PRIVATE .)
+target_link_libraries(ds41_engram_parity PRIVATE truss_engine)
 add_executable(qwen4exp_dsa_long tests/layer/qwen4exp_dsa_long.cu)
 target_include_directories(qwen4exp_dsa_long PRIVATE .)
 target_link_libraries(qwen4exp_dsa_long PRIVATE truss_models truss_kernels)

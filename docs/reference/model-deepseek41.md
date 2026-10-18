@@ -12,7 +12,8 @@ Plan and phases: `docs/PLAN-20261019-dsv41.md`. Math reference: the vendored off
 | `ds41-experts.gguf` (~97 GB, HDD) | `tools/tk-pack/ds41_experts.py` from the X3.1 encodes | `blk.L.ffn_{gate,up,down}_exps.m3_{trellis,meta,suh,svh}`, 256 kept experts per layer renumbered in ascending original id; K codes 2 / 25 / 3 |
 
 The engine reads the experts as an overlay (`TRUSS_EXPERT_OVERLAY`, `gguf::File::overlay`). The Engram tables
-(2 x 384M rows) are not in either file (int4 table file planned, PoC TRACKER R8).
+(2 x 384M rows) are their own files: `ds41-engram-L{1,14}.gguf` from `tools/tk-pack/ds41_engram.py`, int4 rows of
+144 B (55.3 GB each; PoC TRACKER R8 for the error), read row by row by `blocks::Engram`; they belong on NVMe.
 
 ## Files
 
