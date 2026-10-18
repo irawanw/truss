@@ -33,7 +33,7 @@ drafter defers its commit to the next `draft()`. `select()` inside the last stag
 
 | file | block | state per slot |
 |---|---|---|
-| `weights.h` | the blocks' host weight views (`HcWeights`, `GdnWeights`, `DsaWeights`, `PleWeights`, `MoeWeights`) | - |
+| `weights.h` | the blocks' host weight views (`HcWeights`, `GdnWeights`, `DsaWeights`, `PleWeights`, `MoeWeights`, `SkHcWeights`, `Ds41AttnWeights`, `EngramWeights`) | - |
 | `linear.h/.cu` | `Linear`: every projection by the tensor's format (Q8_0 repacked at upload, F32; trellis dense next), `Act` (quantize once per input), `lin`, `lin32` (row-invariant gemv <= 32 rows), `lin_multi` (one launch at decode rows), `lin_multi_silu`; host-resident rows (untied embedding in pinned memory, TRACKER #60) | - |
 | `head.h/.cu` | `Head`: output projection; drafter vocab subset (`set_draft_vocab`); FP16 vocab tiling | - |
 | `hc.h/.cu` | `Hc`: hyper-connection mix / combine / expand (`TRUSS_HC_SILU`, `TRUSS_HC_COLLAPSE` fusions) | - |
@@ -46,6 +46,7 @@ drafter defers its commit to the next `draft()`. `select()` inside the last stag
 | `ffn_dense.h` | `DenseFfn`: SwiGLU (gate + up in one launch at decode rows) | - |
 | `shortconv.h/.cu` | `ShortConv`: in_proj -> B*x causal depthwise conv -> C* -> out_proj | conv rows; snapshot + window rows (`tail_rows`) |
 | `attn_gqa.h/.cu` | `AttnGqa`: q/k/v, per-head norm + rope + cache write, dense causal GQA (kernels/attn/gqa) | K/V (positional) |
+| `attn_ds41.h/.cu` | `AttnDs41`: DeepSeek-V4.1 attention (q LoRA, shared latent kv = key and value, window 128 + compressed top-512, sinks, inverse rope, grouped output LoRA as one wo_a of T x 8 rows + `pick_groups`); KV sources compress (ratio 1 projection, ratio 2 gated pooling) into the compressed cache + fp32 index keys; index sources score and select (`IDX_ROWS` = 64 rows at a time), the candidate source also picks 2,048 blocks of 8; consumers get source pointers (`set_sources`); `alloc()` for tests without a stage. Gate: `ds41_attn_parity` (#177) | window ring (256 rows); KV sources: compressed cache, index keys (positional), ratio-2 raw rings; chunk top-k / candidates on the source |
 | `moe.h/.cu` | `Moe`: router (fp32) + routed experts through `runtime::MoeExec` + optional gated shared expert; routing rule (`RouteFn`) and shared expert are parameters | - (residency is the runtime's) |
 
 **Adding a block** (a new layer kind: GQA attention, short conv, Mamba-2, dense FFN): a class with a dims struct,

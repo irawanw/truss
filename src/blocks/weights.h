@@ -33,4 +33,22 @@ struct MoeWeights {
     T exp_bias = nullptr;                  // [n_expert] fp32 selection bias (sigmoid routers), optional
 };
 
+struct SkHcWeights {   // DeepSeek-V4 mHC around one sub-block: fn [(2 + hc) hc][hc d] fp32, base [(2 + hc) hc], scale [3]
+    T fn = nullptr, base = nullptr, scale = nullptr;
+};
+
+struct Ds41AttnWeights {   // DeepSeek-V4.1 attention (blocks/attn_ds41): q / kv / grouped output LoRA, sinks; the
+                           // compressor and indexer parts only on their source layers (nullptr elsewhere)
+    T q_a = nullptr, q_a_norm = nullptr, q_b = nullptr, kv = nullptr, kv_norm = nullptr, out_a = nullptr,
+      out_b = nullptr, sinks = nullptr;
+    T cmp_kv = nullptr, cmp_gate = nullptr, cmp_norm = nullptr;          // compressor (kv sources; gate: ratio > 1)
+    T idx_k = nullptr, idx_k_norm = nullptr;                             // index keys (kv sources)
+    T idx_q_b = nullptr, idx_proj = nullptr;                             // index queries (index sources)
+};
+
+struct EngramWeights {   // DeepSeek Engram: wkv [buckets head_dim -> (hc + 1) d], q / k gate weights [hc][d]; the
+                         // hash table itself is host-side (its own file)
+    T wkv = nullptr, q = nullptr, k = nullptr;
+};
+
 }  // namespace truss::blocks

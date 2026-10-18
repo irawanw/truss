@@ -118,3 +118,13 @@ cost is per-step latency. Headroom: a chunked (WY) formulation on tensor cores.
 
 **Tested by.** `gdn_prefill_test` (vs the reference: out rel 2.3e-7, state 6e-8), the parity test (GDN blocks vs
 llama-paw), `qwen4exp_forward` (conv/recurrent state across chunks).
+
+## DeepSeek-V4.1 attention kernels: `src/kernels/ds41/` (math: dsref/model.py Attention / Compressor / Indexer)
+
+| file | ops | notes |
+|---|---|---|
+| `attn_ops.{cuh,cu}` | `rope_inv_freq` (host, fp32 like torch, YaRN when orig_ctx > 0), `rope_tail` (last rd dims of each head, adjacent pairs, position `pos_base + row * pos_mul`, inverse = conjugate; fp32 angle = float(pos) * inv_freq, `sincosf`), `ring_write` / `ring_write_f32` (last R rows of a chunk at p % R), `groups_done` + `pool` (ratio-r softmax-gated pooling per dim; earlier positions of a group from the raw rings), `pick_groups` (block-diagonal wo_a from a dense T x G projection), `to_half` | elementwise, deterministic |
+| `indexer.{cuh,cu}` | `idx_scores` (32 heads x 128; one thread per compressed position, query row in shared memory; -inf past the row's visible count (pos + 1) / ratio; weight scale folded), `select_topk` (one CTA per row: 4-pass radix select on the order-preserving uint32 image, entries > -inf only, ties to the lower index, output in ascending index order, -1 padded), `block_max` (+inf pin on the newest block), `mask_blocks` (shared-memory bitmap) | v1 CUDA-core; prefill at long context wants tensor-core scores |
+| `sparse_attn.{cuh,cu}` | `sparse_attn`: CTA (row, head); window keys from the chunk or the ring, compressed keys by index; softmax max over the keys, sink only in the denominator (as the reference); P.V in key order | v1; the 64 heads share keys: a head-batched tensor-core kernel is the speed path |
+
+**Tested.** `ds41_attn_parity` (block level, real weights, #177). Index keys are fp32 (selection is rounding-sensitive).

@@ -3,12 +3,16 @@
 // right).
 // usage: tk-pack-inspect <model.gguf | any shard>          summary
 //        tk-pack-inspect <model.gguf> list                 one line per tensor (tests/unit/gguf_reader_check.py)
+// TRUSS_EXPERT_OVERLAY=<file>: read that overlay over the model first, as the C API does (deepseek41: the experts).
 #include "formats/gguf.h"
 #include "formats/trellis_table.h"
+#include "model/deepseek41/config.h"
+#include "model/deepseek41/weights.h"
 #include "model/qwen4exp/config.h"
 #include "model/qwen4exp/weights.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
@@ -112,6 +116,18 @@ void expert_tables(const File & f)
 void bind_model(const File & f)
 {
     const std::string arch = f.get_string("general.architecture");
+    if (arch == "deepseek41") {
+        const auto c = truss::deepseek41::Config::from_gguf(f);
+        const auto w = truss::deepseek41::bind(f, c);
+        int cmp = 0, idx = 0;
+        for (int l = 0; l < c.n_layer; ++l) cmp += c.is_kv_source(l), idx += c.is_index_source(l);
+        std::printf("\ndeepseek41 binding: all %zu tensors bound; %d layers (%d KV sources, %d index sources), Engram at",
+                    f.tensors().size(), c.n_layer, cmp, idx);
+        for (auto l : c.engram.layers) std::printf(" %lld", (long long) l);
+        std::printf("; d_model %d, vocab %d, experts %d top-%d (x%.2f, clamp %.0f), hc %d, window %d\n", c.d_model,
+                    c.n_vocab, c.n_expert, c.n_expert_used, c.expert_scale, c.swiglu_limit, c.hc, c.window);
+        return;
+    }
     if (arch != "qwen4exp") {
         std::printf("\nno TRUSS model binding for architecture %s\n", arch.c_str());
         return;
@@ -137,6 +153,10 @@ int main(int argc, char ** argv)
     }
     try {
         const auto f = File::open(argv[1]);
+        if (const char * ov = std::getenv("TRUSS_EXPERT_OVERLAY")) {
+            f->overlay(ov);
+            std::printf("overlay %s: %zu tensors replaced\n", ov, f->overlaid());
+        }
         if (argc > 2 && std::strcmp(argv[2], "list") == 0) {
             list(*f);
             return 0;
