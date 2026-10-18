@@ -18,7 +18,7 @@ BASE = /mnt/hdd/ml/flashnext/20260920_dense_codec_requant/data/20260923_q4k_rete
 
 | binary | checks | gate | run |
 |---|---|---|---|
-| `moe_window_test` | `moe::window` vs llama-paw's unfused PAW X3 chain, random trellis weights (all K or `TRUSS_KFIX`); Flash-Next rows plus Lfm2 rows (B3: the Lfm2 shape had no coverage); timing in a CUDA graph | rel within llama's own rounding | `moe_window_test [rows...]` |
+| `moe_window_test` | `moe::window` vs llama-paw's unfused PAW X3 chain, random trellis weights (all K or `TRUSS_KFIX`); Flash-Next, Lfm2 (B3) and DsV41 rows (`TRUSS_SHAPES` subset of `fld`; DsV41 adds `ggml_clamp` to the reference, `TRUSS_XSCALE` scales x so the clamp is hit, the line prints the clamped share); timing in a CUDA graph | rel within llama's own rounding | `moe_window_test [rows...]` |
 | `moe_prefill_test` | `moe::prefill` vs `moe::window` 8 rows at a time; row prefix invariance; TFLOPS | rel ≤ 5e-3, worst token ≤ 2e-2, prefix bit-identical | `moe_prefill_test [T...]` (default 64 512 2048 8192) |
 | `q8_gemm_test` | 8 dense shapes: q8_gemm vs ref LLAMA, a16 vs ref FP32, gemv vs q8_gemm; a16 prefix variance; timings | 1e-5 / 3e-4 / 1e-6 | `q8_gemm_test [timing rows]` |
 | `gdn_prefill_test` | `gdn::delta_rule` vs `ref::gated_delta_rule` (outputs and final state) | 1e-5 | `gdn_prefill_test [T...]` |

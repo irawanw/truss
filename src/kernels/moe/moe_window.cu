@@ -46,6 +46,17 @@ __device__ __forceinline__ unsigned long long now_ns()
 
 __device__ __forceinline__ float silu(float x) { return x / (1.0f + __expf(-x)); }
 
+// silu(g) * u with the shape's SwiGLU clamp (none at SWIGLU_LIMIT 0; folded away at compile time)
+template <class Shape> __device__ __forceinline__ float swiglu(float g, float u)
+{
+    constexpr float L = Shape::SWIGLU_LIMIT;
+    if constexpr (L > 0.0f) {
+        g = fminf(g, L);
+        u = fminf(fmaxf(u, -L), L);
+    }
+    return silu(g) * u;
+}
+
 // GEMV geometry: a block is WK x WG warps; WK warps split the k slices, WG column groups of WNT 16-column tiles;
 // PF = k slices in flight per warp (loads ring).
 template <int WK_, int WG_, int PF_, int WNT_>
@@ -69,6 +80,12 @@ template <> struct Tune<Lfm2> {            // swept 10-15 (TRACKER #164): decode
     using GateUp = Geom<8, 1, 2, 4>;       // 8 k-split warps x 4 tiles: 2x the items of 8 tiles (96 -> 192 at top-4)
     using Down = Geom<8, 1, 2, 8>;         // 128 columns: 2x the down items (32 -> 64), 8 k-split warps over F = 1536
     static constexpr int GU_KSPLIT = 1;    // 2 / 4: no gain
+};
+template <> struct Tune<DsV41> {           // first guess = Lfm2's geometry (F 2304 ~ 1536); sweep pending
+    static constexpr int BLOCKS_PER_SM = 1;
+    using GateUp = Geom<8, 1, 2, 4>;       // 64 columns: 36 groups x 2 projections per slot
+    using Down = Geom<8, 1, 2, 8>;         // 128 columns: 40 groups over D = 5120
+    static constexpr int GU_KSPLIT = 1;
 };
 
 // Compile-time sizes of one shape
@@ -430,10 +447,10 @@ __device__ __noinline__ void run_mid(const Slot & S, const float * __restrict__ 
         had4x32(g.x, g.y, g.z, g.w, lane);
         had4x32(u.x, u.y, u.z, u.w, lane);
         // round to fp16 before the down pre-scale, as the reference feeds fp16 activations into the down GEMV
-        const half2 p01 = __hmul2(__floats2half2_rn(silu(g.x * fg.x) * (u.x * fu.x), silu(g.y * fg.y) * (u.y * fu.y)),
-                                  *(const half2 *) &sd.x);
-        const half2 p23 = __hmul2(__floats2half2_rn(silu(g.z * fg.z) * (u.z * fu.z), silu(g.w * fg.w) * (u.w * fu.w)),
-                                  *(const half2 *) &sd.y);
+        const half2 p01 = __hmul2(__floats2half2_rn(swiglu<Shape>(g.x * fg.x, u.x * fu.x),
+                                                    swiglu<Shape>(g.y * fg.y, u.y * fu.y)), *(const half2 *) &sd.x);
+        const half2 p23 = __hmul2(__floats2half2_rn(swiglu<Shape>(g.z * fg.z, u.z * fu.z),
+                                                    swiglu<Shape>(g.w * fg.w, u.w * fu.w)), *(const half2 *) &sd.y);
         float h0 = __low2float(p01), h1 = __high2float(p01), h2 = __low2float(p23), h3 = __high2float(p23);
         had4x32(h0, h1, h2, h3, lane);
         half2 * o = (half2 *) (A_d + off);
@@ -619,5 +636,9 @@ template size_t workspace_bytes<Lfm2>();
 template void workspace_init<Lfm2>(void *, cudaStream_t);
 template void window<Lfm2>(const Weights &, const float *, const int *, const float *, int, float *, void *,
                            cudaStream_t, TraceEvent *);
+template size_t workspace_bytes<DsV41>();
+template void workspace_init<DsV41>(void *, cudaStream_t);
+template void window<DsV41>(const Weights &, const float *, const int *, const float *, int, float *, void *,
+                            cudaStream_t, TraceEvent *);
 
 }  // namespace truss::moe

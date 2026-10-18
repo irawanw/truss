@@ -7,11 +7,21 @@
 namespace truss::moe {
 
 // Routed-expert shape of a model. A new model is a new struct plus explicit instantiations in the ops' .cu files.
+// SWIGLU_LIMIT > 0: the gate is clamped from above and the up branch on both sides before silu(gate) * up.
 struct FlashNext {                         // Qwen3.8 Flash-Next: 512 experts, top-10
     static constexpr int D_MODEL = 2560, D_FF = 640, TOPK = 10;
+    static constexpr const char * NAME = "FlashNext";
+    static constexpr float SWIGLU_LIMIT = 0.0f;
 };
 struct Lfm2 {                              // LFM2.5-24B-A2B: 64 experts, top-4
     static constexpr int D_MODEL = 2048, D_FF = 1536, TOPK = 4;
+    static constexpr const char * NAME = "Lfm2";
+    static constexpr float SWIGLU_LIMIT = 0.0f;
+};
+struct DsV41 {                             // DeepSeek-V4.1-Flash-1017: 384 experts (256 kept by the pack), top-6
+    static constexpr int D_MODEL = 5120, D_FF = 2304, TOPK = 6;
+    static constexpr const char * NAME = "DsV41";
+    static constexpr float SWIGLU_LIMIT = 10.0f;   // config swiglu_limit (routed and shared experts)
 };
 
 struct ProjView {                          // one projection (gate, up or down) of all experts of a layer

@@ -79,8 +79,10 @@ predecessor-relevant low bits: 2^(16−S) floats per step (shared memory for S �
 
 ## `src/kernels/moe/moe_weights.cuh` — shapes and weight views
 
-`moe::FlashNext { D_MODEL = 2560, D_FF = 640, TOPK = 10 }` (a new model = a new struct + explicit instantiations in
-the op .cu files). `ProjView { trellis (uint16 base), meta ((K, int32 offset from base) per expert), suh
+`moe::FlashNext { D_MODEL = 2560, D_FF = 640, TOPK = 10 }`, `moe::Lfm2 { 2048, 1536, 4 }`,
+`moe::DsV41 { 5120, 2304, 6, SWIGLU_LIMIT = 10 }` (a new model = a new struct + explicit instantiations in the op .cu
+files). Every shape has `NAME` and `SWIGLU_LIMIT`: > 0 clamps gate ≤ L and up to [-L, L] before `silu(gate) * up`
+(`swiglu<Shape>` in `moe_window.cu`; folded away at compile time for 0, so FlashNext / Lfm2 code is unchanged). `ProjView { trellis (uint16 base), meta ((K, int32 offset from base) per expert), suh
 [n_expert][in], svh [n_expert][out], shift }`; `Weights { ProjView proj[3] (gate, up, down); n_expert }`.
 **The kernels address expert e as `trellis + (meta[2e+1] << shift)` words** (int64 math). `shift` = 0 for GGUF
 tables (word offsets, what the tests pass); `ExpertStore` uses 4 (32-byte units, ±64 GiB) so one arena holds every
@@ -100,7 +102,8 @@ Deadlock-free without co-residency (items only wait on earlier queue items).
 
 **Tunables.** `Tune<FlashNext>`: `BLOCKS_PER_SM = 2` (3 was 13–17% slower, #28); `GateUp = Geom<8,1,2,8>`,
 `Down = Geom<4,2,2,8>` (WK k-split warps × WG column groups, PF k-slices in flight, WNT tiles per warp; cp3 tune log
-v6); `Plan::GU_KSPLIT = 1` (2 was 5% slower, #24).
+v6); `Plan::GU_KSPLIT = 1` (2 was 5% slower, #24). `Tune<DsV41>` = Lfm2's geometry, not yet swept (TRACKER #175:
+1 row K2 157 µs / K3 171 µs per layer, 36-50% of 936 GB/s).
 
 **Speed.** 4 rows: K2 ~118–123 µs, K3 ~131, mixed ~130 per layer (#22). GU/D items run at the decode ceiling; losses
 are the prologue (~7 µs), start waits (~7 µs) and tail (~10–15 µs) (#26). `tools/tk-bench/moe_trace.cu` prints the

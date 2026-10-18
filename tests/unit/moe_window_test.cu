@@ -1,7 +1,9 @@
 // truss::moe::window: correctness vs llama-paw's unfused PAW_X3 chain (mm_id gate/up -> swiglu -> mm_id down ->
 // moe_reduce) on the same random trellis weights, and timing inside a CUDA graph.
-// Shapes: Flash-Next layer (2560 x 640, 512 experts, top-10) and Lfm2 (2048 x 1536, 64 experts, top-4, B3: covers
-// the per-128-column mid pieces at decode rows). Env: TRUSS_KFIX (0 = mixed 1..4), TRUSS_REPS.
+// Shapes: Flash-Next layer (2560 x 640, 512 experts, top-10), Lfm2 (2048 x 1536, 64 experts, top-4, B3: covers
+// the per-128-column mid pieces at decode rows) and DsV41 (5120 x 2304, 256 experts, top-6, SwiGLU clamp 10; the
+// reference clamps with ggml_clamp, TRUSS_XSCALE scales its inputs so the clamp is hit). Env: TRUSS_KFIX (0 = mixed
+// 1..4), TRUSS_REPS, TRUSS_SHAPES (subset of "fld", default all).
 // usage: moe_window_test [n_rows ...]
 #include "kernels/moe/moe_window.cuh"
 
@@ -20,6 +22,7 @@
 
 using truss::moe::FlashNext;
 using truss::moe::Lfm2;
+using truss::moe::DsV41;
 
 static int64_t env_int(const char * n, int64_t d) { const char * e = getenv(n); return e ? atoll(e) : d; }
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { printf("CUDA %s at %d\n", cudaGetErrorString(e_), __LINE__); exit(1); } } while (0)
@@ -60,7 +63,13 @@ static int run_shape(ggml_backend_t backend, int64_t n_tokens, int64_t n_expert,
     ggml_tensor * x3d = ggml_reshape_3d(ctx, t_x, n_embd, 1, n_tokens);
     ggml_tensor * gate = ggml_paw_x3_mm_id(ctx, proj[0], proj[1], proj[2], proj[3], t_ids, x3d);
     ggml_tensor * up = ggml_paw_x3_mm_id(ctx, proj[4], proj[5], proj[6], proj[7], t_ids, x3d);
-    ggml_tensor * par = ggml_swiglu_split(ctx, gate, up);
+    ggml_tensor * gate_c = gate, * up_c = up;
+    constexpr float L = Shape::SWIGLU_LIMIT;
+    if (L > 0.0f) {
+        gate_c = ggml_clamp(ctx, gate, -INFINITY, L);
+        up_c = ggml_clamp(ctx, up, -L, L);
+    }
+    ggml_tensor * par = ggml_swiglu_split(ctx, gate_c, up_c);
     ggml_tensor * down = ggml_paw_x3_mm_id(ctx, proj[8], proj[9], proj[10], proj[11], t_ids, par);
     ggml_tensor * ref = ggml_paw_moe_reduce(ctx, down, t_w);
     ggml_build_forward_expand(gf, ref);
@@ -97,11 +106,22 @@ static int run_shape(ggml_backend_t backend, int64_t n_tokens, int64_t n_expert,
     {
         std::vector<float> v(ggml_nelements(t_x));
         std::normal_distribution<float> nd(0.0f, 1.0f);
-        for (auto & f : v) f = nd(rng);
+        const float xs = L > 0.0f ? (float) env_int("TRUSS_XSCALE", 1) : 1.0f;
+        for (auto & f : v) f = xs * nd(rng);
         ggml_backend_tensor_set(t_x, v.data(), 0, ggml_nbytes(t_x));
     }
     ggml_backend_graph_compute(backend, gf);
     ggml_backend_synchronize(backend);
+    double clamped = 0.0;                  // share of gate/up values the clamp changed (0 without one)
+    if (L > 0.0f) {
+        std::vector<float> gv(ggml_nelements(gate)), uv(ggml_nelements(up));
+        ggml_backend_tensor_get(gate, gv.data(), 0, ggml_nbytes(gate));
+        ggml_backend_tensor_get(up, uv.data(), 0, ggml_nbytes(up));
+        int64_t n = 0;
+        for (float f : gv) n += f > L;
+        for (float f : uv) n += std::fabs(f) > L;
+        clamped = (double) n / (gv.size() + uv.size());
+    }
 
     truss::moe::Weights W;
     W.n_expert = (int) n_expert;
@@ -176,8 +196,9 @@ static int run_shape(ggml_backend_t backend, int64_t n_tokens, int64_t n_expert,
     CK(cudaStreamSynchronize(st));
     const bool ok_replay = check();
     const bool ok = ok_first && ok_replay;
-    printf("rows=%-2lld K=%s uniq=%-3lld %.1f MB | rel_rms %.5f cos %.8f %s | %.1f us/layer, %.0f GB/s (%.0f%% of 936)\n",
-           (long long) n_tokens, kfix ? std::to_string(kfix).c_str() : "mix1-4", (long long) uniq, tbytes / 1e6,
+    printf("%-9s rows=%-2lld K=%s uniq=%-3lld %.1f MB clamped %.4f | rel_rms %.5f cos %.8f %s | %.1f us/layer, %.0f GB/s"
+           " (%.0f%% of 936)\n", Shape::NAME,
+           (long long) n_tokens, kfix ? std::to_string(kfix).c_str() : "mix1-4", (long long) uniq, tbytes / 1e6, clamped,
            worst_rel, worst_cos, ok ? "PASS" : ok_first ? "FAIL(replay)" : "FAIL", ms * 1e3, tbytes / (ms * 1e-3) / 1e9,
            100.0 * tbytes / (ms * 1e-3) / 936e9);
 
@@ -194,13 +215,18 @@ int main(int argc, char ** argv)
     if (rows.empty()) rows = { 1, 2, 4, 5, 8 };
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     void * ws;
-    CK(cudaMalloc(&ws, std::max(truss::moe::workspace_bytes<FlashNext>(), truss::moe::workspace_bytes<Lfm2>())));
+    CK(cudaMalloc(&ws, std::max({ truss::moe::workspace_bytes<FlashNext>(), truss::moe::workspace_bytes<Lfm2>(),
+                                  truss::moe::workspace_bytes<DsV41>() })));
+    const char * se = getenv("TRUSS_SHAPES");
+    const std::string shapes = se ? se : "fld";
     std::mt19937 rng(4321);
     int fails = 0;
-    for (int64_t n : rows) fails += run_shape<FlashNext>(backend, n, 512, rng, ws);
+    if (shapes.find('f') != std::string::npos)
+        for (int64_t n : rows) fails += run_shape<FlashNext>(backend, n, 512, rng, ws);
     for (int64_t n : rows) {
         if (n > truss::moe::MAX_ROWS) continue;
-        fails += run_shape<Lfm2>(backend, n, 64, rng, ws);
+        if (shapes.find('l') != std::string::npos) fails += run_shape<Lfm2>(backend, n, 64, rng, ws);
+        if (shapes.find('d') != std::string::npos) fails += run_shape<DsV41>(backend, n, 256, rng, ws);
     }
     printf("%s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
