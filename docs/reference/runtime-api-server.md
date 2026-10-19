@@ -214,7 +214,7 @@ the GGUF; checked token-for-token against llama-tokenize on 7.5K tokens of code 
 **Engine knobs from the environment.** `truss_open_params` applies `qwen4exp::apply_env` (`forward.h`) after the
 params, the same function `tk-bench-spec` uses, so a benched config is served unchanged: `TRUSS_CPU_TRELLIS`,
 `TRUSS_CPU_DYNAMIC`, `TRUSS_CPU_THREADS`, `TRUSS_CPU_SHARE`, `TRUSS_PCIE_GBPS`, `TRUSS_PCIE_FRAC`, `TRUSS_ADAPT_EVERY`,
-`TRUSS_ADAPT_SWAPS`, `TRUSS_RING_GB`, `TRUSS_HINT_K`, `TRUSS_PREFILL_ROWS`, `TRUSS_KV_INT8` (plus the pool's own `TRUSS_CPU_PIN`,
+`TRUSS_ADAPT_SWAPS`, `TRUSS_RING_GB`, `TRUSS_HINT_K`, `TRUSS_TAIL_SKIP`, `TRUSS_PREFILL_ROWS`, `TRUSS_KV_INT8` (plus the pool's own `TRUSS_CPU_PIN`,
 `TRUSS_CPU_SPIN_US`). It also releases the model files' pages after upload (`Options::after_upload`, as the bench:
 the load otherwise peaks near 47 GB resident).
 
@@ -243,7 +243,7 @@ nibble of byte i for i < 16, the high nibble of byte i − 16 otherwise; value (
 block (chosen by squared error among amax/7 × {0.85 … 1.1}). Expert = gate q, gate d, up q, up d (640 × 2560), down
 q, down d (2560 × 640).
 
-**API.** `expert_view(bytes)` → `Q4Expert`; `ExpertPool(threads, d_model = 2560, d_ff = 640, swiglu_limit = 0)` (trellis path: any shape, sized from `MoeKernels`; q4s: Flash-Next only); `start(x [T][2560], T ≤ 8, slots {row, expert,
+**API.** `expert_view(bytes)` → `Q4Expert`; `ExpertPool(threads, d_model = 2560, d_ff = 640, swiglu_limit = 0)` (trellis path: any shape, sized from `MoeKernels`; q4s: Flash-Next only - checked only when the call has slots, so an empty call works for any shape, #191); `start(x [T][2560], T ≤ 8, slots {row, expert,
 w}, y [T][2560])` returns at once, `wait()` blocks (the caller works on items meanwhile); `run` = both.
 
 **Work split.** Slots are grouped by expert. Phase 0 items: an expert's gate and up rows in chunks of 64 (10 per

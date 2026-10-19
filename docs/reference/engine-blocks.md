@@ -67,8 +67,8 @@ moe_kernels.h) and router outputs, never a model.
 | `moe_exec.cu` | construction (budget, hot-set plan, store, CPU tier, route trace, doorbells), `run()` dispatch (all-resident path: every expert on the device and no CPU tier -> the window kernel right after the routing, no doorbell / plan wait / hint; 10-15) + stream path + joins, adaptive tier, routing profile, E6 lending, stats |
 | `moe_paths.cu` | doorbell path (publish, job, shared expert while the driver plans, plan wait, window), fetch path (one sync, CPU split, fetch + hint), split path (E7) |
 | `moe_driver.cu` | `setup_doorbells`, the driver thread loop, watchdog (`TRUSS_DRIVER_DEBUG`) |
-| `moe_serve.cu` | `serve()` (static / dynamic CPU split, copies, plan, hints, idle-link admission, `TRUSS_DRIVER_TS`), `fit_cpu_cost` |
-| `cpu_tier.cc` | CPU tier loaders: q4s files or the pinned pack bytes (the CPU kernels exist for the Flash-Next expert shape only: another shape fails loudly) |
+| `moe_serve.cu` | `serve()` (route tail skip `TRUSS_TAIL_SKIP=R`: a missed expert ranked >= R by weight in every row of the window is masked (-1) with no CPU slot, i.e. contributes 0, no renormalization - CPU tier only, counted in `tail_skipped()`, #192; static / dynamic CPU split, copies, plan, hints, idle-link admission, `TRUSS_DRIVER_TS`), `fit_cpu_cost` |
+| `cpu_tier.cc` | CPU tier loaders: q4s files (Flash-Next expert shape only: another shape fails loudly) or the pinned pack bytes (trellis, any shape the pool takes: DeepSeek 5120 x 2304 with clamp since #181/#191) |
 | `moe_kernels.h` | the shape-erased kernel table |
 | `moe_exec_state.h` | private `CpuTier` and `Bell` |
 

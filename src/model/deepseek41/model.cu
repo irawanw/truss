@@ -83,7 +83,7 @@ std::vector<runtime::MoeLayer> StageModel::moe_layers() const
     std::vector<runtime::MoeLayer> out;
     for (int l = lb_; l < le_; ++l) {
         const blocks::MoeWeights & m = w_.layers[l].moe;
-        out.push_back({ { &m.gate, &m.up, &m.down }, l, false, l + 1 < le_, true });   // no CPU tier (see model.h)
+        out.push_back({ { &m.gate, &m.up, &m.down }, l, true, l + 1 < le_, true });   // CPU tier allowed (#191)
     }
     return out;
 }

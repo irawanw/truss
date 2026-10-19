@@ -54,6 +54,7 @@ struct MoeOptions {
     float split_ms_row = 0.01f;
     bool doorbell = true;
     int hint_k = 4, hint_min_rows = 0;
+    int tail_skip = 0;          // Strata's route tail skip: a missed expert ranked >= this by weight in every row -> 0 (#192)
     double budget_frac = 1.0;   // share of the free VRAM its experts take (layer-split stages sharing a device)
     bool last_stage = true;     // places the aux threads and writes TRUSS_ROUTE_TRACE (one stage does)
 };
@@ -143,6 +144,7 @@ public:
     cpu::ExpertPool * pool() const;
     void driver_ms(double out[3], long & n, bool reset);
     void dyn_stats(long & cpu, long & pcie, double & ms_expert, double & ms_call) const;
+    long tail_skipped() const { return tail_skipped_.load(std::memory_order_relaxed); }   // experts, since construction
     void split_stats(long long out[3]) const;
     std::shared_ptr<cpu::ExpertPool> shared_pool() const;
 
@@ -223,6 +225,7 @@ private:
     double cpu_ms_call_ = 0.12, cpu_ms_expert_ = 0.085, pcie_ms_byte_ = 1.0 / 13.5e6;
     double dyn_s1_ = 0, dyn_sn_ = 0, dyn_st_ = 0, dyn_snn_ = 0, dyn_snt_ = 0;
     long dyn_cpu_ = 0, dyn_pcie_ = 0;
+    std::atomic<long> tail_skipped_{ 0 };
     bool cpu_dynamic_ = false;
     long decode_passes_ = 0;
     std::vector<float> route_usage_;            // [n_store][E] decayed (adaptive tier, driver thread)

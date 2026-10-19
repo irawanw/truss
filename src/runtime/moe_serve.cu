@@ -26,6 +26,27 @@ void MoeExec::serve(const Job & j, Bell & b)
         std::fwrite(h, 4, 2, route_trace_);
         std::fwrite(b.ids, 4, (size_t) n, route_trace_);
     }
+    // TRUSS_TAIL_SKIP=R (Strata's route tail skip, #192): an expert that is not on the device and that every row of the
+    // window ranks R or lower by weight (0-based; ties by position) is neither copied nor computed - its term is 0, the
+    // other weights stay as routed (no renormalization, as Strata). CPU tier only: a skipped entry is masked (-1) like
+    // a CPU one but gets no CPU slot, so the joined CPU rows hold nothing for it.
+    uint8_t skip[8 * 16] = {};
+    if (ct && o_.tail_skip > 0)
+        for (int i = 0; i < n; ++i) {
+            const int e = b.ids[i];
+            if (skip[i] || store_->on_device(l, e)) continue;
+            bool low = true;
+            for (int i2 = 0; i2 < n && low; ++i2) {
+                if (b.ids[i2] != e) continue;
+                const int r0 = i2 / K * K;
+                int rank = 0;
+                for (int q = r0; q < r0 + K; ++q) rank += b.w[q] > b.w[i2] || (b.w[q] == b.w[i2] && q < i2);
+                low = rank >= o_.tail_skip;
+            }
+            if (!low) continue;
+            for (int i2 = i; i2 < n; ++i2) skip[i2] |= b.ids[i2] == e;
+            tail_skipped_.fetch_add(1, std::memory_order_relaxed);
+        }
     std::vector<cpu::Slot> slots;
     std::vector<int> gpu_ids;
     gpu_ids.reserve(n);
@@ -43,7 +64,7 @@ void MoeExec::serve(const Job & j, Bell & b)
             for (int q = 0; q < nd; ++q) seen |= b.ids[dist[q]] == e;
             if (seen) continue;
             dist[nd] = i;
-            if (!store_->on_device(l, e)) {
+            if (!skip[i] && !store_->on_device(l, e)) {
                 if (ct->is_cpu[l][e]) elig.push_back(nd);
                 else pcie_bytes += (double) store_->bytes_of(l, e);
             }
@@ -68,11 +89,12 @@ void MoeExec::serve(const Job & j, Bell & b)
         dyn_cpu_ += n_cpu;
         dyn_pcie_ += best_m;
     } else if (ct) {
-        for (int i = 0; i < n; ++i) to_cpu[i] = ct->is_cpu[l][b.ids[i]];
+        for (int i = 0; i < n; ++i) to_cpu[i] = !skip[i] && ct->is_cpu[l][b.ids[i]];
     }
     for (int i = 0; i < n; ++i) {
         const int e = b.ids[i];
-        b.mids[i] = to_cpu[i] ? -1 : e;
+        b.mids[i] = to_cpu[i] || skip[i] ? -1 : e;
+        if (skip[i]) continue;
         if (to_cpu[i]) slots.push_back(ct->slot(i / K, l, e, b.w[i]));
         else gpu_ids.push_back(e);
     }

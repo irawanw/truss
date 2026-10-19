@@ -111,9 +111,10 @@ int main(int argc, char ** argv)
             sections("decode", S);
             const runtime::ExpertStore::Stats & es = st.moe() ? st.moe()->store().stats() : runtime::ExpertStore::Stats {};
             std::printf("experts: %d of %d resident in the slice; store totals since load: %ld asked, %ld fetched "
-                        "(%.1f MB), %ld hinted (%.1f MB), admitted %.1f MB\n", st.moe() ? st.moe()->n_hot() : 0,
+                        "(%.1f MB), %ld hinted (%.1f MB), admitted %.1f MB, tail-skipped %ld\n", st.moe() ? st.moe()->n_hot() : 0,
                         fam->n_expert() * N, (long) es.experts_asked, (long) es.misses, es.bytes / 1e6,
-                        (long) es.hinted, es.hint_bytes / 1e6, es.admit_bytes / 1e6);
+                        (long) es.hinted, es.hint_bytes / 1e6, es.admit_bytes / 1e6,
+                        st.moe() ? st.moe()->tail_skipped() : 0L);
         }
         return 0;
     } catch (const std::exception & e) {

@@ -244,7 +244,7 @@ void ExpertPool::start(const float * x, int T, const std::vector<Slot> & slots, 
         }
         slot_g_[i] = g, slot_k_[i] = k;
     }
-    if (!trellis_ && (dm_ != D_MODEL || dff_ != D_FF || limit_ != 0.f))
+    if (!trellis_ && !slots_.empty() && (dm_ != D_MODEL || dff_ != D_FF || limit_ != 0.f))   // an empty call has no path
         throw std::invalid_argument("cpu::ExpertPool: the q4s path exists for the Flash-Next shape only");
     if (!trellis_) {
         xq_.resize((size_t) T * D_MODEL);

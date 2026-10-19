@@ -5,6 +5,7 @@
 #include "core/cuda_check.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace truss::hc {
@@ -92,6 +93,53 @@ __global__ void sk_final_kernel(const float * __restrict__ part, int n_chunk, in
         for (int j = 0; j < HC; ++j) o[2 * HC + i * HC + j] = cm[i][j];
 }
 
+// one warp per token, the same arithmetic as sk_final_kernel in the same order (bit-identical, TRACKER #190): lane
+// j < 25 sums its chunk column in chunk order; lanes 0-3 pre, 4-7 post, 8-23 the comb element (i, j) = lane - 8, whose
+// row / column sums gather the four entries by shuffles and add them in index order like the serial loops
+__global__ void __launch_bounds__(128) sk_final_warp_kernel(const float * __restrict__ part, int n_chunk, int T, int hcd,
+                                                            const float * __restrict__ scale, const float * __restrict__ base,
+                                                            float norm_eps, float hc_eps, int iters, int cld,
+                                                            float * __restrict__ coef)
+{
+    const int t = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (t >= T) return;   // whole warps leave together (t is per warp)
+    float m = 0.f;
+    if (lane <= NMIX)
+        for (int c = 0; c < n_chunk; ++c) m += part[((size_t) t * n_chunk + c) * (NMIX + 1) + lane];
+    const float r = rsqrtf(__shfl_sync(0xffffffffu, m, NMIX) / hcd + norm_eps);
+    float * o = coef + (size_t) t * cld;
+    if (lane < HC) o[lane] = sigm(m * r * scale[0] + base[lane]) + hc_eps;
+    else if (lane < 2 * HC) o[lane] = 2.f * sigm(m * r * scale[1] + base[lane]);
+    const bool cb = lane >= 2 * HC && lane < NMIX;
+    const int k = cb ? lane - 2 * HC : 0, i = k / HC, j = k % HC;
+    float x = cb ? m * r * scale[2] + base[lane] : 0.f;
+    auto row = [&](int jj) { return __shfl_sync(0xffffffffu, x, 2 * HC + i * HC + jj); };
+    auto col = [&](int ii) { return __shfl_sync(0xffffffffu, x, 2 * HC + ii * HC + j); };
+    float mx = -INFINITY;
+#pragma unroll
+    for (int jj = 0; jj < HC; ++jj) mx = fmaxf(mx, row(jj));
+    x = expf(x - mx);
+    float s = 0.f;
+#pragma unroll
+    for (int jj = 0; jj < HC; ++jj) s += row(jj);
+    x = x / s + hc_eps;
+    s = 0.f;
+#pragma unroll
+    for (int ii = 0; ii < HC; ++ii) s += col(ii);
+    x /= s + hc_eps;
+    for (int it = 1; it < iters; ++it) {
+        s = 0.f;
+#pragma unroll
+        for (int jj = 0; jj < HC; ++jj) s += row(jj);
+        x /= s + hc_eps;
+        s = 0.f;
+#pragma unroll
+        for (int ii = 0; ii < HC; ++ii) s += col(ii);
+        x /= s + hc_eps;
+    }
+    if (cb) o[lane] = x;
+}
+
 __global__ void sk_collapse_kernel(const float * __restrict__ res, const float * __restrict__ coef, int T, int d, int rld,
                                    int cld, float * __restrict__ y, half * __restrict__ y16)
 {
@@ -174,8 +222,13 @@ void sk_mix(const float * res, const float * fn, const float * scale, const floa
     if (T > 65535) throw std::invalid_argument("hc::sk_mix: T > 65535");
     const int hcd = k.hc * k.d, n_chunk = hcd / SPLIT;
     sk_part_kernel<<<dim3(n_chunk, T), THREADS, 0, stream>>>(res, fn, hcd, k.rld(), (float *) ws);
-    sk_final_kernel<<<(T + 127) / 128, 128, 0, stream>>>((const float *) ws, n_chunk, T, hcd, scale, base, k.norm_eps,
-                                                         k.hc_eps, k.iters, k.cld(), coef);
+    static const bool serial = std::getenv("TRUSS_HC_FINAL_SERIAL") && std::atoi(std::getenv("TRUSS_HC_FINAL_SERIAL"));
+    if (serial)   // the one-thread-per-token reference (A/B only)
+        sk_final_kernel<<<(T + 127) / 128, 128, 0, stream>>>((const float *) ws, n_chunk, T, hcd, scale, base, k.norm_eps,
+                                                             k.hc_eps, k.iters, k.cld(), coef);
+    else
+        sk_final_warp_kernel<<<(T + 3) / 4, 128, 0, stream>>>((const float *) ws, n_chunk, T, hcd, scale, base,
+                                                              k.norm_eps, k.hc_eps, k.iters, k.cld(), coef);
     TRUSS_CUDA(cudaGetLastError());
 }
 

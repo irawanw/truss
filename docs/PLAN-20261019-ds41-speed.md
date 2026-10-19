@@ -48,6 +48,29 @@ copies amortized over more tokens and both links busy at the same time.
 
 ## Phases
 
+### Measured 10-19 (slice bench, L0-5, GPU 0; TRACKER #188-#192)
+
+| | decode ms/layer | TG at 40 layers (est.) | prefill ms/layer (2,048) | PP (est.) |
+|---|---|---|---|---|
+| start, all resident | 0.811 | 30.8 | 114 | 449 |
+| + attention v2 (#189) + sk_final warp (#190) | **0.625** | **40.0** | **70.7** | **724** |
+| 32% resident, PCIe only | 1.350 | 18.5 | 131 | 391 |
+| 32% resident, CPU tier + hints (#191) | 1.080 | 23.1 | | |
+| + tail skip R5 (#192) | 1.009 | 24.8 | | |
+
+What this says about 70 tok/s: the budget is 0.357 ms per layer per token. All-resident is 0.625 (dense gemv 0.27 at ~75%
+of bandwidth, experts 0.17 at ~41%, attention projections + norms ~0.1, mHC 0.09). So the GPU side needs every kernel
+near peak AND the cold path (~1.1 misses x 8.9 MB per layer per token) fully hidden behind it. Speculation amortizes
+the GPU side but multiplies distinct misses per round, so it only pays once misses are cheap. Biggest levers, in
+order: D9 (dense to ~4.5 bits: -4.5 ms/token and +~400 resident experts), expert window kernel to ~85% bandwidth,
+CPU misses overlapped with the GPU (late join), weight-share skip (PolyStrata `--skip-weight`, 10-12% over rank skip
+at equal KL on GLM), then DSpark. Every quality-changing lever is gated by `ds41_kl`.
+
+| id | lever | source | gate |
+|---|---|---|---|
+| D9 | dense weights (attention projections, shared expert; 8 GB/token at Q8_0) to trellis ~4.5 bpw | PAW dense recipe | `ds41_kl` cost; TG |
+| D10 | skip by weight share (an expert outside VRAM under F of its row's weight in every row) | PolyStrata #34 | `ds41_kl` at equal speed vs rank skip |
+
 ### M0 Measure (running 10:16, `20261019_truss_port/data/chain_1016.sh`)
 | id | what | output |
 |---|---|---|

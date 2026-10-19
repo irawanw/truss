@@ -8,7 +8,8 @@
 //   ffn       F = mix_ffn(res);  y = collapse(res, A);        res = post_F(res, moe(ffn_norm(y)));  row coef = F
 // Embedding rows into every copy with a one-hot coef; head = collapse(res, row coef) -> norm -> output (Q8_0).
 // MoE: sqrt(softplus) + bias top-6 of the pack's 256 experts, renormalized, x1.5; ungated shared expert; SwiGLU
-// clamp 10 (moe::DsV41). The CPU expert tier is not used (its kernels are Flash-Next-shaped): misses stream by PCIe.
+// clamp 10 (moe::DsV41). Cold experts run on the CPU trellis tier (shape-generic since #181, on since #191)
+// or stream by PCIe.
 // A stage boundary must fall on an attention source layer (blocks/attn_ds41.h).
 #pragma once
 #include "blocks/attn_ds41.h"
