@@ -25,10 +25,7 @@ int main(int argc, char ** argv)
     }
     try {
         const auto file = gguf::File::open(argv[1]);
-        if (const char * ov = std::getenv("TRUSS_EXPERT_OVERLAY")) {   // X3.1 experts over the served GGUF (#118)
-            file->overlay(ov);
-            std::fprintf(stderr, "expert overlay %s: %zu tensors replaced\n", ov, file->overlaid());
-        }
+        if (const char * ov = std::getenv("TRUSS_EXPERT_OVERLAY")) file->overlay_list(ov);   // X3.1 experts (#118)
         const auto fam = engine::open_family(*file, {});
         const int n = argc > 2 ? std::atoi(argv[2]) : 4096, chunk = argc > 3 ? std::atoi(argv[3]) : 2048;
         const size_t budget = argc > 4 ? (size_t) std::atoll(argv[4]) << 20 : 0;

@@ -20,7 +20,7 @@ public:
         Scratch & sc = *g.sc;
         const size_t m = sc.mark();
         void * ws = sc.alloc<unsigned char>(hc::sk_mix_ws_bytes(T, k_));
-        hc::sk_mix(res, lin_.f32(w_.fn), lin_.f32(w_.base), lin_.f32(w_.scale), T, k_, ws, coef, g.s);
+        hc::sk_mix(res, lin_.f32(w_.fn), lin_.f32(w_.scale), lin_.f32(w_.base), T, k_, ws, coef, g.s);
         sc.release(m);
     }
     // y [T][d] (and y16) = sum_c pre[c] res[c], pre = the first hc floats of each coef row (coef_ld apart)

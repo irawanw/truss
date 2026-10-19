@@ -20,10 +20,12 @@ The engine reads the experts as an overlay (`TRUSS_EXPERT_OVERLAY`, `gguf::File:
 | file | what |
 |---|---|
 | `config.{h,cc}` | `Config::from_gguf`: dims, rope (YaRN), mHC, indexer, candidates, compress ratios, source lists (`kv_source_of`, `index_source_of`: the last source at or before a layer), SwiGLU clamp (one value; the kernel shape carries it), Engram layout. Throws on inconsistent metadata |
-| `model.{h,cu}` | `Family` (shape checks vs `moe::DsV41`, Engram tables present, stage boundaries on attention sources) and `StageModel`: residual row = 4 x 5120 + the 24-float next-collapse coef; per layer [Engram] -> mHC mix / collapse -> attn_norm -> `AttnDs41` -> post -> mHC mix / collapse -> ffn_norm -> `Moe` (sqrt-softplus route, plain shared expert, clamp 10, x1.5) -> post -> coef into the row; head = collapse -> norm -> `Head`. No CPU expert tier (`MoeLayer::cpu_ok = false`: the pool is Flash-Next-shaped) |
+| `model.{h,cu}` | `Family` (shape checks vs `moe::DsV41`, Engram tables present, stage boundaries on attention sources) and `StageModel`: residual row = 4 x 5120 + the 24-float next-collapse coef; per layer [Engram] -> mHC mix / collapse -> attn_norm -> `AttnDs41` -> post -> mHC mix / collapse -> ffn_norm -> `Moe` (sqrt-softplus route, plain shared expert, clamp 10, x1.5) -> post -> coef into the row; head = collapse -> norm -> `Head`. `TRUSS_DS41_DUMP=<dir>` appends each layer's `res_in`, `res_eng` (after Engram), `attn_in`, `attn_out`, `moe_in`, `moe_out` as fp32 rows to `<dir>/<name>_L<nn>.f32` (debug, synchronous). No CPU expert tier (`MoeLayer::cpu_ok = false`: the pool is Flash-Next-shaped) |
 | `weights.{h,cc}` | `bind`: every tensor checked (ggml shapes from mmnga's `Model::validate`) and used once; compressor / index-key tensors on KV sources, index-query tensors on index sources, Engram on its layers |
 
 **Tested.** `tk-pack-inspect` binds the pack (`TRUSS_EXPERT_OVERLAY=<experts>`); blocks: `ds41_ops_test` (router,
-mHC), `moe_window_test` (DsV41 shape), `ds41_attn_parity` (attention).
+mHC), `moe_window_test` (DsV41 shape), `ds41_attn_parity` (attention); whole layers: `ds41_stage_dump` (layers [0, N) on one GPU with the dumps above), checked
+against dsref's mHC math on TRUSS's own sub-block outputs and against the PoC's `moe_in_L00.pt` capture (10-19: found
+`HcSinkhorn::mix` passing base / scale swapped, KL 15 -> fixed; the kernel test called `sk_mix` directly).
 **Layer split.** Sources hand buffers to consumers by pointer, so a stage boundary must fall at a source layer
 (2, 8, 14 or 20 for this model); 20 splits the work roughly in half.

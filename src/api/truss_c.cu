@@ -30,16 +30,7 @@ truss_model * truss_open_params(const char * gguf_path, const truss_params * p)
             auto m = std::make_unique<truss_model>();
             m->file = gguf::File::open(gguf_path);
             // X3.1 experts over the served GGUF (#118); a comma list adds more files (deepseek41: experts, Engram tables)
-            if (const char * ov = std::getenv("TRUSS_EXPERT_OVERLAY")) {
-                for (std::string rest = ov; !rest.empty();) {
-                    const size_t comma = rest.find(',');
-                    const std::string path = rest.substr(0, comma);
-                    rest = comma == std::string::npos ? "" : rest.substr(comma + 1);
-                    if (path.empty()) continue;
-                    m->file->overlay(path);
-                    std::fprintf(stderr, "overlay %s: %zu tensors replaced so far\n", path.c_str(), m->file->overlaid());
-                }
-            }
+            if (const char * ov = std::getenv("TRUSS_EXPERT_OVERLAY")) m->file->overlay_list(ov);
             engine::DrafterFiles df;
             if (p->mtp && *p->mtp) {
                 if (p->drafts < 1 || p->drafts > DRAFTS_MAX)

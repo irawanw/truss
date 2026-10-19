@@ -306,6 +306,18 @@ void File::overlay(const std::string & path)
         for (int i = 0; i < count; ++i) add_shard(shard_path(stem, i, count), false, true);
 }
 
+void File::overlay_list(const std::string & comma_list)
+{
+    for (std::string rest = comma_list; !rest.empty();) {
+        const size_t comma = rest.find(',');
+        const std::string path = rest.substr(0, comma);
+        rest = comma == std::string::npos ? "" : rest.substr(comma + 1);
+        if (path.empty()) continue;
+        overlay(path);
+        std::fprintf(stderr, "overlay %s: %zu tensors replaced so far\n", path.c_str(), overlaid());
+    }
+}
+
 File::~File()
 {
     for (auto & m : maps_) {

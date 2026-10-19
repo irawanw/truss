@@ -33,13 +33,7 @@ int main(int argc, char ** argv)
         std::vector<int32_t> ids((size_t) n_seq * ctx);
         std::ifstream(argv[2], std::ios::binary).read((char *) ids.data(), ids.size() * 4);
         const auto file = gguf::File::open(argv[1]);
-        if (const char * ov = std::getenv("TRUSS_EXPERT_OVERLAY"))
-            for (std::string rest = ov; !rest.empty();) {
-                const size_t comma = rest.find(',');
-                const std::string path = rest.substr(0, comma);
-                rest = comma == std::string::npos ? "" : rest.substr(comma + 1);
-                if (!path.empty()) file->overlay(path);
-            }
+        if (const char * ov = std::getenv("TRUSS_EXPERT_OVERLAY")) file->overlay_list(ov);
         const auto fam = engine::open_family(*file, {});
         const int V = fam->n_vocab();
         float * d_logits;

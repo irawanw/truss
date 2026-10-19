@@ -19,6 +19,9 @@ metadata and tensor infos with bounds checks, and exposes one catalog.
 | `find(name)` / `at(name)` | `const Tensor *` (nullptr if absent) / `const Tensor &` (throws) |
 | `get(key)` | `const Value *` or nullptr; `Value` = `std::variant<int64_t, double, bool, std::string, vector<int64_t>, vector<double>, vector<bool>, vector<string>>` |
 | `get_int / get_float / get_string / get_ints / get_floats / get_bools(key)` | typed access; throws if absent or of another kind (`get_float` accepts ints) |
+| `overlay(path)` | maps another GGUF (single or split) whose tensors replace same-named ones and add new ones; its metadata is ignored (X3.1 expert overlays, #118). Call before binding weights |
+| `overlay_list(list)` | `overlay()` each path of a comma list in order, skipping empty entries, logging each to stderr; what every tool and the C API do with `TRUSS_EXPERT_OVERLAY` (deepseek41: experts, Engram L1, Engram L14) |
+| `overlaid()` | number of tensor names replaced so far |
 | `shard_paths()` | the shard files in order |
 | `type_info(Type)` | `{name, block, bytes}` per ggml type, nullptr if unknown |
 

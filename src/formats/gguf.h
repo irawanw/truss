@@ -67,6 +67,9 @@ public:
     // same name (and add any new ones); its metadata is ignored. The X3.1 experts ship as an experts-only GGUF over
     // the served one. Call before binding weights.
     void overlay(const std::string & path);
+    // overlay() each path of a comma list in order (TRUSS_EXPERT_OVERLAY; deepseek41: experts, then the Engram
+    // tables); empty entries are skipped. Logs each file to stderr.
+    void overlay_list(const std::string & comma_list);
     size_t overlaid() const { return overlaid_.size(); }
 
     const std::vector<Tensor> & tensors() const { return tensors_; }

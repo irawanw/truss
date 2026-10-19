@@ -5,6 +5,10 @@
 #include "kernels/ds41/attn_ops.cuh"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
 
 namespace truss::deepseek41 {
 
@@ -175,6 +179,20 @@ void StageModel::embed(engine::Stage & st, const engine::Chunk & c, float * res)
     hc::sk_expand(emb, c.T, k, res, res + (size_t) c_.hc * c_.d_model, g.s);
 }
 
+// TRUSS_DS41_DUMP=<dir> (parity debugging, tests/layer/ds41_stage_dump.cu): append T x n fp32 rows of a layer's
+// tensor to <dir>/<name>_L<nn>.f32 (synchronous; off unless the variable is set)
+static void dump(engine::Gpu & g, const char * name, int l, const float * p, int T, int n, int ld)
+{
+    static const char * dir = std::getenv("TRUSS_DS41_DUMP");
+    if (!dir) return;
+    std::vector<float> h((size_t) T * n);
+    TRUSS_CUDA(cudaMemcpy2DAsync(h.data(), (size_t) n * 4, p, (size_t) ld * 4, (size_t) n * 4, T, cudaMemcpyDeviceToHost, g.s));
+    g.sync();
+    char path[512];
+    std::snprintf(path, sizeof path, "%s/%s_L%02d.f32", dir, name, l);
+    if (FILE * f = std::fopen(path, "ab")) std::fwrite(h.data(), 4, h.size(), f), std::fclose(f);
+}
+
 void StageModel::layers(engine::Stage & st, const engine::Chunk & c, float * res, const engine::LayerHook & hook)
 {
     engine::Gpu & g = st.gpu();
@@ -189,20 +207,25 @@ void StageModel::layers(engine::Stage & st, const engine::Chunk & c, float * res
         float * y = sc.alloc((size_t) T * d), * x = sc.alloc((size_t) T * d), * out = sc.alloc((size_t) T * d);
         half * x16 = sc.alloc<half>((size_t) T * d);
         st.prof().record(l, 0, g.s);
-        if (engram_[i]) engram_[i]->forward(g, c.slot, c.tokens, c.pos0, T, res, W);
+        dump(g, "res_in", l, res, T, c_.hc * d + NM, W);
+        if (engram_[i]) engram_[i]->forward(g, c.slot, c.tokens, c.pos0, T, res, W), dump(g, "res_eng", l, res, T, c_.hc * d + NM, W);
         // attention
         hc_attn_[i]->mix(g, res, T, A);
         hc_attn_[i]->collapse(g, res, row_coef, W, T, y, nullptr);
         attn_norm_[i]->forward(g, y, T, x, x16);
         st.prof().record(l, 1, g.s);
+        dump(g, "attn_in", l, x, T, d, d);
         attn_[i]->forward(g, c.slot, x, x16, c.pos0, T, out);
+        dump(g, "attn_out", l, out, T, d, d);
         st.prof().record(l, 2, g.s);
         hc_attn_[i]->post(g, res, out, A, NM, T);
         // FFN
         hc_ffn_[i]->mix(g, res, T, F);
         hc_ffn_[i]->collapse(g, res, A, NM, T, y, nullptr);
         ffn_norm_[i]->forward(g, y, T, x, x16);   // fp32 for the router, fp16 for the projections
+        dump(g, "moe_in", l, x, T, d, d);
         moe_[i]->forward(g, x, x16, T, out, c.stream, st.moe_ws(), st.moe_rows());
+        dump(g, "moe_out", l, out, T, d, d);
         hc_ffn_[i]->post(g, res, out, F, NM, T);
         TRUSS_CUDA(cudaMemcpy2DAsync(row_coef, (size_t) W * 4, F, (size_t) NM * 4, (size_t) NM * 4, T,
                                      cudaMemcpyDeviceToDevice, g.s));

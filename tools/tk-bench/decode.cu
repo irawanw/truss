@@ -9,6 +9,7 @@
 #include "model/qwen4exp/config.h"
 #include "engine/graph_step.h"
 #include "engine/model.h"
+#include "engine/options.h"
 #include "engine/pipeline.h"
 #include "model/qwen4exp/weights.h"
 #include "runtime/expert_store.h"
@@ -33,10 +34,7 @@ int main(int argc, char ** argv)
     }
     try {
         const auto file = gguf::File::open(argv[1]);
-        if (const char * ov = std::getenv("TRUSS_EXPERT_OVERLAY")) {   // X3.1 experts over the served GGUF (#118)
-            file->overlay(ov);
-            std::fprintf(stderr, "expert overlay %s: %zu tensors replaced\n", ov, file->overlaid());
-        }
+        if (const char * ov = std::getenv("TRUSS_EXPERT_OVERLAY")) file->overlay_list(ov);   // X3.1 experts (#118)
         const auto fam = engine::open_family(*file, {});
         std::vector<int32_t> tok;
         if (argc > 2 && argv[2][0] == '@') {
@@ -53,6 +51,7 @@ int main(int argc, char ** argv)
         const int n = (int) tok.size(), steps = argc > 3 ? std::atoi(argv[3]) : 64;
         const int n_ctx = argc > 4 ? std::atoi(argv[4]) : 65536, chunk = argc > 5 ? std::atoi(argv[5]) : 8192;
         engine::Options o;
+        engine::apply_env(o);   // TRUSS_LAYER_SPLIT (two GPUs), TRUSS_PREFILL_ROWS, decode-tier knobs; the args below win
         if (argc > 6 && std::string(argv[6]) != "-")
             o.expert_usage = runtime::ExpertStore::load_usage(argv[6], fam->n_layer(), fam->n_expert());
         o.moe.expert_budget = argc > 7 ? (size_t) std::atoll(argv[7]) << 20 : 0;
