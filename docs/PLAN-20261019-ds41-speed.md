@@ -146,6 +146,23 @@ with the PCIe streaming hidden.** Items, by what they cost:
    no drafter model). Coding agents re-emit file text, so it is a free drafter while DSpark / MTP is not ported.
    -> **D11** (spec gate: accepted tokens per round on a coding transcript; cold-expert bytes per round as D7).
 
+## CurtisAccelerate 1017 EXL3 on 4x CMP 170HX (user link 10-19)
+github.com/CurtisAccelerate/DeepSeekv41-Flash-1017-EXL3-CMP170HX (+ `DeepSeekv41-Flash-EXL3-TC-MoE` kernels):
+our exact model, routed experts EXL3 2.9 bpw (trellis, K3, layers 18-22 K2), everything else official FP8, vLLM
+TP4 on 4 x 64 GB = **all 384 experts resident**, Engram on the host (265 GB pinned), DSpark depth 5.
+- Decode (one user, 140 W): structured 180 / **code 137** / prose 97 tok/s; cycle ~34 ms; accepted tokens per
+  step 5.97 structured, ~4.7 code (137 x 0.034), 3.31 prose. **This is the first measured DSpark acceptance for
+  our model: ~4.7 tokens per round on code.**
+- Prefill 1,520 tok/s flat 2K-32K, 1,460 at 64K, 1,330 at 128K (chunk 2,048, `--max-num-batched-tokens 2048`).
+- Kernel rule by rows: cooperative kernel 1-42 rows, `moe_out_v2` 43-64, `moe_out_prefill` 65-2,048 (tensor-core
+  trellis decode to fp16 fragments, hi/lo fp16 split of bf16 activations, fp32 accumulate); one shared workspace.
+What it changes for us: with all experts resident they spend ~34 ms per 6-row round. Our round = GPU side (~25-30
+ms for 6 rows if the window kernels hold) + the cold bytes of ~6 x 0.87 x the misses per token. At ~4.7 accepted
+per round on code, **70 tok/s on code = a round of <= 67 ms** -> the cold bytes per round must fit in ~35-40 ms
+of CPU + PCIe (~1.5-2 GB per round): needs higher residency (D8 ring fix, D9 dense 4.5 bpw), skips (D3/D10) and
+lookahead. **D7 DSpark moves up: it is the multiplier that makes 70 possible on code** (prose at ~3.3 per round
+stays nearer 45).
+
 ## Execution from 10-19 evening: planner + executor
 User (10-19): run the work through opencode2 with `opencode/deepseek-v4.1-flash-free` as the executor; Claude plans,
 writes one brief per batch, reviews the diff and report, runs the gates it doubts, commits and writes TRACKER rows.
@@ -156,7 +173,7 @@ Only slice benches on GPU 0 (no full-model runs, user 10-19: "use more cheap pp 
 |---|---|---|
 | E1 | slice prefill / decode at 8K / 16K / 32K context, chunk 2K / 8K (M0-D, P1, P5 sizing) | done #196: 906 tok/s at 32K, attention flat per token, no O(T^2) yet |
 | E2 | D10 weight-share skip `TRUSS_SKIP_WEIGHT=F`, golden gate, slice speed vs tail skip R5 | done #197: golden identical; F=0.12 27.8 vs R5 24.9 tok/s, KL open |
-| E3 | prefill sparse attention: cp.async, 32 heads per CTA | running (opencode v1; opencode2 stopped: its free-tier compaction is refused) |
+| E3 | prefill sparse attention: cp.async, 32 heads per CTA | done #198: v5 default, 1,042 tok/s est. |
 | E4 | P7 speed side: slice prefill with int8 dense prompt rows (`TRUSS_ACT=q8`) vs fp16; then a prompt-only switch | queued |
 | next | expert window decode kernel to ~85% bandwidth; P8 int8 expert prefill; prefill attention 32 heads/CTA + cp.async; sk_part on tensor cores; D9 4.5-bit dense; split at 14 + pipelined prefill | queued |
 
