@@ -46,6 +46,9 @@ void apply_env(Options & o)
     if (const char * e = std::getenv("TRUSS_RING_GB")) o.ring_bytes_override = (size_t) (std::atof(e) * (1ull << 30));
     // a fixed VRAM budget for the routed experts instead of "all free memory": a test beside another GPU job (#118)
     if (const char * e = std::getenv("TRUSS_EXPERT_GB")) m.expert_budget = (size_t) (std::atof(e) * (1ull << 30));
+    // E7 (E6 option c, D8): GiB of the ring kept as a FIFO cache; the rest is refilled with the plan's next cold
+    // experts as pinned residents after a prompt. Unset = 0 = off: the ring is FIFO-only, byte-identical to before.
+    if (const char * e = std::getenv("TRUSS_PIN_FILL")) m.pin_fill = (size_t) (std::atof(e) * (1ull << 30));
 }
 
 }  // namespace truss::engine

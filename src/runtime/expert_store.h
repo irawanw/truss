@@ -26,6 +26,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -50,6 +51,9 @@ public:
         // 501 -> 388 MB/pass at equal VRAM (the profile's mass on small rarely-routed experts does not show up,
         // and our most-routed experts are the large high-K ones; TRACKER #90)
         double plan_alpha = 0.0;
+        // E7 (E6 option c, D8): bytes of the ring kept free for the FIFO; after a prompt the rest (ring - pin_fill)
+        // is refilled with the plan's next cold experts as pinned residents (0 = off: the ring is FIFO-only)
+        size_t pin_fill = 0;
     };
     // ring = max(ring_bytes, 2 x the largest cold layer + stream_extra), 256-aligned
     static size_t ring_size(const std::vector<ExpertLayer> & layers, const HotSet & hot, const Sizes & z);
@@ -61,10 +65,15 @@ public:
     // large. Without usage: the same count per layer, index order.
     static HotSet plan(const std::vector<ExpertLayer> & layers, size_t budget, const Sizes & z,
                        const std::vector<float> & usage = {});
+    // E7: the cold experts in plan()'s order (usage / bytes^alpha, descending; index order without usage), for the
+    // ring's after-prompt refill. Hot experts are skipped.
+    static std::vector<std::pair<int, int>> fill_order(const std::vector<ExpertLayer> & layers, const HotSet & hot,
+                                                       const std::vector<float> & usage = {}, double alpha = 0.0);
     // usage file: n_layer * n_expert little-endian float32, layer-major (flashnext_truss_usage.py writes it)
     static std::vector<float> load_usage(const std::string & path, int n_layer, int n_expert);
 
-    ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet & hot, const Sizes & z);
+    ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet & hot, const Sizes & z,
+                std::vector<std::pair<int, int>> fill = {});
     ~ExpertStore();
     // The cold copy is page-locked by a background thread that start_pinning() starts (the owner calls it after its
     // own CUDA setup); wait_pinned() starts it if needed and blocks until it is done. Copies before that are pageable.
@@ -134,6 +143,13 @@ public:
     bool claim(int l, int e);
     bool admit_step();
     size_t admit_backlog() const { return adm_backlog_; }       // claimed bytes not issued yet
+    // E7 (E6 option c, D8): after begin_ring() switches back to ring mode, fill the ring's free space (ring -
+    // Sizes::pin_fill) with `fill`'s cold experts as pinned residents. pin_step() (driver thread) reserves the top
+    // [ring_hi_, ring_) region and queues one claim per expert; admit_step() copies them piecewise like any claim,
+    // so a decode step that needs one before it landed fetches it normally and never waits for the fill. Pinned
+    // experts leave the device on the next begin_stream(). pin_pending() stays true until every copy has landed.
+    bool pin_pending() const { return pin_active_.load(std::memory_order_acquire); }
+    void pin_step();
     // E6 (TRACKER #114): device regions lent to the ring (the unused tails of the KV caches). The ring is one virtual
     // offset space: [0, ring_bytes) is its own region, then each segment; an entry never straddles a region and the
     // head skips to the next one as it does at the ring's end. reclaim(j, lo) makes the first lo bytes of segment j
@@ -241,6 +257,16 @@ private:
     int64_t head_ = 0;                                             // next free ring byte (FIFO)
     std::deque<RingEntry> fifo_;
     Mode mode_ = Mode::RING;
+    // E7 pinned refill (E6 option c, D8): fill_[]'s cold experts land at the top of the ring, [ring_hi_, ring_), and
+    // the FIFO's own region shrinks to [0, ring_hi_); ring_put() can never evict a pinned expert.
+    std::vector<std::pair<int, int>> fill_;                     // the plan's cold experts, in order
+    std::vector<RingEntry> pins_;                               // the pinned residents
+    size_t fill_pos_ = 0, pin_bytes_ = 0, pin_budget_ = 0;
+    std::atomic<bool> pin_active_{ false };                     // armed by begin_ring(); cleared when every copy landed
+    bool pin_queued_ = false;                                   // pin_step() queued every claim the budget allows
+    int64_t ring_hi_ = 0;                                       // top of the FIFO's region (== ring_ when nothing pinned)
+    std::chrono::steady_clock::time_point pin_t0_;
+    void pin_report(const char * tag);                          // E7: one line when the refill lands (or a prompt supersedes it)
     std::vector<void *> device_, pinned_;
     uint8_t * host_region_ = nullptr;                              // every layer's cold copy: anonymous, registered
     size_t host_region_bytes_ = 0;

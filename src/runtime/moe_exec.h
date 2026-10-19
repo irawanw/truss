@@ -41,6 +41,7 @@ struct MoeOptions {
     size_t expert_budget = 0;
     size_t ring_bytes = 4ull << 30;
     double plan_alpha = 0.0;
+    size_t pin_fill = 0;        // E7 (E6 option c, D8): bytes of the ring kept FIFO; the rest is pinned-refilled after a prompt
     std::string cpu_dir;
     float cpu_share = 0.5f;
     int cpu_threads = 12;

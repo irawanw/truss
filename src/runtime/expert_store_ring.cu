@@ -22,7 +22,8 @@ uint8_t * ExpertStore::real(int64_t v) const
 
 bool ExpertStore::region(int64_t v, int64_t * b, int64_t * e) const
 {
-    if (v >= 0 && v < (int64_t) ring_) return *b = 0, *e = (int64_t) ring_, true;
+    // E7: the FIFO's own region stops at ring_hi_; everything above it is the pinned refill's (never allocated here)
+    if (v >= 0 && v < ring_hi_) return *b = 0, *e = ring_hi_, true;
     for (const Segment & g : segs_)
         if (v >= g.vbase + g.lo && v < g.vbase + g.size) return *b = g.vbase + g.lo, *e = g.vbase + g.size, true;
     return false;
@@ -192,7 +193,62 @@ void ExpertStore::begin_ring()
 {
     prof_harvest();
     std::lock_guard<std::mutex> g(adm_mu_);
-    if (mode_ != Mode::RING) mode_ = Mode::RING;   // decode after a prompt: the stream area is empty, the rest kept
+    if (mode_ == Mode::RING) return;   // decode after a prompt: the stream area is empty, the rest kept
+    mode_ = Mode::RING;
+    // E7: arm the refill. pin_step() (driver thread) places the experts in the ring's free space, admit_step()
+    // copies them; the FIFO keeps the last Sizes::pin_fill bytes.
+    if (pin_budget_ && !fill_.empty()) {
+        fill_pos_ = 0, pin_bytes_ = 0, pin_queued_ = false;
+        pins_.clear();
+        ring_hi_ = (int64_t) ring_;
+        pin_t0_ = std::chrono::steady_clock::now();
+        pin_active_.store(true, std::memory_order_release);
+    }
+}
+
+// E7 (E6 option c): reserve the top of the ring for `fill`'s next cold experts and queue one claim each. Pinned
+// experts lie in [ring_hi_, ring_) so ring_put()'s FIFO, which only allocates in [0, ring_hi_), never evicts them.
+// Driver thread (it shares the ring with fetch()); the copies run later in admit_step().
+void ExpertStore::pin_step()
+{
+    if (!pin_active_.load(std::memory_order_acquire) || pin_queued_) return;
+    std::lock_guard<std::mutex> g(adm_mu_);
+    if (mode_ != Mode::RING) { pin_queued_ = true; return; }
+    while (fill_pos_ < fill_.size()) {
+        const auto [l, e] = fill_[fill_pos_];
+        Layer & Y = layers_[l];
+        if (Y.cold_off[e] < 0 || Y.ring_at[e] >= 0) { ++fill_pos_; continue; }   // hot, or already in the ring
+        const int64_t need = (int64_t) align_up(Y.bytes[e]);
+        if (pin_bytes_ + (size_t) need > pin_budget_ || ring_hi_ - need < 0) break;   // the FIFO's share is reached
+        const int64_t off = ring_hi_ - need;
+        // the FIFO's region shrinks to [0, off): everything now above it goes, and the cursor moves back if it is there
+        for (auto it = fifo_.begin(); it != fifo_.end();)
+            if (it->off >= off) drop(*it), it = fifo_.erase(it);
+            else ++it;
+        if (head_ >= off) head_ = 0;
+        ring_hi_ = off;
+        Y.ring_at[e] = off;
+        Y.pend[e] = 1;
+        Y.ref[e] = 0;
+        uint8_t * at = real(off);
+        for (int p = 0; p < 3; ++p)
+            Y.ring_meta_host[(size_t) p * 2 * Y.n_expert + 2 * e + 1] = unit_offset(at + Y.part[p][e], base_, l);
+        Y.meta_dirty = true;
+        claims_.push_back({ l, e, off, 0 });   // admit_step() copies it piecewise, like any claim
+        adm_backlog_ += Y.bytes[e];
+        pin_bytes_ += (size_t) need;
+        pins_.push_back({ l, e, off });
+        ++fill_pos_;
+    }
+    pin_queued_ = true;
+}
+
+// E7: how much of the refill landed and how long it ran. `tag` says whether it finished or a prompt superseded it.
+void ExpertStore::pin_report(const char * tag)
+{
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pin_t0_).count();
+    std::fprintf(stderr, "E7 pin fill: %zu experts, %.2f GiB, %.1f ms%s\n", pins_.size(), pin_bytes_ / 1073741824.0, ms,
+                 tag);
 }
 
 bool ExpertStore::fetch(int l, const int * ids, int n, cudaStream_t compute)
@@ -320,6 +376,11 @@ bool ExpertStore::admit_step()
         }
         ev_pool_.push_back(landing_[i].first);
         landing_.erase(landing_.begin() + (ptrdiff_t) i);
+    }
+    // E7: the refill is complete once every claim it queued has been issued and its copies have landed
+    if (pin_active_.load(std::memory_order_acquire) && pin_queued_ && claims_.empty() && landing_.empty()) {
+        pin_active_.store(false, std::memory_order_release);
+        pin_report("");
     }
     if (mode_ != Mode::RING) return false;
     while (!claims_.empty()) {   // drop claims the ring has moved past

@@ -177,7 +177,7 @@ Only slice benches on GPU 0 (no full-model runs, user 10-19: "use more cheap pp 
 | E3 | prefill sparse attention: cp.async, 32 heads per CTA | done #198: v5 default, 1,042 tok/s est. |
 | E5 | P9 whole-model prefill + decode-path KL of the skips | done #200 |
 | E6 | D8 ring breakdown | done #201 |
-| E7 | D8 (c) pinned ring refill after a prompt (`TRUSS_PIN_FILL`) | sent |
+| E7 | D8 (c) pinned ring refill after a prompt (`TRUSS_PIN_FILL`) | done #202: chunk 4K slice TG 17.8 -> 21.3 est.; neutral/worse at 2K; refill never finishes in a 64-step pass. **Project paused by the user after E7 (10-19).** Resume with E6 option (a): prompt buffers out of the ring |
 | E4 | P7 speed side: slice prefill with int8 dense prompt rows (`TRUSS_ACT=q8`) vs fp16; then a prompt-only switch | queued |
 | next | expert window decode kernel to ~85% bandwidth; P8 int8 expert prefill; prefill attention 32 heads/CTA + cp.async; sk_part on tensor cores; D9 4.5-bit dense; split at 14 + pipelined prefill | queued |
 

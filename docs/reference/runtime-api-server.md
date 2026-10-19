@@ -41,14 +41,16 @@ host mirror, one 4 KB copy per projection per layer that changed). `weights(l)` 
 | call | does |
 |---|---|
 | `ExpertStore::plan(layers, budget, Sizes{ring_bytes, stream_extra}, usage = {})` | hot set whose `device_bytes` fit `budget`; ring = max(ring_bytes, 2 × largest cold layer + stream_extra). Without usage: the first N experts of every layer. With usage (routed counts [layer][expert]): every layer first gets its top `floor` experts by count per byte, then greedy by count per byte over all layers; the floor (steps of 8) with the most hot usage wins |
+| `ExpertStore::fill_order(layers, hot, usage = {}, alpha = 0)` | E7 (E6 option c, D8): the cold experts in `plan()`'s order (usage / bytes^alpha, descending; index order without usage) |
 | `ExpertStore::load_usage(path, n_layer, n_expert)` | usage file: n_layer · n_expert float32, layer-major (`tk-profile` or `flashnext_truss_usage.py` writes it) |
-| `ExpertStore(layers, hot, sizes)` | arena, pinned cold copies, both meta tables, suh/svh |
+| `ExpertStore(layers, hot, sizes, fill = {})` | arena, pinned cold copies, both meta tables, suh/svh. `Sizes::pin_fill` (with `fill`): the ring keeps that many bytes free for the FIFO and pins the rest after a prompt |
 | `weights(l)` | `moe::Weights` for layer l in the current mode |
 | `begin_stream(compute)` | a prompt chunk starts: waits for queued compute, drops the ring's contents, stream mode |
 | `spare()` | stream mode: `stream_extra` bytes after the slots, valid until the next `fetch()` |
 | `prefetch(l)` | stream mode: all of layer l's cold experts into slot l % 2 (one copy), after the slot's release |
 | `fetch(l, ids, n, compute)` | ring mode: makes the cold experts among `ids` (host) resident: FIFO allocation (256-B aligned, wrap at the end, evicting the oldest), one copy each, ring meta updated; waits for queued compute first (the ring may overwrite what earlier kernels read). Refetches if a copy evicted an expert this call needs (up to `need + 1` rounds: each re-copied expert lands at the head; a fixed 3-round bound failed on a 4-row verify window, 10-01). Throws outside ring mode. `compute` = nullptr skips the wait (doorbell: the doorbell already orders it) |
-| `begin_ring()` | switch to ring mode (ring starts empty); called on the thread that enqueues kernels, before `weights()`, because with a doorbell driver `fetch` runs later on another thread (a mode switch there raced with kernel enqueue, TRACKER #61) |
+| `begin_ring()` | switch to ring mode (ring starts empty); called on the thread that enqueues kernels, before `weights()`, because with a doorbell driver `fetch` runs later on another thread (a mode switch there raced with kernel enqueue, TRACKER #61). With `Sizes::pin_fill` it also arms the E7 refill |
+| `pin_step()` / `pin_pending()` | E7 (E6 option c, D8), driver thread: reserves the ring's top `[ring_hi_, ring_)` for `fill_order`'s next cold experts (up to `ring - pin_fill` bytes), one claim each, so `admit_step` copies them piecewise and decode never waits (a step that needs one before it landed fetches it). Pinned experts leave `ring_put`'s FIFO region (`[0, ring_hi_)`) and are never evicted; `begin_stream` drops them. Prints `E7 pin fill: N experts, X GiB, Y ms` when the last copy lands |
 | `fetch` return value | true when it queued a copy (ring entries or meta tables) or needs an expert that `prefetch_hint` queued for this layer since its last fetch (`hinted_`, the copy may still be in flight); false = every id already on the device, nothing to wait for (the doorbell's `wait_plan` then skips `go`) |
 | `admit(le, compute)` / `poll_admitted()` | Strata's adaptive tier (TRACKER #78), between decode passes: copy the cold experts `le` into the ring (FIFO eviction) on the copy stream after `compute`'s queued work; evicted experts leave the device at once, admitted ones are pending (`Layer::pend`, `on_device` false) until the batch's event completes (`poll_admitted`, also called by `fetch`, which treats a pending id like a hinted one). One batch in flight at a time |
 | `signal(l, flag, seq)` / `upload(dst, src, bytes)` | queue, behind every copy issued so far, a write of `seq` to device word `flag` (the doorbell's "go"; sources come from a 1,024-entry pinned word ring since a queued copy reads its source when it runs) / a small pinned copy on the copy stream |
@@ -214,7 +216,7 @@ the GGUF; checked token-for-token against llama-tokenize on 7.5K tokens of code 
 **Engine knobs from the environment.** `truss_open_params` applies `qwen4exp::apply_env` (`forward.h`) after the
 params, the same function `tk-bench-spec` uses, so a benched config is served unchanged: `TRUSS_CPU_TRELLIS`,
 `TRUSS_CPU_DYNAMIC`, `TRUSS_CPU_THREADS`, `TRUSS_CPU_SHARE`, `TRUSS_PCIE_GBPS`, `TRUSS_PCIE_FRAC`, `TRUSS_ADAPT_EVERY`,
-`TRUSS_ADAPT_SWAPS`, `TRUSS_RING_GB`, `TRUSS_HINT_K`, `TRUSS_TAIL_SKIP`, `TRUSS_SKIP_WEIGHT`, `TRUSS_PREFILL_ROWS`, `TRUSS_KV_INT8` (plus the pool's own `TRUSS_CPU_PIN`,
+`TRUSS_ADAPT_SWAPS`, `TRUSS_RING_GB`, `TRUSS_PIN_FILL` (E7: GiB of the ring kept FIFO, the rest pinned-refilled after a prompt), `TRUSS_HINT_K`, `TRUSS_TAIL_SKIP`, `TRUSS_SKIP_WEIGHT`, `TRUSS_PREFILL_ROWS`, `TRUSS_KV_INT8` (plus the pool's own `TRUSS_CPU_PIN`,
 `TRUSS_CPU_SPIN_US`). It also releases the model files' pages after upload (`Options::after_upload`, as the bench:
 the load otherwise peaks near 47 GB resident).
 

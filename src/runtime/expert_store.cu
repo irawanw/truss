@@ -24,8 +24,10 @@ namespace truss::runtime {
 
 using namespace store_detail;
 
-ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet & hot, const Sizes & z)
+ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet & hot, const Sizes & z,
+                         std::vector<std::pair<int, int>> fill)
 {
+    fill_ = std::move(fill);
     const int L = (int) layers.size(), half_l = (L + 1) / 2;
     if ((int) hot.size() != L) throw std::invalid_argument("ExpertStore: hot set has the wrong layer count");
     layers_.resize(L);
@@ -67,6 +69,9 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
     }
     ring_ = ring_size(layers, hot, z);
     vend_ = (int64_t) ring_;
+    // E7: the pinned refill may take everything but Sizes::pin_fill, which stays free for the FIFO (0 = off)
+    pin_budget_ = z.pin_fill && ring_ > z.pin_fill ? ring_ - z.pin_fill : 0;
+    ring_hi_ = (int64_t) ring_;
     for (const Layer & Y : layers_) slot_ = std::max(slot_, align_up(Y.cold));
     auto * arena = static_cast<uint8_t *>(device_alloc(hot_lo + ring_ + hot_hi, device_));
     base_ = arena + hot_lo;
@@ -347,6 +352,13 @@ void ExpertStore::begin_stream(cudaStream_t compute)
     hinted_.clear();
     adm_.clear();
     claims_.clear(), adm_backlog_ = 0;   // landing_ events stay: their claims are gone from the ring (checked by offset)
+    // E7: pinned residents leave with the ring; the next begin_ring() refills
+    if (pin_active_.load(std::memory_order_acquire)) pin_report(" (partial: the prompt dropped the rest)");
+    for (const RingEntry & r : pins_) drop(r);
+    pins_.clear();
+    pin_active_.store(false, std::memory_order_release);
+    pin_queued_ = false;
+    ring_hi_ = (int64_t) ring_;
     released_recorded_[0] = released_recorded_[1] = false;
     mode_ = Mode::STREAM;
 }

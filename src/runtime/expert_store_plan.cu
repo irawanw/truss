@@ -113,6 +113,28 @@ ExpertStore::HotSet ExpertStore::plan(const std::vector<ExpertLayer> & layers, s
     return hot;
 }
 
+// E7: the cold experts in plan()'s order: usage / bytes^alpha, descending; index order without a usage profile.
+std::vector<std::pair<int, int>> ExpertStore::fill_order(const std::vector<ExpertLayer> & layers, const HotSet & hot,
+                                                         const std::vector<float> & usage, double alpha)
+{
+    const int L = (int) layers.size(), n_expert = layers.empty() ? 0 : layers[0][0]->n_expert;
+    if (usage.size() != 0 && usage.size() != (size_t) L * n_expert)
+        throw std::invalid_argument("ExpertStore::fill_order: usage has " + std::to_string(usage.size()) +
+                                    " values, expected " + std::to_string((size_t) L * n_expert));
+    std::vector<int> all(size_t(L) * n_expert);
+    for (size_t i = 0; i < all.size(); ++i) all[i] = (int) i;
+    if (!usage.empty()) {
+        std::vector<double> score(all.size());
+        for (int i : all) score[i] = usage[i] / std::pow((double) expert_bytes(layers[i / n_expert], i % n_expert), alpha);
+        std::stable_sort(all.begin(), all.end(), [&](int a, int b) { return score[a] > score[b]; });
+    }
+    std::vector<std::pair<int, int>> out;
+    out.reserve(all.size());
+    for (int i : all)
+        if (!hot[i / n_expert][i % n_expert]) out.push_back({ i / n_expert, i % n_expert });
+    return out;
+}
+
 std::vector<float> ExpertStore::load_usage(const std::string & path, int n_layer, int n_expert)
 {
     std::vector<float> u((size_t) n_layer * n_expert);

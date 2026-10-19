@@ -43,10 +43,13 @@ MoeExec::MoeExec(engine::Gpu & g, const MoeKernels & k, std::vector<MoeLayer> la
     z.ring_bytes = o_.ring_bytes;
     z.plan_alpha = o_.plan_alpha;
     z.stream_extra = stream_extra;
+    z.pin_fill = o_.doorbell ? o_.pin_fill : 0;   // E7: the refill runs on the driver, which owns the ring in doorbell mode
     const ExpertStore::HotSet hot = ExpertStore::plan(tables, budget, z, usage);
     for (const auto & h : hot) n_hot_ += (int) std::count(h.begin(), h.end(), 1);
     engine::load_mark("expert plan");
-    store_ = std::make_unique<ExpertStore>(tables, hot, z);
+    std::vector<std::pair<int, int>> fill;
+    if (z.pin_fill) fill = ExpertStore::fill_order(tables, hot, usage, z.plan_alpha);
+    store_ = std::make_unique<ExpertStore>(tables, hot, z, std::move(fill));
     engine::load_mark("expert store (hot upload + cold copy; page-locking continues in the background)");
     if (!o_.cpu_dir.empty()) load_cpu_tier(hot, usage);
     else if (o_.cpu_trellis) load_cpu_tier_trellis(hot, usage);

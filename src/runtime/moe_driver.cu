@@ -97,7 +97,8 @@ void MoeExec::drive()
         dbg_phase_ = 1;
         for (int i = 0; i < 200000 && jobs_pushed_.load(std::memory_order_acquire) <= taken; ++i) {
             _mm_pause();
-            if (admit_idle_ > 0 && i % 64 == 0) dbg_phase_ = 8, store_->admit_step(), dbg_phase_ = 1;   // the link is ours
+            if ((admit_idle_ > 0 || store_->pin_pending()) && i % 64 == 0)   // the link is ours (and E7's refill)
+                dbg_phase_ = 8, store_->pin_step(), store_->admit_step(), dbg_phase_ = 1;
             if (prof_ && prof_->on() && i == 4096 && (dbg_served_ & 127) == 0) drv_cpu_.store(last_cpu_of(driver_tid_.load()));
         }
         {
@@ -113,7 +114,8 @@ void MoeExec::drive()
         dbg_layer_ = j.sl, dbg_seq_ = j.seq, dbg_phase_ = 3;
         for (int i = 0; *(volatile int *) b.doorbell < j.seq; ++i) {
             _mm_pause();
-            if (admit_idle_ > 0 && i % 64 == 0) dbg_phase_ = 8, store_->admit_step(), dbg_phase_ = 3;
+            if ((admit_idle_ > 0 || store_->pin_pending()) && i % 64 == 0)
+                dbg_phase_ = 8, store_->pin_step(), store_->admit_step(), dbg_phase_ = 3;
         }
         std::atomic_thread_fence(std::memory_order_acquire);
         drv_t_[0] = std::chrono::steady_clock::now();
