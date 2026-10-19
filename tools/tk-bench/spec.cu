@@ -11,10 +11,8 @@
 #include <cuda_profiler_api.h>
 #include <sys/prctl.h>
 #include "kernels/sampling/argmax.cuh"
-#include "model/qwen4exp/config.h"
 #include "engine/model.h"
 #include "engine/pipeline.h"
-#include "model/qwen4exp/weights.h"
 #include "runtime/expert_store.h"
 
 #include <algorithm>
@@ -41,6 +39,12 @@ std::vector<int32_t> read_ids(const char * arg)
     return v;
 }
 
+bool oracle_on()   // TRUSS_BENCH_ORACLE=1 (see the decode loop)
+{
+    static const bool on = std::getenv("TRUSS_BENCH_ORACLE") && std::atoi(std::getenv("TRUSS_BENCH_ORACLE"));
+    return on;
+}
+
 struct Greedy {   // argmax of logit rows on the device, copied back
     int vocab;
     float * logits;
@@ -51,6 +55,14 @@ struct Greedy {   // argmax of logit rows on the device, copied back
         TRUSS_CUDA(cudaMalloc(&logits, sizeof(float) * v * 9));
         TRUSS_CUDA(cudaMalloc(&d_ids, sizeof(int) * 9));
         TRUSS_CUDA(cudaMallocHost(&h_ids, sizeof(int) * 9));
+    }
+    std::vector<float> row(engine::Pipeline & f, int r)   // one logits row of the last rows() call, on the host
+    {
+        std::vector<float> h((size_t) vocab);
+        TRUSS_CUDA(cudaMemcpyAsync(h.data(), logits + (size_t) r * vocab, sizeof(float) * vocab, cudaMemcpyDeviceToHost,
+                                   f.stream()));
+        TRUSS_CUDA(cudaStreamSynchronize(f.stream()));
+        return h;
     }
     void rows(engine::Pipeline & f, int first, int n, int32_t * out)
     {
@@ -122,7 +134,7 @@ int main(int argc, char ** argv)
     try {
         const auto file = gguf::File::open(argv[1]);
         if (const char * ov = std::getenv("TRUSS_EXPERT_OVERLAY")) {   // X3.1 experts over the served GGUF (#118)
-            file->overlay(ov);
+            file->overlay_list(ov);   // a comma list: the experts, then the Engram tables
             std::fprintf(stderr, "expert overlay %s: %zu tensors replaced\n", ov, file->overlaid());
         }
         std::vector<std::vector<int32_t>> prompts;
@@ -197,6 +209,7 @@ int main(int argc, char ** argv)
         for (size_t pi = 0; pi < prompts.size(); ++pi) {
             const std::vector<int32_t> & tok = prompts[pi];
             std::vector<int32_t> ref;
+            std::vector<float> plain_gap;
             int32_t t;
             double plain = 0;
             if (do_plain) {
@@ -208,6 +221,11 @@ int main(int argc, char ** argv)
                     ref.push_back(t);
                     f.run(&t, 1);
                     g.rows(f, 0, 1, &t);
+                    if (oracle_on()) {   // the plain top-1 - top-2 logit gap of output i + 1 (a near tie flips easily)
+                        std::vector<float> h = g.row(f, 0);
+                        std::nth_element(h.begin(), h.begin() + 1, h.end(), std::greater<float>());
+                        plain_gap.push_back(h[0] - h[1]);
+                    }
                 }
                 plain = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             }
@@ -253,7 +271,15 @@ int main(int argc, char ** argv)
                 int32_t win[9], best[9];
                 win[0] = t;
                 TRUSS_CUDA(cudaEventRecord(e0, f.stream()));
-                const int nw = f.draft(t, nd, win + 1);
+                int nw = f.draft(t, nd, win + 1);
+                // TRUSS_BENCH_ORACLE=1: the drafts are the plain run's next tokens (every draft right): a mismatch
+                // then comes from the verify window's numerics or commit, never from a rejected row's rollback
+                const bool oracle = oracle_on();
+                if (oracle && do_plain) {
+                    const int g0 = (int) got.size();
+                    nw = std::max(0, std::min(nd, N - 1 - g0));
+                    for (int k = 0; k < nw; ++k) win[1 + k] = ref[g0 + 1 + k];
+                }
                 TRUSS_CUDA(cudaEventRecord(e1, f.stream()));
                 TRUSS_CUDA(cudaEventSynchronize(e1));
                 { float m = 0; TRUSS_CUDA(cudaEventElapsedTime(&m, e0, e1)); ms_draft += m; }
@@ -272,6 +298,13 @@ int main(int argc, char ** argv)
                 const auto tD = std::chrono::steady_clock::now();
                 int j = 0;
                 while (j < nw && best[j] == win[j + 1]) ++j;
+                if (oracle && do_plain && j < nw && (int) got.size() + j + 1 < N) {   // the first window row that differs
+                    const int at = (int) got.size() + j + 1;
+                    std::vector<float> h = g.row(f, j);
+                    std::printf("oracle: output %d: window row %d of %d says %d (logit %.4f), plain %d (logit %.4f); "
+                                "plain top-2 gap %.4f\n", at, j, nw + 1, best[j], h[best[j]], win[j + 1], h[win[j + 1]],
+                                plain_gap[at - 1]);
+                }
                 f.accept(j + 1);
                 for (int i = 0; i <= j; ++i) got.push_back(win[i]);
                 t = best[j];

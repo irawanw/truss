@@ -76,6 +76,12 @@ template <> struct Tune<DsV41> {           // first guess = Lfm2's geometry (F 2
     using Down = Geom<8, 1, 2, 8>;         // 128 columns: 40 groups over D = 5120
     static constexpr int GU_KSPLIT = 1;
 };
+template <> struct Tune<DSpark> {          // same dims as DsV41, top-3: same geometry
+    static constexpr int BLOCKS_PER_SM = 1;
+    using GateUp = Geom<8, 1, 2, 4>;
+    using Down = Geom<8, 1, 2, 8>;
+    static constexpr int GU_KSPLIT = 1;
+};
 
 // Compile-time sizes of one shape
 template <class Shape>
@@ -629,5 +635,9 @@ template size_t workspace_bytes<DsV41>();
 template void workspace_init<DsV41>(void *, cudaStream_t);
 template void window<DsV41>(const Weights &, const float *, const int *, const float *, int, float *, void *,
                             cudaStream_t, TraceEvent *);
+template size_t workspace_bytes<DSpark>();
+template void workspace_init<DSpark>(void *, cudaStream_t);
+template void window<DSpark>(const Weights &, const float *, const int *, const float *, int, float *, void *,
+                             cudaStream_t, TraceEvent *);
 
 }  // namespace truss::moe

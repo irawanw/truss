@@ -487,5 +487,8 @@ template void prefill<Lfm2>(const Weights &, const float *, const int *, const f
 template size_t prefill_workspace_bytes<DsV41>(int);
 template void prefill<DsV41>(const Weights &, const float *, const int *, const float *, int, float *, void *, int,
                              cudaStream_t);
+template size_t prefill_workspace_bytes<DSpark>(int);
+template void prefill<DSpark>(const Weights &, const float *, const int *, const float *, int, float *, void *, int,
+                              cudaStream_t);
 
 }  // namespace truss::moe

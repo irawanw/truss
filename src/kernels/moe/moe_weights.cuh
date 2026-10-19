@@ -23,6 +23,11 @@ struct DsV41 {                             // DeepSeek-V4.1-Flash-1017: 384 expe
     static constexpr const char * NAME = "DsV41";
     static constexpr float SWIGLU_LIMIT = 10.0f;   // config swiglu_limit (routed and shared experts)
 };
+struct DSpark {                            // DeepSeek-V4.1-Flash DSpark drafter: 128 experts, top-3
+    static constexpr int D_MODEL = 5120, D_FF = 2304, TOPK = 3;
+    static constexpr const char * NAME = "DSpark";
+    static constexpr float SWIGLU_LIMIT = 10.0f;   // config swiglu_limit (routed and shared experts)
+};
 
 #ifdef __CUDACC__
 // silu(g) * u with the shape's SwiGLU clamp (none at SWIGLU_LIMIT 0; folded away at compile time), as both MoE ops

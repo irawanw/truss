@@ -49,7 +49,8 @@ add_library(truss_models STATIC
   src/model/lfm2moe/config.cc
   src/model/lfm2moe/weights.cc
   src/model/deepseek41/config.cc
-  src/model/deepseek41/weights.cc)
+  src/model/deepseek41/weights.cc
+  src/model/deepseek41/dspark_weights.cc)
 target_link_libraries(truss_models PUBLIC truss_formats truss_reference)
 target_compile_options(truss_models PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra>)
 
@@ -98,6 +99,9 @@ add_library(truss_engine STATIC
   src/model/qwen4exp/mtp_draft.cu
   src/model/lfm2moe/model.cu
   src/model/deepseek41/model.cu
+  src/model/deepseek41/dspark.cu
+  src/model/deepseek41/dspark_attn.cu
+  src/model/deepseek41/dspark_draft.cu
   src/model/registry.cc)
 target_link_libraries(truss_engine PUBLIC truss_models truss_kernels truss_cpu)
 

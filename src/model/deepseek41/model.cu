@@ -14,7 +14,13 @@ namespace truss::deepseek41 {
 
 Family::Family(const gguf::File & f, const engine::DrafterFiles & d) : c_(Config::from_gguf(f)), w_(bind(f, c_))
 {
-    engine::require(d.path.empty(), "deepseek41: the DSpark drafter is not wired yet");
+    if (!d.path.empty()) {
+        dspark_file_ = gguf::File::open(d.path);
+        if (const char * e = std::getenv("TRUSS_DSPARK_EXPERT_OVERLAY")) dspark_file_->overlay_list(e);
+        dspark_c_ = std::make_unique<DSparkConfig>(DSparkConfig::from_gguf(*dspark_file_, c_));
+        dspark_w_ = std::make_unique<DSparkWeights>(bind_dspark(*dspark_file_, c_, *dspark_c_));
+        drafter_min_p_ = d.min_p;
+    }
     engine::require(c_.d_model == MoeShape::D_MODEL && c_.d_ff_exp == MoeShape::D_FF && c_.n_expert_used == MoeShape::TOPK
                         && c_.swiglu_limit == MoeShape::SWIGLU_LIMIT,
                     "deepseek41: routed-expert shape differs from moe::DsV41");
@@ -38,7 +44,7 @@ std::unique_ptr<engine::StageModel> Family::stage(int lb, int le, int n_ctx) con
 }
 
 StageModel::StageModel(const Family & fam, int lb, int le, int n_ctx)
-    : c_(fam.config()), w_(fam.weights()), lb_(lb), le_(le), n_ctx_(n_ctx)
+    : fam_(fam), c_(fam.config()), w_(fam.weights()), lb_(lb), le_(le), n_ctx_(n_ctx)
 {
 }
 
@@ -65,7 +71,7 @@ blocks::Ds41AttnDims StageModel::attn_dims(int l) const
 void StageModel::add_tensors(engine::Stage & st)
 {
     blocks::Linear & lin = st.lin();
-    if (lb_ == 0) lin.add(w_.token_embd);
+    if (lb_ == 0 || (le_ == c_.n_layer && fam_.has_drafter())) lin.add(w_.token_embd);
     if (le_ == c_.n_layer) lin.add(w_.final_norm), lin.add(w_.output);
     for (int l = lb_; l < le_; ++l) {
         const Layer & L = w_.layers[l];
@@ -76,6 +82,7 @@ void StageModel::add_tensors(engine::Stage & st)
         blocks::Moe::add_tensors(lin, L.moe);
         if (L.engram.wkv) blocks::Engram::add_tensors(lin, L.engram);
     }
+    if (le_ == c_.n_layer && fam_.has_drafter()) DSpark::add_tensors(lin, *fam_.dspark_weights());
 }
 
 std::vector<runtime::MoeLayer> StageModel::moe_layers() const
@@ -151,6 +158,13 @@ void StageModel::build(engine::Stage & st)
         final_norm_ = std::make_unique<blocks::RmsNorm>(lin, w_.final_norm, c_.d_model, c_.rms_eps);
         head_hc_ = std::make_unique<blocks::HcSinkhorn>(lin, blocks::SkHcWeights {}, k);
         head_ = std::make_unique<blocks::Head>(g, lin, w_.output);
+    }
+    if (le_ == c_.n_layer && fam_.has_drafter()) {
+        const DSparkConfig & dc = *fam_.dspark_config();
+        for (int t : dc.target_layers)
+            engine::require(t >= lb_ && t < le_, "deepseek41: DSpark target layer on another stage (split must put 37-39 last)");
+        dspark_ = std::make_unique<DSpark>(st, c_, w_, dc, *fam_.dspark_weights(), fam_.drafter_min_p());
+        fam_.release_drafter_pages();
     }
 }
 
@@ -269,6 +283,7 @@ void StageModel::layers(engine::Stage & st, const engine::Chunk & c, float * res
         dump(g, "res_in", l, res, T, c_.hc * d + NM, W);
         if (dspark && l >= 37 && l <= 39) dump_dspark_layer(g, dd, res, W, T, c_.hc, d, l - 37);
         if (engram_[i]) engram_[i]->forward(g, c.slot, c.tokens, c.pos0, T, res, W), dump(g, "res_eng", l, res, T, c_.hc * d + NM, W);
+        if (dspark_) dspark_->capture(g, c.slot, l, res, W, T);
         // attention
         hc_attn_[i]->mix(g, res, T, A);
         hc_attn_[i]->collapse(g, res, row_coef, W, T, y, nullptr);

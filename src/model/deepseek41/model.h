@@ -21,6 +21,7 @@
 #include "engine/model.h"
 #include "kernels/moe/moe_weights.cuh"
 #include "model/deepseek41/config.h"
+#include "model/deepseek41/dspark.h"
 #include "model/deepseek41/weights.h"
 
 #include <memory>
@@ -40,10 +41,19 @@ public:
     std::unique_ptr<engine::StageModel> stage(int lb, int le, int n_ctx) const override;
     const Config & config() const { return c_; }
     const Weights & weights() const { return w_; }
+    bool has_drafter() const override { return dspark_c_ != nullptr; }
+    const DSparkConfig * dspark_config() const { return dspark_c_.get(); }
+    const DSparkWeights * dspark_weights() const { return dspark_w_.get(); }
+    float drafter_min_p() const { return drafter_min_p_; }
+    void release_drafter_pages() const { if (dspark_file_) dspark_file_->release_pages(); }
 
 private:
     Config c_;
     Weights w_;
+    std::unique_ptr<gguf::File> dspark_file_;
+    std::unique_ptr<DSparkConfig> dspark_c_;
+    std::unique_ptr<DSparkWeights> dspark_w_;
+    float drafter_min_p_ = 0.f;
 };
 
 class StageModel : public engine::StageModel {
@@ -52,6 +62,11 @@ public:
     ~StageModel() override;
     void add_tensors(engine::Stage & st) override;
     std::vector<const gguf::Tensor *> no_w16() const override { return { w_.token_embd, w_.output }; }
+    const gguf::Tensor * host_rows() const override
+    {
+        return fam_.has_drafter() && le_ == c_.n_layer && lb_ != 0 ? w_.token_embd : nullptr;
+    }
+    engine::Drafter * drafter() override { return dspark_.get(); }
     std::vector<runtime::MoeLayer> moe_layers() const override;
     runtime::MoeKernels moe_kernels() const override { return runtime::MoeKernels::of<MoeShape>(); }
     size_t scratch_bytes(int T) const override;
@@ -65,6 +80,7 @@ public:
 private:
     blocks::Ds41AttnDims attn_dims(int l) const;
     hc::SkDims sk_dims() const;
+    const Family & fam_;
     const Config & c_;
     const Weights & w_;
     const int lb_, le_, n_ctx_;
@@ -77,6 +93,7 @@ private:
     std::unique_ptr<blocks::RmsNorm> final_norm_;
     std::unique_ptr<blocks::HcSinkhorn> head_hc_;                           // collapse only (no weights read)
     std::unique_ptr<blocks::Head> head_;
+    std::unique_ptr<DSpark> dspark_;
 };
 
 }  // namespace truss::deepseek41

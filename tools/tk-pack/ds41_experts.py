@@ -36,7 +36,7 @@ def gguf_str(s):
     return struct.pack("<Q", len(b)) + b
 
 
-def layout(kmap, kept):
+def layout(kmap, kept, prefix="blk"):
     tensors, metas = [], {}
     for L, ids in enumerate(kept):
         n = len(ids)
@@ -49,7 +49,7 @@ def layout(kmap, kept):
                 meta[i] = (KCODE[k], off)
                 off += int(round(16 * k)) * nt
             metas[(L, p)] = meta
-            b = f"blk.{L}.ffn_{p}_exps."
+            b = f"{prefix}.{L}.ffn_{p}_exps."
             tensors += [(b + "m3_trellis", GGML_I16, [off], off * 2), (b + "m3_meta", GGML_I32, [2, n], 8 * n),
                         (b + "m3_suh", GGML_F16, [fin, n], fin * n * 2), (b + "m3_svh", GGML_F16, [fout, n], fout * n * 2)]
     return tensors, metas
@@ -79,7 +79,7 @@ def find_layer(roots, L):
     raise SystemExit(f"L{L}: no encode dir under {roots}")
 
 
-def pack_layer(f, L, ids, where, metas, kmap, roots):
+def pack_layer(f, L, ids, where, metas, kmap, roots, prefix="blk"):
     enc = find_layer(roots, L)
     groups, owner = {}, {}
     for kd in sorted(os.listdir(enc)):
@@ -98,7 +98,7 @@ def pack_layer(f, L, ids, where, metas, kmap, roots):
         if e not in owner or owner[e][0] != float(kmap[L, e]):
             raise SystemExit(f"L{L}: kept expert {e} missing or at a K other than the kmap's ({kmap[L, e]})")
     for p, fin, fout in PROJ:
-        b = f"blk.{L}.ffn_{p}_exps."
+        b = f"{prefix}.{L}.ffn_{p}_exps."
         # whole files, read sequentially (mmap + per-expert reads alternate between the K files: HDD seeks, ~22 MB/s)
         tr = {k: np.load(f"{d}/trellis_{p}.npy") for k, d in groups.items()}
         su = {k: np.load(f"{d}/suh_{p}.npy", mmap_mode="r") for k, d in groups.items()}
@@ -142,6 +142,7 @@ def main():
     ap.add_argument("--kmap", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", type=int, default=0, help="first N layers only (test); 0 = all")
+    ap.add_argument("--prefix", default="blk", help="tensor name prefix (a drafter overlay: dspark)")
     a = ap.parse_args()
     roots = a.roots.split(",")
     keep = torch.load(a.keep)["keep"]
@@ -151,7 +152,7 @@ def main():
     for L, ids in enumerate(kept):
         if any(float(kmap[L, e]) == 0 for e in ids):
             raise SystemExit(f"L{L}: a kept expert has K 0 in the kmap")
-    tensors, metas = layout(kmap, kept)
+    tensors, metas = layout(kmap, kept, a.prefix)
     note = f"{os.path.basename(a.kmap)} over {os.path.basename(a.keep)}"
     hdr, start, offs, total = header(tensors, note)
     if not os.path.exists(a.out):
@@ -171,7 +172,7 @@ def main():
             if str(L) in rec:
                 continue
             t0 = time.time()
-            pack_layer(f, L, kept[L], where, metas, kmap, roots)
+            pack_layer(f, L, kept[L], where, metas, kmap, roots, a.prefix)
             os.fsync(f.fileno())
             rec[str(L)] = {"time": time.strftime("%m-%d %T"), "s": round(time.time() - t0)}
             json.dump(rec, open(rec_path + ".tmp", "w"), indent=1)
