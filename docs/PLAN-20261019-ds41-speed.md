@@ -72,6 +72,7 @@ at equal KL on GLM), then DSpark. Every quality-changing lever is gated by `ds41
 |---|---|---|---|
 | D9 | dense weights (attention projections, shared expert; 8 GB/token at Q8_0) to trellis ~4.5 bpw | PAW dense recipe | `ds41_kl` cost; TG |
 | D10 | skip by weight share (an expert outside VRAM under F of its row's weight in every row) | PolyStrata #34 | `ds41_kl` at equal speed vs rank skip |
+| D12 | VRAM, from tqLLM's `-fit` / KV review (10-19): token embedding to host RAM (exact, ~0.7 GB on the first stage); `TRUSS_KV_INT8` wired for DS41 only if 256K needs it (KV + state is only ~0.24-0.31 GiB per stage at 36K, ~2 GB total at 256K est.: DS41's latent KV is already small); host-RAM KV tail (TqCache) rejected: it reads over PCIe every step | tqLLM | resident experts +N; golden |
 
 ### M0 Measure (running 10:16, `20261019_truss_port/data/chain_1016.sh`)
 | id | what | output |
@@ -174,6 +175,9 @@ Only slice benches on GPU 0 (no full-model runs, user 10-19: "use more cheap pp 
 | E1 | slice prefill / decode at 8K / 16K / 32K context, chunk 2K / 8K (M0-D, P1, P5 sizing) | done #196: 906 tok/s at 32K, attention flat per token, no O(T^2) yet |
 | E2 | D10 weight-share skip `TRUSS_SKIP_WEIGHT=F`, golden gate, slice speed vs tail skip R5 | done #197: golden identical; F=0.12 27.8 vs R5 24.9 tok/s, KL open |
 | E3 | prefill sparse attention: cp.async, 32 heads per CTA | done #198: v5 default, 1,042 tok/s est. |
+| E5 | P9 whole-model prefill + decode-path KL of the skips | done #200 |
+| E6 | D8 ring breakdown | done #201 |
+| E7 | D8 (c) pinned ring refill after a prompt (`TRUSS_PIN_FILL`) | sent |
 | E4 | P7 speed side: slice prefill with int8 dense prompt rows (`TRUSS_ACT=q8`) vs fp16; then a prompt-only switch | queued |
 | next | expert window decode kernel to ~85% bandwidth; P8 int8 expert prefill; prefill attention 32 heads/CTA + cp.async; sk_part on tensor cores; D9 4.5-bit dense; split at 14 + pipelined prefill | queued |
 
