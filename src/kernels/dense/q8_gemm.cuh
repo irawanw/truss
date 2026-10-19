@@ -40,6 +40,12 @@ void q8_gemm(const Q8Matrix & W, const int8_t * xq, const half * xd, int rows, f
 // fp16 rounding of q * d) and multiplied by cuBLAS with fp32 accumulation. W.in % 64 == 0.
 void q8_gemm_a16(const Q8Matrix & W, const half * x, int rows, float * y, half * w16, cublasHandle_t cublas,
                  cudaStream_t stream);
+// Block-diagonal (grouped) q8_gemm_a16: W [G * R][K] holds G blocks of R outputs; row t's group g input is
+// x[t][g * K .. (g + 1) * K) (x [rows][G * K]) and its outputs go to y[t][g * R .. (g + 1) * R) (y [rows][G * R]).
+// One dequant, one strided-batched cuBLAS GEMM (batch = group): G times fewer FLOPs than the dense product of the
+// rows x G stacked inputs with all of W (DeepSeek-V4.1's grouped output LoRA wo_a, TRACKER #194). W.out % G == 0.
+void q8_gemm_a16_grouped(const Q8Matrix & W, int G, const half * x, int rows, float * y, half * w16,
+                         cublasHandle_t cublas, cudaStream_t stream);
 
 // q8_gemm for a few rows (decode, rows <= GEMV_ROWS): one warp per output, reads each weight once. Same numerics.
 constexpr int GEMV_ROWS = 8;

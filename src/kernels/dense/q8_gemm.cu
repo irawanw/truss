@@ -245,6 +245,24 @@ void q8_gemm_a16(const Q8Matrix & W, const half * x, int rows, float * y, half *
                               CUDA_R_16F, W.in, &zero, y, CUDA_R_32F, W.out, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
 }
 
+void q8_gemm_a16_grouped(const Q8Matrix & W, int G, const half * x, int rows, float * y, half * w16,
+                         cublasHandle_t cublas, cudaStream_t stream)
+{
+    if (W.in % 64 || G < 1 || W.out % G) throw std::runtime_error("q8_gemm_a16_grouped: in % 64, out % G");
+    const size_t n = (size_t) W.in * W.out;
+    dequant_kernel<<<(unsigned) ((n / 4 + 255) / 256), 256, 0, stream>>>(W.q, W.d, n, w16);
+    TRUSS_CUDA(cudaGetLastError());
+    // per group g, column-major: W_g^T (K x R, ld K) at w16 + g R K, x_g^T (K x rows, ld G K) at x + g K,
+    // y_g^T (R x rows, ld G R) at y + g R
+    const int K = W.in, R = W.out / G;
+    const float one = 1.f, zero = 0.f;
+    TRUSS_CUBLAS(cublasSetStream(cublas, stream));
+    TRUSS_CUBLAS(cublasGemmStridedBatchedEx(cublas, CUBLAS_OP_T, CUBLAS_OP_N, R, rows, K, &one, w16, CUDA_R_16F, K,
+                                            (long long) R * K, x, CUDA_R_16F, G * K, (long long) K, &zero, y,
+                                            CUDA_R_32F, G * R, (long long) R, G, CUBLAS_COMPUTE_32F,
+                                            CUBLAS_GEMM_DEFAULT));
+}
+
 void q8_repack(const void * blocks, int in, int out, int8_t * q, half * d, cudaStream_t stream)
 {
     if (in % 64) throw std::runtime_error("q8_repack: in must be a multiple of 64, got " + std::to_string(in));

@@ -195,13 +195,18 @@ void AttnDs41::forward(engine::Gpu & g, int slot, const float * in, const half *
     }
     ds41::ring_write(S.ring, RING, kvn, D, pos0, T, g.s);
     ds41::rope_tail(o, T, H, D, rd, pos0, 1, d_.inv_freq, true, g.s);
-    // grouped output LoRA: o as [T * G][H D / G] rows through the whole wo_a, then each row's own group block
+    // grouped output LoRA: each row's group g of o (H D / G dims) through wo_a's block g (R outputs)
     half * o16 = sc.alloc<half>((size_t) T * H * D);
     ds41::to_half(o, (size_t) T * H * D, o16, g.s);
-    float * ya = sc.alloc((size_t) T * G * G * R), * yo = sc.alloc((size_t) T * G * R);
+    float * yo = sc.alloc((size_t) T * G * R);
     half * yo16 = sc.alloc<half>((size_t) T * G * R);
-    lin_.lin(w_.out_a, o16, T * G, ya);
-    ds41::pick_groups(ya, T, G, R, yo, g.s);
+    if (lin_.act() == Activations::FP16 && T * G > dense::GEMV_ROWS) {   // prompt rows: per-group GEMMs (#194)
+        dense::q8_gemm_a16_grouped(lin_.q8(w_.out_a), G, o16, T, yo, lin_.w16(), g.blas, g.s);
+    } else {   // decode rows: one gemv of the T x G stacked rows reads wo_a once, then each row's own block
+        float * ya = sc.alloc((size_t) T * G * G * R);
+        lin_.lin(w_.out_a, o16, T * G, ya);
+        ds41::pick_groups(ya, T, G, R, yo, g.s);
+    }
     ds41::to_half(yo, (size_t) T * G * R, yo16, g.s);
     lin_.lin(w_.out_b, yo16, T, out);
     sc.release(m);
