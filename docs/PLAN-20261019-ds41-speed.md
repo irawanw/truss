@@ -48,7 +48,7 @@ copies amortized over more tokens and both links busy at the same time.
 
 ## Phases
 
-### Measured 10-19 (slice bench, L0-5, GPU 0; TRACKER #188-#192)
+### Measured 10-19 (slice bench, L0-5, GPU 0; TRACKER #188-#195)
 
 | | decode ms/layer | TG at 40 layers (est.) | prefill ms/layer (2,048) | PP (est.) |
 |---|---|---|---|---|
@@ -57,6 +57,8 @@ copies amortized over more tokens and both links busy at the same time.
 | 32% resident, PCIe only | 1.350 | 18.5 | 131 | 391 |
 | 32% resident, CPU tier + hints (#191) | 1.080 | 23.1 | | |
 | + tail skip R5 (#192) | 1.009 | 24.8 | | |
+| all resident + grouped wo_a GEMM (#194) | 0.624 | 40.1 | **56.5** | **906** |
+| 8,192-token chunk (1,176 of 1,536 resident) | | | 215 per 8K | 953 |
 
 What this says about 70 tok/s: the budget is 0.357 ms per layer per token. All-resident is 0.625 (dense gemv 0.27 at ~75%
 of bandwidth, experts 0.17 at ~41%, attention projections + norms ~0.1, mHC 0.09). So the GPU side needs every kernel
@@ -110,3 +112,12 @@ numbers. Pack quality (F1, layer-20 three-way check) resumes after D1/P1 or when
   and RAM bandwidth: measure under their load, never assume an idle box.
 - Judge quality only with TRUSS (`ds41_kl`) or exact math, never the Python swap simulation.
 - Files < 500 lines, model code in `src/model/deepseek41/`, docs/reference updated with each change.
+
+## Prefill budget after #194 (slice, per layer at 2,048 rows: 56.5 ms; 2,000 tok/s needs <= 25.6)
+
+experts 18.4 (gate_up 12.5 + down 5.9), sparse attention 12.5 (~10 TFLOPS: each CTA re-reads its row's 640 keys,
+5.4 GB/layer of key traffic; next: 32 heads per CTA + cp.async), dense GEMMs 11.6, mHC sk_part 3.2 (fp32 CUDA cores
+-> tensor cores), rest ~4. PCIe (*est.*): ~65 GB of cold experts per chunk; split at 14 (GPU 2 x4 takes layers 0-13)
+balances the links at ~3.5 s per chunk -> 8,192-token chunks cap at ~2,300 tok/s with both stages pipelined.
+256K: the indexer's O(T^2) scores (~8.6 GFLOP/token at the end of a 256K prompt over 8 index layers) must run on
+tensor cores; not measured yet (slice at 32K next).
