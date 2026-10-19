@@ -193,6 +193,62 @@ static void dump(engine::Gpu & g, const char * name, int l, const float * p, int
     if (FILE * f = std::fopen(path, "ab")) std::fwrite(h.data(), 4, h.size(), f), std::fclose(f);
 }
 
+// TRUSS_DUMP_DSPARK=<file> (E8 acceptance, debug; off unless set): one record per forward call of the stage that owns
+// layers 37-39 (the DSpark target layers in config.json), as
+//   int32 pos0, int32 T, int32 tokens[T], half hidden[T][3][d_model]
+// where hidden[t][i] is the mean over the hc copies of the residual at the input of layer 37 + i. Host mean: this is
+// a debug path and T is at most one prompt chunk, so the 3 x hc x d_model x T floats per call are cheap next to the
+// forward. Records append, so one file holds both the warm-up and timed passes of a bench run.
+namespace {
+
+struct DsparkDump {
+    FILE * f = nullptr;
+    std::vector<half> hidden;   // [T][3][d_model]
+    std::vector<float> acc, tmp;
+};
+
+DsparkDump & dspark_dump()
+{
+    static DsparkDump d;
+    static bool init = false;
+    if (!init) {
+        init = true;
+        if (const char * p = std::getenv("TRUSS_DUMP_DSPARK")) d.f = std::fopen(p, "ab");
+    }
+    return d;
+}
+
+void dump_dspark_layer(engine::Gpu & g, DsparkDump & d, const float * res, int W, int T, int hc, int dm, int li)
+{
+    d.acc.resize((size_t) T * dm);
+    d.tmp.resize((size_t) T * dm);
+    TRUSS_CUDA(cudaMemcpy2DAsync(d.acc.data(), (size_t) dm * 4, res, (size_t) W * 4, (size_t) dm * 4, T,
+                                 cudaMemcpyDeviceToHost, g.s));
+    g.sync();
+    for (int c = 1; c < hc; ++c) {
+        TRUSS_CUDA(cudaMemcpy2DAsync(d.tmp.data(), (size_t) dm * 4, res + (size_t) c * dm, (size_t) W * 4,
+                                     (size_t) dm * 4, T, cudaMemcpyDeviceToHost, g.s));
+        g.sync();
+        for (size_t i = 0; i < d.acc.size(); ++i) d.acc[i] += d.tmp[i];
+    }
+    const float inv = 1.f / hc;
+    for (int t = 0; t < T; ++t)
+        for (int j = 0; j < dm; ++j)
+            d.hidden[((size_t) t * 3 + li) * dm + j] = __float2half(d.acc[(size_t) t * dm + j] * inv);
+}
+
+void dump_dspark_record(DsparkDump & d, const engine::Chunk & c, int dm)
+{
+    const int32_t pos0 = c.pos0, T = c.T;
+    std::fwrite(&pos0, 4, 1, d.f);
+    std::fwrite(&T, 4, 1, d.f);
+    std::fwrite(c.tokens, 4, T, d.f);
+    std::fwrite(d.hidden.data(), sizeof(half), (size_t) T * 3 * dm, d.f);
+    std::fflush(d.f);
+}
+
+}  // namespace
+
 void StageModel::layers(engine::Stage & st, const engine::Chunk & c, float * res, const engine::LayerHook & hook)
 {
     engine::Gpu & g = st.gpu();
@@ -201,6 +257,9 @@ void StageModel::layers(engine::Stage & st, const engine::Chunk & c, float * res
     float * row_coef = res + (size_t) c_.hc * d;   // each row's next-collapse coef (W floats apart)
     float * A = sc.alloc((size_t) T * NM), * F = sc.alloc((size_t) T * NM);
     const size_t base = sc.mark();
+    DsparkDump & dd = dspark_dump();
+    const bool dspark = dd.f && lb_ <= 37 && le_ >= 40;   // the stage that owns the three DSpark target layers
+    if (dspark) dd.hidden.resize((size_t) T * 3 * d);
     for (int l = lb_; l < le_; ++l) {
         sc.release(base);
         const int i = l - lb_;
@@ -208,6 +267,7 @@ void StageModel::layers(engine::Stage & st, const engine::Chunk & c, float * res
         half * x16 = sc.alloc<half>((size_t) T * d);
         st.prof().record(l, 0, g.s);
         dump(g, "res_in", l, res, T, c_.hc * d + NM, W);
+        if (dspark && l >= 37 && l <= 39) dump_dspark_layer(g, dd, res, W, T, c_.hc, d, l - 37);
         if (engram_[i]) engram_[i]->forward(g, c.slot, c.tokens, c.pos0, T, res, W), dump(g, "res_eng", l, res, T, c_.hc * d + NM, W);
         // attention
         hc_attn_[i]->mix(g, res, T, A);
@@ -235,6 +295,7 @@ void StageModel::layers(engine::Stage & st, const engine::Chunk & c, float * res
             hook(l, res, T);
         }
     }
+    if (dspark) dump_dspark_record(dd, c, d);
 }
 
 void StageModel::head(engine::Stage & st, const float * rows, int n, float * logits, bool draft)
