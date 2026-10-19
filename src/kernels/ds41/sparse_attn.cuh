@@ -33,4 +33,19 @@ bool sparse_attn_tc_ok(const SparseAttnArgs & a);
 size_t sparse_attn_tc_ws_floats(const SparseAttnArgs & a);
 void sparse_attn_tc(const SparseAttnArgs & a, float * ws, cudaStream_t stream);
 
+// v3: v2 with a cp.async double-buffered key tile (same shapes, same output)
+bool sparse_attn_tc_async_ok(const SparseAttnArgs & a);
+size_t sparse_attn_tc_async_ws_floats(const SparseAttnArgs & a);
+void sparse_attn_tc_async(const SparseAttnArgs & a, float * ws, cudaStream_t stream);
+
+// v4: 32 heads per CTA, 8 warps (same shapes when H % 32 == 0, same output)
+bool sparse_attn_tc_h32_ok(const SparseAttnArgs & a);
+size_t sparse_attn_tc_h32_ws_floats(const SparseAttnArgs & a);
+void sparse_attn_tc_h32(const SparseAttnArgs & a, float * ws, cudaStream_t stream);
+
+// v5: 32 heads per CTA, 16 warps (512 threads), S split over the two halves of the reduction (same shapes, same output)
+bool sparse_attn_tc_16w_ok(const SparseAttnArgs & a);
+size_t sparse_attn_tc_16w_ws_floats(const SparseAttnArgs & a);
+void sparse_attn_tc_16w(const SparseAttnArgs & a, float * ws, cudaStream_t stream);
+
 }  // namespace truss::ds41

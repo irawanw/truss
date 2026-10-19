@@ -129,6 +129,9 @@ add_library(truss_kernels STATIC
   src/kernels/ds41/indexer.cu
   src/kernels/ds41/sparse_attn.cu
   src/kernels/ds41/sparse_attn_tc.cu
+  src/kernels/ds41/sparse_attn_tc_async.cu
+  src/kernels/ds41/sparse_attn_tc_h32.cu
+  src/kernels/ds41/sparse_attn_tc_16w.cu
   src/kernels/ds41/engram.cu
   src/kernels/ffn/ffn_ops.cu
   src/kernels/ffn/route_sigmoid.cu

@@ -187,7 +187,18 @@ void AttnDs41::forward(engine::Gpu & g, int slot, const float * in, const half *
     a.sinks = lin_.f32(w_.sinks), a.H = H, a.D = D, a.window = d_.window, a.pos0 = pos0, a.T = T;
     a.scale = 1.0f / std::sqrt((float) D), a.out = o;
     static const bool v1 = std::getenv("TRUSS_DS41_ATTN_V1") && std::atoi(std::getenv("TRUSS_DS41_ATTN_V1"));
-    if (!v1 && ds41::sparse_attn_tc_ok(a)) {   // v2, tensor cores (TRACKER #189); TRUSS_DS41_ATTN_V1=1: the v1 kernel
+    // v5 (32 heads per CTA, 16 warps) is the default when the shape allows; 1 = v2, 2 = v3 (cp.async), 3 = v4, 4 = v5
+    static const int tc = std::getenv("TRUSS_DS41_ATTN_TC") ? std::atoi(std::getenv("TRUSS_DS41_ATTN_TC")) : 4;
+    if (!v1 && tc == 2 && ds41::sparse_attn_tc_async_ok(a)) {   // v3: v2 with a cp.async double-buffered key tile
+        const size_t n = ds41::sparse_attn_tc_async_ws_floats(a);
+        ds41::sparse_attn_tc_async(a, n ? sc.alloc(n) : nullptr, g.s);
+    } else if (!v1 && tc == 3 && ds41::sparse_attn_tc_h32_ok(a)) {   // v4: 32 heads per CTA, 8 warps
+        const size_t n = ds41::sparse_attn_tc_h32_ws_floats(a);
+        ds41::sparse_attn_tc_h32(a, n ? sc.alloc(n) : nullptr, g.s);
+    } else if (!v1 && tc == 4 && ds41::sparse_attn_tc_16w_ok(a)) {   // v5: 32 heads per CTA, 16 warps, S split over k
+        const size_t n = ds41::sparse_attn_tc_16w_ws_floats(a);
+        ds41::sparse_attn_tc_16w(a, n ? sc.alloc(n) : nullptr, g.s);
+    } else if (!v1 && ds41::sparse_attn_tc_ok(a)) {   // v2, tensor cores (TRACKER #189); TRUSS_DS41_ATTN_V1=1: the v1 kernel
         const size_t n = ds41::sparse_attn_tc_ws_floats(a);
         ds41::sparse_attn_tc(a, n ? sc.alloc(n) : nullptr, g.s);
     } else {
