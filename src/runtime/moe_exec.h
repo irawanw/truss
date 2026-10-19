@@ -55,6 +55,7 @@ struct MoeOptions {
     bool doorbell = true;
     int hint_k = 4, hint_min_rows = 0;
     int tail_skip = 0;          // Strata's route tail skip: a missed expert ranked >= this by weight in every row -> 0 (#192)
+    float skip_weight = 0.f;    // PolyStrata #34 (D10): a missed expert under this share of its row's K routed weights in every row -> 0
     double budget_frac = 1.0;   // share of the free VRAM its experts take (layer-split stages sharing a device)
     bool last_stage = true;     // places the aux threads and writes TRUSS_ROUTE_TRACE (one stage does)
 };

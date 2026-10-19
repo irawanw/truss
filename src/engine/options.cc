@@ -25,6 +25,7 @@ void apply_env(Options & o)
     f("TRUSS_HINT_K", m.hint_k);               // pre-gated prefetch width
     f("TRUSS_HINT_MIN_ROWS", m.hint_min_rows);
     f("TRUSS_TAIL_SKIP", m.tail_skip);         // route tail skip rank (0 off; CPU tier decode only, #192)
+    f("TRUSS_SKIP_WEIGHT", m.skip_weight);     // weight-share skip: missed expert under this share of its row's K weights, every row (PolyStrata #34, D10)
     f("TRUSS_ADMIT_IDLE", m.admit_idle);       // admission on the idle link, experts per pass
     f("TRUSS_ADMIT_MIN", m.admit_min);
     f("TRUSS_ADMIT_DECAY", m.admit_decay);

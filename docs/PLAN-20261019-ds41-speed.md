@@ -107,6 +107,20 @@ at equal KL on GLM), then DSpark. Every quality-changing lever is gated by `ds41
 M0 -> D1 + P1 (biggest, cheapest) -> D2 + P2/P3 -> D3-D6 -> D7 -> P5 -> P6. Re-plan after each with the measured
 numbers. Pack quality (F1, layer-20 three-way check) resumes after D1/P1 or whenever the user says.
 
+## Execution from 10-19 evening: planner + executor
+User (10-19): run the work through opencode2 with `opencode/deepseek-v4.1-flash-free` as the executor; Claude plans,
+writes one brief per batch, reviews the diff and report, runs the gates it doubts, commits and writes TRACKER rows.
+Briefs and reports: `~/ML_projects/dsv41flash/20261019_truss_port/exec/` (`E<n>_brief.md` -> `E<n>_report.md`).
+Only slice benches on GPU 0 (no full-model runs, user 10-19: "use more cheap pp and tg").
+
+| batch | what | status |
+|---|---|---|
+| E1 | slice prefill / decode at 8K / 16K / 32K context, chunk 2K / 8K (M0-D, P1, P5 sizing) | done #196: 906 tok/s at 32K, attention flat per token, no O(T^2) yet |
+| E2 | D10 weight-share skip `TRUSS_SKIP_WEIGHT=F`, golden gate, slice speed vs tail skip R5 | done #197: golden identical; F=0.12 27.8 vs R5 24.9 tok/s, KL open |
+| next | expert window decode kernel to ~85% bandwidth; prefill attention 32 heads/CTA + cp.async; sk_part on tensor cores; D9 4.5-bit dense; split at 14 + pipelined prefill | queued |
+
+KL for E2 / D3 (the full-model `ds41_kl`, two GPUs) waits for the user's OK.
+
 ## Rules carried
 - At most GPUs 0 + 2, every GPU job under `run_watched2.sh` (renter wins). CPU tier competes with renters for cores
   and RAM bandwidth: measure under their load, never assume an idle box.

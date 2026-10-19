@@ -214,7 +214,7 @@ the GGUF; checked token-for-token against llama-tokenize on 7.5K tokens of code 
 **Engine knobs from the environment.** `truss_open_params` applies `qwen4exp::apply_env` (`forward.h`) after the
 params, the same function `tk-bench-spec` uses, so a benched config is served unchanged: `TRUSS_CPU_TRELLIS`,
 `TRUSS_CPU_DYNAMIC`, `TRUSS_CPU_THREADS`, `TRUSS_CPU_SHARE`, `TRUSS_PCIE_GBPS`, `TRUSS_PCIE_FRAC`, `TRUSS_ADAPT_EVERY`,
-`TRUSS_ADAPT_SWAPS`, `TRUSS_RING_GB`, `TRUSS_HINT_K`, `TRUSS_TAIL_SKIP`, `TRUSS_PREFILL_ROWS`, `TRUSS_KV_INT8` (plus the pool's own `TRUSS_CPU_PIN`,
+`TRUSS_ADAPT_SWAPS`, `TRUSS_RING_GB`, `TRUSS_HINT_K`, `TRUSS_TAIL_SKIP`, `TRUSS_SKIP_WEIGHT`, `TRUSS_PREFILL_ROWS`, `TRUSS_KV_INT8` (plus the pool's own `TRUSS_CPU_PIN`,
 `TRUSS_CPU_SPIN_US`). It also releases the model files' pages after upload (`Options::after_upload`, as the bench:
 the load otherwise peaks near 47 GB resident).
 

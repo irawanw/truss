@@ -26,24 +26,31 @@ void MoeExec::serve(const Job & j, Bell & b)
         std::fwrite(h, 4, 2, route_trace_);
         std::fwrite(b.ids, 4, (size_t) n, route_trace_);
     }
-    // TRUSS_TAIL_SKIP=R (Strata's route tail skip, #192): an expert that is not on the device and that every row of the
-    // window ranks R or lower by weight (0-based; ties by position) is neither copied nor computed - its term is 0, the
-    // other weights stay as routed (no renormalization, as Strata). CPU tier only: a skipped entry is masked (-1) like
-    // a CPU one but gets no CPU slot, so the joined CPU rows hold nothing for it.
+    // TRUSS_TAIL_SKIP=R (Strata's route tail skip, #192) and TRUSS_SKIP_WEIGHT=F (PolyStrata #34, D10): an expert that
+    // is not on the device is neither copied nor computed - its term is 0, the other weights stay as routed (no
+    // renormalization, as Strata). The rank rule holds when every row of the window ranks it R or lower by weight
+    // (0-based; ties by position); the weight rule when, in every row that routes to it, its weight is under F of that
+    // row's K routed weights. Either rule may mark an expert. CPU tier only: a skipped entry is masked (-1) like a CPU
+    // one but gets no CPU slot, so the joined CPU rows hold nothing for it.
     uint8_t skip[8 * 16] = {};
-    if (ct && o_.tail_skip > 0)
+    if (ct && (o_.tail_skip > 0 || o_.skip_weight > 0.f))
         for (int i = 0; i < n; ++i) {
             const int e = b.ids[i];
             if (skip[i] || store_->on_device(l, e)) continue;
-            bool low = true;
-            for (int i2 = 0; i2 < n && low; ++i2) {
+            bool low = o_.tail_skip > 0, low_w = o_.skip_weight > 0.f;
+            for (int i2 = 0; i2 < n && (low || low_w); ++i2) {
                 if (b.ids[i2] != e) continue;
                 const int r0 = i2 / K * K;
                 int rank = 0;
-                for (int q = r0; q < r0 + K; ++q) rank += b.w[q] > b.w[i2] || (b.w[q] == b.w[i2] && q < i2);
-                low = rank >= o_.tail_skip;
+                float sum = 0.f;
+                for (int q = r0; q < r0 + K; ++q) {
+                    rank += b.w[q] > b.w[i2] || (b.w[q] == b.w[i2] && q < i2);
+                    sum += b.w[q];
+                }
+                low = low && rank >= o_.tail_skip;
+                low_w = low_w && b.w[i2] / sum < o_.skip_weight;
             }
-            if (!low) continue;
+            if (!low && !low_w) continue;
             for (int i2 = i; i2 < n; ++i2) skip[i2] |= b.ids[i2] == e;
             tail_skipped_.fetch_add(1, std::memory_order_relaxed);
         }

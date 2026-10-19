@@ -13,7 +13,7 @@ unchanged byte for byte (`tests/golden/`, 10 engine configurations, TRACKER #160
 | `stage.h`, `stage.cu`, `stage_seq.cu` | `Stage`: one device's layer range. Construction = the memory plan (dense weights, small buffers, blocks and their slot states, then the expert store takes the VRAM left, then the prompt buffers carved from its spare region). `run_chunk`, `head`, `accept`, `checkpoint` / `restore` / `reset`, `select` / `settle`, the stage lock and the layer-split hand-off |
 | `pipeline.h`, `pipeline.cu`, `pipeline_slots.cu`, `pipeline_stats.cu` | `Pipeline`: the public engine (one stage or a layer split). Selected-slot calls (`run`, `head`, `verify`/`accept`, `draft`, `reset`, `checkpoint`/`restore`, `set_position` (B1: re-align the host cursor, graph mode)), the concurrent slot calls `prompt()` (first stage a chunk ahead on its own thread, decode share) and `round()` (drafts, verify window over both stages, pick, accept; unwind on a throw), diagnostics summed over stages (`split`, `all_resident`, `graph_info` for B1) |
 | `graph_step.h`, `graph_step.cu` | `GraphStep` (B1): one all-resident T=1 decode step (run + head + greedy argmax + token copy-back) as a reusable CUDA graph; per step refreshes pos0 in the model's pos-taking nodes (`cudaGraphExecKernelNodeSetParams`), rewrites the pinned token, launches + syncs; re-captures on the model's epoch change; requires no split, all experts resident, same logits/next_d addresses; always `cudaGraphInstantiateWithFlags` (the legacy 3-arg call segfaults, TRACKER #169) |
-| `options.h`, `options.cc` | `Options` (every engine knob, `MoeOptions` inside) and `apply_env` (all `TRUSS_*` knobs: one place) |
+| `options.h`, `options.cc` | `Options` (every engine knob, `MoeOptions` inside) and `apply_env` (all `TRUSS_*` knobs: one place; `TRUSS_SKIP_WEIGHT` for the D10 weight-share skip) |
 | `gpu.h` | `Gpu`: a stage's device, stream, cuBLAS handle, current scratch, owned allocations |
 | `limits.h` | `FETCH_ROWS` (32): fetch vs stream chunks, row-invariant fp32 gemv size |
 | `profile.h`, `profile.cc` | `Profile`: `TRUSS_PROFILE_SECTIONS` / `TRUSS_SECT_CSV` section events per layer (0..6 layer chain, 7..12 doorbell MoE split) |
@@ -63,11 +63,11 @@ moe_kernels.h) and router outputs, never a model.
 
 | file | content |
 |---|---|
-| `moe_exec.h` | `MoeOptions`, `MoeLayer` (tables, model layer, `cpu_ok`, `next_in_stage`, `profiled`), `MoeExec`, `all_resident()` (B1) |
+| `moe_exec.h` | `MoeOptions` (incl. the skip knobs `tail_skip`, `skip_weight`), `MoeLayer` (tables, model layer, `cpu_ok`, `next_in_stage`, `profiled`), `MoeExec`, `all_resident()` (B1) |
 | `moe_exec.cu` | construction (budget, hot-set plan, store, CPU tier, route trace, doorbells), `run()` dispatch (all-resident path: every expert on the device and no CPU tier -> the window kernel right after the routing, no doorbell / plan wait / hint; 10-15) + stream path + joins, adaptive tier, routing profile, E6 lending, stats |
 | `moe_paths.cu` | doorbell path (publish, job, shared expert while the driver plans, plan wait, window), fetch path (one sync, CPU split, fetch + hint), split path (E7) |
 | `moe_driver.cu` | `setup_doorbells`, the driver thread loop, watchdog (`TRUSS_DRIVER_DEBUG`) |
-| `moe_serve.cu` | `serve()` (route tail skip `TRUSS_TAIL_SKIP=R`: a missed expert ranked >= R by weight in every row of the window is masked (-1) with no CPU slot, i.e. contributes 0, no renormalization - CPU tier only, counted in `tail_skipped()`, #192; static / dynamic CPU split, copies, plan, hints, idle-link admission, `TRUSS_DRIVER_TS`), `fit_cpu_cost` |
+| `moe_serve.cu` | `serve()` (route tail skip `TRUSS_TAIL_SKIP=R`: a missed expert ranked >= R by weight in every row of the window is masked (-1) with no CPU slot, i.e. contributes 0, no renormalization - CPU tier only, counted in `tail_skipped()`, #192; weight-share skip `TRUSS_SKIP_WEIGHT=F` (PolyStrata #34, D10): same masking when, in every row routing to it, the expert is under F of that row's K routed weights; either rule may mark an expert, both 0 keeps today's path; static / dynamic CPU split, copies, plan, hints, idle-link admission, `TRUSS_DRIVER_TS`), `fit_cpu_cost` |
 | `cpu_tier.cc` | CPU tier loaders: q4s files (Flash-Next expert shape only: another shape fails loudly) or the pinned pack bytes (trellis, any shape the pool takes: DeepSeek 5120 x 2304 with clamp since #181/#191) |
 | `moe_kernels.h` | the shape-erased kernel table |
 | `moe_exec_state.h` | private `CpuTier` and `Bell` |
