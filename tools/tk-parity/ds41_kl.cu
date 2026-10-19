@@ -6,6 +6,8 @@
 // engine from the pack).
 // usage: TRUSS_EXPERT_OVERLAY=<experts>,<engram L1>,<engram L14> ds41_kl <dense.gguf> <ids.i32> <n_seq> <ctx>
 //          <ref.bf16> [<ref2.bf16> ...]
+// TRUSS_KL_DECODE=P: each sequence's first P tokens run as one prompt, the rest one token per run (the decode path:
+// CPU tier, tail / weight-share skip act only there); KL and top-1 over positions >= P only.
 #include "core/cuda_check.h"
 #include "engine/model.h"
 #include "engine/options.h"
@@ -30,6 +32,8 @@ int main(int argc, char ** argv)
     }
     try {
         const int n_seq = std::atoi(argv[3]), ctx = std::atoi(argv[4]);
+        const int dec = std::getenv("TRUSS_KL_DECODE") ? std::atoi(std::getenv("TRUSS_KL_DECODE")) : 0;
+        if (dec < 0 || dec >= ctx) throw std::runtime_error("TRUSS_KL_DECODE must be in [0, ctx)");
         std::vector<int32_t> ids((size_t) n_seq * ctx);
         std::ifstream(argv[2], std::ios::binary).read((char *) ids.data(), ids.size() * 4);
         const auto file = gguf::File::open(argv[1]);
@@ -55,8 +59,17 @@ int main(int argc, char ** argv)
         std::vector<uint16_t> rb((size_t) ctx * V);
         for (int s = 0; s < n_seq; ++s) {
             p.reset();
-            p.run(ids.data() + (size_t) s * ctx, ctx);
-            p.head(0, ctx, d_logits);
+            const int32_t * seq = ids.data() + (size_t) s * ctx;
+            if (dec > 0) {
+                p.run(seq, dec);
+                for (int t = dec; t < ctx; ++t) {
+                    p.run(seq + t, 1);
+                    p.head(0, 1, d_logits + (size_t) t * V);
+                }
+            } else {
+                p.run(seq, ctx);
+                p.head(0, ctx, d_logits);
+            }
             TRUSS_CUDA(cudaMemcpyAsync(lg.data(), d_logits, lg.size() * 4, cudaMemcpyDeviceToHost, p.stream()));
             TRUSS_CUDA(cudaStreamSynchronize(p.stream()));
             for (int r = 0; r < n_ref; ++r) {
@@ -65,7 +78,7 @@ int main(int argc, char ** argv)
                 std::vector<float> ks(ctx);
                 std::vector<char> ag(ctx);
 #pragma omp parallel for
-                for (int t = 0; t < ctx; ++t) {
+                for (int t = dec; t < ctx; ++t) {
                     const float * q = lg.data() + (size_t) t * V;
                     const uint16_t * pr = rb.data() + (size_t) t * V;
                     auto bf = [] (uint16_t h) { uint32_t u = (uint32_t) h << 16; float f; std::memcpy(&f, &u, 4); return f; };
@@ -86,7 +99,7 @@ int main(int argc, char ** argv)
                     }
                     ks[t] = (float) k, ag[t] = ar == aq;
                 }
-                for (int t = 0; t < ctx; ++t) kl[r].push_back(ks[t]), agree[r] += ag[t];
+                for (int t = dec; t < ctx; ++t) kl[r].push_back(ks[t]), agree[r] += ag[t];
             }
             double m0 = 0;
             for (float v : kl[0]) m0 += v;

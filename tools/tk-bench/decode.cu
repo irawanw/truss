@@ -71,7 +71,12 @@ int main(int argc, char ** argv)
         for (int pass = 0; pass < 2; ++pass) {
             f.reset();
             const auto p0 = std::chrono::steady_clock::now();
-            for (int s = 0; s < n; s += chunk) f.run(tok.data() + s, std::min(chunk, n - s));
+            // the server's prompt path: a layer split runs its stages a chunk apart (#155); TRUSS_BENCH_SERIAL=1 = one
+            // chunk at a time through every stage (the numbers before 10-19)
+            if (std::getenv("TRUSS_BENCH_SERIAL") && std::atoi(std::getenv("TRUSS_BENCH_SERIAL")))
+                for (int s = 0; s < n; s += chunk) f.run(tok.data() + s, std::min(chunk, n - s));
+            else
+                f.run_prompt(tok.data(), n, chunk);
             f.head((n - 1) % chunk, 1, logits);   // the prompt's last row, in the last chunk
             sampling::argmax(logits, fam->n_vocab(), next_d, f.stream());
             TRUSS_CUDA(cudaMemcpyAsync(next_h, next_d, 4, cudaMemcpyDeviceToHost, f.stream()));

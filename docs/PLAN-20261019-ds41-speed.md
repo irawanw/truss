@@ -107,6 +107,45 @@ at equal KL on GLM), then DSpark. Every quality-changing lever is gated by `ds41
 M0 -> D1 + P1 (biggest, cheapest) -> D2 + P2/P3 -> D3-D6 -> D7 -> P5 -> P6. Re-plan after each with the measured
 numbers. Pack quality (F1, layer-20 three-way check) resumes after D1/P1 or whenever the user says.
 
+## Compared with Flash-Next on TRUSS (4,363 tok/s, 2 GPUs) and tqLLM (10-19, user: "check deeply")
+
+**Work per token** (FLOPs, from the shapes; Flash-Next from `ledger-prefill-20261006.md`):
+| per token per layer | Flash-Next (48 layers) | DS41 (40 layers) |
+|---|---|---|
+| routed experts | 10 x 3 x 640 x 2,560 x 2 = 98 M | 6 x 3 x 2,304 x 5,120 x 2 = 425 M |
+| dense Q8 (attention projections, shared expert, indexer, mHC) | 3.6 G params / 48 x 2 = 150 M | ~7.6 GB Q8 / 40 x 2 = ~380 M |
+| attention | DSA in 12 of 48 layers, 2,048 keys x 256 x 24 heads: ~13 M average | every layer, ~640 keys x 512 x 64 heads: ~84 M + indexer |
+| **whole model** | **~13 GFLOP / token** | **~36 GFLOP / token (2.8x)** |
+
+So Flash-Next's 2,259 (one GPU) / 4,363 (two) at 150K is worth ~810 / ~1,560 tok/s of DS41 work at the same
+efficiency. The DS41 slice already does ~1,000 per GPU (#196, E3 32-head attention 51 ms/layer): per GPU we are
+at ~1.2x Flash-Next's efficiency. **2,000 = both GPUs pipelined (Flash-Next's 1.93x, #155) x ~1,050 per GPU
+with the PCIe streaming hidden.** Items, by what they cost:
+
+1. **The recipe that gave Flash-Next 4,363 was never run on DS41.** #185/#187 (247 tok/s) = one 2,048-token chunk
+   through `tk-bench-decode`: no chunk pipelining (needs many chunks, `Pipeline::run_prompt` in `tk-bench-spec`),
+   no copy/compute overlap across chunks, and 2K chunks re-stream every cold expert per 2K tokens. Flash-Next's
+   number: 150K prompt, 8,192-token chunks, run_prompt pipelined, link busy 75% of a compute-bound chunk.
+   -> **P9: one full-model prefill run in that recipe** (32K prompt, chunk 8K; ~3 min on GPUs 0 + 2, asks user).
+2. **PCIe at 2,000 tok/s** (*est.*): ~67 GB cold experts per 8K chunk = 4.1 s per chunk at 2,000. Split 14:
+   GPU 2 (x4, 6.7 GB/s) 14 layers ~23 GB = 3.5 s; GPU 0 (x8) 26 layers ~44 GB = 3.3 s -> fits, both links ~85%
+   busy. 16K chunks halve it but cost VRAM (residency). Compute per GPU at split 14: GPU 0 needs 26 layers in
+   4.1 s = 19 us/token/layer vs 25 today -> the kernel work below is still needed.
+3. **Dense prompt GEMMs are fp16 HMMA (W8A16, dequant + cuBLAS: 47-71 TFLOPS, #44); Flash-Next's ledger ran
+   int8 IMMA (Q8_1 activations, `q8_gemm.cu` 65-94 TOPS, 120 peak at 1,440 MHz).** -> **P7: int8 prompt rows,
+   fp16 decode** (`TRUSS_ACT=q8` exists for both; a prompt-only switch is new). Dense is 11.6 of 51 ms/layer;
+   ~-5 ms if 2x. Quality gate `ds41_kl` (Flash-Next: KL 0.065 vs 0.040 for activations, both phases).
+4. **Experts in prefill: trellis -> fp16 HMMA at 0.69-0.78 of peak** (ledger: "at target"; DS41 18.4 ms per 2K =
+   ~47 TFLOPS). Only int8 doubles that ceiling. tqLLM's X3 prefill reconstructs trellis weights straight to int8
+   with load-time row scales into the GEMM layout (+18-22% then +7% pp, commits 367611d / 30c8d50 / c3b611f).
+   -> **P8: trellis -> int8 tile + int8 activations for expert prompt rows** (error: weight row-scale rounding +
+   activation int8; gate `ds41_kl`).
+5. Attention: Flash-Next's DSA attention was its worst kernel too (eta 0.11, ledger item 4a); our E3 32-head
+   kernel continues that line (56.8 -> 51.0 ms/layer, parity PASS).
+6. **tqLLM decode lever: retrieval drafts** (`--draft-retrieve 32`: draft tokens copied from the prompt / history,
+   no drafter model). Coding agents re-emit file text, so it is a free drafter while DSpark / MTP is not ported.
+   -> **D11** (spec gate: accepted tokens per round on a coding transcript; cold-expert bytes per round as D7).
+
 ## Execution from 10-19 evening: planner + executor
 User (10-19): run the work through opencode2 with `opencode/deepseek-v4.1-flash-free` as the executor; Claude plans,
 writes one brief per batch, reviews the diff and report, runs the gates it doubts, commits and writes TRACKER rows.
@@ -117,7 +156,9 @@ Only slice benches on GPU 0 (no full-model runs, user 10-19: "use more cheap pp 
 |---|---|---|
 | E1 | slice prefill / decode at 8K / 16K / 32K context, chunk 2K / 8K (M0-D, P1, P5 sizing) | done #196: 906 tok/s at 32K, attention flat per token, no O(T^2) yet |
 | E2 | D10 weight-share skip `TRUSS_SKIP_WEIGHT=F`, golden gate, slice speed vs tail skip R5 | done #197: golden identical; F=0.12 27.8 vs R5 24.9 tok/s, KL open |
-| next | expert window decode kernel to ~85% bandwidth; prefill attention 32 heads/CTA + cp.async; sk_part on tensor cores; D9 4.5-bit dense; split at 14 + pipelined prefill | queued |
+| E3 | prefill sparse attention: cp.async, 32 heads per CTA | running (opencode v1; opencode2 stopped: its free-tier compaction is refused) |
+| E4 | P7 speed side: slice prefill with int8 dense prompt rows (`TRUSS_ACT=q8`) vs fp16; then a prompt-only switch | queued |
+| next | expert window decode kernel to ~85% bandwidth; P8 int8 expert prefill; prefill attention 32 heads/CTA + cp.async; sk_part on tensor cores; D9 4.5-bit dense; split at 14 + pipelined prefill | queued |
 
 KL for E2 / D3 (the full-model `ds41_kl`, two GPUs) waits for the user's OK.
 
