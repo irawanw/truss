@@ -128,6 +128,7 @@ add_library(truss_kernels STATIC
   src/kernels/ds41/attn_ops.cu
   src/kernels/ds41/indexer.cu
   src/kernels/ds41/sparse_attn.cu
+  src/kernels/ds41/sparse_attn_tc.cu
   src/kernels/ds41/engram.cu
   src/kernels/ffn/ffn_ops.cu
   src/kernels/ffn/route_sigmoid.cu
@@ -251,6 +252,8 @@ target_link_libraries(qwen4exp_forward PRIVATE truss_engine)
 add_executable(tk-bench-prefill tools/tk-bench/prefill.cu)
 target_link_libraries(tk-bench-prefill PRIVATE truss_engine)
 add_executable(tk-bench-decode tools/tk-bench/decode.cu)
+add_executable(tk-bench-ds41-slice tools/tk-bench/ds41_slice.cu)
+target_link_libraries(tk-bench-ds41-slice PRIVATE truss_engine)
 target_link_libraries(tk-bench-decode PRIVATE truss_engine)
 add_executable(tk-bench-graph tools/tk-bench/graph_probe.cu)
 target_link_libraries(tk-bench-graph PRIVATE truss_engine)

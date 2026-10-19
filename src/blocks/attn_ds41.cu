@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace truss::blocks {
@@ -185,7 +186,13 @@ void AttnDs41::forward(engine::Gpu & g, int slot, const float * in, const half *
     }
     a.sinks = lin_.f32(w_.sinks), a.H = H, a.D = D, a.window = d_.window, a.pos0 = pos0, a.T = T;
     a.scale = 1.0f / std::sqrt((float) D), a.out = o;
-    ds41::sparse_attn(a, g.s);
+    static const bool v1 = std::getenv("TRUSS_DS41_ATTN_V1") && std::atoi(std::getenv("TRUSS_DS41_ATTN_V1"));
+    if (!v1 && ds41::sparse_attn_tc_ok(a)) {   // v2, tensor cores (TRACKER #189); TRUSS_DS41_ATTN_V1=1: the v1 kernel
+        const size_t n = ds41::sparse_attn_tc_ws_floats(a);
+        ds41::sparse_attn_tc(a, n ? sc.alloc(n) : nullptr, g.s);
+    } else {
+        ds41::sparse_attn(a, g.s);
+    }
     ds41::ring_write(S.ring, RING, kvn, D, pos0, T, g.s);
     ds41::rope_tail(o, T, H, D, rd, pos0, 1, d_.inv_freq, true, g.s);
     // grouped output LoRA: o as [T * G][H D / G] rows through the whole wo_a, then each row's own group block
