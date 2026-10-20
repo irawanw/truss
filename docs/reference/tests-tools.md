@@ -83,6 +83,7 @@ A/B in one session (renters on GPUs 0/3 change clocks, TRACKER #27); nsys + sqli
 counters without root); label estimates as *(est.)*.
 | `tools/tk-pack/ds41_dense.py` | DeepSeek-V4.1 dense GGUF (`deepseek41`, mmnga names) from HTTP ranges of the HF shards: FP8 / BF16 -> Q8_0, small tensors F32, keep256 router rows, Engram hash layout + tokens | `PYTHONPATH=~/llama-paw/gguf-py:<poc>/scripts/dsref ~/src/venvs/exl3new/bin/python ds41_dense.py --model-dir ... --keep ... --out ...` |
 | `tools/tk-pack/ds41_experts.py` | X3.1 expert overlay (m3_* per layer / projection, kept experts renumbered) from `enc_pack256` encode dirs; written and read back per layer | `ds41_experts.py --roots ... --keep ... --kmap ... --out ...` |
+| `tools/tk-pack/ds41_dense_x3.py` | X3.1 dense overlay over `ds41-dense.gguf` (the m3 naming the binder reads: `m3_trellis` / `m3_suh` / `m3_svh` / `m3_meta` per matrix, plus a placeholder that shadows the base's Q8 tensor so the group is taken); written and read back per layer | `ds41_dense_x3.py --enc <encode dir> --out <file> [--layers 0-39] [--matrices ...]` |
 | `tools/tk-parity/ds41_attn_ref.py` | reference attention dumps for `ds41_attn_parity` | see the file |
 | `tools/tk-pack/ds41_engram.py` | Engram table -> int4 rows GGUF (`blk.L.engram_embd.q4`, I8 [144][rows]) streamed over HTTP in resumable 512K-row ranges, 8 streams | `ds41_engram.py --model-dir ... --layer L --out ...` |
 | `tools/tk-parity/ds41_engram_ref.py` | Engram parity data (sparse table + reference) | see the file |

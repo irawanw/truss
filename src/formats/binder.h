@@ -20,12 +20,12 @@ public:
 
     // The tensor, checked against `dims` (trailing 1s ignored on both sides). A dense matrix may also be a trellis
     // group ("<name>.m3_trellis" with its scales): then the handle is the group's words tensor and the parts are
-    // bound here, so a model family names its weights the same way whatever format the file holds.
+    // bound here, so a model family names its weights the same way whatever format the file holds. A group wins over
+    // a plain tensor of the same name (the X3.1 dense overlay shadows the base's Q8 tensor with a placeholder: the
+    // group is the matrix).
     const gguf::Tensor * need(const std::string & name, std::initializer_list<int64_t> dims)
     {
-        if (!f_.find(name)) {
-            if (const gguf::Tensor * w = f_.find(name + ".m3_trellis")) return need_trellis(name, w, dims);
-        }
+        if (const gguf::Tensor * w = f_.find(name + ".m3_trellis")) return need_trellis(name, w, dims);
         const gguf::Tensor & t = f_.at(name);
         std::vector<int64_t> want(dims), have(t.shape);
         while (want.size() > 1 && want.back() == 1) want.pop_back();
@@ -53,6 +53,7 @@ public:
         use(name + ".m3_suh");
         use(name + ".m3_svh");
         if (g->meta) use(name + ".m3_meta");
+        if (f_.find(name)) use(name);   // the shadowed plain tensor (the overlay's placeholder): bound, carries nothing
         return words;
     }
 

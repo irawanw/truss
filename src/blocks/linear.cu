@@ -210,7 +210,9 @@ void Linear::lin_trellis(const trellis_dense::Matrix & M, const Act & a, int row
         trellis_dense::matvec(L, M.k, a.x, g_.s);
         return;
     }
-    const int chunk = (int) (td_recon_bytes_ / (sizeof(half) * (size_t) M.in));
+    // reconstruct addresses whole 128-row blocks: a chunk that is not a multiple of 128 rows starts the next chunk
+    // mid-block (misaligned scale reads, wrong tiles)
+    const int chunk = (int) (td_recon_bytes_ / (sizeof(half) * (size_t) M.in)) / 128 * 128;
     for (int r0 = 0; r0 < M.out; r0 += chunk) {
         const int nr = std::min(chunk, M.out - r0);
         trellis_dense::reconstruct(M, td_recon_, r0, nr, g_.s);

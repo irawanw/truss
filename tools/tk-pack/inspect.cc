@@ -97,7 +97,10 @@ void expert_tables(const File & f)
     const std::string sfx = ".m3_trellis";
     for (const Tensor & t : f.tensors()) {
         if (!ends_with(t.name, sfx)) continue;
-        const auto e = truss::formats::read_expert_table(f, t.name.substr(0, t.name.size() - sfx.size()));
+        const std::string base = t.name.substr(0, t.name.size() - sfx.size());
+        const Tensor * suh = f.find(base + ".m3_suh");
+        if (suh && suh->shape.size() == 1) continue;   // a dense matrix's group, not an expert table
+        const auto e = truss::formats::read_expert_table(f, base);
         projections += e.n_expert;
         words += e.trellis->bytes;
         scales += e.suh->bytes + e.svh->bytes;

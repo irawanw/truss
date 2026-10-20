@@ -22,10 +22,14 @@ experts use):
 `words` = `k_tile_u16(k)` (`src/formats/trellis_k.h`): 16 (K1), 24 (K1.5), 32 (K2), 40 (K2.5), 48 (K3), 56 (K3.5),
 64 (K4). The kernels support the integer rates 1..4 and the half-integer 1.5 / 2.5 / 3.5 (the codec headers).
 
-**Binding rule** (`src/formats/binder.h`): `Binder::need(name, dims)` returns the plain tensor `<name>` if the file has
-it, else the trellis group `<name>.m3_trellis` (the handle is the group's words tensor, the parts are bound so that
-every tensor of the file is still used exactly once). A model family therefore names its weights the same way whatever
+**Binding rule** (`src/formats/binder.h`): `Binder::need(name, dims)` returns the trellis group `<name>.m3_trellis` if
+the file has one, else the plain tensor `<name>` (a group wins over a plain tensor of the same name: an overlay can
+shadow the base's tensor with a placeholder). The handle is the group's words tensor, the parts are bound so that
+every tensor of the file is still used exactly once. A model family therefore names its weights the same way whatever
 format the file holds - no per-format code in `src/model/*/weights.cc`.
+
+The words' ggml shape is `[words, tiles]` (the words are the fastest dim, as PAW-27B-X3.1 writes them); the flat
+order is the tile order (k-tile major / row-tile minor).
 
 **Transform.** The stored matrix is in the transformed basis: `W = diag(svh) . H128 . W_hat . H128 . diag(suh)` per
 128x128 block (`H128` = the 128-point Hadamard, natural order, scaled by 1/sqrt(128)). The runtime path transforms the
@@ -79,7 +83,10 @@ to ~1e-3, not bit-exactly. Against tqLLM's own `reconstruct_had_rows` the result
 | the output scales | `svh[row0 ...]`: the chunk's rows are `row0` rows into the matrix, so the scales are offset by `row0` |
 | the write | the chunk's local row (`block * 128 + row`), not the matrix's row |
 
-`row0` must be a multiple of 16 (the tile granularity); the engine uses 1024-row chunks.
+`row0` must be a multiple of 16 (the tile granularity). The engine's chunk is the buffer (1024 rows x `max_in`)
+divided by the matrix's `in`, **rounded down to 128 rows** (`Linear::lin_trellis`): a narrow matrix gets more rows per
+chunk, and an unrounded count (e.g. 6553 for `in` 1280) started the next chunk off the tile grid (CUDA misaligned
+address, DS41 E14 10-20).
 
 **Why fp16 and not int8 for the prompt path.** The engine's int8 GEMM (`dense::q8_gemm`) needs the weights in the
 Q8_0 layout (int8 with one fp16 scale per 32 weights); the trellis reconstruction produces a continuous fp16 matrix,

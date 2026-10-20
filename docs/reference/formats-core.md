@@ -129,8 +129,11 @@ under-estimate shows up as the exception above (it happened once: the embedding 
 `experts(prefix, in, out, n_expert)` (trellis table read and checked), `check_all_used()` (every tensor in the file
 bound exactly once). Every family's `weights.cc` uses it; errors name the family and the tensor.
 
-**The binding rule (the format a weight has is the file's business).** `need(name, dims)` returns the plain tensor
-`<name>` if the file has it, else the trellis group `<name>.m3_trellis` (the handle is the group's words tensor, the
-parts are bound so that every tensor of the file is still used exactly once). A model family therefore binds its
-weights the same way whatever format the file holds - no per-format code in `src/model/*/weights.cc`. The group is
-checked against `dims` the same way a plain tensor is (in, out).
+**The binding rule (the format a weight has is the file's business).** `need(name, dims)` returns the trellis group
+`<name>.m3_trellis` if the file has one (the handle is the group's words tensor, the parts are bound so that every
+tensor of the file is still used exactly once), else the plain tensor `<name>`. A group wins over a plain tensor of
+the same name: the X3.1 dense overlay (tools/tk-pack/ds41_dense_x3.py) shadows the base's Q8 tensor with a two-byte
+placeholder (the reader's overlay replaces same-named tensors), so the group is the matrix and the placeholder is
+counted as bound (it carries no weights). A model family therefore binds its weights the same way whatever format the
+file holds - no per-format code in `src/model/*/weights.cc`. The group is checked against `dims` the same way a plain
+tensor is (in, out).
