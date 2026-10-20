@@ -16,6 +16,14 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)   # the static libraries also go into li
 
 # llama-paw's ggml, used by tests only, as the reference implementation
 set(LLAMA_PAW_DIR $ENV{HOME}/llama-paw CACHE PATH "llama-paw checkout (reference for tests)")
+# The three targets that link llama-paw's ggml (moe_window_test, tk-bench-cpu-quant, tk-parity-llama-dump) are built only
+# when its libraries exist; llama-paw is no longer part of the workflow (10-20), so the default build does not need it.
+if(EXISTS ${LLAMA_PAW_DIR}/build/bin/libggml-cuda.so AND EXISTS ${LLAMA_PAW_DIR}/build/bin/libllama.so)
+    set(_truss_llama_ref ON)
+else()
+    set(_truss_llama_ref OFF)
+endif()
+option(TRUSS_LLAMA_REF "build the targets that link llama-paw's ggml" ${_truss_llama_ref})
 
 # ---- formats: model file readers (host only)
 add_library(truss_formats STATIC
@@ -155,11 +163,13 @@ target_include_directories(truss_kernels PUBLIC src)
 target_link_libraries(truss_kernels PUBLIC CUDA::cublas)
 
 # ---- tests (tests/unit: one binary per op, exit code = pass/fail)
-add_executable(moe_window_test tests/unit/moe_window_test.cu)
-target_include_directories(moe_window_test PRIVATE ${LLAMA_PAW_DIR}/ggml/include)
-target_link_directories(moe_window_test PRIVATE ${LLAMA_PAW_DIR}/build/bin)
-target_link_libraries(moe_window_test PRIVATE truss_kernels ggml ggml-base ggml-cuda)
-set_target_properties(moe_window_test PROPERTIES BUILD_RPATH ${LLAMA_PAW_DIR}/build/bin)
+if(TRUSS_LLAMA_REF)
+    add_executable(moe_window_test tests/unit/moe_window_test.cu)
+    target_include_directories(moe_window_test PRIVATE ${LLAMA_PAW_DIR}/ggml/include)
+    target_link_directories(moe_window_test PRIVATE ${LLAMA_PAW_DIR}/build/bin)
+    target_link_libraries(moe_window_test PRIVATE truss_kernels ggml ggml-base ggml-cuda)
+    set_target_properties(moe_window_test PROPERTIES BUILD_RPATH ${LLAMA_PAW_DIR}/build/bin)
+endif()
 
 add_executable(moe_prefill_test tests/unit/moe_prefill_test.cu)
 target_link_libraries(moe_prefill_test PRIVATE truss_kernels)
@@ -240,23 +250,27 @@ target_link_libraries(tk-bench-trellis-dense PRIVATE truss_engine)
 target_link_libraries(tk-bench-moe-trace PRIVATE truss_kernels)
 
 # Lead Order-2 microbench: trellis K2.5/K3.5 (truss_cpu) vs ggml Q3_K/Q4_K/Q8_0 vec_dot (llama-paw's AVX2 build).
-add_executable(tk-bench-cpu-quant tools/tk-bench/cpu_quant.cc)
-target_include_directories(tk-bench-cpu-quant PRIVATE src ${LLAMA_PAW_DIR}/ggml/src)
-target_link_directories(tk-bench-cpu-quant PRIVATE ${LLAMA_PAW_DIR}/build/bin)
-target_link_libraries(tk-bench-cpu-quant PRIVATE truss_cpu ggml-cpu ggml-base Threads::Threads)
-set_target_properties(tk-bench-cpu-quant PROPERTIES BUILD_RPATH ${LLAMA_PAW_DIR}/build/bin)
-target_compile_options(tk-bench-cpu-quant PRIVATE -O3 -mavx2 -mfma -mf16c)
+if(TRUSS_LLAMA_REF)
+    add_executable(tk-bench-cpu-quant tools/tk-bench/cpu_quant.cc)
+    target_include_directories(tk-bench-cpu-quant PRIVATE src ${LLAMA_PAW_DIR}/ggml/src)
+    target_link_directories(tk-bench-cpu-quant PRIVATE ${LLAMA_PAW_DIR}/build/bin)
+    target_link_libraries(tk-bench-cpu-quant PRIVATE truss_cpu ggml-cpu ggml-base Threads::Threads)
+    set_target_properties(tk-bench-cpu-quant PROPERTIES BUILD_RPATH ${LLAMA_PAW_DIR}/build/bin)
+    target_compile_options(tk-bench-cpu-quant PRIVATE -O3 -mavx2 -mfma -mf16c)
+endif()
 
 # ---- tools/tk-pack: model file catalog, pack converter
 add_executable(tk-pack-inspect tools/tk-pack/inspect.cc)
 target_link_libraries(tk-pack-inspect PRIVATE truss_models)
 
 # ---- tools/tk-parity: reference activations from llama-paw (CP2 layer parity)
-add_executable(tk-parity-llama-dump tools/tk-parity/llama_dump.cpp)
-target_include_directories(tk-parity-llama-dump PRIVATE ${LLAMA_PAW_DIR}/include ${LLAMA_PAW_DIR}/ggml/include)
-target_link_directories(tk-parity-llama-dump PRIVATE ${LLAMA_PAW_DIR}/build/bin)
-target_link_libraries(tk-parity-llama-dump PRIVATE llama ggml ggml-base ggml-cpu)
-set_target_properties(tk-parity-llama-dump PROPERTIES BUILD_RPATH ${LLAMA_PAW_DIR}/build/bin)
+if(TRUSS_LLAMA_REF)
+    add_executable(tk-parity-llama-dump tools/tk-parity/llama_dump.cpp)
+    target_include_directories(tk-parity-llama-dump PRIVATE ${LLAMA_PAW_DIR}/include ${LLAMA_PAW_DIR}/ggml/include)
+    target_link_directories(tk-parity-llama-dump PRIVATE ${LLAMA_PAW_DIR}/build/bin)
+    target_link_libraries(tk-parity-llama-dump PRIVATE llama ggml ggml-base ggml-cpu)
+    set_target_properties(tk-parity-llama-dump PROPERTIES BUILD_RPATH ${LLAMA_PAW_DIR}/build/bin)
+endif()
 
 # ---- tools/codec-lab: codebook studies (quantization MSE vs the Gaussian bound)
 add_executable(tk-codec-lab tools/codec-lab/viterbi_mse.cu)

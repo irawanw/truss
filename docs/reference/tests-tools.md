@@ -4,6 +4,10 @@ Conventions (CODE.md): one binary per op; compare against an independent referen
 NaN-fill outputs first; **exit code is the verdict**; one line per case with error and timing. Run on GPU 2:
 `CUDA_VISIBLE_DEVICES=2 ./build/<name> ...`.
 
+llama-paw is no longer part of the workflow (10-20). The three targets that link its ggml (`moe_window_test`,
+`tk-bench-cpu-quant`, `tk-parity-llama-dump`) build only with `-DTRUSS_LLAMA_REF=ON`, which is on by default only
+when `${LLAMA_PAW_DIR}/build/bin/` holds `libggml-cuda.so` and `libllama.so`. Everything else builds without llama-paw.
+
 Data paths used below:
 
 ```
