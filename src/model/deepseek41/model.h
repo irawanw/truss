@@ -69,7 +69,7 @@ public:
     engine::Drafter * drafter() override { return dspark_.get(); }
     std::vector<runtime::MoeLayer> moe_layers() const override;
     runtime::MoeKernels moe_kernels() const override { return runtime::MoeKernels::of<MoeShape>(); }
-    size_t scratch_bytes(int T) const override;
+    size_t scratch_bytes(int T, bool decode) const override;
     void build(engine::Stage & st) override;
     void bind_experts(engine::Stage & st) override;
     void embed(engine::Stage & st, const engine::Chunk & c, float * res) override;

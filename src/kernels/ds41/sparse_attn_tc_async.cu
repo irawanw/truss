@@ -55,7 +55,7 @@ __device__ __forceinline__ const half * key_ptr(const SparseAttnArgs & a, int t,
         const int p = w0 + j;
         return p >= a.pos0 ? a.chunk_kv + (size_t) (p - a.pos0) * D : a.ring + (size_t) (p % a.R) * D;
     }
-    const int c = a.idx[(size_t) t * a.k + (j - nwin)];
+    const int c = a.idx[(size_t) (t + a.row_off) * a.k + (j - nwin)];
     return c >= 0 ? a.comp + (size_t) c * D : nullptr;
 }
 
@@ -67,7 +67,7 @@ __global__ void __launch_bounds__(THREADS) sparse_attn_tc_async_kernel(const Spa
     float * valid = row_a + HG;
     const int ngrp = a.H / HG, t = blockIdx.x / ngrp, h0 = (blockIdx.x % ngrp) * HG, split = blockIdx.y;
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32, g = lane / 4, c2 = (lane % 4) * 2;
-    const int p = a.pos0 + t, w0 = max(0, p - a.window + 1), nwin = p - w0 + 1;
+    const int p = a.pos0 + t, w0 = max(a.clip, p - a.window + 1), nwin = p - w0 + 1;
     const int nkeys = nwin + (a.idx ? a.k : 0), ntile = (nkeys + KT - 1) / KT;
     const int tb = split * tiles_per_split, te = min(ntile, tb + tiles_per_split);
     // the 16 query rows as fp16

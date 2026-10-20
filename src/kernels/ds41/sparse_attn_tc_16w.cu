@@ -50,7 +50,7 @@ __device__ __forceinline__ const half * key_ptr(const SparseAttnArgs & a, int t,
         const int p = w0 + j;
         return p >= a.pos0 ? a.chunk_kv + (size_t) (p - a.pos0) * D : a.ring + (size_t) (p % a.R) * D;
     }
-    const int c = a.idx[(size_t) t * a.k + (j - nwin)];
+    const int c = a.idx[(size_t) (t + a.row_off) * a.k + (j - nwin)];
     return c >= 0 ? a.comp + (size_t) c * D : nullptr;
 }
 
@@ -65,7 +65,7 @@ __global__ void __launch_bounds__(THREADS) sparse_attn_tc_16w_kernel(const Spars
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     const int ph = warp / 8, pd = warp % 8, pk = pd / 2, kd = warp % 2;   // S split: head half, key octet, k half
     const int g = lane / 4, c2 = (lane % 4) * 2;
-    const int p = a.pos0 + t, w0 = max(0, p - a.window + 1), nwin = p - w0 + 1;
+    const int p = a.pos0 + t, w0 = max(a.clip, p - a.window + 1), nwin = p - w0 + 1;
     const int nkeys = nwin + (a.idx ? a.k : 0), ntile = (nkeys + KT - 1) / KT;
     const int tb = split * tiles_per_split, te = min(ntile, tb + tiles_per_split);
     // the 32 query rows as fp16

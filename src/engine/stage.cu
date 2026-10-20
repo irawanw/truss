@@ -103,13 +103,21 @@ Stage::Stage(const Family & fam, int n_ctx, int max_chunk, const Options & o, co
     if (o_.after_upload) o_.after_upload();
     if (prefill_rows_ > FETCH_ROWS) {   // the prompt path's buffers: carved from the ring's spare region
         auto * p = static_cast<unsigned char *>(moe_ ? moe_->spare() : (void *) g_.alloc<unsigned char>(big_bytes()));
-        const size_t sb = model_->scratch_bytes(prefill_rows_);
-        const size_t wb = moe_ ? Gpu::align(model_->moe_kernels().prefill_ws(prefill_rows_)) : 0;
+        const size_t sb = model_->scratch_bytes(prefill_rows_, false);   // the prompt path's peak
+        // the MoE prefill's workspace: a piece of rows (the prefill runs in row pieces), not the chunk
+        moe_rows_ = std::max(std::min(prefill_rows_, engine::prefill_piece()), o_.moe.split_rows);
+        const size_t wb = moe_ ? Gpu::align(model_->moe_kernels().prefill_ws(moe_rows_)) : 0;
         const size_t rb = Gpu::align(sizeof(float) * prefill_rows_ * fam.res_width());
+        {
+            const double gb = 1073741824.0;
+            std::fprintf(stderr, "stage %d-%d: prompt buffers at %d rows: %.2f GiB (scratch %.2f, moe ws %.2f, residual %.2f)\n",
+                         lb_, le_ - 1, prefill_rows_, big_bytes() / gb, sb / gb, wb / gb,
+                         (1 + n_extra_) * rb / gb);
+        }
         big_scratch_ = std::make_unique<Scratch>(p, sb);
         big_.scratch = big_scratch_.get();
         big_.moe_ws = moe_ ? p + Gpu::align(sb) : nullptr;
-        big_.moe_rows = prefill_rows_;
+        big_.moe_rows = moe_rows_;
         big_.res = reinterpret_cast<float *>(p + Gpu::align(sb) + wb);
         for (int i = 0; i < n_extra_; ++i) big_.extra.push_back(reinterpret_cast<float *>(p + Gpu::align(sb) + wb + (1 + i) * rb));
     }
@@ -132,7 +140,7 @@ Stage::~Stage()
 
 void Stage::alloc_buffers(int small_rows)
 {
-    small_scratch_ = std::make_unique<Scratch>(model_->scratch_bytes(small_rows));
+    small_scratch_ = std::make_unique<Scratch>(model_->scratch_bytes(small_rows, true));   // the decode path's peak
     small_.scratch = small_scratch_.get();
     const runtime::MoeKernels k = model_->moe_kernels();
     if (k.prefill_ws) small_.moe_ws = g_.alloc<unsigned char>(k.prefill_ws(small_rows));
@@ -146,7 +154,8 @@ void Stage::alloc_buffers(int small_rows)
 size_t Stage::big_bytes() const
 {
     const runtime::MoeKernels k = model_->moe_kernels();
-    return Gpu::align(model_->scratch_bytes(prefill_rows_)) + (k.prefill_ws ? Gpu::align(k.prefill_ws(prefill_rows_)) : 0) +
+    const int mr = std::max(std::min(prefill_rows_, engine::prefill_piece()), o_.moe.split_rows);
+    return Gpu::align(model_->scratch_bytes(prefill_rows_, false)) + (k.prefill_ws ? Gpu::align(k.prefill_ws(mr)) : 0) +
            (1 + n_extra_) * Gpu::align(sizeof(float) * prefill_rows_ * fam_.res_width());
 }
 

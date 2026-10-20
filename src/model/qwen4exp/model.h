@@ -63,7 +63,7 @@ public:
     std::vector<const gguf::Tensor *> no_w16() const override { return { w_.token_embd, w_.output }; }
     std::vector<runtime::MoeLayer> moe_layers() const override;
     runtime::MoeKernels moe_kernels() const override { return runtime::MoeKernels::of<MoeShape>(); }
-    size_t scratch_bytes(int T) const override;
+    size_t scratch_bytes(int T, bool decode) const override;
     int extra_buffers() const override { return mtp_ ? 2 : 0; }   // the MTP block's input rows and its residual
     void build(engine::Stage & st) override;
     void bind_experts(engine::Stage & st) override;

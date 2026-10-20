@@ -74,23 +74,29 @@ __device__ __forceinline__ void mma_s8(const uint32_t (&a)[4], const uint32_t (&
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(0), "r"(0), "r"(0), "r"(0));
 }
 
+template <bool GROUPED>
 __global__ __launch_bounds__(THREADS) void gemm_kernel(Q8Matrix W, const int8_t * __restrict__ xq,
                                                        const half * __restrict__ xd, int rows, float * __restrict__ y,
-                                                       int sw)
+                                                       int sw, int G, int R)
 {
     // grouped raster (sw > 0): sw token tiles run each weight tile back to back while it is in L2 (a weight matrix of
     // 26-31 MB was re-read from DRAM by every one of the 64 token tiles at 8K rows). Tile order only: bit-identical.
     int bx = blockIdx.x, by = blockIdx.y;
-    if (sw > 0) {
+    if (!GROUPED && sw > 0) {
         const int pid = blockIdx.y * gridDim.x + blockIdx.x, per = sw * gridDim.x;
         const int first = pid / per * sw, gs = min((int) gridDim.y - first, sw);
         by = first + (pid % per) % gs, bx = (pid % per) / gs;
     }
+    // the grouped mode (DeepSeek-V4.1's output LoRA): block grp of the weights, the stacked activation row
+    // (t * G + grp) of the group's slice, the output at y[t][grp * R ..). The int32 block dots and their fp32 folding
+    // are per output element: the same values as the dense product of the stacked rows with all of W.
+    const int grp = GROUPED ? (int) blockIdx.z : 0;
     __shared__ __align__(16) int8_t sq[2][STAGE];            // [stage][W rows | x rows][SK]
     __shared__ float sd[2][BM + BN][KC / 32];                 // scales of the stage's two blocks
 
     const int o0 = bx * BM, t0 = by * BN;
     const int K = W.in, KB = K / 32;
+    const int n_out = GROUPED ? R : W.out;
     const int wid = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int wm = (wid / (BN / WN)) * WM, wn = (wid % (BN / WN)) * WN;
     const int g = lane >> 2, q = lane & 3;
@@ -101,16 +107,18 @@ __global__ __launch_bounds__(THREADS) void gemm_kernel(Q8Matrix W, const int8_t 
             const int r = i / (KC / 16), v = i % (KC / 16);
             const bool is_w = r < BM;
             const int row = is_w ? o0 + r : t0 + r - BM;
-            const bool ok = row < (is_w ? W.out : rows);
-            const int8_t * src = (is_w ? W.q : xq) + (size_t) (ok ? row : 0) * K + kc * KC + v * 16;
+            const bool ok = row < (is_w ? n_out : rows);
+            const int64_t srow = GROUPED ? (is_w ? (int64_t) grp * R + row : (int64_t) row * G + grp) : row;
+            const int8_t * src = (is_w ? W.q : xq) + (size_t) srow * K + kc * KC + v * 16;
             cp16(&sq[s][r * SK + v * 16], src, ok);
         }
         for (int i = threadIdx.x; i < (BM + BN) * (KC / 32); i += THREADS) {
             const int r = i / (KC / 32), b = i % (KC / 32);
             const bool is_w = r < BM;
             const int row = is_w ? o0 + r : t0 + r - BM;
-            const bool ok = row < (is_w ? W.out : rows);
-            sd[s][r][b] = ok ? __half2float((is_w ? W.d : xd)[(size_t) row * KB + kc * (KC / 32) + b]) : 0.f;
+            const bool ok = row < (is_w ? n_out : rows);
+            const int64_t srow = GROUPED ? (is_w ? (int64_t) grp * R + row : (int64_t) row * G + grp) : row;
+            sd[s][r][b] = ok ? __half2float((is_w ? W.d : xd)[(size_t) srow * KB + kc * (KC / 32) + b]) : 0.f;
         }
         asm volatile("cp.async.commit_group;\n" ::);
     };
@@ -180,7 +188,10 @@ __global__ __launch_bounds__(THREADS) void gemm_kernel(Q8Matrix W, const int8_t 
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 const int o = o0 + wm + m * 16 + g + (i >> 1) * 8, t = t0 + wn + n * 8 + 2 * q + (i & 1);
-                if (o < W.out && t < rows) y[(size_t) t * W.out + o] = acc[m][n][i];
+                if (o < n_out && t < rows) {
+                    if (GROUPED) y[(size_t) t * G * R + (size_t) grp * R + o] = acc[m][n][i];
+                    else y[(size_t) t * W.out + o] = acc[m][n][i];
+                }
             }
 }
 
@@ -296,7 +307,18 @@ void q8_gemm(const Q8Matrix & W, const int8_t * xq, const half * xd, int rows, f
     // measured on the 8K-row shapes (tools/tk-bench/g128_gemm_bench): 10-12K outputs x1.25 at 8, 6K x1.06 at 16, a
     // 2.5K output with a 6K input slower grouped
     const int sw = W.out >= 8192 ? 8 : W.out >= 4096 ? 16 : 0;
-    gemm_kernel<<<grid, THREADS, 0, stream>>>(W, xq, xd, rows, y, (int) grid.y > sw ? sw : 0);
+    gemm_kernel<false><<<grid, THREADS, 0, stream>>>(W, xq, xd, rows, y, (int) grid.y > sw ? sw : 0, 1, 0);
+    TRUSS_CUDA(cudaGetLastError());
+}
+
+void q8_gemm_grouped(const Q8Matrix & W, int G, const int8_t * xq, const half * xd, int rows, float * y,
+                     cudaStream_t stream)
+{
+    if (W.in % KC) throw std::invalid_argument("q8_gemm_grouped: W.in must be a multiple of 64");
+    if (G < 1 || W.out % G) throw std::invalid_argument("q8_gemm_grouped: W.out % G");
+    const int R = W.out / G;
+    const dim3 grid((R + BM - 1) / BM, (rows + BN - 1) / BN, G);
+    gemm_kernel<true><<<grid, THREADS, 0, stream>>>(W, xq, xd, rows, y, 0, G, R);
     TRUSS_CUDA(cudaGetLastError());
 }
 

@@ -18,7 +18,7 @@ __device__ __forceinline__ const half * key_ptr(const SparseAttnArgs & a, int t,
         const int p = w0 + j;
         return p >= a.pos0 ? a.chunk_kv + (size_t) (p - a.pos0) * a.D : a.ring + (size_t) (p % a.R) * a.D;
     }
-    const int c = a.idx[(size_t) t * a.k + (j - nwin)];
+    const int c = a.idx[(size_t) (t + a.row_off) * a.k + (j - nwin)];
     return c >= 0 ? a.comp + (size_t) c * a.D : nullptr;
 }
 
@@ -27,7 +27,7 @@ __global__ void __launch_bounds__(THREADS) sparse_attn_kernel(const SparseAttnAr
     __shared__ float sq[D_MAX], sp[KEYS_MAX];
     __shared__ float s_red[WARPS];
     const int t = blockIdx.x / a.H, h = blockIdx.x % a.H, lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    const int p = a.pos0 + t, w0 = max(0, p - a.window + 1), nwin = p - w0 + 1;
+    const int p = a.pos0 + t, w0 = max(a.clip, p - a.window + 1), nwin = p - w0 + 1;
     const int nkeys = nwin + (a.idx ? a.k : 0);
     const float * q = a.q + ((size_t) t * a.H + h) * a.D;
     for (int i = threadIdx.x; i < a.D; i += THREADS) sq[i] = q[i];

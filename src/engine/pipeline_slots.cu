@@ -4,11 +4,66 @@
 // wedged behind it (review C1/C2).
 #include "engine/pipeline.h"
 
+#include <algorithm>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <thread>
 
 namespace truss::engine {
+
+namespace {
+
+// the confidence-scheduled verify (the DeepInfer recipe, item 8b): off by default.
+bool varlen_on()
+{
+    static const bool on = [] {
+        const char * e = std::getenv("TRUSS_DSPARK_VARLEN");
+        return e && std::atoi(e) != 0;
+    }();
+    return on;
+}
+
+// the cost of a verify pass with n+1 verified rows, in ms: cost(n) = c0 + c1 * n (measured in item 8a)
+void varlen_cost(double & c0, double & c1)
+{
+    static const double k0 = [] {
+        const char * e = std::getenv("TRUSS_VARLEN_C0");
+        return e ? std::atof(e) : 0.0;
+    }();
+    static const double k1 = [] {
+        const char * e = std::getenv("TRUSS_VARLEN_C1");
+        return e ? std::atof(e) : 0.0;
+    }();
+    c0 = k0;
+    c1 = k1;
+}
+
+// the prefix n that maximizes (1 + sum cumprod(p)_1..n) / cost(n); returns nw if the model has no confidence
+int varlen_pick(const float * p, int cn, int nw, int & nw_drafted)
+{
+    double c0 = 0, c1 = 0;
+    varlen_cost(c0, c1);
+    if (!p || cn <= 0 || c1 <= 0) return nw;
+    double cum = 1.0, toks = 1.0, best = -1.0;
+    int best_n = nw;
+    for (int n = 0; n <= nw; ++n) {
+        if (n > 0) {
+            cum *= p[std::min(n - 1, cn - 1)];
+            toks += cum;
+        }
+        const double val = toks / (c0 + c1 * n);
+        if (val > best) {
+            best = val;
+            best_n = n;
+        }
+    }
+    nw_drafted = nw;
+    return std::min(nw, best_n);
+}
+
+}  // namespace
 
 void Pipeline::prompt(int slot, const int32_t * tokens, int n, int step, float * logits,
                       const std::function<void()> & after, const std::function<void(int)> & done)
@@ -217,12 +272,23 @@ int Pipeline::round(int slot, int32_t next, int nd, int32_t * win, float * logit
     };
     int nw = 0, keep = 0;
     long ticket = 0;
+    int nw_sel_ = -1, nw_drafted_ = -1;
+    bool logged_ = false;
     try {
         {   // the drafts (the drafter lives on the last stage)
             Held<Stage> h(*m_, 0);
             m_->select(slot);
             inject_fault("round-draft", slot);
             nw = m_->draft(next, pos, nd, win + 1, ds);
+        }
+        if (varlen_on()) {   // the confidence-scheduled verify: only the prefix the schedule pays for
+            int cn = 0, nw_drafted = nw;
+            const float * p = m_->draft_confidence(&cn);
+            const int nw_sel = varlen_pick(p, cn, nw, nw_drafted);
+            nw_sel_ = nw_sel;
+            nw_drafted_ = nw_drafted;
+            logged_ = true;
+            nw = nw_sel;
         }
         win[0] = next;
         const int T = nw + 1;
@@ -268,6 +334,14 @@ int Pipeline::round(int slot, int32_t next, int nd, int32_t * win, float * logit
             require(keep >= 1 && keep <= T, "round(): pick() kept " + std::to_string(keep) + " of " + std::to_string(T));
             m_->accept(keep);
             last_open = false;
+            if (logged_) {   // the calibration record: pos, the accepted rows, the verified prefix, the drafts
+                static FILE * f = std::getenv("TRUSS_ACCEPT_LOG") ? std::fopen(std::getenv("TRUSS_ACCEPT_LOG"), "ab") : nullptr;
+                if (f) {
+                    const int32_t rec[4] = { pos, keep, nw_sel_, nw_drafted_ };
+                    std::fwrite(rec, 4, 4, f);
+                    std::fflush(f);
+                }
+            }
         }
         for (auto & p : front_) p->set_defer(slot, keep);   // read under that stage's lock by this slot's next call
     } catch (...) {

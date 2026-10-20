@@ -1,5 +1,6 @@
 #include "model/deepseek41/model.h"
 
+#include "engine/limits.h"
 #include "engine/stage.h"
 #include "kernels/dense/q8_gemm.cuh"
 #include "kernels/ds41/attn_ops.cuh"
@@ -95,14 +96,20 @@ std::vector<runtime::MoeLayer> StageModel::moe_layers() const
     return out;
 }
 
-size_t StageModel::scratch_bytes(int T) const
+// The prompt path's peak temporaries at T rows. The attention's per-row scratch is the prompt path's (the decode
+// path also stacks the grouped output LoRA's rows); its output buffer is a piece (engine::PREFILL_PIECE rows), not a
+// row, so the chunk's rows do not scale the attention's memory (TRACKER #201: the prompt path's buffers are carved
+// from the expert ring, and the ring's size decides how many experts stay resident).
+size_t StageModel::scratch_bytes(int T, bool decode) const
 {
     const size_t d = c_.d_model, rw = (size_t) c_.hc * d + 24;
-    size_t attn = 0, fixed = 0;
+    size_t attn = 0, fixed = 0, piece = 0;
     for (int l = lb_; l < le_; ++l) {
         const auto ad = attn_dims(l);
-        attn = std::max(attn, blocks::AttnDs41::scratch_per_row(ad));
+        attn = std::max(attn, decode ? blocks::AttnDs41::scratch_decode_per_row(ad)
+                                      : blocks::AttnDs41::scratch_per_row(ad));
         fixed = std::max(fixed, blocks::AttnDs41::scratch_fixed(ad, n_ctx_));
+        piece = std::max(piece, blocks::AttnDs41::scratch_piece(ad));
     }
     blocks::MoeDims md { c_.d_model, c_.n_expert, c_.n_expert_used, c_.d_ff_exp * c_.n_shexp };
     const blocks::EngramDims ed { c_.hc, c_.d_model, c_.engram.heads, c_.engram.head_dim, c_.engram.max_ngram, 0, 0,
@@ -110,8 +117,9 @@ size_t StageModel::scratch_bytes(int T) const
     const size_t base = d * (4 + 4 + 2) + 2 * 24 * 4 + 64;   // collapse out fp32, sub-block out, normed fp16, coefs
     const size_t per_row = base + std::max({ attn, md.scratch_per_row(), blocks::Engram::scratch_per_row(ed),
                                              blocks::HcSinkhorn::scratch_per_row(sk_dims()) });
+    const size_t rows = std::min((size_t) T, (size_t) engine::prefill_piece());
     (void) rw;
-    return (size_t) T * per_row + fixed + (64ull << 20);
+    return (size_t) T * per_row + fixed + piece * rows / engine::prefill_piece() + (64ull << 20);
 }
 
 void StageModel::build(engine::Stage & st)

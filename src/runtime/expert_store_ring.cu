@@ -38,8 +38,13 @@ int64_t ExpertStore::next_region(int64_t v, int64_t need) const
 
 void ExpertStore::drop(const RingEntry & r)
 {
-    layers_[r.layer].ring_at[r.expert] = -1;
-    layers_[r.layer].pend[r.expert] = 0;
+    Layer & Y = layers_[r.layer];
+    if (adapt_reuse_on_ && !Y.adapt_set.empty() && Y.adapt_set[r.expert]) {   // the admission's reuse count
+        ++adapt_reuse_[Y.adapt_hits[r.expert]];
+        Y.adapt_set[r.expert] = 0;
+    }
+    Y.ring_at[r.expert] = -1;
+    Y.pend[r.expert] = 0;
 }
 
 int ExpertStore::add_segment(uint8_t * ptr, size_t bytes)
@@ -83,7 +88,7 @@ size_t ExpertStore::lent_bytes() const
     return n;
 }
 
-bool ExpertStore::ring_put(int l, int e, bool hint, bool copy)
+bool ExpertStore::ring_put(int l, int e, bool hint, bool copy, bool adapt)
 {
     Layer & Y = layers_[l];
     const int64_t need = (int64_t) align_up(Y.bytes[e]);
@@ -148,6 +153,7 @@ bool ExpertStore::ring_put(int l, int e, bool hint, bool copy)
     Y.meta_dirty = true;   // uploaded once at the next fetch/hint/acquire of this layer (1.A)
     if (!copy) return true;
     if (hint) stats_.hint_bytes += Y.bytes[e], ++stats_.hinted;
+    else if (adapt) stats_.adapt_bytes += Y.bytes[e], ++stats_.adapt_copies;
     else stats_.bytes += Y.bytes[e], ++stats_.misses;
     return true;
 }
@@ -169,7 +175,13 @@ void ExpertStore::admit(const std::vector<std::pair<int, int>> & le, cudaStream_
     for (const auto & [l, e] : le) {
         Layer & Y = layers_.at(l);
         if (Y.cold_off[e] < 0 || Y.ring_at[e] >= 0) continue;
-        ring_put(l, e);
+        ring_put(l, e, false, true, true);   // the adaptive tier's copy: its own counter
+        if (adapt_reuse_on_ && Y.adapt_set.empty()) {
+            Y.adapt_set.assign(Y.n_expert, 0);
+            Y.adapt_hits.assign(Y.n_expert, 0);
+        }
+        if (adapt_reuse_on_) Y.adapt_set[e] = 1;
+        Y.adapt_hits[e] = 0;
         Y.pend[e] = 1;
         adm_.push_back({ l, e });
         touched[l] = 1;
@@ -273,6 +285,9 @@ bool ExpertStore::fetch(int l, const int * ids, int n, cudaStream_t compute)
         hinted_[l].clear();
     }
     poll_admitted();
+    if (adapt_reuse_on_)
+        for (int e : need)
+            if (!Y.adapt_set.empty() && Y.adapt_set[e]) ++Y.adapt_hits[e];   // the admission paid off: routed again
     for (int e : need)
         if (Y.pend[e]) {   // admitted or claimed, copy maybe in flight: wait for go (after the rest of a claim)
             claim_flush(l, e);
@@ -428,6 +443,16 @@ void ExpertStore::prefetch_hint(int l, const int * ids, int n)
                                        sizeof(int32_t) * 2 * Y.n_expert, cudaMemcpyHostToDevice, copy_));
         Y.meta_dirty = false;
     }
+}
+
+std::string ExpertStore::adapt_reuse_report() const
+{
+    std::string s = "adaptive tier admissions: reuse histogram";
+    for (const auto & [hits, n] : adapt_reuse_) s += " " + std::to_string(hits) + "x:" + std::to_string(n);
+    long tot = 0, sum = 0;
+    for (const auto & [hits, n] : adapt_reuse_) tot += n, sum += hits * n;
+    s += " (experts " + std::to_string(tot) + ", mean reuses " + std::to_string(tot ? double(sum) / tot : 0.0) + ")";
+    return s;
 }
 
 }  // namespace truss::runtime

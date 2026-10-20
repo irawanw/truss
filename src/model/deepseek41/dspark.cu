@@ -106,6 +106,9 @@ DSpark::DSpark(engine::Stage & st, const Config & c, const Weights & w, const DS
     logits_ = g_.alloc<float>((size_t) d_.block_size * d_.n_vocab);
     me_ = g_.alloc<float>(d_.markov_rank), mbias_ = g_.alloc<float>(d_.n_vocab);
     m16_ = g_.alloc<half>(d_.markov_rank);
+    // the confidence head: p_i = sigmoid(proj([hidden_i (before the final norm); markov_emb_i]) / T)
+    xconf_ = g_.alloc<float>(d_.d_model + d_.markov_rank);
+    conf_logit_ = g_.alloc<float>(d_.block_size);
     ids_ = g_.alloc<int>(d_.block_size + 1), draft_ids_ = g_.alloc<int>(d_.block_size + 1);
     TRUSS_CUDA(cudaMallocHost(reinterpret_cast<void **>(&ids_host_), (d_.block_size + 1) * sizeof(int32_t)));
     TRUSS_CUDA(cudaMallocHost(reinterpret_cast<void **>(&draft_host_), (d_.block_size + 1) * sizeof(int32_t)));
@@ -145,7 +148,7 @@ void DSpark::ck_buffers(int slot, std::vector<std::pair<float *, size_t>> & out)
     for (auto & a : attn_) out.push_back({ reinterpret_cast<float *>(a->ring(slot)), (size_t) RING * d_.head_dim / 2 });
 }
 
-void DSpark::capture(engine::Gpu & g, int slot, int layer, const float * res, int W, int T)
+void DSpark::capture(engine::Gpu & g, int slot, int layer, const float * res, int W, int T, int row_off)
 {
     int li = -1;
     for (int i = 0; i < (int) d_.target_layers.size(); ++i)
@@ -155,7 +158,7 @@ void DSpark::capture(engine::Gpu & g, int slot, int layer, const float * res, in
     const int total = n * d_.d_model;
     capture_kernel<<<(total + 255) / 256, 256, 0, g.s>>>(res, W, start, d_.hc, d_.d_model, li, total, sl_[slot].cap);
     sl_[slot].cap_n = n;
-    sl_[slot].cap_start = start;
+    sl_[slot].cap_start = row_off + start;   // the chunk's row of the first captured row
 }
 
 void DSpark::seed(engine::Stage & st, int slot, const half * hid, int n, int pos0)

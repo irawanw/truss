@@ -1,5 +1,6 @@
 #include "blocks/attn_ds41.h"
 
+#include "engine/limits.h"
 #include "engine/stage.h"
 #include "kernels/ds41/attn_ops.cuh"
 #include "kernels/ds41/indexer.cuh"
@@ -24,13 +25,37 @@ void AttnDs41::add_tensors(Linear & lin, const Ds41AttnWeights & w)
         lin.add(t);
 }
 
+// the prompt path's peak temporaries per row (bytes): the q projection's fp32 rows and its fp16 copy, q, the kv
+// rows, o16 (the grouped LoRA's input), the LoRA's yo and yo16, the Q8_1 stacked rows' quantization, and (on a KV
+// source / an index source) the compressor's and the indexer's rows. The attention's output o is a piece
+// (engine::PREFILL_PIECE rows), not a row: scratch_piece() adds it.
 size_t AttnDs41::scratch_per_row(const Ds41AttnDims & d)
 {
     const size_t Q = d.q_rank, HD = (size_t) d.n_head * d.head_dim, D = d.head_dim, G = d.o_groups,
                  GR = (size_t) d.o_groups * d.o_rank, ID = (size_t) d.index_heads * d.index_dim;
-    const size_t f = Q * 2 + HD * 2 + D * 5 + G * GR + GR * 2 + ID + d.index_heads + D * 8 + d.index_dim * 2;
-    const size_t h = Q + D + HD + GR + D;
-    return f * 4 + h * 2 + 64 * 256;
+    size_t b = Q * 6              // qa (fp32) + qr16 (fp16)
+             + HD * 4             // q (fp32)
+             + D * 10             // kv, kvn (fp32) + kv16 (fp16)
+             + HD * 2             // o16 (fp16)
+             + GR * 6             // yo (fp32) + yo16 (fp16)
+             + HD * 17 / 16;      // the Q8_1 stacked rows (int8 + the fp16 scales)
+    if (d.kv_source) b += D * 10 + ID * 4;                                  // the compressor's rows + the index keys
+    if (d.index_source) b += (size_t) d.index_heads * d.index_dim * 4 + d.index_heads * 4;   // the indexer's rows
+    return b;
+}
+
+// the piece's output buffer (the attention's o): engine::PREFILL_PIECE rows
+size_t AttnDs41::scratch_piece(const Ds41AttnDims & d)
+{
+    const size_t HD = (size_t) d.n_head * d.head_dim;
+    return (size_t) engine::prefill_piece() * HD * 4;
+}
+
+// the decode path: the same rows plus the grouped LoRA's stacked rows (the gemv path's ya)
+size_t AttnDs41::scratch_decode_per_row(const Ds41AttnDims & d)
+{
+    const size_t G = d.o_groups, GR = (size_t) d.o_groups * d.o_rank;
+    return scratch_per_row(d) + G * GR * 4;
 }
 
 size_t AttnDs41::scratch_fixed(const Ds41AttnDims & d, int n_ctx)
@@ -174,45 +199,72 @@ void AttnDs41::forward(engine::Gpu & g, int slot, const float * in, const half *
         if (d_.kv_source) compress(g, S, in, in16, pos0, T);
         if (d_.index_source) index(g, slot, qr16, in16, pos0, T);
     }
-    // attention
-    float * o = sc.alloc((size_t) T * H * D);
-    ds41::SparseAttnArgs a;
-    a.q = q, a.chunk_kv = kv16, a.ring = S.ring, a.R = RING;
-    if (d_.ratio) {
-        const AttnDs41 & ks = kv_src_ ? *kv_src_ : *this, & is = idx_src_ ? *idx_src_ : *this;
-        a.comp = ks.sl_[slot].comp, a.idx = is.topk_, a.k = d_.index_top_k;
-    } else {
-        a.comp = nullptr, a.idx = nullptr, a.k = 0;
-    }
-    a.sinks = lin_.f32(w_.sinks), a.H = H, a.D = D, a.window = d_.window, a.pos0 = pos0, a.T = T;
-    a.scale = 1.0f / std::sqrt((float) D), a.out = o;
-    static const bool v1 = std::getenv("TRUSS_DS41_ATTN_V1") && std::atoi(std::getenv("TRUSS_DS41_ATTN_V1"));
-    // v5 (32 heads per CTA, 16 warps) is the default when the shape allows; 1 = v2, 2 = v3 (cp.async), 3 = v4, 4 = v5
-    static const int tc = std::getenv("TRUSS_DS41_ATTN_TC") ? std::atoi(std::getenv("TRUSS_DS41_ATTN_TC")) : 4;
-    if (!v1 && tc == 2 && ds41::sparse_attn_tc_async_ok(a)) {   // v3: v2 with a cp.async double-buffered key tile
-        const size_t n = ds41::sparse_attn_tc_async_ws_floats(a);
-        ds41::sparse_attn_tc_async(a, n ? sc.alloc(n) : nullptr, g.s);
-    } else if (!v1 && tc == 3 && ds41::sparse_attn_tc_h32_ok(a)) {   // v4: 32 heads per CTA, 8 warps
-        const size_t n = ds41::sparse_attn_tc_h32_ws_floats(a);
-        ds41::sparse_attn_tc_h32(a, n ? sc.alloc(n) : nullptr, g.s);
-    } else if (!v1 && tc == 4 && ds41::sparse_attn_tc_16w_ok(a)) {   // v5: 32 heads per CTA, 16 warps, S split over k
-        const size_t n = ds41::sparse_attn_tc_16w_ws_floats(a);
-        ds41::sparse_attn_tc_16w(a, n ? sc.alloc(n) : nullptr, g.s);
-    } else if (!v1 && ds41::sparse_attn_tc_ok(a)) {   // v2, tensor cores (TRACKER #189); TRUSS_DS41_ATTN_V1=1: the v1 kernel
-        const size_t n = ds41::sparse_attn_tc_ws_floats(a);
-        ds41::sparse_attn_tc(a, n ? sc.alloc(n) : nullptr, g.s);
-    } else {
-        ds41::sparse_attn(a, g.s);
-    }
-    ds41::ring_write(S.ring, RING, kvn, D, pos0, T, g.s);
-    ds41::rope_tail(o, T, H, D, rd, pos0, 1, d_.inv_freq, true, g.s);
-    // grouped output LoRA: each row's group g of o (H D / G dims) through wo_a's block g (R outputs)
+    // The attention and the grouped output LoRA in row pieces: the chunk's per-row scratch (the attention's output o
+    // and the LoRA's yo) must not scale with the chunk - the prompt path's buffers are carved from the expert ring's
+    // spare region, and a chunk of 8K rows would take 6 GB of it (the ring's size decides how many experts stay
+    // resident, TRACKER #201). The dense projections stay whole-chunk: cuBLAS picks its kernel by the row count, so
+    // splitting them would change the last bits (tests/unit/gemm_piece_test.cu). The pieces themselves are exact: the
+    // attention kernel's rows are independent, and the grouped GEMM's values do not depend on the row count.
+    const int P = engine::prefill_piece();
     half * o16 = sc.alloc<half>((size_t) T * H * D);
-    ds41::to_half(o, (size_t) T * H * D, o16, g.s);
     float * yo = sc.alloc((size_t) T * G * R);
     half * yo16 = sc.alloc<half>((size_t) T * G * R);
-    if (lin_.act() == Activations::FP16 && T * G > dense::GEMV_ROWS) {   // prompt rows: per-group GEMMs (#194)
-        dense::q8_gemm_a16_grouped(lin_.q8(w_.out_a), G, o16, T, yo, lin_.w16(), g.blas, g.s);
+    const int W_in = lin_.q8(w_.out_a).in;   // the grouped LoRA's K (the group's slice of the row)
+    const bool grouped = T * G > dense::GEMV_ROWS;   // more rows than a gemv: the per-group GEMMs (#194)
+    Linear::Act ia;   // the Q8_1 path's quantized stacked rows (the groups' slices)
+    if (grouped && lin_.act() != Activations::FP16) ia = lin_.quant(o16, T * G, W_in);
+    for (int r0 = 0; r0 < T; r0 += P) {
+        const int rb = std::min(P, T - r0);
+        const size_t m2 = sc.mark();
+        float * o = sc.alloc((size_t) rb * H * D);
+        ds41::SparseAttnArgs a;
+        // the piece's keys: the rows at or after the piece's start are in the piece's kv, the earlier ones in the
+        // window ring (the chunk's rows are written to the ring before the piece's attention reads them)
+        a.q = q + (size_t) r0 * H * D, a.chunk_kv = kv16 + (size_t) r0 * D, a.ring = S.ring, a.R = RING;
+        if (d_.ratio) {
+            const AttnDs41 & ks = kv_src_ ? *kv_src_ : *this, & is = idx_src_ ? *idx_src_ : *this;
+            a.comp = ks.sl_[slot].comp, a.idx = is.topk_ + (size_t) r0 * d_.index_top_k, a.k = d_.index_top_k;
+        } else {
+            a.comp = nullptr, a.idx = nullptr, a.k = 0;
+        }
+        ds41::ring_write(S.ring, RING, kvn + (size_t) r0 * D, D, pos0 + r0, rb, g.s);
+        a.sinks = lin_.f32(w_.sinks), a.H = H, a.D = D, a.window = d_.window, a.pos0 = pos0 + r0, a.T = rb;
+        a.scale = 1.0f / std::sqrt((float) D), a.out = o;
+        static const bool v1 = std::getenv("TRUSS_DS41_ATTN_V1") && std::atoi(std::getenv("TRUSS_DS41_ATTN_V1"));
+        // v5 (32 heads per CTA, 16 warps) is the default when the shape allows; 1 = v2, 2 = v3 (cp.async), 3 = v4, 4 = v5
+        static const int tc = std::getenv("TRUSS_DS41_ATTN_TC") ? std::atoi(std::getenv("TRUSS_DS41_ATTN_TC")) : 4;
+        if (!v1 && tc == 2 && ds41::sparse_attn_tc_async_ok(a)) {   // v3: v2 with a cp.async double-buffered key tile
+            const size_t n = ds41::sparse_attn_tc_async_ws_floats(a);
+            ds41::sparse_attn_tc_async(a, n ? sc.alloc(n) : nullptr, g.s);
+        } else if (!v1 && tc == 3 && ds41::sparse_attn_tc_h32_ok(a)) {   // v4: 32 heads per CTA, 8 warps
+            const size_t n = ds41::sparse_attn_tc_h32_ws_floats(a);
+            ds41::sparse_attn_tc_h32(a, n ? sc.alloc(n) : nullptr, g.s);
+        } else if (!v1 && tc == 4 && ds41::sparse_attn_tc_16w_ok(a)) {   // v5: 32 heads per CTA, 16 warps, S split over k
+            const size_t n = ds41::sparse_attn_tc_16w_ws_floats(a);
+            ds41::sparse_attn_tc_16w(a, n ? sc.alloc(n) : nullptr, g.s);
+        } else if (!v1 && ds41::sparse_attn_tc_ok(a)) {   // v2, tensor cores (#189); TRUSS_DS41_ATTN_V1=1: the v1 kernel
+            const size_t n = ds41::sparse_attn_tc_ws_floats(a);
+            ds41::sparse_attn_tc(a, n ? sc.alloc(n) : nullptr, g.s);
+        } else {
+            ds41::sparse_attn(a, g.s);
+        }
+        ds41::rope_tail(o, rb, H, D, rd, pos0 + r0, 1, d_.inv_freq, true, g.s);
+        ds41::to_half(o, (size_t) rb * H * D, o16 + (size_t) r0 * H * D, g.s);
+        sc.release(m2);
+    }
+    // grouped output LoRA: each row's group g of o (H D / G dims) through wo_a's block g (R outputs)
+    if (grouped && lin_.act() == Activations::FP16) {
+        for (int r0 = 0; r0 < T; r0 += P) {
+            const int rb = std::min(P, T - r0);
+            dense::q8_gemm_a16_grouped(lin_.q8(w_.out_a), G, o16 + (size_t) r0 * H * D, rb, yo + (size_t) r0 * G * R,
+                                       lin_.w16(), g.blas, g.s);
+        }
+    } else if (grouped) {   // Q8_1: the quantized stacked rows, then the grouped int8 GEMM: the same values as the
+        for (int r0 = 0; r0 < T; r0 += P) {   // dense product of the stacked rows with all of W, G times fewer FLOPs
+            const int rb = std::min(P, T - r0);
+            dense::q8_gemm_grouped(lin_.q8(w_.out_a), G, ia.q + (size_t) r0 * G * W_in,
+                                   ia.d + (size_t) r0 * G * (W_in / 32), rb, yo + (size_t) r0 * G * R, g.s);
+        }
     } else {   // decode rows: one gemv of the T x G stacked rows reads wo_a once, then each row's own block
         float * ya = sc.alloc((size_t) T * G * G * R);
         lin_.lin(w_.out_a, o16, T * G, ya);

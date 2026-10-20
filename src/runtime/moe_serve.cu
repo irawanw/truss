@@ -98,6 +98,7 @@ void MoeExec::serve(const Job & j, Bell & b)
     } else if (ct) {
         for (int i = 0; i < n; ++i) to_cpu[i] = !skip[i] && ct->is_cpu[l][b.ids[i]];
     }
+    store_->add_cpu_experts(n_cpu);   // the CPU tier's experts this call (the report's cost per expert)
     for (int i = 0; i < n; ++i) {
         const int e = b.ids[i];
         b.mids[i] = to_cpu[i] || skip[i] ? -1 : e;

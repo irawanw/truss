@@ -34,11 +34,18 @@ struct Ds41AttnDims {
 
 class AttnDs41 : public engine::Stateful {
 public:
-    static constexpr int RING = 256;
+    // The window ring: the window (128 positions) plus the verify window plus the prompt path's row piece: a piece's
+    // attention reads the positions before its start from the ring, so the ring must hold the piece's rows and the
+    // window before them (the piece's rows are written to the ring before the piece's attention reads them).
+    static constexpr int RING = 256 + 1024;
 
     AttnDs41(Linear & lin, const Ds41AttnWeights & w, const Ds41AttnDims & d) : lin_(lin), w_(w), d_(d) {}
     static void add_tensors(Linear & lin, const Ds41AttnWeights & w);
+    // the prompt path's peak temporaries per row (the attention's output o is a piece, not a row) and the decode
+    // path's (it also stacks the grouped LoRA's rows: the gemv path's ya)
     static size_t scratch_per_row(const Ds41AttnDims & d);
+    static size_t scratch_decode_per_row(const Ds41AttnDims & d);
+    static size_t scratch_piece(const Ds41AttnDims & d);   // the piece's output buffer (PREFILL_PIECE rows)
     static size_t scratch_fixed(const Ds41AttnDims & d, int n_ctx);
     // consumers: the layer whose compressed cache / top-k / candidates this layer reads (nullptr: itself / none)
     void set_sources(const AttnDs41 * kv, const AttnDs41 * index, const AttnDs41 * candidates)

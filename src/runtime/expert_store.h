@@ -29,6 +29,7 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -181,10 +182,18 @@ public:
         size_t bytes = 0;                                      // demand bytes
         long hinted = 0;                                       // copied by prefetch_hint
         size_t hint_bytes = 0;
+        long adapt_copies = 0;                                 // copied by the adaptive tier's admissions
+        size_t adapt_bytes = 0;
         size_t admit_bytes = 0;                                // copied by admit_step() / claim flushes
         long admitted_claims = 0;                              // claims fully issued
     };
     const Stats & stats() const { return stats_; }
+    // the CPU tier's experts (the driver's decision, counted there)
+    void add_cpu_experts(long n) { cpu_experts_.fetch_add(n, std::memory_order_relaxed); }
+    long cpu_experts() const { return cpu_experts_.load(std::memory_order_relaxed); }
+    // The adaptive tier's admissions: how often each admitted expert was routed again before it left the ring
+    // (the reuse that pays for its copy). The histogram: [reuses] -> how many experts.
+    std::string adapt_reuse_report() const;
 
 private:
     struct Layer {
@@ -199,6 +208,8 @@ private:
         std::vector<int64_t> ring_at;                               // [expert] byte offset in the ring, -1: absent
         std::vector<uint8_t> pend;                                  // [expert] admitted, copy not known to have landed
         std::vector<uint8_t> ref;                                   // [expert] ring entry used since it was copied in
+        std::vector<uint32_t> adapt_hits;                           // [expert] the adaptive tier's admission: the reuses
+        std::vector<uint8_t> adapt_set;                             // [expert] the adaptive tier admitted it
         const half * suh[3] = {}, * svh[3] = {};
         int n_expert = 0;
     };
@@ -222,7 +233,8 @@ private:
     int64_t next_region(int64_t v, int64_t need) const;         // start of the next usable region after v's with room
     void drop(const RingEntry & r);                             // forget an evicted entry
     // hint: refuse (false) to evict a protected expert; copy false: claim the slot only (claim())
-    bool ring_put(int layer, int expert, bool hint = false, bool copy = true);
+    // adapt: the adaptive tier's admission (its own counter: the demand fetches are the misses)
+    bool ring_put(int layer, int expert, bool hint = false, bool copy = true, bool adapt = false);
     struct Claim {
         int layer, expert;
         int64_t off;
@@ -250,6 +262,10 @@ private:
     long adm_total_ = 0;
     int protect_layer_ = -1;
 
+    std::map<uint32_t, long> adapt_reuse_;                // the adaptive tier's admissions: reuses -> experts
+    bool adapt_reuse_on_ = false;                         // TRUSS_ADAPT_REUSE: the reuse histogram (off: it costs a
+                                                        // counter per routed expert)
+    std::atomic<long> cpu_experts_{ 0 };                   // the CPU tier's experts (the driver's decision)
     std::vector<Layer> layers_;
     uint8_t * base_ = nullptr;                                     // ring start
     size_t ring_ = 0, slot_ = 0;

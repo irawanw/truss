@@ -88,7 +88,7 @@ std::vector<runtime::MoeLayer> StageModel::moe_layers() const
 
 // peak per-layer temporaries: the layer's own buffers plus the largest of hc mix / PLE / GDN / DSA / FFN (with the
 // MTP block, its join and the layer's own peak are live together: added)
-size_t StageModel::scratch_bytes(int T) const
+size_t StageModel::scratch_bytes(int T, bool) const
 {
     const size_t hcd = c_.hc_dim(), dm = c_.d_model;
     const size_t base = dm * 4 + 4 + dm * (4 + 4 + 2) + c_.hc * 4;   // embedding + ids, then the layer's own

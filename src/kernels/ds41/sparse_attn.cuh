@@ -24,6 +24,8 @@ struct SparseAttnArgs {
     int H, D, window, pos0, T;
     float scale;
     float * out;              // [T][H][D]
+    int row_off = 0;          // this layer's rows are the chunk's rows [row_off, row_off + T) (the tail prefill)
+    int clip = 0;             // the window's first position (the tail prefill's replay start: no stale ring slots)
 };
 
 void sparse_attn(const SparseAttnArgs & a, cudaStream_t stream);

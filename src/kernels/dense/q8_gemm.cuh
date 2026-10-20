@@ -47,6 +47,14 @@ void q8_gemm_a16(const Q8Matrix & W, const half * x, int rows, float * y, half *
 void q8_gemm_a16_grouped(const Q8Matrix & W, int G, const half * x, int rows, float * y, half * w16,
                          cublasHandle_t cublas, cudaStream_t stream);
 
+// Grouped Q8_1: W [G * R][K] holds G blocks of R outputs; row t's group g input is x[t][g * K .. (g + 1) * K) (the
+// quantized activations xq [rows][G * K], the scales xd) and its outputs go to y[t][g * R .. (g + 1) * R)
+// (y [rows][G * R]). G times fewer FLOPs than the dense product of the rows x G stacked inputs with all of W, and
+// G times less output memory (no stacked ya). Bit-identical to that dense product: the int32 block dots and their
+// fp32 folding depend on the output element alone, not on the tile it shares.
+void q8_gemm_grouped(const Q8Matrix & W, int G, const int8_t * xq, const half * xd, int rows, float * y,
+                     cudaStream_t stream);
+
 // q8_gemm for a few rows (decode, rows <= GEMV_ROWS): one warp per output, reads each weight once. Same numerics.
 constexpr int GEMV_ROWS = 8;
 void q8_gemv(const Q8Matrix & W, const int8_t * xq, const half * xd, int rows, float * y, cudaStream_t stream);

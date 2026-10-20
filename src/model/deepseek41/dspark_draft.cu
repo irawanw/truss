@@ -10,6 +10,7 @@
 #include "kernels/sampling/spec.cuh"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -22,6 +23,16 @@ __global__ void add_bias_kernel(float * x, const float * bias, int n)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] += bias[i];
+}
+
+// the confidence head's temperature (DeepInfer: DEEPINFER_DFLASH_CONFIDENCE_HEAD_TEMPERATURE, default 1.0)
+float conf_T()
+{
+    static const float t = [] {
+        const char * e = std::getenv("TRUSS_DSPARK_CONF_T");
+        return e ? std::atof(e) : 1.f;
+    }();
+    return t;
 }
 
 }  // namespace
@@ -67,10 +78,19 @@ int DSpark::draft(engine::Stage & st, int slot, int32_t next, int pos, int n, in
     lin_.lin(w_.output, y16, T, logits_);
     // markov: bias from the previous draft token's embedding, then sample this row
     int made = 0;
+    // the confidence head only runs when something needs it (the varlen schedule or the calibration log): the
+    // shipped path pays nothing for it.
+    const bool conf_want = std::getenv("TRUSS_DSPARK_VARLEN") || std::getenv("TRUSS_DSPARK_CONF_LOG");
     for (int i = 0; i < n; ++i) {
         dense::q8_rows(lin_.q8(dw_.layers.back().markov_embed), ids_ + i, 1, me_, g.s);
         ds41::to_half(me_, d_.markov_rank, m16_, g.s);
         lin_.lin(dw_.layers.back().markov_head, m16_, 1, mbias_);
+        // the confidence: p_i = sigmoid(proj([hidden_i; markov_emb_i]) / T) (the head's weights are fp32)
+        if (conf_want) {
+            TRUSS_CUDA(cudaMemcpyAsync(xconf_, y + (size_t) i * d, sizeof(float) * d, cudaMemcpyDeviceToDevice, g.s));
+            TRUSS_CUDA(cudaMemcpyAsync(xconf_ + d, me_, sizeof(float) * d_.markov_rank, cudaMemcpyDeviceToDevice, g.s));
+            lin_.lin32(dw_.layers.back().confidence_proj, xconf_, 1, conf_logit_ + i);
+        }
         add_bias_kernel<<<(d_.n_vocab + 255) / 256, 256, 0, g.s>>>(logits_ + (size_t) i * d_.n_vocab, mbias_, d_.n_vocab);
         sampling::argmax_prob(logits_ + (size_t) i * d_.n_vocab, d_.n_vocab, nullptr, draft_ids_ + i + 1,
                               draft_prob_ + i, g.s);
@@ -87,6 +107,28 @@ int DSpark::draft(engine::Stage & st, int slot, int32_t next, int pos, int n, in
         ++made;
     }
     if (made) TRUSS_CUDA(cudaMemcpyAsync(draft_host_, draft_ids_ + 1, sizeof(int32_t) * made, cudaMemcpyDeviceToHost, g.s));
+    if (conf_want) {   // the confidence p_i of the made drafts (the host copy the varlen schedule reads)
+        std::vector<float> lg(std::max(made, 1));
+        TRUSS_CUDA(cudaMemcpyAsync(lg.data(), conf_logit_, sizeof(float) * std::max(made, 1), cudaMemcpyDeviceToHost, g.s));
+        g.sync();
+        conf_.resize(made);
+        const float t = conf_T();
+        for (int i = 0; i < made; ++i) {
+            const float z = lg[i] / t;
+            conf_[i] = 1.f / (1.f + std::exp(-z));
+        }
+    } else {
+        conf_.clear();
+    }
+    {   // TRUSS_DSPARK_CONF_LOG=<file>: the calibration record (pos, made, p_i...)
+        static FILE * f = std::getenv("TRUSS_DSPARK_CONF_LOG") ? std::fopen(std::getenv("TRUSS_DSPARK_CONF_LOG"), "ab") : nullptr;
+        if (f) {
+            const int32_t hdr[3] = { pos, next, made };
+            std::fwrite(hdr, 4, 3, f);
+            std::fwrite(conf_.data(), 4, conf_.size(), f);
+            std::fflush(f);
+        }
+    }
     g.sync();
     std::copy(draft_host_, draft_host_ + made, out);
     {   // TRUSS_DSPARK_DEBUG=<file>: one record per draft call (parity with the Python reference)

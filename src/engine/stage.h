@@ -130,6 +130,7 @@ private:
     const int lb_, le_;
     const bool first_, last_;
     const int n_ctx_, max_chunk_, prefill_rows_, spec_rows_;
+    int moe_rows_ = 0;                       // the MoE prefill's workspace rows (a piece, not the chunk)
     int seq_ctx_ = 0;
     std::unique_ptr<StageModel> model_;
     std::unique_ptr<blocks::Linear> lin_;

@@ -61,7 +61,7 @@ std::vector<runtime::MoeLayer> StageModel::moe_layers() const
     return out;
 }
 
-size_t StageModel::scratch_bytes(int T) const
+size_t StageModel::scratch_bytes(int T, bool) const
 {
     const size_t d = c_.d_model;
     const size_t base = d * (4 + 4 + 4 + 2) + 4;   // two op / ffn outputs, normed rows fp32 + fp16, ids

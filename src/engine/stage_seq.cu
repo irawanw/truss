@@ -185,6 +185,16 @@ int Stage::draft(int32_t nxt, int pos, int n, int32_t * out, const Drafter::Samp
     return d->draft(*this, slot_, nxt, pos, n, out, s);
 }
 
+const float * Stage::draft_confidence(int * n) const
+{
+    Drafter * d = model_->drafter();
+    if (!d) {
+        *n = 0;
+        return nullptr;
+    }
+    return d->draft_confidence(n);
+}
+
 // Take hand-offs up to `up_to` that the previous stage wrote and this stage never read (its request threw between
 // the write and the read): the stage lock grants a later ticket only once taken + 1 reaches it, so an untaken
 // hand-off wedges every slot behind it. Only up to a hand-off the calling request produced itself (C1).

@@ -91,7 +91,7 @@ public:
     static void add_tensors(blocks::Linear & lin, const DSparkWeights & w);
 
     // captured target hidden of layers 37/38/39 (device kernel; called from StageModel::layers before the layer)
-    void capture(engine::Gpu & g, int slot, int layer, const float * res, int W, int T);
+    void capture(engine::Gpu & g, int slot, int layer, const float * res, int W, int T, int row_off = 0);
 
     // Drafter
     void on_commit(engine::Stage & st, const engine::Chunk & c) override;
@@ -100,6 +100,8 @@ public:
     void park(engine::Stage &, int) override {}
     void unpark(engine::Stage &, int) override {}
     int draft(engine::Stage & st, int slot, int32_t next, int pos, int n, int32_t * out, const Sampling & s) override;
+    // the per-draft confidence p_i of the last draft call (the acceptance probability of draft i)
+    const float * draft_confidence(int * n) const override { *n = (int) conf_.size(); return conf_.data(); }
     engine::Stateful * state() override { return this; }
 
     // Stateful
@@ -134,6 +136,9 @@ private:
     std::vector<Slot> sl_;
     float * mproj_ = nullptr, * mx_ = nullptr, * kv_ = nullptr, * logits_ = nullptr, * me_ = nullptr, * mbias_ = nullptr;
     half * mx16_ = nullptr, * kv16_ = nullptr, * m16_ = nullptr;
+    // the confidence head: the [hidden; markov_emb] input (fp32), the logits, the host p_i
+    float * xconf_ = nullptr, * conf_logit_ = nullptr;
+    std::vector<float> conf_;
     int * ids_ = nullptr, * draft_ids_ = nullptr;
     int32_t * ids_host_ = nullptr, * draft_host_ = nullptr;
     float * draft_prob_ = nullptr, * qfull_ = nullptr;

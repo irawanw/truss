@@ -67,6 +67,7 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
             (hot[l][e] ? (l < half_l ? hot_lo : hot_hi) : Y.cold) += Y.bytes[e];
         }
     }
+    adapt_reuse_on_ = std::getenv("TRUSS_ADAPT_REUSE") && std::atoi(std::getenv("TRUSS_ADAPT_REUSE"));
     ring_ = ring_size(layers, hot, z);
     vend_ = (int64_t) ring_;
     // E7: the pinned refill may take everything but Sizes::pin_fill, which stays free for the FIFO (0 = off)
@@ -75,6 +76,11 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
     for (const Layer & Y : layers_) slot_ = std::max(slot_, align_up(Y.cold));
     auto * arena = static_cast<uint8_t *>(device_alloc(hot_lo + ring_ + hot_hi, device_));
     base_ = arena + hot_lo;
+    {   // the ring's composition: the two stream slots (the cold experts of two layers) and the prompt chunk's buffers
+        const double gb = 1073741824.0;
+        std::fprintf(stderr, "expert store: ring %.2f GiB = 2 slots %.2f + prompt buffers %.2f (hot %.2f GiB)\n",
+                     ring_ / gb, 2.0 * slot_ / gb, z.stream_extra / gb, (hot_lo + hot_hi) / gb);
+    }
     spare_ = z.stream_extra ? base_ + 2 * slot_ : nullptr;
     stream_end_ = (int64_t) align_up(2 * slot_ + z.stream_extra);
     device_bytes_ = hot_lo + ring_ + hot_hi;

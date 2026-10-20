@@ -73,7 +73,10 @@ public:
     // the stage's routed-expert layers in store order (a drafter's last), and the expert kernels; empty: dense model
     virtual std::vector<runtime::MoeLayer> moe_layers() const { return {}; }
     virtual runtime::MoeKernels moe_kernels() const { return {}; }
-    virtual size_t scratch_bytes(int T) const = 0;    // peak temporaries of a chunk of T rows
+    // peak temporaries of a chunk of T rows. decode: the decode path's (the small scratch: a few rows, the decode
+    // only buffers); prompt: the prompt path's (a chunk of rows). They differ: the decode path stacks the grouped
+    // output LoRA's rows, the prompt path does not.
+    virtual size_t scratch_bytes(int T, bool decode) const = 0;
     virtual int extra_buffers() const { return 0; }   // extra [rows][res_width] buffers per buffer set (a drafter's)
     virtual void build(Stage &) = 0;                  // create the blocks (weights are on the device by now)
     // the stage's expert runtime exists (after build(): its memory plan needs the blocks' state allocated first):

@@ -169,7 +169,14 @@ void MoeExec::run(const Call & c)
         run_split(c);
     } else {   // whole layers stream ahead (prefetch(l + 2) while this layer computes)
         store_->acquire(l, g_.s);
-        k_.prefill(store_->weights(l), c.x, c.ids, c.wts, T, c.routed, c.moe_ws, c.moe_rows, g_.s);
+        // the prefill in row pieces: the workspace (the per-pair activations) is a piece, not the chunk, so the
+        // prompt path's buffers do not scale with the chunk's rows (TRACKER #201). The pieces are exact: the prefill
+        // kernels' arithmetic is per (expert, row) and the routing order inside a piece is the same.
+        for (int r0 = 0; r0 < T; r0 += c.moe_rows) {
+            const int rb = std::min(c.moe_rows, T - r0);
+            k_.prefill(store_->weights(l), c.x + (size_t) r0 * k_.d_model, c.ids + (size_t) r0 * K_,
+                       c.wts + (size_t) r0 * K_, rb, c.routed + (size_t) r0 * k_.d_model, c.moe_ws, c.moe_rows, g_.s);
+        }
         store_->release(l, g_.s);
         if (l + 2 < n_store()) store_->prefetch(l + 2);   // a drafter's layer streams after the last layer
     }
