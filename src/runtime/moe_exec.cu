@@ -199,11 +199,13 @@ void MoeExec::lock_pool()
 }
 
 // Strata's adapt() (generate.cpp): the most-routed missing experts (decayed count >= adapt_min) of every store layer,
-// at most adapt_swaps, into the ring; then counts x adapt_decay. Between passes: the driver thread is idle (the
-// caller synced the last pass for its logits), so route_usage is not being written.
+// at most adapt_swaps, into the ring; then counts x adapt_decay. The driver must be idle: it writes route_usage and
+// plans from the ring that admit() changes. A caller that does not sync between passes (ds41_kl queues a whole
+// sequence's decode steps) would race it, so wait for every queued FFN first; after a synced pass this returns at once.
 void MoeExec::adapt_tick()
 {
     if (o_.adapt_every <= 0 || ++decode_passes_ % o_.adapt_every != 0) return;
+    drain_jobs();
     store_->poll_admitted();
     if (store_->admitting()) return;   // the previous batch is still being copied
     std::vector<std::tuple<float, int, int>> cand;
