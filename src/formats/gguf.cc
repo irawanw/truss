@@ -2,6 +2,8 @@
 // with bounds checks; tensor data is never copied.
 #include "formats/gguf.h"
 
+#include "formats/trellis_k.h"
+
 #include <algorithm>
 #include <mutex>
 #include <fcntl.h>
@@ -208,6 +210,7 @@ std::unique_ptr<File> File::open(const std::string & path)
     if (count > 1 && f->get_int("split.tensors.count") != (int64_t) f->tensors_.size())
         fail(path, "split.tensors.count " + std::to_string(f->get_int("split.tensors.count")) + " but shards hold " +
                    std::to_string(f->tensors_.size()));
+    f->build_trellis_groups();
     return f;
 }
 
@@ -298,12 +301,59 @@ void File::add_shard(const std::string & path, bool first, bool overlay)
     }
 }
 
+// The trellis-coded dense matrices of the X3.1 convention: "<base>.m3_trellis" (the words) with "<base>.m3_suh"
+// (the input scales) and "<base>.m3_svh" (the output scales), optionally "<base>.m3_meta" (the rate code). The
+// handle of a group is its ".m3_trellis" tensor, so one handle names the whole matrix.
+void File::build_trellis_groups()
+{
+    for (auto & g : groups_) g->trellis->trellis = nullptr;
+    groups_.clear();
+    for (Tensor & t : tensors_) t.trellis = nullptr;
+
+    const std::string suffix = ".m3_trellis";
+    for (Tensor & t : tensors_) {
+        if (t.name.size() <= suffix.size() || t.name.compare(t.name.size() - suffix.size(), suffix.size(), suffix) != 0)
+            continue;
+        const std::string base = t.name.substr(0, t.name.size() - suffix.size());
+        const Tensor * suh = find(base + ".m3_suh"), * svh = find(base + ".m3_svh");
+        if (!suh || !svh) continue;   // not a dense matrix: a stray tensor
+        if (t.type != Type::I16 || suh->type != Type::F16 || svh->type != Type::F16)
+            fail(t.name, "trellis matrix parts have the wrong types");
+        if (suh->shape.size() == 2 && svh->shape.size() == 2)
+            continue;   // not a dense matrix: the expert tables keep one scale row per expert (formats/trellis_table.h)
+        if (suh->shape.size() != 1 || svh->shape.size() != 1)
+            fail(t.name, "trellis matrix scales must be vectors");
+        auto g = std::make_unique<TrellisGroup>();
+        g->trellis = &t;
+        g->suh = suh;
+        g->svh = svh;
+        g->meta = find(base + ".m3_meta");
+        g->in = suh->shape[0];
+        g->out = svh->shape[0];
+        if (g->in % 16 || g->out % 16) fail(t.name, "trellis matrix in/out not multiples of 16");
+        int k = 0;
+        if (g->meta) {
+            if (g->meta->type != Type::I32 || g->meta->elements() < 1) fail(t.name, "bad trellis matrix meta");
+            k = (int) reinterpret_cast<const int32_t *>(g->meta->data)[0];
+        }
+        if (!k) k = formats::k_from_words((int) t.shape[0]);
+        if (!formats::k_valid(k)) fail(t.name, "trellis matrix rate code " + std::to_string(k));
+        if (t.shape.size() != 2 || t.shape[1] != g->in / 16 * g->out / 16)
+            fail(t.name, "trellis matrix words do not match in/out");
+        if ((int) t.shape[0] != formats::k_tile_u16(k)) fail(t.name, "trellis matrix tile width vs rate code");
+        g->k = k;
+        t.trellis = g.get();
+        groups_.push_back(std::move(g));
+    }
+}
+
 void File::overlay(const std::string & path)
 {
     const auto [stem, count] = split_name(path);
     if (count == 1) add_shard(path, false, true);
     else
         for (int i = 0; i < count; ++i) add_shard(shard_path(stem, i, count), false, true);
+    build_trellis_groups();
 }
 
 void File::overlay_list(const std::string & comma_list)

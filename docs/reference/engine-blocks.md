@@ -34,7 +34,7 @@ drafter defers its commit to the next `draft()`. `select()` inside the last stag
 | file | block | state per slot |
 |---|---|---|
 | `weights.h` | the blocks' host weight views (`HcWeights`, `GdnWeights`, `DsaWeights`, `PleWeights`, `MoeWeights`, `SkHcWeights`, `Ds41AttnWeights`, `EngramWeights`) | - |
-| `linear.h/.cu` | `Linear`: every projection by the tensor's format (Q8_0 repacked at upload, F32; trellis dense next), `Act` (quantize once per input), `lin`, `lin32` (row-invariant gemv <= 32 rows), `lin_multi` (one launch at decode rows), `lin_multi_silu`; host-resident rows (untied embedding in pinned memory, TRACKER #60) | - |
+| `linear.h/.cu` | `Linear`: every projection by the tensor's format (Q8_0 repacked at upload, F32, trellis), `Act` (quantize once per input), `lin`, `lin32` (row-invariant gemv <= 32 rows), `lin_multi` (one launch at decode rows), `lin_multi_silu`; host-resident rows (untied embedding in pinned memory, TRACKER #60) | - |
 | `head.h/.cu` | `Head`: output projection; drafter vocab subset (`set_draft_vocab`); FP16 vocab tiling | - |
 | `hc.h/.cu` | `Hc`: hyper-connection mix / combine / expand (`TRUSS_HC_SILU`, `TRUSS_HC_COLLAPSE` fusions) | - |
 | `gdn.h/.cu` | `Gdn`: gated delta net mixer | state x2 (window flip), conv rows; snapshot + raw rows for replay |
@@ -50,6 +50,12 @@ drafter defers its commit to the next `draft()`. `select()` inside the last stag
 | `engram.h/.cu` | `Engram`: DeepSeek-V4.1 n-gram lookup at its layers (before attention): host hash of the 2-4-grams over the compressed vocab (24 row ids per token), int4 rows by a pread pool (16 threads) into pinned memory, `engram_dequant_q4` -> wkv (Q8_0) -> `engram_gate` per copy. v1 syncs the stream before reusing the pinned rows. Gate: `ds41_engram_parity` (#178) | last 3 committed tokens (`commit`; checkpointed) |
 | `hc_sinkhorn.h` | `HcSinkhorn`: DeepSeek-V4 mHC around one sub-block (`mix` -> [T][24] coef, `collapse`, `post` in place; coef row stride per call, residual stride from the dims) | - |
 | `moe.h/.cu` | `Moe`: router (fp32) + routed experts through `runtime::MoeExec` + optional shared expert (gated when `shexp_gate_inp` exists, else plain: DeepSeek); routing rule (`RouteFn`: softmax / sigmoid+bias / `route_sqrtsoftplus_bias`), `MoeDims::swiglu_limit` (shared expert clamp) and `route_scale` (routed x scale, `ffn::scaled_add`) are parameters | - (residency is the runtime's) |
+
+**The weight formats.** `Linear` picks the kernel by the weight's format: Q8_0 (repacked at upload, `dense::q8_gemv` /
+`q8_gemm`), F32 (cuBLAS SGEMM or the row-invariant `f32_gemv`) and trellis (PAW X3.1 mul1 tiles: the window GEMV at
+decode rows, reconstruct + GEMM for the prompt rows - `docs/reference/kernels-trellis-dense.md`). A trellis matrix is
+bound by name like any other weight (`formats::Binder::need` resolves `<name>` to the plain tensor or to the
+`<name>.m3_trellis` group), so no model family names a format.
 
 **Adding a block** (a new layer kind: GQA attention, short conv, Mamba-2, dense FFN): a class with a dims struct,
 `add_tensors`, `forward(gpu, slot, ...)`, and `Stateful` if it keeps per-sequence state; a unit test vs a reference;

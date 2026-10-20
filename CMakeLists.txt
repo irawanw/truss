@@ -119,6 +119,8 @@ target_link_libraries(truss_encode PUBLIC truss_core)
 # ---- engine kernels
 add_library(truss_kernels STATIC
   src/kernels/moe/moe_window.cu
+  src/kernels/trellis/dense/gemv_window.cu
+  src/kernels/trellis/dense/reconstruct.cu
   src/kernels/moe/moe_prefill.cu
   src/kernels/dense/q8_gemm.cu
   src/kernels/dense/q8_gemv.cu
@@ -195,6 +197,9 @@ target_link_libraries(dsa_prefill_test PRIVATE truss_kernels truss_reference)
 
 add_executable(frac_decode_test tests/unit/frac_decode_test.cu)
 target_link_libraries(frac_decode_test PRIVATE truss_kernels truss_reference)
+add_executable(trellis_dense_test tests/unit/trellis_dense_test.cu)
+target_link_libraries(trellis_dense_test PRIVATE truss_engine truss_kernels truss_reference truss_core)
+
 add_executable(codec_v2one_test tests/unit/codec_v2one_test.cu)
 target_link_libraries(codec_v2one_test PRIVATE truss_encode)
 
@@ -230,6 +235,8 @@ target_link_libraries(tk-bench-gemv-pattern PRIVATE truss_kernels)
 add_executable(tk-bench-router tools/tk-bench/router_bench.cu)
 target_link_libraries(tk-bench-router PRIVATE truss_engine)
 add_executable(tk-bench-moe-trace tools/tk-bench/moe_trace.cu)
+add_executable(tk-bench-trellis-dense tools/tk-bench/trellis_dense_bench.cu)
+target_link_libraries(tk-bench-trellis-dense PRIVATE truss_engine)
 target_link_libraries(tk-bench-moe-trace PRIVATE truss_kernels)
 
 # Lead Order-2 microbench: trellis K2.5/K3.5 (truss_cpu) vs ggml Q3_K/Q4_K/Q8_0 vec_dot (llama-paw's AVX2 build).

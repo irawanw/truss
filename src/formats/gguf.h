@@ -40,8 +40,21 @@ struct Tensor {
     uint64_t file_offset;                  // absolute, in that shard
     uint64_t bytes;
     const std::byte * data;                // into the mapping
+    const struct TrellisGroup * trellis = nullptr;   // set when this tensor is a trellis-coded matrix's words
 
     int64_t elements() const;
+};
+
+// A trellis-coded dense matrix (the X3.1 convention: "<base>.m3_trellis" / ".m3_suh" / ".m3_svh", optionally
+// ".m3_meta"): the group hangs off its ".m3_trellis" tensor, so one handle identifies the whole matrix. The words
+// are I16 [words per tile][tiles], suh is F16 [in], svh is F16 [out]; the rate code is in formats/trellis_k.h.
+struct TrellisGroup {
+    Tensor * trellis = nullptr;
+    const Tensor * suh = nullptr;
+    const Tensor * svh = nullptr;
+    const Tensor * meta = nullptr;      // I32 [2][1] = (rate code, 0), or null (the rate is read from the words)
+    int k = 0;                          // the rate code
+    int64_t in = 0, out = 0;
 };
 
 // A metadata value. Integers of every width are widened to int64 (uint64 values above INT64_MAX are rejected),
@@ -88,6 +101,10 @@ public:
 
     const std::vector<std::string> & shard_paths() const { return paths_; }
 
+    // Builds the trellis groups (the X3.1 dense matrices): every "<base>.m3_trellis" with a "<base>.m3_suh" and a
+    // "<base>.m3_svh" is one matrix, and its handle is the ".m3_trellis" tensor. Called at open and after an overlay.
+    void build_trellis_groups();
+
     // Drop the file-backed pages of every shard from the process. The mapping stays valid (PROT_READ | MAP_SHARED):
     // a later touch just re-faults from disk, so this is safe once the tensors have been uploaded. Worth doing after
     // Forward's upload() — the shards are tens of GB of RSS that would otherwise sit resident beside every run
@@ -105,6 +122,7 @@ private:
     std::unordered_map<std::string, size_t> index_;
     std::unordered_map<std::string, Value> kv_;          // from shard 0; split.* keys of later shards are checked
     std::unordered_set<std::string> overlaid_;           // names replaced by overlay()
+    std::vector<std::unique_ptr<TrellisGroup>> groups_;  // the trellis-coded dense matrices (owned here)
 };
 
 }  // namespace truss::gguf

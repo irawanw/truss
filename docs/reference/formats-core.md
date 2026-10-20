@@ -21,6 +21,7 @@ metadata and tensor infos with bounds checks, and exposes one catalog.
 | `get_int / get_float / get_string / get_ints / get_floats / get_bools(key)` | typed access; throws if absent or of another kind (`get_float` accepts ints) |
 | `overlay(path)` | maps another GGUF (single or split) whose tensors replace same-named ones and add new ones; its metadata is ignored (X3.1 expert overlays, #118). Call before binding weights |
 | `overlay_list(list)` | `overlay()` each path of a comma list in order, skipping empty entries, logging each to stderr; what every tool and the C API do with `TRUSS_EXPERT_OVERLAY` (deepseek41: experts, Engram L1, Engram L14) |
+| `build_trellis_groups()` | called at open and after every overlay: collects the trellis-coded dense matrices (see below) |
 | `overlaid()` | number of tensor names replaced so far |
 | `shard_paths()` | the shard files in order |
 | `type_info(Type)` | `{name, block, bytes}` per ggml type, nullptr if unknown |
@@ -28,7 +29,17 @@ metadata and tensor infos with bounds checks, and exposes one catalog.
 **`Tensor` fields.** `name`, `type` (`gguf::Type`, ggml numbering, e.g. `Q8_0 = 8`, `I16 = 25`), `shape` (**ggml
 order: `shape[0]` is the contiguous dimension**, so a matrix with `out` rows of `in` weights has `shape = {in,
 out}`), `shard`, `file_offset` (absolute in its shard), `bytes`, `data` (`const std::byte *` into the mapping),
-`elements()`.
+`elements()`, `trellis` (the group this tensor is the words of, or null - see below).
+
+**Trellis-coded dense matrices.** A dense matrix may be stored as the X3.1 group `<base>.m3_trellis` (the words,
+I16) with `<base>.m3_suh` (F16 `[in]`), `<base>.m3_svh` (F16 `[out]`) and optionally `<base>.m3_meta` (I32
+`[2][1]` = the rate code). `build_trellis_groups()` finds them: the group's handle is its `.m3_trellis` tensor and
+`gguf::TrellisGroup { trellis, suh, svh, meta, k (the rate code), in, out }` hangs off it (`Tensor::trellis`). The
+rate comes from the meta or from the tile width (`trellis_k.h`'s `k_from_words`). The groups are rebuilt after every
+overlay (an overlay can replace a part). Checks: the part types, the scales are vectors, in/out multiples of 16, the
+words' shape matches in/out, the tile width matches the rate code. The routed-expert tables (per-expert scale rows,
+2-D scales) are skipped here and read by `trellis_table.cc`. The kernels and the binding rule:
+`docs/reference/kernels-trellis-dense.md`.
 
 **Invariants / checks.** Magic and version 3; every tensor type known (`type_info` non-null); data offsets aligned
 to `general.alignment` (default 32) and inside the shard; for split files `split.no` matches the file name and
@@ -39,6 +50,21 @@ rejected); metadata comes from shard 0.
 llama-paw's gguf-py, through `tk-pack-inspect list`), TRACKER #29.
 
 **Change it.** A new ggml type: add it to `enum class Type` and the `type_info` table. Nothing else parses GGUF.
+
+---
+
+## `src/formats/trellis_k.h` — the trellis rate codes
+
+**What.** The rate of a trellis projection, shared by the host (the file readers) and the device (the codecs): an
+integer rate `k` = 1..8 or a half-integer one stored as `10 * KA + 5` (15 = K1.5, 25 = K2.5, 35 = K3.5). The helpers
+are `constexpr` (host and device): `k_frac(k)`, `k_valid(k)`, `k_ka(k)` (the whole bits per weight), `k_tile_u16(k)`
+(the uint16 words of a 16x16 tile: 16·k for an integer rate, 16·KA + 8 for a half-integer one), `k_tile_bits(k)`,
+`k_bits(k)` (the bits per weight) and `k_window_end(k, j)` (the ring bit where weight j's window ends - the exact bit
+definition the codecs and `ref::trellis_dequant` share). `k_from_words(words)` is the inverse of `k_tile_u16`: the
+rate a tile of that width holds (0 = none).
+
+**Used by.** `trellis_table.cc` (the routed experts), `gguf.cc` (the trellis dense groups), the codecs
+(`src/kernels/trellis/codec_mul1.cuh`), `ref::trellis_dequant`.
 
 ---
 
@@ -102,3 +128,9 @@ under-estimate shows up as the exception above (it happened once: the embedding 
 `Binder(file, family)`: `need(name, dims)` (shape checked, ggml order, trailing 1s ignored), `maybe(...)`,
 `experts(prefix, in, out, n_expert)` (trellis table read and checked), `check_all_used()` (every tensor in the file
 bound exactly once). Every family's `weights.cc` uses it; errors name the family and the tensor.
+
+**The binding rule (the format a weight has is the file's business).** `need(name, dims)` returns the plain tensor
+`<name>` if the file has it, else the trellis group `<name>.m3_trellis` (the handle is the group's words tensor, the
+parts are bound so that every tensor of the file is still used exactly once). A model family therefore binds its
+weights the same way whatever format the file holds - no per-format code in `src/model/*/weights.cc`. The group is
+checked against `dims` the same way a plain tensor is (in, out).

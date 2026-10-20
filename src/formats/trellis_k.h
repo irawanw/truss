@@ -27,6 +27,16 @@ TRUSS_HD constexpr int k_window_end(int k, int j)
     return k_frac(k) ? (2 * (k / 10) + 1) * (j >> 1) + k / 10 + (j & 1) * (k / 10 + 1) : (j + 1) * k;
 }
 
+// The rate code whose 16x16 tile is `words` uint16 wide (0 = none): the tile's width says the rate.
+TRUSS_HD constexpr int k_from_words(int words)
+{
+    for (int k = 1; k <= 8; ++k)
+        if (!k_frac(k) && k_tile_u16(k) == words) return k;
+    for (int ka = 1; ka <= 3; ++ka)
+        if (k_tile_u16(10 * ka + 5) == words) return 10 * ka + 5;
+    return 0;
+}
+
 }  // namespace truss::formats
 
 #undef TRUSS_HD

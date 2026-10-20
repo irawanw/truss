@@ -18,9 +18,14 @@ class Binder {
 public:
     Binder(const gguf::File & f, std::string family) : f_(f), fam_(std::move(family)) {}
 
-    // the tensor, checked against `dims` (trailing 1s ignored on both sides)
+    // The tensor, checked against `dims` (trailing 1s ignored on both sides). A dense matrix may also be a trellis
+    // group ("<name>.m3_trellis" with its scales): then the handle is the group's words tensor and the parts are
+    // bound here, so a model family names its weights the same way whatever format the file holds.
     const gguf::Tensor * need(const std::string & name, std::initializer_list<int64_t> dims)
     {
+        if (!f_.find(name)) {
+            if (const gguf::Tensor * w = f_.find(name + ".m3_trellis")) return need_trellis(name, w, dims);
+        }
         const gguf::Tensor & t = f_.at(name);
         std::vector<int64_t> want(dims), have(t.shape);
         while (want.size() > 1 && want.back() == 1) want.pop_back();
@@ -29,6 +34,26 @@ public:
                                                    str(want));
         use(name);
         return &t;
+    }
+
+    // A trellis-coded dense matrix: the handle is the group's words tensor, the parts are bound (so every tensor of
+    // the file is used exactly once).
+    const gguf::Tensor * need_trellis(const std::string & name, const gguf::Tensor * words,
+                                      std::initializer_list<int64_t> dims)
+    {
+        const gguf::TrellisGroup * g = words->trellis;
+        if (!g) throw std::runtime_error(fam_ + ": " + name + " is not a trellis matrix");
+        std::vector<int64_t> want(dims), have{ g->in, g->out };
+        while (want.size() > 1 && want.back() == 1) want.pop_back();
+        while (have.size() > 1 && have.back() == 1) have.pop_back();
+        if (want != have)
+            throw std::runtime_error(fam_ + ": " + name + " is " + std::to_string(g->out) + "x" + std::to_string(g->in) +
+                                     ", expected " + str(want));
+        use(name + ".m3_trellis");
+        use(name + ".m3_suh");
+        use(name + ".m3_svh");
+        if (g->meta) use(name + ".m3_meta");
+        return words;
     }
 
     formats::ExpertTable experts(const std::string & prefix, int64_t in, int64_t out, int n_expert)

@@ -1,10 +1,11 @@
 // Every dense projection of a stage, whatever the weight's format. Blocks call lin*() with a tensor; the tensor's
 // type picks the kernel, so neither a block nor a model family ever names a weight format.
 //
-// Formats today: Q8_0 (repacked at upload into dense::Q8Matrix; dense::q8_gemv / gemm, int8 or fp16 activations)
-// and F32 (router-like projections, cuBLAS SGEMM, or a row-invariant gemv at decode sizes so routing does not depend
-// on the window size). Trellis-coded dense matrices (m3_trellis / m3_suh / m3_svh, PAW-27B-X3.1) are the next format:
-// add them as a case in upload() and lin(), nothing else changes.
+// Formats today: Q8_0 (repacked at upload into dense::Q8Matrix; dense::q8_gemv / gemm, int8 or fp16 activations),
+// F32 (router-like projections, cuBLAS SGEMM, or a row-invariant gemv at decode sizes so routing does not depend on
+// the window size) and trellis (PAW X3.1 mul1 tiles: the window GEMV reads the words in place at decode sizes, the
+// matrix is reconstructed to fp16 for the prompt path). The weight's format picks the kernel: a block and a model
+// family never name a format.
 //
 // Activations::Q8_1 quantizes each fp16 input once per call site (Act) and every projection reading it shares that
 // (TRACKER #60); FP16 runs the a16 kernels. Moved unchanged from the old qwen4exp::Forward (bit-identical).
@@ -14,6 +15,7 @@
 #include "engine/gpu.h"
 #include "formats/gguf.h"
 #include "kernels/dense/q8_gemm.cuh"
+#include "kernels/trellis/dense/trellis_dense.h"
 
 #include <cuda_fp16.h>
 
@@ -61,6 +63,10 @@ public:
     void lin_multi_silu(const std::vector<Proj> & ps, half * y16, float scale, const Act & a, int rows);
     void lin32_multi(const std::vector<Proj> & ps, const float * x, int rows);
 
+    // A trellis-coded matrix (formats/gguf.h): the window GEMV at decode sizes, reconstruct + GEMM for prompt rows.
+    bool has_trellis(T t) const { return trellis_.count(t) != 0; }
+    const trellis_dense::Matrix & trellis(T t) const { return trellis_.at(t); }
+
     const DTensor & d(T t) const { return (*dev_)(t); }
     const float * f32(T t) const { return d(t).as<float>(); }
     const dense::Q8Matrix & q8(T t) const { return q8_.at(t); }
@@ -72,7 +78,16 @@ public:
 private:
     engine::Gpu & g_;
     const Activations act_;
-    std::vector<T> plain_, q8_list_;
+    std::vector<T> plain_, q8_list_, trellis_list_;
+    std::unordered_map<T, trellis_dense::Matrix> trellis_;   // the trellis-coded matrices, on the device
+    void * td_scratch_ = nullptr;          // the window GEMV scratch (the staged activations + the partial sums)
+    size_t td_scratch_bytes_ = 0;
+    half * td_recon_ = nullptr;            // the prompt path's reconstructed matrix (a row chunk)
+    size_t td_recon_bytes_ = 0;
+    int td_sms_ = 0;                       // the device's SM count (the k split of the window GEMV)
+    void upload_trellis();
+    void lin_trellis(const trellis_dense::Matrix & M, const Act & a, int rows, float * y);
+    void lin_trellis_multi(const std::vector<Proj> & ps, const Act & a, int rows);
     std::unique_ptr<DeviceTensors> dev_;                 // every non-Q8_0 tensor, as stored
     std::unordered_map<T, dense::Q8Matrix> q8_;          // Q8_0 matrices, repacked
     half * w16_ = nullptr;
