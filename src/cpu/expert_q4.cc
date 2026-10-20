@@ -284,6 +284,9 @@ void ExpertPool::start(const float * x, int T, const std::vector<Slot> & slots, 
     t_start_ = std::chrono::steady_clock::now();
     last_ms_ = 0;
     first_us_.store(-1, std::memory_order_relaxed), longest_us_.store(0, std::memory_order_relaxed);   // see last_wake_us
+    // an empty call still owes y = 0: no item runs, so nothing else clears it, and the doorbell join adds y whether or
+    // not the layer gave the CPU any expert (TRACKER #209: a stale y from an earlier call broke skip + PCIe share)
+    if (G == 0) std::fill(y, y + (size_t) T * dm_, 0.f);
     busy_ = G > 0;   // seq_cst: the item fields above are visible to any worker that sees busy_
     if (G) wake();
 }
