@@ -45,7 +45,7 @@ fi
 
 # the model's open arguments (server/app.py flags; arms.py takes the same)
 DS41_ARGS=(--model "$T/data/pack/ds41-dense.gguf" --tokenizer "$T/data/tokenizer/tokenizer.json"
-           --n-ctx 131072 --chunk 8192 --expert-usage "$T/data/bench_in/usage_calib256.f32"
+           --n-ctx 262144 --chunk 8192 --expert-usage "$T/data/bench_in/usage_calib256.f32"
            --mtp "$T/data/drafter/ds41-dspark-dense.gguf" --drafts 3 --draft-min-p 0)
 # drafts 3 (TRACKER #223, arms bench 10-21): d2 38.6 / d3 41.9 / d4 42.0 / d5 38.7 tok/s; d3 the steadiest, 5x fewer
 # fetched bytes per pass than d5. The bench opens with --drafts-open 5 so arms can still try 4 and 5.
