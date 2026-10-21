@@ -54,17 +54,19 @@ CHAT_ASK = ("Write a Python module implementing a binary min-heap class with pus
 
 def parse_arm(s):
     name, _, body = s.rpartition(":") if ":" in s else ("", "", s)
-    knobs, env = {}, {}
+    knobs, env, spec = {}, {}, True
     if body != "base":
         for kv in filter(None, body.split(",")):
             k, v = kv.split("=", 1)
             if k.startswith("TRUSS_"):
                 env[k] = v
+            elif k == "spec":   # spec=0: plain sampling steps (the loop task, arms_loop.py)
+                spec = v != "0"
             elif k == "drafts" or k in KNOB_DEFAULT:
                 knobs[k] = float(v)
             else:
                 raise SystemExit(f"arm {s!r}: {k} is not a runtime knob (load-time options need their own run)")
-    return dict(name=name or body, knobs=knobs, env=env)
+    return dict(name=name or body, knobs=knobs, env=env, spec=spec)
 
 
 def served_value(k, drafts):
@@ -424,6 +426,9 @@ def main():
     ap.add_argument("--tasks", default="chat,code,long,recall,kl")
     ap.add_argument("--recall", type=int, default=256, help="copied tokens teacher-forced in the recall task")
     ap.add_argument("--recall-min", type=float, default=0.90)
+    ap.add_argument("--loop-dir", default=os.path.expanduser("~/ML_projects/dsv41flash/20261019_truss_port/data/loop_prompts"))
+    ap.add_argument("--loop-k", type=int, default=8)
+    ap.add_argument("--loop-tokens", type=int, default=1024)
     ap.add_argument("--tokens", type=int, default=128, help="spec tokens per prompt task")
     ap.add_argument("--repeat", type=int, default=2, help="speed repeats per arm (the check runs on the first)")
     ap.add_argument("--no-check", action="store_true")
@@ -466,6 +471,8 @@ def main():
     for t in tasks:
         if t == "kl":
             b.kl_task()
+        elif t == "loop":   # loop rate on saved long agent prompts (tools/tk-bench/arms_loop.py)
+            __import__("arms_loop").loop_task(b, a)
         elif t.startswith("recall"):   # recall (~21K), recall60, recall90: the copy source ~N K tokens back; a
             # trailing i (recall90i): the context read turn by turn as the server builds an agent's (read_turns)
             b.recall_task(recall_prompt(a, tok, int(t[6:].rstrip("i") or 0)), a.recall, t)
