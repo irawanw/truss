@@ -18,9 +18,11 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export TRUSS_EXPERT_OVERLAY="$T/data/pack/ds41-experts.gguf,$T/data/pack/ds41-engram-L1.gguf,$T/data/pack/ds41-engram-L14.gguf,$T/data/pack/ds41-dense-x3.gguf"
 export TRUSS_DSPARK_EXPERT_OVERLAY="$T/data/drafter/ds41-dspark-experts.gguf"
 export TRUSS_LAYER_SPLIT=${TRUSS_LAYER_SPLIT:-14} TRUSS_LAYER_SPLIT_DEVICE=1   # a bench run may override the split
+# skip 0.10 (TRACKER #224, arms bench 8-9 KL seqs on the served path): 0.20 KL 0.104-0.107 (over the 0.0728 budget),
+# 0.15 0.081, 0.10 0.069-0.070, 0.05 0.069, 0 0.073; decode 36 -> ~27-28 tok/s. The old 0.0687 (#218) was ds41_kl, not serving.
 # the CPU tier (E14): pinned RAM threads, the 42 GB/s trellis, the per-layer adaptation of the resident set
 export TRUSS_CPU_TRELLIS=1 TRUSS_CPU_DYNAMIC=1 TRUSS_CPU_PIN=1 TRUSS_CPU_THREADS=20 TRUSS_AUX_CPUS=auto
-export TRUSS_SKIP_WEIGHT=0.20 TRUSS_PCIE_FRAC=0.1 TRUSS_ADAPT_EVERY=1 TRUSS_ADAPT_SWAPS=8
+export TRUSS_SKIP_WEIGHT=${TRUSS_SKIP_WEIGHT:-0.10} TRUSS_PCIE_FRAC=0.1 TRUSS_ADAPT_EVERY=1 TRUSS_ADAPT_SWAPS=8
 # item 9: the adaptive tier already prefetches, so the hint router only costs; item 7: the consumer layers' tail prefill
 export TRUSS_HINT_K=0 TRUSS_TAIL_PREFILL=134
 # a short prompt runs as decode-path chunks (only its routed experts move) instead of a prompt chunk that streams
