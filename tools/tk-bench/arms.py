@@ -390,8 +390,10 @@ def recall_prompt(a, tok, ctx=0):
         repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
         names = list(LONG_FILES)
         if ctx:
-            names += sorted(os.path.relpath(os.path.join(d, f), repo) for d, _, fs in os.walk(os.path.join(repo, "src"))
-                            for f in fs if f.endswith((".cu", ".cc", ".h", ".cuh")))
+            names += sorted(os.path.relpath(os.path.join(d, f), repo) for top in ("src", "tools", "tests", "docs")
+                            for d, _, fs in os.walk(os.path.join(repo, top))
+                            for f in fs if f.endswith((".cu", ".cc", ".h", ".cuh", ".py", ".md")) and f not in
+                            [os.path.basename(x) for x in LONG_FILES])
         ids = [tok.token_id("<｜begin▁of▁sentence｜>")]
         first = None
         for f in names:
