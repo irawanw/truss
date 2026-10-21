@@ -15,6 +15,7 @@ from server.reasoning import BAN_EOS_IN_THINK, BAN_MAX_TOKENS
 import os
 LOOP_GUARD = os.environ.get("TRUSS_LOOP_GUARD", "1") != "0"
 LOOP_EVERY, LOOP_MIN_PERIOD, LOOP_MAX_PERIOD, LOOP_COPIES, LOOP_COPIES_ANSWER = 64, 64, 1024, 3, 5
+LOOP_LONG_PERIOD = 200   # in the reasoning, 2 copies of a block this long count too
 
 
 def loop_period(ids, min_p=LOOP_MIN_PERIOD, max_p=LOOP_MAX_PERIOD, copies=LOOP_COPIES):
@@ -140,6 +141,9 @@ class EngineGenerate:
                         guard_at = n_gen + LOOP_EVERY
                         copies = LOOP_COPIES if in_think else LOOP_COPIES_ANSWER
                         p = loop_period(out_ids, copies=copies)
+                        if not p and in_think:   # a long block repeated once is already a loop (10-21: 462 tokens x 3)
+                            copies = 2
+                            p = loop_period(out_ids, min_p=LOOP_LONG_PERIOD, copies=2)
                         if p and in_think and not closed and close_id is not None and close_id >= 0:
                             self.log(f"{self.log_tag}: slot {slot.idx} LOOP GUARD at gen {n_gen}: {copies} copies "
                                      f"of a {p}-token block in the reasoning; </think> fed")

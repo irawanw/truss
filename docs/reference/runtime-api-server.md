@@ -150,7 +150,7 @@ dispatch on `general.architecture` inside `truss_open`.
 
 ## `server/` — OpenAI-compatible HTTP server (Python)
 
-Files: `app.py` (FastAPI routes, request parsing, `main`), `engine.py` (model + sequence slots + fair gates), `generate.py` (one request's prompt reuse and decode loop; the loop guard: every 64 generated tokens it checks for back-to-back copies of a >= 64-token block - 3 in the reasoning feeds `</think>`, 5 in the answer ends the reply; `TRUSS_LOOP_GUARD=0` off; added 10-21 after the DS41 agent repeated one reasoning paragraph until max_tokens), `engine_debug.py` (dumps, stop logs, /debug/probe), `seq.py` (prefix matching, raw ids, `FairGate`, `Slot`), `reasoning.py` (think-block ban and splitting), `chat.py`, `tools.py`, `truss_ctypes.py`.
+Files: `app.py` (FastAPI routes, request parsing, `main`), `engine.py` (model + sequence slots + fair gates), `generate.py` (one request's prompt reuse and decode loop; the loop guard: every 64 generated tokens it checks for back-to-back copies of a >= 64-token block - 3 (or 2 of a >= 200-token block) in the reasoning feeds `</think>`, 5 in the answer ends the reply; `TRUSS_LOOP_GUARD=0` off; added 10-21 after the DS41 agent repeated one reasoning paragraph until max_tokens), `engine_debug.py` (dumps, stop logs, /debug/probe), `seq.py` (prefix matching, raw ids, `FairGate`, `Slot`), `reasoning.py` (think-block ban and splitting), `chat.py`, `tools.py`, `truss_ctypes.py`.
 
 | file | role |
 |---|---|
