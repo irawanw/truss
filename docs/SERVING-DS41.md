@@ -11,7 +11,7 @@ port 8115. Measured speed, KL and the open issues are in the model card
 |---|---|
 | GPU | **two** 24 GB NVIDIA cards, Ampere (sm_86), CUDA 12.x. Tested on 2 x RTX 3090. One GPU is not supported yet |
 | CPU / RAM | AVX2, 16+ cores; **128 GB RAM**: about 82 GB of cold experts stay in pinned RAM (a kept copy, see below) |
-| Disk | 215 GB on **NVMe**. The two n-gram tables (104 GB) are read row by row on every step |
+| Disk | 230 GB on **NVMe**. The two n-gram tables (111 GB) are read row by row on every step |
 | Software | Linux, CMake 3.24+, Ninja, Python 3.10+ (`fastapi uvicorn anyio numpy transformers torch huggingface_hub`) |
 
 ## Install
@@ -21,7 +21,7 @@ git clone https://github.com/irawanw/truss && cd truss
 cmake -S . -B build-dsv41 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86 && cmake --build build-dsv41
 pip install fastapi uvicorn anyio numpy transformers torch huggingface_hub
 
-hf download lackonendes/PAW-763B-X3 --local-dir /nvme/ds41      # 215 GB
+hf download lackonendes/PAW-763B-X3 --local-dir /nvme/ds41      # 227 GB
 ```
 
 ## Serve
@@ -36,7 +36,7 @@ curl localhost:8115/v1/chat/completions -H 'Content-Type: application/json' \
 ```
 
 `scripts/serve_ds41.sh` sources `scripts/ds41_env.sh`, which holds the whole configuration; the benchmark
-(`scripts/bench_ds41.sh`) sources the same file, so what is measured is what is served. The first load reads the 93 GB
+(`scripts/bench_ds41.sh`) sources the same file, so what is measured is what is served. The first load reads the 99 GB
 of experts from disk; the first request after it is slower (page-locking the cold copy, about 20 s).
 
 ## The settings and why

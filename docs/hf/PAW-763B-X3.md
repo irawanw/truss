@@ -25,8 +25,8 @@ counting its n-gram tables) on two 24 GB GPUs plus CPU, with the full 262,144-to
 | what is in this pack | text only (no vision tower). **256 of the 384 routed experts per layer are kept** (the most used); the rest are dropped |
 | experts | 73 hot experts per layer at 2.5 bit (3 bit in layers 25-35) and 183 cold experts at 2 bit, trellis codec "X3" |
 | dense | Q8_0, plus an X3 trellis overlay for the attention and shared tensors |
-| n-gram tables | 2 x 384 M rows, int4, 52 GB each, read row by row from NVMe |
-| drafter | the model's own DSpark drafter (3 drafts per step), 5.5 GB |
+| n-gram tables | 2 x 384 M rows, int4, 55 GB each, read row by row from NVMe |
+| drafter | the model's own DSpark drafter (3 drafts per step), 5.8 GB |
 | context | 262,144 tokens |
 | hardware tested | 2 x RTX 3090 (24 GB), 128 GB RAM, NVMe |
 
@@ -34,15 +34,15 @@ counting its n-gram tables) on two 24 GB GPUs plus CPU, with the full 262,144-to
 
 | file | size | what |
 |---|---:|---|
-| `ds41-dense.gguf` | 9 GB | dense weights, Q8_0 (the model file the server opens) |
-| `ds41-dense-x3.gguf` (+ `.layers.json`) | 3 GB | X3 overlay for attention / shared tensors |
-| `ds41-experts.gguf` (+ `.layers.json`) | 93 GB | the 256 kept routed experts per layer, X3 |
-| `ds41-engram-L1.gguf`, `ds41-engram-L14.gguf` | 52 GB each | n-gram tables (NVMe, not loaded into RAM) |
-| `drafter/` | 5.5 GB | DSpark drafter: dense part and its experts |
+| `ds41-dense.gguf` | 9.1 GB | dense weights, Q8_0 (the model file the server opens) |
+| `ds41-dense-x3.gguf` (+ `.layers.json`) | 2.3 GB | X3 overlay for attention / shared tensors |
+| `ds41-experts.gguf` (+ `.layers.json`) | 99 GB | the 256 kept routed experts per layer, X3 |
+| `ds41-engram-L1.gguf`, `ds41-engram-L14.gguf` | 55 GB each | n-gram tables (NVMe, not loaded into RAM) |
+| `drafter/` | 5.8 GB | DSpark drafter: dense part and its experts |
 | `tokenizer/` | 7 MB | tokenizer from the base model |
 | `usage_calib256.f32` | 40 KB | which experts are hot (the residency plan's starting point) |
 
-215 GB in all. Serving steps: [docs/SERVING-DS41.md](https://github.com/irawanw/truss/blob/main/docs/SERVING-DS41.md).
+227 GB in all (211 GiB). Serving steps: [docs/SERVING-DS41.md](https://github.com/irawanw/truss/blob/main/docs/SERVING-DS41.md).
 
 ## Measured (2026-10-21, 2 x RTX 3090, TRUSS `main`)
 
