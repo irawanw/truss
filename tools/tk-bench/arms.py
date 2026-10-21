@@ -81,7 +81,7 @@ class Bench:
         self.knobs = sorted({k for arm in self.arms for k in arm["knobs"]})
         self.envs = sorted({k for arm in self.arms for k in arm["env"]})
         self.base_env = {k: os.environ.get(k) for k in self.envs}
-        self.drafts_open = model.drafts
+        self.drafts_open = a.drafts   # the served value (the model may be opened with more: --drafts-open)
         self.stop = {i for i in (tok.token_id("<｜end▁of▁sentence｜>"),) if i is not None} if tok else set()
         self.res = {arm["name"]: dict(arm=arm, tasks={}, health=[]) for arm in self.arms}
 
@@ -388,6 +388,8 @@ def main():
     ap.add_argument("--mtp")
     ap.add_argument("--drafts", type=int, default=5)
     ap.add_argument("--draft-min-p", type=float, default=0.0)
+    ap.add_argument("--drafts-open", type=int, default=0, help="open with this many drafts (buffers) so arms can go "
+                    "above the served --drafts; the served value stays the arms' default")
     ap.add_argument("--arm", action="append", help="[name:]k=v[,k=v...] or base; repeat for more arms")
     ap.add_argument("--tasks", default="chat,code,long,recall,kl")
     ap.add_argument("--recall", type=int, default=256, help="copied tokens teacher-forced in the recall task")
@@ -418,7 +420,10 @@ def main():
     th = threading.Thread(target=lambda: holder.setdefault("chat", __import__("server.chat").chat.Chat(a.tokenizer, None)),
                           daemon=True)
     th.start()
-    m = Model(a.model, a.n_ctx, a.chunk, a.expert_usage, mtp=a.mtp, drafts=a.drafts, draft_min_p=a.draft_min_p)
+    m = Model(a.model, a.n_ctx, a.chunk, a.expert_usage, mtp=a.mtp, drafts=max(a.drafts, a.drafts_open),
+              draft_min_p=a.draft_min_p)
+    if m.drafts != a.drafts:
+        m.set_option("drafts", a.drafts)
     th.join()
     tok = holder.get("chat")
     print(f"loaded in {time.time() - t0:.1f} s", flush=True)

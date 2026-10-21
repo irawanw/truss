@@ -3,13 +3,14 @@
 #
 # The env is the best arm measured in E15 item 9 (20261019_truss_port/exec/E15_report.md, section 9): the e14g CPU
 # tier (experts split VRAM + pinned RAM), layer split 14 across GPUs 0 and 2, skip 0.20, TRUSS_HINT_K=0 (the
-# adaptive tier already prefetches), the DSpark drafter with 5 drafts and the item-7 tail prefill.
+# adaptive tier already prefetches), the DSpark drafter (5 drafts in item 9, 3 since #223) and the item-7 tail prefill.
 #   spec, 5 drafts, hints off, skip 0.20:  42.1 tok/s on the bench (plain 32.1)
 # Greedy spec output differs from plain greedy by design (the call-scoped CPU weight-share skip); sampled serving is
 # the normal path and is unaffected in quality (ds41_kl 0.0687 vs 0.0728 budget).
 T=${TRUSS_PORT_DIR:-$HOME/ML_projects/dsv41flash/20261019_truss_port}
 H=${TRUSS_HOME:-/mnt/hdd/ml/dsv41flash/20261019_truss_port}
-REPO=${TRUSS_REPO:-$HOME/trellis-kernel}
+# the checkout this file is in: ~/trellis-kernel (development, the agent's) or ~/trellis-serve (the served copy)
+REPO=${TRUSS_REPO:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 
@@ -43,4 +44,6 @@ fi
 # the model's open arguments (server/app.py flags; arms.py takes the same)
 DS41_ARGS=(--model "$T/data/pack/ds41-dense.gguf" --tokenizer "$T/data/tokenizer/tokenizer.json"
            --n-ctx 131072 --chunk 8192 --expert-usage "$T/data/bench_in/usage_calib256.f32"
-           --mtp "$T/data/drafter/ds41-dspark-dense.gguf" --drafts 5 --draft-min-p 0)
+           --mtp "$T/data/drafter/ds41-dspark-dense.gguf" --drafts 3 --draft-min-p 0)
+# drafts 3 (TRACKER #223, arms bench 10-21): d2 38.6 / d3 41.9 / d4 42.0 / d5 38.7 tok/s; d3 the steadiest, 5x fewer
+# fetched bytes per pass than d5. The bench opens with --drafts-open 5 so arms can still try 4 and 5.
