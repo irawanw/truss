@@ -9,7 +9,7 @@ rewound). Greedy decoding takes the argmax on the device; sampling copies the lo
 Tool calls: the model's <tool_call> XML is returned as OpenAI `tool_calls` (finish_reason "tool_calls"), and
 assistant tool calls in the history have their JSON-string arguments parsed before templating (server/tools.py).
 
-Sampling defaults are llama-server's (temperature 0.8, top_k 40, top_p 0.95, min_p 0.05; DeepSeek-V4.1: its own 1.0 / 1.0, no top_k / min_p), so a client that sends no
+Sampling defaults are llama-server's (temperature 0.8, top_k 40, top_p 0.95, min_p 0.05; DeepSeek-V4.1: its own 1.0 / 1.0, no top_k, min_p 0.05), so a client that sends no
 sampling parameters gets what it got from llama-paw on this port; temperature 0 is greedy.
 
 Each request logs one line (to stdout and --log) in the format flashnext_strata_bench.py parses, so that bench runs
@@ -42,7 +42,9 @@ def make_app(engine: Engine) -> FastAPI:
     # unset sampling fields: DeepSeek-V4.1's own defaults (DeepInfer sampling_params.py: temperature 1.0, top_p 1.0,
     # no top_k / min_p; its evals run at 1.0) for that family - the narrower llama-server defaults below were the
     # suspect for the agent's reasoning loops (10-21) - and llama-server's for every other family
-    dflt = (dict(temperature=1.0, top_p=1.0, top_k=0, min_p=0.0) if getattr(engine, "ds41", None)
+    # min_p 0.05 on top for DS41: at 1.0 / 1.0 the quantized model sampled junk from its tail ("转基因" inside English
+    # reasoning, 10-21); min_p drops what is under 5% of the top token and keeps the diversity
+    dflt = (dict(temperature=1.0, top_p=1.0, top_k=0, min_p=0.05) if getattr(engine, "ds41", None)
             else dict(temperature=0.8, top_p=0.95, top_k=40, min_p=0.05))
 
     def params(body):

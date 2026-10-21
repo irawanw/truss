@@ -16,6 +16,18 @@ import os
 LOOP_GUARD = os.environ.get("TRUSS_LOOP_GUARD", "1") != "0"
 LOOP_EVERY, LOOP_MIN_PERIOD, LOOP_MAX_PERIOD, LOOP_COPIES, LOOP_COPIES_ANSWER = 64, 64, 1024, 3, 5
 LOOP_LONG_PERIOD = 200   # in the reasoning, 2 copies of a block this long count too
+# near-loops (no exact copy: "Let me run. Hmm." / "OK let me run now. Hmm." ...): the share of distinct 6-token
+# phrases in the last 512 reasoning tokens. Calibrated 10-21 on the agent's own reasoning blocks: near-loops 0.30 and
+# 0.36, exact loops 0.63-0.66 at their minimum, normal reasoning 0.99-1.0.
+LOOP_VARIETY, LOOP_VARIETY_WINDOW, LOOP_VARIETY_N = 0.45, 512, 6
+
+
+def variety(ids, w=LOOP_VARIETY_WINDOW, n=LOOP_VARIETY_N):
+    """distinct n-grams / n-grams over the last w ids (1.0 when shorter)"""
+    if len(ids) < w:
+        return 1.0
+    t = ids[-w:]
+    return len({tuple(t[i:i + n]) for i in range(w - n + 1)}) / (w - n + 1)
 
 
 def loop_period(ids, min_p=LOOP_MIN_PERIOD, max_p=LOOP_MAX_PERIOD, copies=LOOP_COPIES):
@@ -134,6 +146,7 @@ class EngineGenerate:
             rounds = []    # (generated tokens before the round, emitted [nxt + accepted drafts], next): stop diagnosis
             t_round, max_gap = t1, 0.0   # the gap between the end of one round and the end of the next
             out_ids, in_think, guard_at, closed = [], think_open, LOOP_EVERY, False   # the loop guard's state
+            think_from = 0   # where the reasoning started in out_ids (the variety window stays inside it)
             close_id = getattr(self, "think_close", None)   # None in the host tests' bare engines
             try:
                 while n_gen < max_tokens:
@@ -141,16 +154,20 @@ class EngineGenerate:
                         guard_at = n_gen + LOOP_EVERY
                         copies = LOOP_COPIES if in_think else LOOP_COPIES_ANSWER
                         p = loop_period(out_ids, copies=copies)
+                        why = f"{copies} copies of a {p}-token block"
                         if not p and in_think:   # a long block repeated once is already a loop (10-21: 462 tokens x 3)
-                            copies = 2
                             p = loop_period(out_ids, min_p=LOOP_LONG_PERIOD, copies=2)
+                            why = f"2 copies of a {p}-token block"
+                        if not p and in_think and len(out_ids) - think_from >= LOOP_VARIETY_WINDOW:
+                            v = variety(out_ids)
+                            if v < LOOP_VARIETY:   # a near-loop: report it as one, the reaction is the same
+                                p, why = LOOP_VARIETY_WINDOW, f"a near-loop (distinct 6-grams {v:.2f} in the last 512)"
                         if p and in_think and not closed and close_id is not None and close_id >= 0:
-                            self.log(f"{self.log_tag}: slot {slot.idx} LOOP GUARD at gen {n_gen}: {copies} copies "
-                                     f"of a {p}-token block in the reasoning; </think> fed")
+                            self.log(f"{self.log_tag}: slot {slot.idx} LOOP GUARD at gen {n_gen}: {why} in the "
+                                     f"reasoning; </think> fed")
                             nxt, closed = close_id, True
                         elif p:
-                            self.log(f"{self.log_tag}: slot {slot.idx} LOOP GUARD at gen {n_gen}: {copies} copies "
-                                     f"of a {p}-token block; reply ended")
+                            self.log(f"{self.log_tag}: slot {slot.idx} LOOP GUARD at gen {n_gen}: {why}; reply ended")
                             finish = "stop"
                             break
                     if spec and not pending:   # one round: nxt plus the accepted drafts enter the sequence
