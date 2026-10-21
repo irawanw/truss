@@ -14,9 +14,18 @@ REPO=${TRUSS_REPO:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && 
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 
+# where the model files are: TRUSS_MODEL_DIR = a download of the Hugging Face repo lackonendes/PAW-763B-X3 (flat layout,
+# docs/SERVING-DS41.md); unset = the development tree under $T/data
+if [ -n "${TRUSS_MODEL_DIR:-}" ]; then
+  PK=$TRUSS_MODEL_DIR DR=$TRUSS_MODEL_DIR/drafter TK=$TRUSS_MODEL_DIR/tokenizer USAGE=$TRUSS_MODEL_DIR/usage_calib256.f32
+else
+  PK=$T/data/pack DR=$T/data/drafter TK=$T/data/tokenizer USAGE=$T/data/bench_in/usage_calib256.f32
+fi
+mkdir -p "$H/logs"
+
 # the model: the served dense GGUF + the X3.1 expert/Engram overlays (#118), as data/e14g_cpu.sh and item 9
-export TRUSS_EXPERT_OVERLAY="$T/data/pack/ds41-experts.gguf,$T/data/pack/ds41-engram-L1.gguf,$T/data/pack/ds41-engram-L14.gguf,$T/data/pack/ds41-dense-x3.gguf"
-export TRUSS_DSPARK_EXPERT_OVERLAY="$T/data/drafter/ds41-dspark-experts.gguf"
+export TRUSS_EXPERT_OVERLAY="$PK/ds41-experts.gguf,$PK/ds41-engram-L1.gguf,$PK/ds41-engram-L14.gguf,$PK/ds41-dense-x3.gguf"
+export TRUSS_DSPARK_EXPERT_OVERLAY="$DR/ds41-dspark-experts.gguf"
 export TRUSS_LAYER_SPLIT=${TRUSS_LAYER_SPLIT:-20} TRUSS_LAYER_SPLIT_DEVICE=1   # a bench run may override the split
 # skip 0.10 (TRACKER #224, arms bench 8-9 KL seqs on the served path): 0.20 KL 0.104-0.107 (over the 0.0728 budget),
 # 0.15 0.081, 0.10 0.069-0.070, 0.05 0.069, 0 0.073; decode 36 -> ~27-28 tok/s. The old 0.0687 (#218) was ds41_kl, not serving.
@@ -44,8 +53,8 @@ if [ "$TRUSS_COLD_KEEP" != 0 ] && ! python3 "$REPO/tools/cold_keeper.py" --socke
 fi
 
 # the model's open arguments (server/app.py flags; arms.py takes the same)
-DS41_ARGS=(--model "$T/data/pack/ds41-dense.gguf" --tokenizer "$T/data/tokenizer/tokenizer.json"
-           --n-ctx 262144 --chunk 8192 --expert-usage "$T/data/bench_in/usage_calib256.f32"
-           --mtp "$T/data/drafter/ds41-dspark-dense.gguf" --drafts 3 --draft-min-p 0)
+DS41_ARGS=(--model "$PK/ds41-dense.gguf" --tokenizer "$TK/tokenizer.json"
+           --n-ctx 262144 --chunk 8192 --expert-usage "$USAGE"
+           --mtp "$DR/ds41-dspark-dense.gguf" --drafts 3 --draft-min-p 0)
 # drafts 3 (TRACKER #223, arms bench 10-21): d2 38.6 / d3 41.9 / d4 42.0 / d5 38.7 tok/s; d3 the steadiest, 5x fewer
 # fetched bytes per pass than d5. The bench opens with --drafts-open 5 so arms can still try 4 and 5.

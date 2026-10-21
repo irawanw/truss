@@ -1,7 +1,32 @@
 # TRUSS (trellis-kernel)
 
-Our own inference engine for **trellis-quantized MoE models on one or two RTX 3090s** (Ampere, sm_86). First model:
-**Qwen3.8 Flash-Next PAW X3.1** (qwen4exp, 48 layers, 512 experts), served through an OpenAI-compatible API.
+Our own inference engine for **trellis-quantized MoE models on one or two RTX 3090s** (Ampere, sm_86), served through
+an OpenAI-compatible API. Two models run on it today:
+**[PAW-763B-X3](https://huggingface.co/lackonendes/PAW-763B-X3)** (DeepSeek-V4.1-Flash-1017, 763B parameters, two RTX 3090s)
+and **[PAW-125B-FLASH-NEXT-X3.1](https://huggingface.co/lackonendes/PAW-125B-FLASH-NEXT-X3.1)** (Qwen3.8 Flash-Next, 125B).
+
+## PAW-763B-X3: DeepSeek-V4.1-Flash-1017 on two RTX 3090s (2026-10-21)
+
+TRUSS now serves **PAW-763B-X3**, a 763B-parameter DeepSeek model (557B routed experts, 197B n-gram tables) on two 24 GB
+cards plus CPU and NVMe, with the full 262,144-token context. The pack keeps 256 of the 384 experts per layer at 2-3
+bit. Files and model card: **[lackonendes/PAW-763B-X3](https://huggingface.co/lackonendes/PAW-763B-X3)**
+(215 GB). How to run it: **[docs/SERVING-DS41.md](docs/SERVING-DS41.md)**.
+
+| two RTX 3090s, 128 GB RAM, NVMe | measured |
+|---|---:|
+| decode, bench (speculative, 3 drafts) | **29-30.5 tok/s** |
+| decode, real agent session at 70-95K context | **20-23 tok/s** |
+| prefill, 21K-token prompt | **1,100-1,300 tok/s** |
+| KL against the original checkpoint (8 sequences; budget 0.0728) | **0.061-0.069** |
+| recall of a passage copied from 21K / 60K / 100K / 200K tokens back | 99.6% / 100% / 100% / 100% |
+
+Pending, not solved: (1) past about 60K tokens of context roughly 30% of agent turns loop in their reasoning; a loop
+guard in the server ends the loop, the cause is not found and the test that isolates it (`tools/tk-bench/arms_loop.py`)
+has not run yet; (2) decode and prefill are below the 70 / 2,000 tok/s goals, because 130-150 routed experts per pass are
+not in VRAM and every prompt chunk re-streams the cold ones; (3) quality is measured by KL and recall only, no task
+benchmarks yet. The plan and every measurement: [docs/PLAN-20261021-ds41-70-2000.md](docs/PLAN-20261021-ds41-70-2000.md).
+
+## PAW-125B-FLASH-NEXT-X3.1
 
 ## Status (2026-10-13)
 
@@ -35,6 +60,7 @@ sampling, run-to-run spread 1.2%):
 
 ## Start here
 
+- **[docs/SERVING-DS41.md](docs/SERVING-DS41.md)** — run PAW-763B-X3 (DeepSeek-V4.1-Flash-1017): install, download, settings, benchmark.
 - **[docs/reference/](docs/reference/README.md)** — every source file: what it computes, API and shapes, layouts,
   numerics, invariants, tests, tunables, how to change it. Start with its README (data flow of one forward pass).
 - **[docs/HANDOVER-20261014-engine-lfm.md](docs/HANDOVER-20261014-engine-lfm.md)** — current state, what is running, next steps in order.
@@ -47,7 +73,7 @@ sampling, run-to-run spread 1.2%):
 
 ## Quickstart
 
-Serve **PAW-125B-FLASH-NEXT-X3.1** ([model on Hugging Face](https://huggingface.co/lackonendes/PAW-125B-FLASH-NEXT-X3.1))
+PAW-763B-X3 (two 24 GB GPUs, 128 GB RAM): see [docs/SERVING-DS41.md](docs/SERVING-DS41.md). Serve **PAW-125B-FLASH-NEXT-X3.1** ([model on Hugging Face](https://huggingface.co/lackonendes/PAW-125B-FLASH-NEXT-X3.1))
 on one or two 24 GB GPUs plus CPU: **[docs/SERVING-FLASHNEXT-X31.md](docs/SERVING-FLASHNEXT-X31.md)** (install, download,
 the best settings, memory, expected speed). Short version:
 
@@ -63,8 +89,8 @@ Tests and benchmarks: [docs/reference/tests-tools.md](docs/reference/tests-tools
 
 ## Credits
 
-TRUSS is an independent, from-scratch implementation (no shared code, no fork), but two projects shaped
-how it's built:
+TRUSS is an independent, from-scratch implementation (no shared code, no fork), but these projects shaped how it's
+built. Thank you to everyone below; their work is what we measured against and learned from.
 
 - **[Strata](https://github.com/Niko1221/Strata)** (Niko1221, MIT) is where the serving architecture comes
   from. Running a 125B MoE on one consumer GPU means most experts can't live in VRAM, and Strata's answer —
@@ -74,12 +100,30 @@ how it's built:
   techniques (CPU-resident experts, the async doorbell handoff, adaptive/usage-ranked residency, an int8 KV
   layout, accepting speculative drafts row-by-row) were studied from Strata's engine and reimplemented here
   independently, not copied: see `docs/06-truss.md` and `docs/reference/` for what each piece does in TRUSS
-  and how it differs.
+  and how it differs. **[mmnga/Strata](https://github.com/mmnga/Strata)**'s DeepSeek port was our cross-check for the
+  DeepSeek-V4.1 tensor names and metadata keys, and **[PolyStrata](https://github.com/VecSzn/PolyStrata)** (VecSzn)
+  for the tensor-core attention pattern.
 - **[ExLlamaV3](https://github.com/turboderp-org/exllamav3)** (turboderp, MIT) is where the weight codec
   comes from. Its EXL3 format (a QTIP-style trellis/Viterbi quantizer) is the basis for the X3 / X3.1
-  codec that compresses this model's experts to ~2.6 bits/weight on GPU; TRUSS's decode kernels and its
+  codec that compresses this model's experts to 2-3 bits/weight on GPU; TRUSS's decode kernels and its
   encoder's refit/drift step port that design (`docs/reference/kernels-trellis-moe.md`,
-  `docs/reference/formats-core.md`).
+  `docs/reference/formats-core.md`). The underlying method is **QTIP**
+  ([arXiv 2406.11235](https://arxiv.org/abs/2406.11235)).
+- **[DeepInfer](https://github.com/deepseek-ai/DeepInfer)** (DeepSeek, Apache-2.0): the reference for the
+  DeepSeek-V4.1 architecture details (YaRN only on the compressed layers; its lazy hyper-connection post step is on our plan).
+- **[tqLLM](https://github.com/turbo-tan/tqllm)** (turbo-tan, Apache-2.0): the trellis GEMV kernel family that
+  reaches Q8 speed, and the retrieval-draft and trellis-to-int8 prefill ideas on our plan.
+- **[TensorFold](https://github.com/ashhart/TensorFold)** (ashhart): exact DSpark speculation, the q4 draft head, and
+  pipelined prompt reading.
+- **[Maya](https://github.com/mw00/project-maya)** (mw00): large prompt chunks, experts borrowing VRAM during prompts,
+  and the long-prompt skip that our tail prefill is compared with.
+- **[sybil-solutions/dsv41-flash-offload](https://github.com/sybil-solutions/dsv41-flash-offload)** (MIT): staged-DMA
+  prefill and FP16 GEMM for experts with many rows.
+- **[dsx](https://github.com/lxe/dsx)** (lxe): deferring low-rank CPU experts by one layer.
+- **[Xolotl](https://github.com/Indras-Mirror/Xolotl)** (Indras-Mirror): moving the draft model off the card during long
+  prompts, and learning experts per conversation (ideas we studied).
+- **[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)** (DeepSeek, MIT): the
+  model itself.
 
 ## Layout
 

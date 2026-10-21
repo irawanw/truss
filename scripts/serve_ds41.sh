@@ -25,11 +25,12 @@ cd "$REPO"
 
 # the last 12 requests as prompt/generated ids (.npz, server/engine_debug.py save_request): real long-context prompts
 # for the bench's loop-rate test (the agent loops past ~60K context, 10-21)
-export TRUSS_REQ_LOG_DIR=${TRUSS_REQ_LOG_DIR:-$T/data/req_log}
+D=${TRUSS_MODEL_DIR:+$H}; D=${D:-$T/data}   # a downloaded model keeps its logs under TRUSS_HOME
+export TRUSS_REQ_LOG_DIR=${TRUSS_REQ_LOG_DIR:-$D/req_log}
 
 # the served routing, for offline residency replays (plan D: hits vs VRAM expert budget); the last stage's layers
 # (14-39), ~2.5 KB per decode pass. TRUSS_ROUTE_TRACE=0: off
-RT=${TRUSS_ROUTE_TRACE:-$T/data/route_trace/serve_$(date +%m%d-%H%M%S).bin}
+RT=${TRUSS_ROUTE_TRACE:-$D/route_trace/serve_$(date +%m%d-%H%M%S).bin}
 if [ "$RT" != 0 ]; then mkdir -p "$(dirname "$RT")"; export TRUSS_ROUTE_TRACE="$RT"; else unset TRUSS_ROUTE_TRACE; fi
 
 exec python3 -m server.app "${DS41_ARGS[@]}" \
