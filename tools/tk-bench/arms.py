@@ -213,7 +213,10 @@ class Bench:
         P = len(ids) - n_target
         print(f"task {name}: {P} prompt tokens + {n_target} copied tokens teacher-forced", flush=True)
         self.m.reset()
-        self.m.eval(ids[:P - 1])
+        if name.endswith("i"):   # incremental, as the server builds an agent's context turn by turn (see read_turns)
+            self.read_turns(ids[:P - 1])
+        else:
+            self.m.eval(ids[:P - 1])
         self.m.checkpoint()
         for arm in self.arms:
             self.apply(arm)
@@ -237,6 +240,21 @@ class Bench:
             if top1 < self.a.recall_min:
                 self.bad(arm, f"{name} top-1 {100 * top1:.1f}% < {100 * self.a.recall_min:.0f}% (attention to earlier "
                               f"prompt chunks broken?)")
+
+    def read_turns(self, ids, first=40000, sizes=(1500, 81, 985, 60, 2600, 300)):
+        """the first `first` tokens in one read, the rest in agent-turn sized pieces, each one as the server does it:
+        checkpoint, a read past the checkpoint, restore, the same piece again (the client re-sent the turn), on - so
+        the restore path, decode-path pieces (<= TRUSS_FETCH_PROMPT) and tail-prefill pieces all run at long context"""
+        self.m.eval(ids[:first])
+        i, k = first, 0
+        while i < len(ids):
+            n = min(sizes[k % len(sizes)], len(ids) - i)
+            self.m.checkpoint()
+            self.m.eval(ids[i:i + n])
+            self.m.restore()
+            self.m.eval(ids[i:i + n])
+            i, k = i + n, k + 1
+        print(f"  read in {k + 1} turns (checkpoint / read / restore / read again each)", flush=True)
 
     # ---- KL task
     def kl_task(self):
@@ -446,8 +464,9 @@ def main():
     for t in tasks:
         if t == "kl":
             b.kl_task()
-        elif t.startswith("recall"):   # recall (~21K), recall60, recall90: the copy source ~N K tokens back
-            b.recall_task(recall_prompt(a, tok, int(t[6:] or 0)), a.recall, t)
+        elif t.startswith("recall"):   # recall (~21K), recall60, recall90: the copy source ~N K tokens back; a
+            # trailing i (recall90i): the context read turn by turn as the server builds an agent's (read_turns)
+            b.recall_task(recall_prompt(a, tok, int(t[6:].rstrip("i") or 0)), a.recall, t)
         elif t in prompts:
             b.prompt_task(t, prompts[t])
         else:
