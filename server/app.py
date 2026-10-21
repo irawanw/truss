@@ -9,7 +9,7 @@ rewound). Greedy decoding takes the argmax on the device; sampling copies the lo
 Tool calls: the model's <tool_call> XML is returned as OpenAI `tool_calls` (finish_reason "tool_calls"), and
 assistant tool calls in the history have their JSON-string arguments parsed before templating (server/tools.py).
 
-Sampling defaults are llama-server's (temperature 0.8, top_k 40, top_p 0.95, min_p 0.05), so a client that sends no
+Sampling defaults are llama-server's (temperature 0.8, top_k 40, top_p 0.95, min_p 0.05; DeepSeek-V4.1: its own 1.0 / 1.0, no top_k / min_p), so a client that sends no
 sampling parameters gets what it got from llama-paw on this port; temperature 0 is greedy.
 
 Each request logs one line (to stdout and --log) in the format flashnext_strata_bench.py parses, so that bench runs
@@ -39,14 +39,20 @@ from server.seq import FairGate, raw_ids  # noqa: F401  (re-exported: tests use 
 def make_app(engine: Engine) -> FastAPI:
     app = FastAPI()
 
+    # unset sampling fields: DeepSeek-V4.1's own defaults (DeepInfer sampling_params.py: temperature 1.0, top_p 1.0,
+    # no top_k / min_p; its evals run at 1.0) for that family - the narrower llama-server defaults below were the
+    # suspect for the agent's reasoning loops (10-21) - and llama-server's for every other family
+    dflt = (dict(temperature=1.0, top_p=1.0, top_k=0, min_p=0.0) if getattr(engine, "ds41", None)
+            else dict(temperature=0.8, top_p=0.95, top_k=40, min_p=0.05))
+
     def params(body):
         stop = body.get("stop") or []
         def get(key, default, cast):
             v = body.get(key)
             return cast(default if v is None else v)
         p = dict(max_tokens=int(body.get("max_tokens") or body.get("max_completion_tokens") or engine.model.n_ctx),
-                 temperature=get("temperature", 0.8, float), top_p=get("top_p", 0.95, float),
-                 top_k=get("top_k", 40, int), min_p=get("min_p", 0.05, float), seed=body.get("seed"),
+                 temperature=get("temperature", dflt["temperature"], float), top_p=get("top_p", dflt["top_p"], float),
+                 top_k=get("top_k", dflt["top_k"], int), min_p=get("min_p", dflt["min_p"], float), seed=body.get("seed"),
                  presence_penalty=get("presence_penalty", 0.0, float),
                  frequency_penalty=get("frequency_penalty", 0.0, float),
                  # llama-server's names too
