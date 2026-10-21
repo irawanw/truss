@@ -7,6 +7,26 @@ from server.chat import Detokenizer
 from server.truss_ctypes import PENALTY_CAP, Sampling, TrussError
 from server.reasoning import BAN_EOS_IN_THINK, BAN_MAX_TOKENS
 
+# The loop guard (TRUSS_LOOP_GUARD=0: off). A quantized model can fall into a verbatim loop: 10-21 the DS41 agent
+# repeated one ~250-token paragraph of its reasoning until max_tokens. Every LOOP_EVERY generated tokens the tail is
+# checked for back-to-back copies of one block of >= LOOP_MIN_PERIOD tokens: LOOP_COPIES inside the reasoning (the
+# guard then feeds </think>: the model answers or acts with what it has), LOOP_COPIES_ANSWER in the answer (code and
+# tables repeat legitimately more often; the guard then ends the reply).
+import os
+LOOP_GUARD = os.environ.get("TRUSS_LOOP_GUARD", "1") != "0"
+LOOP_EVERY, LOOP_MIN_PERIOD, LOOP_MAX_PERIOD, LOOP_COPIES, LOOP_COPIES_ANSWER = 64, 64, 1024, 3, 5
+
+
+def loop_period(ids, min_p=LOOP_MIN_PERIOD, max_p=LOOP_MAX_PERIOD, copies=LOOP_COPIES):
+    """The shortest period p in [min_p, max_p] whose `copies` back-to-back copies end `ids`, or 0."""
+    a = np.asarray(ids[-max_p * copies:], dtype=np.int64)
+    n = len(a)
+    for p in range(min_p, n // copies + 1):
+        t = a[n - p * copies:]
+        if np.array_equal(t[p:], t[:-p]):
+            return p
+    return 0
+
 
 class EngineGenerate:
     """Engine.generate: one request's prompt read and decode loop on its slot (a mixin of server.engine.Engine)."""
@@ -112,8 +132,23 @@ class EngineGenerate:
             pending = []   # tokens the engine already holds that are still to be emitted (speculative rounds)
             rounds = []    # (generated tokens before the round, emitted [nxt + accepted drafts], next): stop diagnosis
             t_round, max_gap = t1, 0.0   # the gap between the end of one round and the end of the next
+            out_ids, in_think, guard_at, closed = [], think_open, LOOP_EVERY, False   # the loop guard's state
+            close_id = getattr(self, "think_close", None)   # None in the host tests' bare engines
             try:
                 while n_gen < max_tokens:
+                    if LOOP_GUARD and not pending and n_gen >= guard_at:   # at a round boundary: nxt not fed yet
+                        guard_at = n_gen + LOOP_EVERY
+                        copies = LOOP_COPIES if in_think else LOOP_COPIES_ANSWER
+                        p = loop_period(out_ids, copies=copies)
+                        if p and in_think and not closed and close_id is not None and close_id >= 0:
+                            self.log(f"{self.log_tag}: slot {slot.idx} LOOP GUARD at gen {n_gen}: {copies} copies "
+                                     f"of a {p}-token block in the reasoning; </think> fed")
+                            nxt, closed = close_id, True
+                        elif p:
+                            self.log(f"{self.log_tag}: slot {slot.idx} LOOP GUARD at gen {n_gen}: {copies} copies "
+                                     f"of a {p}-token block; reply ended")
+                            finish = "stop"
+                            break
                     if spec and not pending:   # one round: nxt plus the accepted drafts enter the sequence
                         if slot.pos + 1 >= self.model.n_ctx:
                             break
@@ -132,6 +167,9 @@ class EngineGenerate:
                         t_round = tr
                     tok = pending.pop(0) if spec else nxt
                     n_gen += 1
+                    out_ids.append(tok)
+                    if tok == close_id:
+                        in_think = False
                     if sp is not None and sp.n_ban and (tok == self.think_close or n_gen >= BAN_MAX_TOKENS):
                         # the reasoning block closed (the engine lifts the ban only inside the call that feeds
                         # </think>), or it ran so long that a stuck reply must still be able to end
