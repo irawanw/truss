@@ -78,6 +78,8 @@ public:
     void set_defer(int slot, int n) { slots_[slot].defer_n = n; }
     cudaEvent_t slot_done(int slot) const { return slots_[slot].done; }
     int draft(int32_t next, int pos, int n, int32_t * out, const Drafter::Sampling & s);
+    // the drafter's per-draft confidence p_i of the last draft call (null: none)
+    const float * draft_confidence(int * n) const;
 
     // layer split hand-off (Pipeline): the residual rows after le - 1 go to the next stage through pinned host memory
     Stage * prev = nullptr, * next = nullptr;

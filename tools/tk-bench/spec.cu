@@ -340,6 +340,10 @@ int main(int argc, char ** argv)
                 FILE * fd = std::fopen(dp, pi ? "ab" : "wb");
                 if (fd) std::fwrite(got.data(), 4, std::min<size_t>(got.size(), N), fd), std::fclose(fd);
             }
+            if (const char * dp = std::getenv("TRUSS_BENCH_DUMP_PLAIN"); dp && do_plain) {   // the plain tokens, likewise
+                FILE * fd = std::fopen(dp, pi ? "ab" : "wb");
+                if (fd) std::fwrite(ref.data(), 4, std::min<size_t>(ref.size(), N), fd), std::fclose(fd);
+            }
             S.spec_s += spec, S.plain_s += plain, S.passes += passes, S.tokens += N, S.drafted += drafted;
             S.accepted += accepted, S.ms_draft += ms_draft, S.ms_verify += ms_verify, S.ms_head += ms_head;
             if (do_plain) S.identical += same, S.compared += N;

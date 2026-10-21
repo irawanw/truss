@@ -50,6 +50,9 @@ public:
         float * q = nullptr;
     };
     virtual int draft(Stage &, int slot, int32_t next, int pos, int n, int32_t * out, const Sampling & s) = 0;
+    // the model's per-draft confidence p_i (the acceptance probability of draft i, the DeepInfer recipe): the
+    // varlen verify schedule uses them. nullptr: no confidence (the fixed-length schedule).
+    virtual const float * draft_confidence(int * n) const { *n = 0; return nullptr; }
     virtual Stateful * state() = 0;                                  // its per-slot state (registered with the stage)
 };
 

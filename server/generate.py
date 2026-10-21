@@ -82,7 +82,8 @@ class EngineGenerate:
                                            daemon=True)
                 watcher.start()
             try:
-                # checkpoint just before the prompt's last <|im_start|> (~10 ms): the next request may resume there.
+                # checkpoint just before the prompt's last <|im_start|> (DS41: <｜Assistant｜>, engine.py) (~10 ms): the
+                # next request may resume there.
                 # Not at the prompt's end: its generation prompt ("...assistant\n<think>\n") tokenizes differently
                 # once the reply follows it ("\n\n</think>"), but nothing before a special token can change.
                 cut = next((i for i in range(len(prompt_ids) - 1, reuse, -1) if prompt_ids[i] == self.im_start), 0)

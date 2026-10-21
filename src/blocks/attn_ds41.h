@@ -53,7 +53,10 @@ public:
         kv_src_ = kv, idx_src_ = index, cand_src_ = candidates;
     }
     // in [T][d] (normed; fp32 and fp16 copies of the same rows) at positions pos0 .. -> out [T][d]
-    void forward(engine::Gpu & g, int slot, const float * in, const half * in16, int pos0, int T, float * out);
+    // row_off: this layer's rows are the chunk's rows [row_off, row_off + T) (the tail prefill); clip: the window's
+    // first position (the chunk's start: the positions before it were not written into the ring).
+    void forward(engine::Gpu & g, int slot, const float * in, const half * in16, int pos0, int T, float * out,
+                 int row_off = 0, int clip = 0);
 
     const int * topk() const { return topk_; }   // index sources: the chunk's top-k [rows][index_top_k] (device)
     void alloc_slots(engine::Stage & st, int n_slots, int seq_ctx, int spec_rows) override;

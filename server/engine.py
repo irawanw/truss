@@ -31,13 +31,23 @@ class Engine(EngineGenerate, EngineDebug):
             raise RuntimeError(f"tokenizer {a.tokenizer} failed to load (see the thread's traceback above)")
         self.chat = chat["c"]
         self.chat.template = self.model.meta_string("tokenizer.chat_template")
+        # DeepSeek-V4.1 has no GGUF chat template: its prompt and reply format come from the official encoder
+        # (server/encoding.py, MIT), driven by server/ds41.py. The family decides, not a flag.
+        self.ds41 = None
+        if self.model.meta_string("general.architecture") == "deepseek41":
+            from server.ds41 import Ds41Chat
+            self.ds41 = Ds41Chat(self.chat.tok)
         self.stop_ids = {i for i in (self.model.meta_int("tokenizer.ggml.eos_token_id"),
-                                     self.chat.token_id("<|im_end|>"), self.chat.token_id("<|endoftext|>"))
+                                     self.chat.token_id("<|im_end|>"), self.chat.token_id("<|endoftext|>"),
+                                     self.chat.token_id("<｜end▁of▁sentence｜>"))
                          if i is not None and i >= 0}
         self.name, self.log_path, self.log_tag = a.name, a.log, a.log_tag
         self.dump_dir = a.dump_dir
         self.init_sequences(a.chunk)   # one record per sequence + the two fair gates (see below)
         self.im_start = self.chat.token_id("<|im_start|>")
+        if self.ds41:   # DeepSeek's turn marker: the prompt-end checkpoint sits before the last <｜Assistant｜>
+            from server import encoding as ds_enc
+            self.im_start = self.chat.token_id(ds_enc.ASSISTANT_SP_TOKEN)
         self.think_close = self.chat.token_id("</think>")
 
     def log(self, line: str):

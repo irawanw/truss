@@ -174,7 +174,8 @@ void AttnDs41::index(engine::Gpu & g, int slot, const half * qr16, const half * 
     }
 }
 
-void AttnDs41::forward(engine::Gpu & g, int slot, const float * in, const half * in16, int pos0, int T, float * out)
+void AttnDs41::forward(engine::Gpu & g, int slot, const float * in, const half * in16, int pos0, int T, float * out,
+                       int row_off, int clip)
 {
     Scratch & sc = *g.sc;
     const size_t m = sc.mark();
@@ -223,12 +224,15 @@ void AttnDs41::forward(engine::Gpu & g, int slot, const float * in, const half *
         a.q = q + (size_t) r0 * H * D, a.chunk_kv = kv16 + (size_t) r0 * D, a.ring = S.ring, a.R = RING;
         if (d_.ratio) {
             const AttnDs41 & ks = kv_src_ ? *kv_src_ : *this, & is = idx_src_ ? *idx_src_ : *this;
-            a.comp = ks.sl_[slot].comp, a.idx = is.topk_ + (size_t) r0 * d_.index_top_k, a.k = d_.index_top_k;
+            // the chunk's top-k from its first row: the kernels index it at row (t + row_off), and row_off below
+            // already holds the piece's r0 (offsetting the pointer too read r0 rows past it: 10-21 crash)
+            a.comp = ks.sl_[slot].comp, a.idx = is.topk_, a.k = d_.index_top_k;
         } else {
             a.comp = nullptr, a.idx = nullptr, a.k = 0;
         }
         ds41::ring_write(S.ring, RING, kvn + (size_t) r0 * D, D, pos0 + r0, rb, g.s);
         a.sinks = lin_.f32(w_.sinks), a.H = H, a.D = D, a.window = d_.window, a.pos0 = pos0 + r0, a.T = rb;
+        a.row_off = row_off + r0, a.clip = clip;   // the tail prefill: the chunk's top-k row, the window's clip
         a.scale = 1.0f / std::sqrt((float) D), a.out = o;
         static const bool v1 = std::getenv("TRUSS_DS41_ATTN_V1") && std::atoi(std::getenv("TRUSS_DS41_ATTN_V1"));
         // v5 (32 heads per CTA, 16 warps) is the default when the shape allows; 1 = v2, 2 = v3 (cp.async), 3 = v4, 4 = v5

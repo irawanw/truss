@@ -111,12 +111,12 @@ public:
 
 private:
     struct Slot {
-        half * cap = nullptr;   // [CAP_ROWS][3][d_model]
+        float * cap = nullptr;  // [CAP_ROWS][3][d_model], fp32: some rows exceed the fp16 range
         int cap_n = 0;          // rows captured
         int cap_start = 0;      // the chunk row the capture starts at (T > CAP_ROWS: the tail)
         bool seeded = false;
     };
-    void seed(engine::Stage & st, int slot, const half * hid, int n, int pos0);
+    void seed(engine::Stage & st, int slot, const float * hid, int n, int pos0);
     hc::SkDims sk_dims() const;
 
     const Config & c_;
@@ -136,6 +136,7 @@ private:
     std::vector<Slot> sl_;
     float * mproj_ = nullptr, * mx_ = nullptr, * kv_ = nullptr, * logits_ = nullptr, * me_ = nullptr, * mbias_ = nullptr;
     half * mx16_ = nullptr, * kv16_ = nullptr, * m16_ = nullptr;
+    half * hid16_ = nullptr;   // [CAP_ROWS][3][d_model]: seed()'s fp16 rows for main_proj (own memory, not scratch)
     // the confidence head: the [hidden; markov_emb] input (fp32), the logits, the host p_i
     float * xconf_ = nullptr, * conf_logit_ = nullptr;
     std::vector<float> conf_;

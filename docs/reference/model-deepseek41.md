@@ -24,6 +24,60 @@ The engine reads the experts as an overlay (`TRUSS_EXPERT_OVERLAY`, `gguf::File:
 | `dspark.{h,cu}`, `dspark_attn.cu`, `dspark_draft.cu`, `dspark_weights.cc` | The DSpark drafter (`mtp.0-2`, dsref `DSparkBlock` / `forward_spec`) as an `engine::Drafter` on the last stage (which must own layers 37-39). **Its own `runtime::MoeExec`** (`moe::DSpark`: 128 experts, top-3, all resident, no ring / CPU tier), built in `StageModel::build` before the stage's store takes the VRAM left; `moe_layers()` stays the main layers. `capture`: the hc-copy mean of the input residual of layers 37/38/39 per row (device kernel) -> `main_proj` + `main_norm` -> each layer's kv latent (rms, base-theta rope, **no YaRN**, as dsref's window-only layers) into a 128-slot ring per slot (`seed`, on commit / accept). `draft`: one 5-row block [next, 4 x noise 128799] at positions pos .. pos+4, per layer hc collapse -> norm -> window attention (noncausal over ring + block, scale head_dim^-0.5) -> hc post -> MoE (sqrt-softplus, no VL bias) -> hc post; then the last layer's norm, the main head, the markov bias of the previous token per row and argmax (or `draft_sample`). Weights: `ds41-dspark-dense.gguf` (`tools/tk-pack/ds41_dspark.py`, 690 MB) as the drafter file + `TRUSS_DSPARK_EXPERT_OVERLAY=ds41-dspark-experts.gguf` (`dspark.L.ffn_*_exps.*`, K3, 5.1 GB). `TRUSS_DSPARK_DEBUG=<file>`: per draft call `pos, next, n, made, drafts[made]`, row 0's top 5 (id, logit). Measured E9 (TRACKER #205): 3.40 tokens per verify pass on code (Python reference E8: 3.89 teacher-forced); spec output = plain greedy until a router near-tie flips between the 6-row window and 1-row decode (`TRUSS_BENCH_ORACLE`) |
 | `weights.{h,cc}` | `bind`: every tensor checked (ggml shapes from mmnga's `Model::validate`) and used once; compressor / index-key tensors on KV sources, index-query tensors on index sources, Engram on its layers |
 
+## The tail prefill (E15 item 7) and the DSpark confidence head (E15 item 8)
+
+`TRUSS_TAIL_PREFILL=<n>` (default 0 = off): on a **prompt** chunk the *consumer* layers (the ones that read the
+candidate source's compressed KV, `compress_ratio > 0` and `kv_source_of(l) == candidate_source`, i.e. layers 21-39)
+run on the **last n rows** of the chunk only (the reference's "SWA bounded replay", `n = 134 = 128 + 6`): the
+residual, the collapse coef, the token ids, the positions and the row count shift to that suffix
+(`src/model/deepseek41/model.cu` ✓), the attention's top-k is read at the shifted row (`row_off` ✓,
+`src/kernels/ds41/sparse_attn*.cuh` ✓) and the sliding window is **clipped at the chunk's start** (`clip` ✓, the
+reference's `max(s, i-127)` rule ✓ — the skipped rows' ring slots hold stale data ✓ and must not be read ✓). The
+decode path is untouched ✓ (the mode applies to the prompt chunks only ✓). Measured (E15 item 7): the 32K prompt's
+prefill 1032-1052 → **1348-1349 tok/s** ✓ (+29% ✓), the decode unchanged ✓, the decode-path KL 0.0678 → 0.0692
+(budget 0.0728 ✓). The **exact (cone)** variant of the brief is not implemented ✓ (it needs a KV-only attention pass
+for the skipped rows ✓).
+
+`TRUSS_DSPARK_VARLEN=1` (default off) + `TRUSS_VARLEN_C0` / `TRUSS_VARLEN_C1` (the cost model
+`cost(n) = c0 + c1 n` in ms ✓): the **confidence-scheduled verify** ✓. The drafter's confidence head
+(`confidence_proj`, fp32 in the pack ✓) gives `p_i = sigmoid(proj([hidden_i before the final norm ; markov_emb_i]) / T)`
+✓ (`TRUSS_DSPARK_CONF_T`, default 1.0 ✓ = the reference's ✓) — it is **only computed when the schedule or the
+calibration log asks for it** ✓ (`TRUSS_DSPARK_CONF_LOG=<file>`: per draft call `pos, next, made, p_0..p_{n-1}` ✓;
+`TRUSS_ACCEPT_LOG=<file>`: per round `pos, kept, verified prefix, drafts` ✓), so the shipped path pays nothing ✓.
+The engine (`src/engine/pipeline_slots.cu` ✓) then verifies only the prefix that maximizes
+`(1 + Σ cumprod(p)_1..n) / cost(n)` ✓. Measured (E15 item 8): the head is **well calibrated** ✓ (the mean p_i per
+position 0.80 / 0.73 / 0.63 / 0.57 / 0.52 ✓, the predicted 3.365 tokens/pass vs the measured 3.37-3.61 ✓) but the
+schedule is a **no-op** ✓ (the DSpark's drafts are good enough that the longest window always wins ✓) and the varlen
+arm measured **+43 ms per pass in the draft phase** ✓ — unexplained ✓ (the `TRUSS_ACCEPT_LOG` file was not written
+in those runs ✓) → the mode stays **off** ✓.
+
+## Serving fixes (10-21, item 10)
+
+Three bugs kept the served config (spec, 5 drafts, `TRUSS_HINT_K=0`, chunk 8192, `TRUSS_TAIL_PREFILL=134`) from
+running; all three were found with `compute-sanitizer` / NaN probes on the real model (`$P/data/p10_dbg.sh`):
+
+- **DSpark capture overflowed fp16.** `capture` stored the layer-37/38/39 hc-mean rows as fp16; on a short prompt
+  some captured rows hold residual values above 65504 (30 of 322,560 values on a 21-token prompt; long prompts keep
+  only later rows) → inf → NaN in the draft attention → the drafter's router picked garbage expert ids →
+  `window_kernel<moe::DSpark>` read 1.5 GB before a valid allocation. Now `Slot::cap` is **fp32** and `seed`
+  converts each row with its own scale into the fp16 range (`rows_to_half_scaled`, into the drafter's own
+  `hid16_` buffer, not scratch): `main_proj` has no bias and `main_norm` (RMSNorm) follows it, so a per-row positive
+  scale leaves the result unchanged up to eps.
+- **Attention row pieces counted the piece offset twice.** `AttnDs41::forward` runs the attention in
+  `engine::prefill_piece()` rows (1024) and passed both `a.idx = topk_ + r0 * k` and `a.row_off = row_off + r0`;
+  the kernels index `idx[(t + row_off) * k]`, so every piece after the first read `r0` rows past its top-k (garbage
+  key indices; a crash on any prompt longer than 1024 rows once the memory past the buffer was not zero, silently
+  wrong keys otherwise). `a.idx` is now the chunk's top-k base. This came from merging the item-7 `row_off` onto the
+  item-2 row pieces (10-21 06:45); the item-9 measurements predate it.
+- **`ExpertStore::admit` wrote `adapt_hits` unconditionally** (`expert_store_ring.cu`), a vector sized only with
+  `TRUSS_ADAPT_REUSE`: a segfault at the first adaptive admission. Now guarded with the reuse counters.
+
+Checked after the fixes (`tk-bench-spec`, e14g env + drafter, chunk 2048): a 21-token prompt and two 2,048-token
+prompts in one process run; spec 41.6 / 50.4 tok/s vs plain 26.1 / 30.7 on the long prompts (3.37 / 3.61 tokens per
+pass); the decoded spec text is coherent and correct (it leaves plain greedy at near ties, e.g. "check status of" vs
+"check the status of", and continues with different but equally valid code). Greedy spec != plain greedy is expected
+(the CPU tier's skip rule is call-scoped, E15 item 9).
+
 **Tested.** `tk-pack-inspect` binds the pack (`TRUSS_EXPERT_OVERLAY=<experts>`); blocks: `ds41_ops_test` (router,
 mHC), `moe_window_test` (DsV41 shape), `ds41_attn_parity` (attention); whole layers: `ds41_stage_dump` (layers [0, N) on one GPU with the dumps above), checked
 against dsref's mHC math on TRUSS's own sub-block outputs and against the PoC's `moe_in_L00.pt` capture (10-19: found

@@ -269,6 +269,17 @@ void dump_dspark_record(DsparkDump & d, const engine::Chunk & c, int dm)
     std::fflush(d.f);
 }
 
+// the tail prefill (item 7): TRUSS_TAIL_PREFILL=<n> (rows) - the consumer layers run on the last n rows of a
+// prompt chunk (the reference's "SWA bounded replay": 128 + 6 = 134). 0: off.
+int tail_rows_cfg()
+{
+    static const int n = [] {
+        const char * e = std::getenv("TRUSS_TAIL_PREFILL");
+        return e ? std::atoi(e) : 0;
+    }();
+    return n;
+}
+
 }  // namespace
 
 void StageModel::layers(engine::Stage & st, const engine::Chunk & c, float * res, const engine::LayerHook & hook)
@@ -282,34 +293,47 @@ void StageModel::layers(engine::Stage & st, const engine::Chunk & c, float * res
     DsparkDump & dd = dspark_dump();
     const bool dspark = dd.f && lb_ <= 37 && le_ >= 40;   // the stage that owns the three DSpark target layers
     if (dspark) dd.hidden.resize((size_t) T * 3 * d);
+    const int tail_n = tail_rows_cfg();   // the tail prefill (item 7): the consumer layers run on the last n rows
+    const auto is_consumer = [&](int l) {   // the layers that read the candidate source's compressed KV
+        return c_.compress_ratio[l] > 0 && l > c_.candidate_source && c_.kv_source_of(l) == c_.candidate_source;
+    };
     for (int l = lb_; l < le_; ++l) {
         sc.release(base);
         const int i = l - lb_;
+        // the tail: the consumer layers (the compressed-KV readers after the candidate source) run on the last
+        // tail_n rows of the prompt chunk; the rows before them are skipped (the SWA window is clipped at the
+        // chunk's start, the reference's "SWA bounded replay").
+        const bool tail = tail_n > 0 && c.stream && is_consumer(l) && T > tail_n;
+        const int Tl = tail ? tail_n : T, sh = T - Tl;
+        float * res_l = res + (size_t) sh * W, * coef_l = row_coef + (size_t) sh * W;
+        const int32_t * tok_l = c.tokens + sh;
+        const int pos_l = c.pos0 + sh;
+        const int clip = sh > 0 ? c.pos0 : 0;   // the window's first position (the skipped rows' ring slots are stale)
         float * y = sc.alloc((size_t) T * d), * x = sc.alloc((size_t) T * d), * out = sc.alloc((size_t) T * d);
         half * x16 = sc.alloc<half>((size_t) T * d);
         st.prof().record(l, 0, g.s);
-        dump(g, "res_in", l, res, T, c_.hc * d + NM, W);
-        if (dspark && l >= 37 && l <= 39) dump_dspark_layer(g, dd, res, W, T, c_.hc, d, l - 37);
-        if (engram_[i]) engram_[i]->forward(g, c.slot, c.tokens, c.pos0, T, res, W), dump(g, "res_eng", l, res, T, c_.hc * d + NM, W);
-        if (dspark_) dspark_->capture(g, c.slot, l, res, W, T);
+        dump(g, "res_in", l, res_l, Tl, c_.hc * d + NM, W);
+        if (dspark && l >= 37 && l <= 39) dump_dspark_layer(g, dd, res_l, W, Tl, c_.hc, d, l - 37);
+        if (engram_[i]) engram_[i]->forward(g, c.slot, tok_l, pos_l, Tl, res_l, W), dump(g, "res_eng", l, res_l, Tl, c_.hc * d + NM, W);
+        if (dspark_) dspark_->capture(g, c.slot, l, res_l, W, Tl, sh);
         // attention
-        hc_attn_[i]->mix(g, res, T, A);
-        hc_attn_[i]->collapse(g, res, row_coef, W, T, y, nullptr);
-        attn_norm_[i]->forward(g, y, T, x, x16);
+        hc_attn_[i]->mix(g, res_l, Tl, A);
+        hc_attn_[i]->collapse(g, res_l, coef_l, W, Tl, y, nullptr);
+        attn_norm_[i]->forward(g, y, Tl, x, x16);
         st.prof().record(l, 1, g.s);
-        dump(g, "attn_in", l, x, T, d, d);
-        attn_[i]->forward(g, c.slot, x, x16, c.pos0, T, out);
-        dump(g, "attn_out", l, out, T, d, d);
+        dump(g, "attn_in", l, x, Tl, d, d);
+        attn_[i]->forward(g, c.slot, x, x16, pos_l, Tl, out, sh, clip);
+        dump(g, "attn_out", l, out, Tl, d, d);
         st.prof().record(l, 2, g.s);
-        hc_attn_[i]->post(g, res, out, A, NM, T);
+        hc_attn_[i]->post(g, res_l, out, A, NM, Tl);
         // FFN
-        hc_ffn_[i]->mix(g, res, T, F);
-        hc_ffn_[i]->collapse(g, res, A, NM, T, y, nullptr);
-        ffn_norm_[i]->forward(g, y, T, x, x16);   // fp32 for the router, fp16 for the projections
-        dump(g, "moe_in", l, x, T, d, d);
-        moe_[i]->forward(g, x, x16, T, out, c.stream, st.moe_ws(), st.moe_rows());
-        dump(g, "moe_out", l, out, T, d, d);
-        hc_ffn_[i]->post(g, res, out, F, NM, T);
+        hc_ffn_[i]->mix(g, res_l, Tl, F);
+        hc_ffn_[i]->collapse(g, res_l, A, NM, Tl, y, nullptr);
+        ffn_norm_[i]->forward(g, y, Tl, x, x16);   // fp32 for the router, fp16 for the projections
+        dump(g, "moe_in", l, x, Tl, d, d);
+        moe_[i]->forward(g, x, x16, Tl, out, c.stream, st.moe_ws(), st.moe_rows());
+        dump(g, "moe_out", l, out, Tl, d, d);
+        hc_ffn_[i]->post(g, res_l, out, F, NM, Tl);
         TRUSS_CUDA(cudaMemcpy2DAsync(row_coef, (size_t) W * 4, F, (size_t) NM * 4, (size_t) NM * 4, T,
                                      cudaMemcpyDeviceToDevice, g.s));
         st.prof().record(l, 6, g.s);

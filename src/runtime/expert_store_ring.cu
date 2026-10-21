@@ -180,8 +180,7 @@ void ExpertStore::admit(const std::vector<std::pair<int, int>> & le, cudaStream_
             Y.adapt_set.assign(Y.n_expert, 0);
             Y.adapt_hits.assign(Y.n_expert, 0);
         }
-        if (adapt_reuse_on_) Y.adapt_set[e] = 1;
-        Y.adapt_hits[e] = 0;
+        if (adapt_reuse_on_) Y.adapt_set[e] = 1, Y.adapt_hits[e] = 0;   // sized only with TRUSS_ADAPT_REUSE
         Y.pend[e] = 1;
         adm_.push_back({ l, e });
         touched[l] = 1;

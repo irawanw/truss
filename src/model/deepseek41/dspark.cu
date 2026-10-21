@@ -15,7 +15,7 @@ namespace truss::deepseek41 {
 
 namespace {
 
-__global__ void capture_kernel(const float * res, int rw, int start, int hc, int dm, int li, int total, half * out)
+__global__ void capture_kernel(const float * res, int rw, int start, int hc, int dm, int li, int total, float * out)
 {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t) total) return;
@@ -23,7 +23,28 @@ __global__ void capture_kernel(const float * res, int rw, int start, int hc, int
     const float * p = res + (size_t) (start + row) * rw;
     float sum = p[j];
     for (int c = 1; c < hc; ++c) sum += p[(size_t) c * dm + j];
-    out[((size_t) row * 3 + li) * dm + j] = __float2half(sum / hc);
+    out[((size_t) row * 3 + li) * dm + j] = sum / hc;
+}
+
+// fp16 copy of the captured rows for main_proj, each row scaled into the fp16 range: some rows (seen on a 21-token
+// prompt; the long prompts keep only later rows) carry
+// residual values far above 65504, which became inf and then NaN in the draft attention (10-21: short prompts
+// crashed the drafter's MoE on garbage expert ids). main_proj has no bias and main_norm (RMSNorm) follows it, so a
+// per-row positive scale leaves the result unchanged (up to eps).
+__global__ void rows_to_half_scaled(const float * x, int cols, half * out)
+{
+    const float * r = x + (size_t) blockIdx.x * cols;
+    __shared__ float red[256];
+    float m = 0.f;
+    for (int j = threadIdx.x; j < cols; j += blockDim.x) m = fmaxf(m, fabsf(r[j]));
+    red[threadIdx.x] = m;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (threadIdx.x < o) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + o]);
+        __syncthreads();
+    }
+    const float s = red[0] > 16384.f ? 16384.f / red[0] : 1.f;
+    for (int j = threadIdx.x; j < cols; j += blockDim.x) out[(size_t) blockIdx.x * cols + j] = __float2half(r[j] * s);
 }
 
 size_t expert_budget(const DSparkWeights & dw, int n_expert)
@@ -102,7 +123,7 @@ DSpark::DSpark(engine::Stage & st, const Config & c, const Weights & w, const DS
     last_norm_ = std::make_unique<blocks::RmsNorm>(lin_, dw_.layers.back().norm, d_.d_model, d_.rms_eps);
     const size_t n = CAP_ROWS, dm = d_.d_model;
     mproj_ = g_.alloc<float>(n * dm), mx_ = g_.alloc<float>(n * dm), kv_ = g_.alloc<float>(n * d_.head_dim);
-    mx16_ = g_.alloc<half>(n * dm), kv16_ = g_.alloc<half>(n * d_.head_dim);
+    mx16_ = g_.alloc<half>(n * dm), kv16_ = g_.alloc<half>(n * d_.head_dim), hid16_ = g_.alloc<half>(n * 3 * dm);
     logits_ = g_.alloc<float>((size_t) d_.block_size * d_.n_vocab);
     me_ = g_.alloc<float>(d_.markov_rank), mbias_ = g_.alloc<float>(d_.n_vocab);
     m16_ = g_.alloc<half>(d_.markov_rank);
@@ -129,7 +150,7 @@ void DSpark::alloc_slots(engine::Stage & st, int n_slots, int, int)
 {
     (void) st;
     sl_.assign(n_slots, Slot {});
-    for (int s = 0; s < n_slots; ++s) sl_[s].cap = g_.alloc<half>((size_t) CAP_ROWS * 3 * d_.d_model);
+    for (int s = 0; s < n_slots; ++s) sl_[s].cap = g_.alloc<float>((size_t) CAP_ROWS * 3 * d_.d_model);
     for (auto & a : attn_) a->alloc(g_, n_slots);
 }
 
@@ -161,14 +182,15 @@ void DSpark::capture(engine::Gpu & g, int slot, int layer, const float * res, in
     sl_[slot].cap_start = row_off + start;   // the chunk's row of the first captured row
 }
 
-void DSpark::seed(engine::Stage & st, int slot, const half * hid, int n, int pos0)
+void DSpark::seed(engine::Stage & st, int slot, const float * hid, int n, int pos0)
 {
     (void) st;
     if (n <= 0) return;
     Scratch & sc = *g_.sc;
     const size_t m = sc.mark();
     const int dm = d_.d_model;
-    lin_.lin(dw_.layers[0].main_proj, hid, n, mproj_);
+    rows_to_half_scaled<<<n, 256, 0, g_.s>>>(hid, 3 * dm, hid16_);
+    lin_.lin(dw_.layers[0].main_proj, hid16_, n, mproj_);
     norm::rms(mproj_, lin_.f32(dw_.layers[0].main_norm), n, dm, d_.rms_eps, mx_, nullptr, g_.s);
     ds41::to_half(mx_, (size_t) n * dm, mx16_, g_.s);
     for (auto & a : attn_) a->seed(g_, slot, mx16_, n, pos0);

@@ -148,8 +148,13 @@ def make_app(engine: Engine) -> FastAPI:
         elif raw is not None:
             ids = await anyio.to_thread.run_sync(engine.chat.encode, raw)
         else:
-            prompt = await anyio.to_thread.run_sync(
-                lambda: engine.chat.prompt(normalize_messages(body["messages"]), tools=tools, template_kwargs=kw))
+            msgs = normalize_messages(body["messages"])
+            if engine.ds41 is not None:   # the official DeepSeek-V4.1 encoder, not a GGUF template
+                prompt, thinking = await anyio.to_thread.run_sync(
+                    lambda: engine.ds41.prompt(msgs, tools=tools, template_kwargs=kw))
+            else:
+                prompt = await anyio.to_thread.run_sync(
+                    lambda: engine.chat.prompt(msgs, tools=tools, template_kwargs=kw))
             ids = await anyio.to_thread.run_sync(engine.chat.encode, prompt)
         if (r := too_long(ids)) is not None:
             return r
@@ -170,13 +175,21 @@ def make_app(engine: Engine) -> FastAPI:
                     return "data: " + json.dumps({"id": rid, "object": "chat.completion.chunk", "created": created,
                                                   "model": engine.name,
                                                   "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}) + "\n\n"
-                split, calls = ThinkSplitter(thinking), ToolStream(tools) if tools else None
+                # DS41 parses its own format (server/ds41.py): the DSML token and </think> by token id, so the
+                # splitter sees the token ids as well as the text deltas
+                ds41 = engine.ds41
+                split = ds41.stream(thinking) if ds41 else ThinkSplitter(thinking)
+                calls = ToolStream(tools) if (tools and not ds41) else None
 
                 def emit(pairs):
                     for kind, x in pairs:
                         yield chunk({"tool_calls": [x]} if kind == "call" else {"content": x})
 
                 def out(pairs):
+                    if ds41:
+                        for kind, x in pairs:
+                            yield chunk({"tool_calls": [x]}) if kind == "call" else chunk({kind: x})
+                        return
                     for field, d in pairs:
                         if field == "content" and calls:
                             yield from emit(calls.push(d))
@@ -197,12 +210,15 @@ def make_app(engine: Engine) -> FastAPI:
                         continue
                     tok, delta, finish = item
                     n_gen += tok is not None
-                    for c in out(split.push(delta)):
+                    for c in out(split.push(tok, delta) if ds41 else split.push(delta)):
                         yield c
                     if finish:
                         for c in out(split.flush()):
                             yield c
-                        if calls:
+                        if ds41:
+                            if split.calls and finish == "stop":
+                                finish = "tool_calls"
+                        elif calls:
                             for c in emit(calls.finish()):
                                 yield c
                             if calls.calls and finish == "stop":
@@ -224,17 +240,23 @@ def make_app(engine: Engine) -> FastAPI:
                 n += 1
             if fin:
                 finish = fin
-        reasoning, content = split_reasoning(text, thinking)
-        found = []
-        if tools:
-            content, found = parse_calls(content, tools)
-        msg = {"role": "assistant", "content": content}
-        if found:
-            msg["tool_calls"] = found
-            if finish == "stop":
+        if engine.ds41 is not None:
+            msg = engine.ds41.parse(text, thinking, finish)
+            if msg.get("tool_calls"):
                 finish = "tool_calls"
-        if reasoning:
-            msg["reasoning_content"] = reasoning
+            msg = {k: v for k, v in msg.items() if v or k in ("role", "content")}
+        else:
+            reasoning, content = split_reasoning(text, thinking)
+            found = []
+            if tools:
+                content, found = parse_calls(content, tools)
+            msg = {"role": "assistant", "content": content}
+            if found:
+                msg["tool_calls"] = found
+                if finish == "stop":
+                    finish = "tool_calls"
+            if reasoning:
+                msg["reasoning_content"] = reasoning
         return JSONResponse({"id": rid, "object": "chat.completion", "created": created, "model": engine.name,
                              "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
                              "usage": {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n}})

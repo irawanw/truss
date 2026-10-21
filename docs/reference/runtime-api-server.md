@@ -184,6 +184,24 @@ last `penalty_last_n` tokens (default 64, llama-server's and Strata's) of the en
 `penalty_last_n` −1, every token this request generated (vLLM's rule, which Qwen's `presence_penalty` 0-2 advice
 assumes), capped at 4,096. Tested by `tests/server/penalty_history_test.py` (host, a fake model checks the history
 at every call, plain and speculative, both rules).
+**DeepSeek-V4.1 (`server/ds41.py`, `server/encoding.py`).** The GGUF has no chat template: when
+`general.architecture == "deepseek41"` (`engine.py`) the prompt and the reply go through DeepSeek's **official**
+V4.1 encoder, vendored verbatim as `server/encoding.py` (MIT, stdlib only, from
+huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017 `encoding/`; DeepInfer loads the same file from the checkpoint):
+`encode_messages` (turns, thinking markers, numeric reasoning effort, the tool schemas), the DSML tool-call markup
+(`<｜DSML｜ calls>` / `invoke` / `parameter`) and `parse_message_from_completion_text`. `ds41.py` adapts it:
+`Ds41Chat.prompt()` (OpenAI messages → the encoder; `enable_thinking` / `reasoning_effort` from
+`chat_template_kwargs`), `Ds41Chat.parse()` (the official parser; `_lenient` for output it refuses — a length stop in
+thinking mode before `</think>` is all `reasoning_content`, as the stream reports it), `with_ids()` (OpenAI tool calls
+need an `id` the tool result answers; the official converter leaves it out), `Ds41Stream` (`</think>` and the DSML token
+detected by token id, the tool name emitted as soon as its invoke tag closes). `<｜end▁of▁sentence｜>` joins the stop
+ids, and the prompt-end checkpoint sits before the last `<｜Assistant｜>` (the Qwen marker `<|im_start|>` never occurs in a DS41 prompt, so before 10-21 nothing was checkpointed and a tool-result follow-up re-read the whole history: 410 of 410 tokens). Host test: `python3 tests/server/ds41_encoding_test.py`. Launch: `scripts/serve_ds41.sh` (port 8115, name
+`ds41-flash`, pm2 app `truss-ds41` under the GPU watchdog `run_watched2.sh 0 2`). Measured on the served config
+(10-21, warm): decode 41.9 tok/s at temperature 0.3 (63 of 85 drafts accepted), 27.7 tok/s at 0.6; a prompt chunk
+costs ~5.3 s + ~0.4 ms/token (2,769 tokens 6.4 s, 5,195 tokens 7.4 s = 703 tok/s), the fetch path ~43 ms/token, so
+`TRUSS_FETCH_PROMPT=96`. The first requests after a load paid a one-time 35-45 s (cause not diagnosed); the launch
+script sends a background warm-up request once `/health` answers.
+
 **Context full.** A prompt of n_ctx tokens or more gets llama-server's 400 before any response starts
 (`exceed_context_size_error`, "the request exceeds the available context size, try increasing it", with
 `n_prompt_tokens` and `n_ctx`); omp matches that message and compacts. An engine error after the stream started is

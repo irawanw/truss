@@ -84,6 +84,7 @@ int main(int argc, char ** argv)
             const double pms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - p0).count();
             std::printf("  prefill %d tokens: %.0f ms (%.0f tok/s)\n", n, pms, 1e3 * n / pms);
             const runtime::ExpertStore::Stats st0 = f.experts()->stats();
+            const long cpu0 = f.experts()->cpu_experts();
             std::vector<double> ms;
             int pos = n;
             for (int i = 0; i < steps; ++i) {
@@ -107,9 +108,14 @@ int main(int argc, char ** argv)
                         pass ? "timed" : "warm-up", n, steps, sum / steps, 1e3 * steps / sum, sorted[steps / 2], sorted[0],
                         sorted[steps - 1]);
             const runtime::ExpertStore::Stats & st = f.experts()->stats();
-            std::printf("  per step: %.1f cold experts routed, %.1f fetched (%.1f MB)\n",
+            std::printf("  per step: %.1f cold experts routed, %.1f fetched (%.1f MB), %.1f adapt admissions (%.1f MB), "
+                        "%.1f CPU experts\n",
                         (double) (st.experts_asked - st0.experts_asked) / steps, (double) (st.misses - st0.misses) / steps,
-                        (st.bytes - st0.bytes) / 1e6 / steps);
+                        (st.bytes - st0.bytes) / 1e6 / steps,
+                        (double) (st.adapt_copies - st0.adapt_copies) / steps,
+                        (st.adapt_bytes - st0.adapt_bytes) / 1e6 / steps,
+                        (double) (f.experts()->cpu_experts() - cpu0) / steps);
+            std::printf("  %s\n", f.experts()->adapt_reuse_report().c_str());
         }
         return 0;
     } catch (const std::exception & e) {
