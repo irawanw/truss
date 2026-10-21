@@ -17,7 +17,7 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 # the model: the served dense GGUF + the X3.1 expert/Engram overlays (#118), as data/e14g_cpu.sh and item 9
 export TRUSS_EXPERT_OVERLAY="$T/data/pack/ds41-experts.gguf,$T/data/pack/ds41-engram-L1.gguf,$T/data/pack/ds41-engram-L14.gguf,$T/data/pack/ds41-dense-x3.gguf"
 export TRUSS_DSPARK_EXPERT_OVERLAY="$T/data/drafter/ds41-dspark-experts.gguf"
-export TRUSS_LAYER_SPLIT=${TRUSS_LAYER_SPLIT:-14} TRUSS_LAYER_SPLIT_DEVICE=1   # a bench run may override the split
+export TRUSS_LAYER_SPLIT=${TRUSS_LAYER_SPLIT:-20} TRUSS_LAYER_SPLIT_DEVICE=1   # a bench run may override the split
 # skip 0.10 (TRACKER #224, arms bench 8-9 KL seqs on the served path): 0.20 KL 0.104-0.107 (over the 0.0728 budget),
 # 0.15 0.081, 0.10 0.069-0.070, 0.05 0.069, 0 0.073; decode 36 -> ~27-28 tok/s. The old 0.0687 (#218) was ds41_kl, not serving.
 # the CPU tier (E14): pinned RAM threads, the 42 GB/s trellis, the per-layer adaptation of the resident set
