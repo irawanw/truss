@@ -209,9 +209,9 @@ class Bench:
                 print(line, flush=True)
 
     # ---- recall task
-    def recall_task(self, ids, n_target):
+    def recall_task(self, ids, n_target, name="recall"):
         P = len(ids) - n_target
-        print(f"task recall: {P} prompt tokens + {n_target} copied tokens teacher-forced", flush=True)
+        print(f"task {name}: {P} prompt tokens + {n_target} copied tokens teacher-forced", flush=True)
         self.m.reset()
         self.m.eval(ids[:P - 1])
         self.m.checkpoint()
@@ -232,10 +232,10 @@ class Bench:
                 if j + 1 < n_target:
                     lg = self.m.eval([t])
             top1 = hit / n_target
-            self.res[arm["name"]]["tasks"]["recall"] = dict(top1=top1, nll=nll / n_target)
+            self.res[arm["name"]]["tasks"][name] = dict(top1=top1, nll=nll / n_target)
             print(f"  {arm['name']:>14}: recall top-1 {100 * top1:.1f}%, nll {nll / n_target:.3f}", flush=True)
             if top1 < self.a.recall_min:
-                self.bad(arm, f"recall top-1 {100 * top1:.1f}% < {100 * self.a.recall_min:.0f}% (attention to earlier "
+                self.bad(arm, f"{name} top-1 {100 * top1:.1f}% < {100 * self.a.recall_min:.0f}% (attention to earlier "
                               f"prompt chunks broken?)")
 
     # ---- KL task
@@ -294,7 +294,7 @@ class Bench:
               "routed / fetched / MB / CPU misses)")
         base_kl = None
         for name, R in self.res.items():
-            T = {k: v for k, v in R["tasks"].items() if k not in ("kl", "recall")}
+            T = {k: v for k, v in R["tasks"].items() if k != "kl" and not k.startswith("recall")}
             reps = []
             for r in range(self.a.repeat):
                 tok = sum(v["runs"][r]["tokens"] for v in T.values() if len(v["runs"]) > r)
@@ -318,14 +318,14 @@ class Bench:
                 S["kl"], S["top1"] = float(np.mean(kl["kl"])), 100 * kl["agree"] / kl["n"]
                 base_kl = S["kl"] if base_kl is None else base_kl
             if not runs:   # only recall / kl ran
-                print(f"{name:>14}:" + (f"  recall {100 * R['tasks']['recall']['top1']:.1f}%" if "recall" in R["tasks"] else "")
+                print(f"{name:>14}:" + "".join(f"  {k} {100 * v['top1']:.1f}%" for k, v in R["tasks"].items() if k.startswith("recall"))
                       + (f"  KL {S['kl']:.4f} ({S['kl'] - base_kl:+.4f}) top-1 {S['top1']:.1f}%" if "kl" in S else "")
                       + ("  HEALTH FAIL" if R["health"] else "  ok"))
                 continue
             print(f"{name:>14}: spec {S['spec_tps']:5.1f} [{S['spread'][0]:.1f}-{S['spread'][1]:.1f}]  plain "
                   f"{S['plain_tps']:5.1f}  {S['tokens_per_pass']:.2f} tok/pass  per pass {cnt[0]:.0f}/{cnt[1]:.1f}/"
                   f"{cnt[2] / 1e6:.0f}/{cnt[5]:.1f}  ties {S['ties']} disagree {S['disagree']}"
-                  + (f"  recall {100 * R['tasks']['recall']['top1']:.1f}%" if "recall" in R["tasks"] else "")
+                  + "".join(f"  {k} {100 * v['top1']:.1f}%" for k, v in R["tasks"].items() if k.startswith("recall"))
                   + (f"  KL {S['kl']:.4f} ({S['kl'] - base_kl:+.4f}) top-1 {S['top1']:.1f}%" if "kl" in S else "")
                   + ("  " + " ".join(f"PP[{k}] {v:.0f}" for k, v in S["prefill"].items()))
                   + ("  HEALTH FAIL" if R["health"] else "  ok"))
@@ -362,19 +362,29 @@ LONG_FILES = ["server/app.py", "server/engine.py", "server/generate.py", "server
               "server/ds41.py", "server/truss_ctypes.py"]   # ~21K tokens: 3 chunks
 
 
-def recall_prompt(a, tok):
+def recall_prompt(a, tok, ctx=0):
     """raw text: every LONG_FILES file in a code block, then the first one again, cut after a.recall tokens; each
-    piece encoded on its own so the repeat is the first copy's exact ids. Frozen in --prompts like the others."""
-    path = os.path.join(a.prompts, "arms_recall.i32")
+    piece encoded on its own so the repeat is the first copy's exact ids. ctx > 0 (tasks recall60 / recall90): more
+    distinct repo files (src/, sorted) between them until the prompt reaches ~ctx K tokens, so the copy source sits
+    that far back (long-context attention: 10-21 the agent looped only past ~60K). Frozen in --prompts like the others."""
+    path = os.path.join(a.prompts, f"arms_recall{ctx or ''}.i32")
     if not os.path.exists(path):
         repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
-        files = [tok.encode(open(os.path.join(repo, f)).read()) for f in LONG_FILES]
+        names = list(LONG_FILES)
+        if ctx:
+            names += sorted(os.path.relpath(os.path.join(d, f), repo) for d, _, fs in os.walk(os.path.join(repo, "src"))
+                            for f in fs if f.endswith((".cu", ".cc", ".h", ".cuh")))
         ids = [tok.token_id("<｜begin▁of▁sentence｜>")]
-        for f, body in zip(LONG_FILES, files):
+        first = None
+        for f in names:
+            body = tok.encode(open(os.path.join(repo, f)).read().replace("<｜", "<|"))
+            first = body if first is None else first
             ids += tok.encode(f"File {f}:\n```\n") + body + tok.encode("```\n\n")
-        ids += tok.encode(f"File {LONG_FILES[0]} again, unchanged:\n```\n") + files[0][:a.recall]
+            if len(ids) >= ctx * 1000 - a.recall - 64 and (ctx or f == names[len(LONG_FILES) - 1]):
+                break
+        ids += tok.encode(f"File {LONG_FILES[0]} again, unchanged:\n```\n") + first[:a.recall]
         np.asarray(ids, dtype=np.int32).tofile(path)
-        print(f"wrote {path}", flush=True)
+        print(f"wrote {path} ({len(ids)} tokens)", flush=True)
     return [int(x) for x in np.fromfile(path, dtype=np.int32)]
 
 
@@ -436,8 +446,8 @@ def main():
     for t in tasks:
         if t == "kl":
             b.kl_task()
-        elif t == "recall":
-            b.recall_task(recall_prompt(a, tok), a.recall)
+        elif t.startswith("recall"):   # recall (~21K), recall60, recall90: the copy source ~N K tokens back
+            b.recall_task(recall_prompt(a, tok, int(t[6:] or 0)), a.recall, t)
         elif t in prompts:
             b.prompt_task(t, prompts[t])
         else:
