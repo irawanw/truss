@@ -4,6 +4,7 @@
 #include "runtime/expert_store.h"
 
 #include "core/cuda_check.h"
+#include "runtime/cold_keep.h"
 #include "runtime/expert_store_util.h"
 
 #include <algorithm>
@@ -96,11 +97,25 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
         host_region_bytes_ += align_up(layers_[l].cold, 4096);
         cold_total_ += layers_[l].cold;
     }
+    // TRUSS_COLD_KEEP (cold_keep.h): the copy is a memfd a keeper process holds between runs; a hit maps it filled
+    const std::string keep = host_region_bytes_ ? cold_keep::socket_path() : std::string();
+    uint64_t keep_slot = 0, keep_key = 0;
+    int keep_fd = -1;
+    bool kept = false;
+    if (!keep.empty() && cold_keep_ids(layers, hot, host_region_bytes_, keep_slot, keep_key)) {
+        keep_fd = cold_keep::get(keep, keep_slot, keep_key, host_region_bytes_);
+        kept = keep_fd >= 0;
+        if (!kept) keep_fd = memfd_create("truss-cold", MFD_CLOEXEC);
+        if (!kept && keep_fd >= 0 && ftruncate(keep_fd, (off_t) host_region_bytes_) != 0) close(keep_fd), keep_fd = -1;
+    }
     if (host_region_bytes_) {
-        void * m = mmap(nullptr, host_region_bytes_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        void * m = keep_fd >= 0 ? mmap(nullptr, host_region_bytes_, PROT_READ | PROT_WRITE, MAP_SHARED, keep_fd, 0)
+                                : mmap(nullptr, host_region_bytes_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (m == MAP_FAILED) throw std::runtime_error("ExpertStore: mmap of the cold copy failed");
         madvise(m, host_region_bytes_, MADV_NOHUGEPAGE);   // THP faults compact this fragmented box: 8 GB took 31 s
         host_region_ = static_cast<uint8_t *>(m);
+        kept_ = kept;
+        if (kept) std::fprintf(stderr, "expert store: cold copy %.2f GB mapped from the keeper\n", host_region_bytes_ / 1e9);
     }
     struct Hot {   // a layer's hot experts: one contiguous device run in expert order
         uint8_t * dev = nullptr;
@@ -159,14 +174,17 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
         std::vector<std::atomic<int>> layer_left(L);
         for (auto & a : layer_left) a = 2;
         std::vector<std::string> errs(T);
-        auto copy_part = [&](int l, int e, uint8_t * dst) {   // expert e of layer l as [gate | up | down]
+        constexpr size_t BOUNCE = 16u << 20;   // per worker, O_DIRECT (TRUSS_LOAD_DIRECT=0: off); ~3 MB projections
+        auto copy_part = [&](int l, int e, uint8_t * dst, void * bounce) {   // expert e of layer l as [gate | up | down]
             for (int p = 0; p < 3; ++p) {
                 const formats::ExpertTable & t = *layers[l][p];
                 const uint8_t * from = reinterpret_cast<const uint8_t *>(t.trellis->data) + t.offset[e] * 2;
-                // pread from the shard: no faults, no file pages mapped (through the mapping, 16 workers had ~16
-                // layers of file pages resident at once)
-                if (!gguf::read_mapped(from, proj_bytes(t, e), dst + layers_[l].part[p][e])) {
-                    std::memcpy(dst + layers_[l].part[p][e], from, proj_bytes(t, e));
+                // O_DIRECT (no page cache, which the load's resident peak counted) else a buffered pread: no
+                // faults, no file pages mapped (through the mapping, 16 workers held ~16 layers of file pages)
+                uint8_t * to = dst + layers_[l].part[p][e];
+                if (!(bounce && gguf::read_direct(from, proj_bytes(t, e), to, bounce, BOUNCE)) &&
+                    !gguf::read_mapped(from, proj_bytes(t, e), to)) {
+                    std::memcpy(to, from, proj_bytes(t, e));
                     release_range(from, proj_bytes(t, e));
                 }
             }
@@ -175,6 +193,9 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
             cudaStream_t st = nullptr;
             uint8_t * stage[2] = {};
             cudaEvent_t done[2] = {};
+            void * bounce = nullptr;
+            static const bool direct = !std::getenv("TRUSS_LOAD_DIRECT") || std::atoi(std::getenv("TRUSS_LOAD_DIRECT"));
+            if (direct && posix_memalign(&bounce, gguf::DIRECT_ALIGN, BOUNCE) != 0) bounce = nullptr;
             try {
                 for (;;) {
                     const int j = next.fetch_add(1);
@@ -182,8 +203,8 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
                     const int l = j / 2;
                     const Layer & Y = layers_[l];
                     if (j % 2 == 0) {
-                        for (int e = 0; e < Y.n_expert; ++e)
-                            if (Y.cold_off[e] >= 0) copy_part(l, e, host_region_ + region_at[l] + Y.cold_off[e]);
+                        for (int e = 0; e < Y.n_expert && !kept; ++e)
+                            if (Y.cold_off[e] >= 0) copy_part(l, e, host_region_ + region_at[l] + Y.cold_off[e], bounce);
                     } else if (!hot_run[l].experts.empty()) {
                         if (!st) {
                             TRUSS_CUDA(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
@@ -204,7 +225,7 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
                         for (int e : hot_run[l].experts) {
                             if (Y.bytes[e] > STAGE) throw std::runtime_error("ExpertStore: expert larger than the load stage");
                             if (fill + Y.bytes[e] > STAGE) flush();
-                            copy_part(l, e, stage[b] + fill);
+                            copy_part(l, e, stage[b] + fill, bounce);
                             fill += Y.bytes[e];
                         }
                         flush();
@@ -226,6 +247,7 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
                 if (done[b]) cudaEventDestroy(done[b]);
             }
             if (st) cudaStreamDestroy(st);
+            std::free(bounce);
         };
         const auto t0 = std::chrono::steady_clock::now();
         int dev = 0;
@@ -238,7 +260,15 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
             });
         for (auto & th : pool) th.join();
         for (const std::string & m : errs)
-            if (!m.empty()) throw std::runtime_error("ExpertStore load: " + m);
+            if (!m.empty()) {
+                if (keep_fd >= 0) close(keep_fd);
+                throw std::runtime_error("ExpertStore load: " + m);
+            }
+        if (keep_fd >= 0) {   // only a finished fill is handed over; the mapping outlives the fd
+            if (!kept && cold_keep::put(keep, keep_slot, keep_key, host_region_bytes_, keep_fd))
+                std::fprintf(stderr, "expert store: cold copy %.2f GB handed to the keeper\n", host_region_bytes_ / 1e9);
+            close(keep_fd);
+        }
         if (std::getenv("TRUSS_LOAD_TIMES"))
             std::fprintf(stderr, "load ExpertStore: %d workers copied %.2f GB cold + uploaded the hot set in %.2f s\n", T,
                          cold_total_ / 1e9, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
@@ -263,39 +293,6 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
             device_bytes_ += 2 * sizeof(int32_t) * 2 * E + t.suh->bytes + t.svh->bytes;
         }
     }}
-
-void ExpertStore::start_pinning()
-{
-    // Page-locking the cold copy (~0.08 s/GB, serialized in the driver: ~3 s here) runs in the background, layer by
-    // layer; the owner starts it after its own setup, since it holds the driver lock that cudaMalloc / cudaMemcpy /
-    // cudaHostAlloc also take. Until a layer is registered its copies are pageable (synchronous on the issuing
-    // thread, slower), never wrong; wait_pinned() blocks until all are done (the benches call it before timing).
-    if (reg_thread_.joinable() || reg_ok_) return;
-    const int L = (int) layers_.size();
-    reg_ok_.reset(new std::atomic<uint8_t>[L]);
-    for (int l = 0; l < L; ++l) reg_ok_[l] = 0;
-    int dev = 0;
-    TRUSS_CUDA(cudaGetDevice(&dev));
-    reg_thread_ = std::thread([this, dev, L] {
-        cudaSetDevice(dev);
-        const auto r0 = std::chrono::steady_clock::now();
-        for (int l = 0; l < L && !reg_stop_; ++l) {
-            const Layer & Y = layers_[l];
-            if (!Y.cold) continue;
-            const cudaError_t e = cudaHostRegister(const_cast<uint8_t *>(Y.host), align_up(Y.cold, 4096),
-                                                   cudaHostRegisterDefault);
-            if (e != cudaSuccess) {   // the copies stay pageable: slower, still right
-                std::fprintf(stderr, "ExpertStore: cudaHostRegister of layer %d failed (%s); its copies stay pageable\n", l,
-                             cudaGetErrorString(e));
-                continue;
-            }
-            reg_ok_[l] = 1;
-        }
-        if (std::getenv("TRUSS_LOAD_TIMES"))
-            std::fprintf(stderr, "load ExpertStore: cold copy page-locked in the background in %.2f s\n",
-                         std::chrono::duration<double>(std::chrono::steady_clock::now() - r0).count());
-    });
-}
 
 ExpertStore::~ExpertStore()
 {
@@ -485,12 +482,6 @@ void ExpertStore::release(int l, cudaStream_t compute)
 {
     TRUSS_CUDA(cudaEventRecord(released_[l % 2], compute));
     released_recorded_[l % 2] = true;
-}
-
-void ExpertStore::wait_pinned()
-{
-    start_pinning();
-    if (reg_thread_.joinable()) reg_thread_.join();
 }
 
 }  // namespace truss::runtime

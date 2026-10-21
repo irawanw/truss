@@ -286,6 +286,7 @@ private:
     std::vector<void *> device_, pinned_;
     uint8_t * host_region_ = nullptr;                              // every layer's cold copy: anonymous, registered
     size_t host_region_bytes_ = 0;
+    bool kept_ = false;                                            // host_region_ maps the keeper's copy (cold_keep.h)
     std::unique_ptr<std::atomic<uint8_t>[]> reg_ok_;               // [layer] its cold copy is page-locked
     std::thread reg_thread_;                                       // page-locks the cold copy after the constructor
     std::atomic<bool> reg_stop_{ false };

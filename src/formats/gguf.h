@@ -67,6 +67,17 @@ using Value = std::variant<int64_t, double, bool, std::string, std::vector<int64
 // of an open File or a read fails (the caller then copies through the mapping). Thread-safe.
 bool read_mapped(const void * p, size_t n, void * dst);
 
+// read_mapped() through an O_DIRECT descriptor of the shard (no page cache: the buffered path's 128 KiB readahead
+// pulled ~1.1 GB/s from an NVMe that does ~3.5): the aligned window around [p, p + n) is read into bounce
+// (DIRECT_ALIGN-aligned, bounce_bytes at least 2 * DIRECT_ALIGN; one read per bounce_bytes) and the n bytes copied to
+// dst. False as read_mapped(), or if the file system refuses O_DIRECT (the caller falls back). Thread-safe.
+constexpr size_t DIRECT_ALIGN = 4096;
+bool read_direct(const void * p, size_t n, void * dst, void * bounce, size_t bounce_bytes);
+
+// Where p (inside a mapping of an open File) comes from, stable across processes: file = a hash of the shard's path,
+// size and mtime, offset = p's byte offset in it. False if p is in no mapping. Keys the kept cold copy (cold_keep.h).
+bool span_ident(const void * p, uint64_t & file, uint64_t & offset);
+
 class File {
 public:
     // path: a single-file model or any shard of a split one ("...-0000N-of-0000M.gguf"); every shard is opened.

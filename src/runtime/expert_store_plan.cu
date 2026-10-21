@@ -1,12 +1,18 @@
 // ExpertStore sizing and the hot-set plan (static members): how many experts of which layers stay resident in a
-// VRAM budget, and the usage file reader.
+// VRAM budget, and the usage file reader. Also the background page-locking of the cold copy (start/wait_pinned).
 #include "runtime/expert_store.h"
 #include "runtime/expert_store_util.h"
 
+#include "core/cuda_check.h"
+
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <numeric>
+#include <thread>
+#include <sys/mman.h>
 
 namespace truss::runtime {
 
@@ -147,6 +153,48 @@ std::vector<float> ExpertStore::load_usage(const std::string & path, int n_layer
         throw std::runtime_error("ExpertStore::load_usage: " + path + " is not " + std::to_string(n_layer) + " x " +
                                  std::to_string(n_expert) + " float32");
     return u;
+}
+
+void ExpertStore::start_pinning()
+{
+    // Page-locking the cold copy (~0.08 s/GB, serialized in the driver: ~3 s here) runs in the background, layer by
+    // layer; the owner starts it after its own setup, since it holds the driver lock that cudaMalloc / cudaMemcpy /
+    // cudaHostAlloc also take. Until a layer is registered its copies are pageable (synchronous on the issuing
+    // thread, slower), never wrong; wait_pinned() blocks until all are done (the benches call it before timing).
+    if (reg_thread_.joinable() || reg_ok_) return;
+    const int L = (int) layers_.size();
+    reg_ok_.reset(new std::atomic<uint8_t>[L]);
+    for (int l = 0; l < L; ++l) reg_ok_[l] = 0;
+    int dev = 0;
+    TRUSS_CUDA(cudaGetDevice(&dev));
+    reg_thread_ = std::thread([this, dev, L] {
+        cudaSetDevice(dev);
+        const auto r0 = std::chrono::steady_clock::now();
+        for (int l = 0; l < L && !reg_stop_; ++l) {
+            const Layer & Y = layers_[l];
+            if (!Y.cold) continue;
+            // a kept copy (cold_keep.h) is filled but has no page tables in this process: populating them first,
+            // outside the driver lock, took the register of 61 GB 17.9 -> 7.5 s, which a first request waits behind
+            if (kept_) madvise(const_cast<uint8_t *>(Y.host), align_up(Y.cold, 4096), 23 /* MADV_POPULATE_WRITE */);
+            const cudaError_t e = cudaHostRegister(const_cast<uint8_t *>(Y.host), align_up(Y.cold, 4096),
+                                                   cudaHostRegisterDefault);
+            if (e != cudaSuccess) {   // the copies stay pageable: slower, still right
+                std::fprintf(stderr, "ExpertStore: cudaHostRegister of layer %d failed (%s); its copies stay pageable\n", l,
+                             cudaGetErrorString(e));
+                continue;
+            }
+            reg_ok_[l] = 1;
+        }
+        if (std::getenv("TRUSS_LOAD_TIMES"))
+            std::fprintf(stderr, "load ExpertStore: cold copy page-locked in the background in %.2f s\n",
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - r0).count());
+    });
+}
+
+void ExpertStore::wait_pinned()
+{
+    start_pinning();
+    if (reg_thread_.joinable()) reg_thread_.join();
 }
 
 }  // namespace truss::runtime

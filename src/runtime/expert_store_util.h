@@ -1,6 +1,7 @@
 // ExpertStore internals shared by its implementation files (expert_store*.cu): sizes, offsets, page release.
 #pragma once
 #include "core/cuda_check.h"
+#include "formats/gguf.h"
 #include "runtime/expert_store.h"
 
 #include <climits>
@@ -71,6 +72,30 @@ inline int32_t unit_offset(const uint8_t * at, const uint8_t * base, int layer)
     if (u < INT_MIN || u > INT_MAX)
         throw std::runtime_error("ExpertStore: layer " + std::to_string(layer) + " expert offset exceeds int32 units");
     return (int32_t) u;
+}
+
+// The kept cold copy's ids (cold_keep.h): slot = where every layer's projections come from (file identity + offset,
+// expert count), key = slot + the cold expert set + the copy's size. False if a projection is in no open mapping.
+inline bool cold_keep_ids(const std::vector<ExpertLayer> & layers, const ExpertStore::HotSet & hot, size_t bytes,
+                          uint64_t & slot, uint64_t & key)
+{
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](uint64_t v) {
+        for (int i = 0; i < 8; ++i) h = (h ^ ((v >> (8 * i)) & 0xff)) * 1099511628211ull;
+    };
+    for (size_t l = 0; l < layers.size(); ++l)
+        for (int p = 0; p < 3; ++p) {
+            uint64_t file = 0, off = 0;
+            if (!gguf::span_ident(layers[l][p]->trellis->data, file, off)) return false;
+            mix(file), mix(off), mix((uint64_t) layers[l][p]->n_expert);
+        }
+    slot = h;
+    mix(bytes);
+    for (size_t l = 0; l < hot.size(); ++l)
+        for (size_t e = 0; e < hot[l].size(); ++e)
+            if (!hot[l][e]) mix(l << 32 | e);
+    key = h;
+    return true;
 }
 
 }  // namespace truss::runtime::store_detail

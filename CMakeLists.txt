@@ -28,6 +28,7 @@ option(TRUSS_LLAMA_REF "build the targets that link llama-paw's ggml" ${_truss_l
 # ---- formats: model file readers (host only)
 add_library(truss_formats STATIC
   src/formats/gguf.cc
+  src/formats/gguf_io.cc
   src/formats/trellis_table.cc)
 target_include_directories(truss_formats PUBLIC src)
 target_compile_options(truss_formats PRIVATE -Wall -Wextra)
@@ -93,6 +94,7 @@ add_library(truss_engine STATIC
   src/blocks/attn_gqa.cu
   src/blocks/attn_ds41.cu
   src/blocks/engram.cu
+  src/runtime/cold_keep.cc
   src/runtime/expert_store.cu
   src/runtime/expert_store_plan.cu
   src/runtime/expert_store_ring.cu
@@ -192,6 +194,8 @@ add_executable(ple_reader_test tests/unit/ple_reader_test.cc)
 target_link_libraries(ple_reader_test PRIVATE truss_models)
 add_executable(gemv_multi_test tests/unit/gemv_multi_test.cu)
 target_link_libraries(gemv_multi_test PRIVATE truss_kernels)
+add_executable(read_direct_test tests/unit/read_direct_test.cc)
+target_link_libraries(read_direct_test PRIVATE truss_models)
 add_executable(ds41_ops_test tests/unit/ds41_ops_test.cu)
 target_link_libraries(ds41_ops_test PRIVATE truss_kernels)
 add_executable(hc_fuse_test tests/unit/hc_fuse_test.cu)

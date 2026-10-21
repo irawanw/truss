@@ -5,7 +5,7 @@ is memory-mapped and every consumer reads through pointers into the mapping.
 
 ---
 
-## `src/formats/gguf.h`, `gguf.cc` — GGUF v3 reader
+## `src/formats/gguf.h`, `gguf.cc`, `gguf_io.cc` / `gguf_io.h` — GGUF v3 reader
 
 **What.** Opens a single-file or split (`...-0000N-of-0000M.gguf`) model, maps every shard read-only, parses header,
 metadata and tensor infos with bounds checks, and exposes one catalog.
@@ -25,6 +25,9 @@ metadata and tensor infos with bounds checks, and exposes one catalog.
 | `overlaid()` | number of tensor names replaced so far |
 | `shard_paths()` | the shard files in order |
 | `type_info(Type)` | `{name, block, bytes}` per ggml type, nullptr if unknown |
+| `gguf::read_mapped(p, n, dst)` | copies n bytes at p (inside a mapping of an open File) to dst with a buffered `pread` on that shard: no faults, no mapped file pages. False if p is in no mapping (caller copies through the mapping) |
+| `gguf::read_direct(p, n, dst, bounce, bounce_bytes)` | the same through an `O_DIRECT` descriptor of the shard (opened on first use): the `DIRECT_ALIGN` (4 KiB) window around the span is read into `bounce` (aligned, at least 2 × 4 KiB; one read per `bounce_bytes`) and the span copied out. No page cache. False as above or if the file system refuses `O_DIRECT`. Used by the ExpertStore cold-copy load (`TRUSS_LOAD_DIRECT=0`: off) |
+| `gguf::span_ident(p, file, offset)` | p's origin, stable across processes: `file` = FNV hash of the shard's path, size and mtime, `offset` = byte offset in it. Keys the kept cold copy (`runtime/cold_keep.h`) |
 
 **`Tensor` fields.** `name`, `type` (`gguf::Type`, ggml numbering, e.g. `Q8_0 = 8`, `I16 = 25`), `shape` (**ggml
 order: `shape[0]` is the contiguous dimension**, so a matrix with `out` rows of `in` weights has `shape = {in,
@@ -46,7 +49,14 @@ to `general.alignment` (default 32) and inside the shard; for split files `split
 `split.tensors.count` equals the tensors found; integer metadata widened to int64 (uint64 values above INT64_MAX are
 rejected); metadata comes from shard 0.
 
-**Tested by.** `tests/unit/gguf_reader_check.py` (every tensor's name, type, shape, shard, offset, bytes vs
+**Mapping registry (`gguf_io.cc`).** `File::add_shard` registers each mapping (address range, fd, path, identity);
+`read_mapped` / `read_direct` / `span_ident` look the pointer up there (a mutex; the O_DIRECT fd is opened lazily and
+closed when the shard unmaps). On this box (970 EVO Plus held at power state 1 since the 10-21 freezes) both read
+paths run at the disk's ~1 GB/s; direct avoids filling ~50 GB of page cache during a DS41 load, which had made the
+cold copy's page-locking take 53 s instead of ~8.
+
+**Tested by.** `read_direct_test <gguf>` (400 random spans of 1 B - 3 MiB + 4 KiB at odd destination offsets and the
+file's last bytes, memcmp vs the mapping; then the direct vs buffered read rate), `tests/unit/gguf_reader_check.py` (every tensor's name, type, shape, shard, offset, bytes vs
 llama-paw's gguf-py, through `tk-pack-inspect list`), TRACKER #29.
 
 **Change it.** A new ggml type: add it to `enum class Type` and the `type_info` table. Nothing else parses GGUF.

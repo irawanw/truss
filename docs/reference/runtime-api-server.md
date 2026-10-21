@@ -2,7 +2,7 @@
 
 ---
 
-## `src/runtime/expert_store.h`, `expert_store.cu` (core, stream mode), `expert_store_plan.cu` (sizes, hot-set plan), `expert_store_ring.cu` (decode ring, fetch, admission), `expert_store_util.h` — which experts live where
+## `src/runtime/expert_store.h`, `expert_store.cu` (core, stream mode, load), `expert_store_plan.cu` (sizes, hot-set plan, page-locking), `cold_keep.{h,cc}` (kept cold copy), `expert_store_ring.cu` (decode ring, fetch, admission), `expert_store_util.h` — which experts live where
 
 **Hot-set ranking (TRACKER #90).** `plan()` ranks by `usage / bytes^Sizes::plan_alpha` (default 0: by usage). Per byte
 (alpha 1, the old rule) is the knapsack optimum for the profile's own counts, but on real 256K routing that set covered
@@ -23,6 +23,24 @@ for them. The rest (cold, ~24 GB) must come over PCIe (13.5 GB/s pinned, x8) whe
 FIFO cache of recently fetched cold experts, or, during a prompt chunk, two whole-layer stream slots plus the chunk's
 own large buffers (`spare()`: Forward's prefill scratch, `moe::prefill` workspace, residual). *host*: every cold
 expert in pinned memory, per layer `[expert: gate | up | down]` in expert order.
+
+**Load (cold copy).** The host copy is one mapping filled by `TRUSS_LOAD_THREADS` (16) workers, each layer's cold
+experts one job and its hot run another (32 MB pinned staging to the device); reads are `gguf::read_direct` (O_DIRECT,
+16 MB bounce per worker) falling back to `read_mapped`. Page-locking (`start_pinning`, `expert_store_plan.cu`) runs
+afterwards in a background thread, layer by layer: until a layer is registered its copies are pageable, never wrong.
+The thread holds the driver lock while it registers, so a request in that window is slower.
+
+**Kept cold copy (`TRUSS_COLD_KEEP=<socket>`, `src/runtime/cold_keep.{h,cc}`, `tools/cold_keeper.py`).** The host copy
+is then a `memfd` that a keeper process holds between engine runs. At load the store asks the keeper for its *slot*
+(hash of every layer projection's file identity + offset + expert count, `store_detail::cold_keep_ids`) with a *key*
+(slot + copy size + the cold expert set). A hit maps the memfd (`MAP_SHARED`): no cold reads. Then `start_pinning`
+populates the page tables (`MADV_POPULATE_WRITE`, outside the driver lock) before each register. A miss fills a new
+memfd as usual and hands it over (`PUT`) only after the whole fill succeeded. Every keeper failure falls back to the
+private anonymous copy. The copy is read-only after load (every later use is a host->device copy or a CPU-tier read),
+which is what makes sharing it safe. A different plan (other budget, usage file or overlay) misses and replaces that
+slot; the keeper evicts least-recently-used slots to stay under `--max-gb` (90) before the new fill. Its RAM stays
+taken while no engine runs: `cold_keeper.py --socket S --drop` (or kill it) frees it. DS41 (10-21, NVMe ~1 GB/s):
+start -> listening 110-124 s -> **34 s**, first request after start 36 s -> 6 s (`scripts/serve_ds41.sh` turns it on).
 
 **Layout.** One device arena:
 
