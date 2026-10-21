@@ -23,6 +23,10 @@ cd "$REPO"
   curl -s -m 600 "http://127.0.0.1:8115/v1/chat/completions" -H 'Content-Type: application/json' \
        -d '{"model":"ds41-flash","max_tokens":4,"messages":[{"role":"user","content":"Hi"}]}' >/dev/null 2>&1 ) &
 
+# the last 12 requests as prompt/generated ids (.npz, server/engine_debug.py save_request): real long-context prompts
+# for the bench's loop-rate test (the agent loops past ~60K context, 10-21)
+export TRUSS_REQ_LOG_DIR=${TRUSS_REQ_LOG_DIR:-$T/data/req_log}
+
 # the served routing, for offline residency replays (plan D: hits vs VRAM expert budget); the last stage's layers
 # (14-39), ~2.5 KB per decode pass. TRUSS_ROUTE_TRACE=0: off
 RT=${TRUSS_ROUTE_TRACE:-$T/data/route_trace/serve_$(date +%m%d-%H%M%S).bin}
