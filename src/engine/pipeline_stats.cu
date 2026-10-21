@@ -173,4 +173,31 @@ void Pipeline::table_stats(double & ms, long & calls, long & rows, bool reset, d
     each_stage([&](Stage & m) { m.model().table_stats(ms, calls, rows, reset, wait_ms, phase_ms); });
 }
 
+void Pipeline::expert_counts(long long out[6]) const
+{
+    for (int k = 0; k < 6; ++k) out[k] = 0;
+    auto add = [&](Stage & m) {
+        const runtime::MoeExec * x = m.moe();
+        if (!x) return;
+        const runtime::ExpertStore::Stats & s = x->store().stats();
+        out[0] += s.experts_asked, out[1] += s.misses, out[2] += (long long) s.bytes;
+        out[3] += s.hinted, out[4] += (long long) s.hint_bytes;
+    };
+    for (auto & p : front_) add(*p);
+    add(*m_);
+    long cpu, pcie;
+    double a, b;
+    dyn_stats(cpu, pcie, a, b);
+    out[5] = cpu;
+}
+
+bool Pipeline::set_moe_option(const std::string & name, double v)
+{
+    bool ok = true, any = false;
+    each_stage([&](Stage & m) {
+        if (m.moe()) any = true, ok = m.moe()->set_option(name, v) && ok;
+    });
+    return any && ok;
+}
+
 }  // namespace truss::engine

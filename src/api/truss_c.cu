@@ -54,7 +54,7 @@ truss_model * truss_open_params(const char * gguf_path, const truss_params * p)
             if (p->expert_usage && *p->expert_usage)
                 o.expert_usage = runtime::ExpertStore::load_usage(p->expert_usage, m->family->n_layer(), m->family->n_expert());
             if (m->family->has_drafter()) {
-                m->drafts = p->drafts;
+                m->drafts = m->drafts_max = p->drafts;
                 o.spec_rows = p->drafts + 1;
             }
             if (p->cpu_dir && *p->cpu_dir) {
@@ -209,6 +209,30 @@ int truss_eval_argmax(truss_model * m, const int32_t * tokens, int n, int32_t * 
 }
 
 int truss_drafts(const truss_model * m) { return m->drafts; }
+
+int truss_set_option(truss_model * m, const char * name, double value)
+{
+    return guarded(
+        [&] {
+            const std::string k = name ? name : "";
+            if (k == "drafts") {
+                if (value < 1 || value > m->drafts_max)
+                    throw std::invalid_argument("drafts must be 1.." + std::to_string(m->drafts_max) + " (the open value)");
+                m->drafts = (int) value;
+                return 0;
+            }
+            if (!m->fwd->set_moe_option(k, value)) throw std::invalid_argument("truss_set_option: not a runtime knob: " + k);
+            return 0;
+        },
+        -1);
+}
+
+int truss_wait_ready(truss_model * m)
+{
+    return guarded([&] { m->fwd->wait_pinned(); return 0; }, -1);
+}
+
+void truss_expert_counts(const truss_model * m, long long * out6) { m->fwd->expert_counts(out6); }
 
 int truss_slots(const truss_model * m) { return m->fwd->slots(); }
 

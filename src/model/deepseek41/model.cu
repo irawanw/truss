@@ -270,14 +270,12 @@ void dump_dspark_record(DsparkDump & d, const engine::Chunk & c, int dm)
 }
 
 // the tail prefill (item 7): TRUSS_TAIL_PREFILL=<n> (rows) - the consumer layers run on the last n rows of a
-// prompt chunk (the reference's "SWA bounded replay": 128 + 6 = 134). 0: off.
+// prompt chunk (the reference's "SWA bounded replay": 128 + 6 = 134). 0: off. Read per chunk (like
+// TRUSS_FETCH_PROMPT), so a bench arm can change it on a loaded model.
 int tail_rows_cfg()
 {
-    static const int n = [] {
-        const char * e = std::getenv("TRUSS_TAIL_PREFILL");
-        return e ? std::atoi(e) : 0;
-    }();
-    return n;
+    const char * e = std::getenv("TRUSS_TAIL_PREFILL");
+    return e ? std::atoi(e) : 0;
 }
 
 }  // namespace

@@ -230,6 +230,25 @@ void MoeExec::adapt_tick()
     for (float & u : route_usage_) u *= o_.adapt_decay;
 }
 
+bool MoeExec::set_option(const std::string & name, double v)
+{
+    drain_jobs();   // the driver reads skip_weight / tail_skip / pcie_frac / hint_k while it plans
+    if (name == "skip_weight") o_.skip_weight = (float) v;
+    else if (name == "tail_skip") o_.tail_skip = (int) v;
+    else if (name == "pcie_frac") o_.pcie_frac = (float) v;
+    else if (name == "hint_k") o_.hint_k = (int) v;
+    else if (name == "hint_min_rows") o_.hint_min_rows = (int) v;
+    else if (name == "adapt_every") {
+        o_.adapt_every = (int) v;
+        if (o_.adapt_every > 0 && route_usage_.empty()) route_usage_.assign((size_t) n_store() * E_, 0.f);
+    }
+    else if (name == "adapt_swaps") o_.adapt_swaps = (int) v;
+    else if (name == "adapt_min") o_.adapt_min = (float) v;
+    else if (name == "adapt_decay") o_.adapt_decay = (float) v;
+    else return false;
+    return true;
+}
+
 // Wait until the driver has finished every queued decode FFN. begin_stream() switches the store's mode on the host at
 // once, while a decode job queued just before may not have been served yet: its fetch() then threw "outside ring
 // mode" (the served hangs of 2026-10-12). The GPU reaches the doorbells on its own, so this wait ends.

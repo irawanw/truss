@@ -127,6 +127,10 @@ public:
     int n_store() const { return (int) layers_.size(); }
     void adapt_tick();                          // Options::adapt_every: Strata's adaptive tier, every n decode passes
     void drain_jobs();                          // the driver has served every queued decode FFN
+    // a decode knob changed between passes (truss_set_option: the bench's arms on one loaded model). Names are the
+    // MoeOptions fields: skip_weight, tail_skip, pcie_frac, hint_k, hint_min_rows, adapt_every, adapt_swaps,
+    // adapt_min, adapt_decay. Waits for the driver first. False: not a runtime knob (load-time ones need a reload).
+    bool set_option(const std::string & name, double v);
     void check_driver();                        // rethrow a driver error at the caller's next sync point
     void place_threads();                       // TRUSS_AUX_CPUS
     bool aux_on() const { return aux_.on; }
@@ -179,7 +183,7 @@ private:
     const MoeKernels k_;
     std::vector<MoeLayer> layers_;
     const int E_, K_;
-    const MoeOptions o_;
+    MoeOptions o_;   // fixed after construction except the set_option() knobs
     engine::Profile * prof_;
     std::unique_ptr<ExpertStore> store_;
     int n_hot_ = 0;

@@ -26,7 +26,7 @@ The engine reads the experts as an overlay (`TRUSS_EXPERT_OVERLAY`, `gguf::File:
 
 ## The tail prefill (E15 item 7) and the DSpark confidence head (E15 item 8)
 
-`TRUSS_TAIL_PREFILL=<n>` (default 0 = off): on a **prompt** chunk the *consumer* layers (the ones that read the
+`TRUSS_TAIL_PREFILL=<n>` (default 0 = off; read per chunk, so a bench arm can change it on a loaded model): on a **prompt** chunk the *consumer* layers (the ones that read the
 candidate source's compressed KV, `compress_ratio > 0` and `kv_source_of(l) == candidate_source`, i.e. layers 21-39)
 run on the **last n rows** of the chunk only (the reference's "SWA bounded replay", `n = 134 = 128 + 6`): the
 residual, the collapse coef, the token ids, the positions and the row count shift to that suffix

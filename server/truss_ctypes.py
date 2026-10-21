@@ -113,6 +113,9 @@ class Model:
         for name, (res, args) in {
             "truss_round_trace_dump": (None, []),
             "truss_round_trace_mark": (None, [c_int]),
+            "truss_set_option": (c_int, [p, ctypes.c_char_p, ctypes.c_double]),
+            "truss_expert_counts": (None, [p, ctypes.POINTER(ctypes.c_longlong)]),
+            "truss_wait_ready": (c_int, [p]),
         }.items():
             fn = getattr(lib, name, None)
             if fn is not None:
@@ -286,6 +289,22 @@ class Model:
         """[front held, front wait, last held, last wait] ms since the last reset (engine stage locks)."""
         out = (ctypes.c_double * 4)()
         self._lib.truss_lock_ms(self._m, out, int(reset))
+        return list(out)
+
+    def set_option(self, name: str, value: float):
+        """A runtime knob between calls (truss_set_option: drafts and the decode-tier knobs; tools/tk-bench/arms.py)."""
+        self._check(self._lib.truss_set_option(self._m, name.encode(), float(value)))
+        if name == "drafts":
+            self.drafts = int(value)
+
+    def wait_ready(self):
+        """Blocks until the load's background page-locking is done (truss_wait_ready)."""
+        self._check(self._lib.truss_wait_ready(self._m))
+
+    def expert_counts(self):
+        """Cumulative [cold experts routed, fetched on demand, their bytes, prefetched, their bytes, CPU-tier misses]."""
+        out = (ctypes.c_longlong * 6)()
+        self._lib.truss_expert_counts(self._m, out)
         return list(out)
 
     def trace_mark(self, tag: int):

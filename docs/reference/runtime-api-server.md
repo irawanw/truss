@@ -129,6 +129,8 @@ One `truss_model` = one model file, one sequence, on the current CUDA device (`C
 | `truss_default_params()`, `truss_open_params(gguf, &params)` | every load option: `n_ctx`, `max_chunk`, `expert_usage`, `mtp` (draft block GGUF → speculative decoding), `drafts` (1..7), `cpu_dir` / `cpu_share` / `cpu_threads` (CPU tier). `truss_open` = defaults + its three arguments |
 | `truss_spec_step(m, next, emitted, &n, &new_next)` | one greedy speculative round after `next`: drafts, one verify pass, accept the matching prefix; appends `emitted[0..n)` (`next` first, then the accepted drafts) and returns the greedy token after them. Output equals plain greedy decoding. Near n_ctx it falls back to one plain step |
 | `truss_drafts(m)` | drafts per round (0: no MTP) |
+| `truss_set_option(m, name, value)` | a runtime knob, between calls (no call running on any slot): `drafts` (1 .. the open value; the buffers keep the open size) and the decode-tier knobs `skip_weight`, `tail_skip`, `pcie_frac`, `hint_k`, `hint_min_rows`, `adapt_every`, `adapt_swaps`, `adapt_min`, `adapt_decay` (`MoeExec::set_option` on every stage via `Pipeline::set_moe_option`; it drains the driver first). -1 for any other name: those are load-time. Used by `tools/tk-bench/arms.py` (many arms on one load) |
+| `truss_expert_counts(m, out6)` | cumulative over the stages since open: cold experts routed, fetched on demand, their bytes, prefetched, their bytes, dynamic-split misses served by the CPU tier (`Pipeline::expert_counts`); diff two reads per measurement |
 | `truss_close(m)` | free everything |
 | `truss_last_error()` | message of the last failure on this thread |
 | `truss_n_vocab`, `truss_n_ctx`, `truss_position` | sizes; tokens in the sequence |

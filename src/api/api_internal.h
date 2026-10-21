@@ -34,6 +34,7 @@ struct truss_model {
     std::unique_ptr<gguf::File> file;
     std::unique_ptr<engine::Family> family;
     int drafts = 0;
+    int drafts_max = 0;                      // the drafts the buffers were sized for (truss_set_option may lower drafts)
     int * spec_next = nullptr, * spec_host = nullptr;   // device / pinned argmax of each verify row
     bool spec_sample = false;                // TRUSS_SPEC_SAMPLE=1: sampled drafts + min(1, p/q) acceptance
     std::vector<float *> q_full;             // per slot, device [drafts][n_vocab]: the sampled drafts' q

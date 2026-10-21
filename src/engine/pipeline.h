@@ -79,6 +79,11 @@ public:
     void cpu_shape_reset();
     void dyn_stats(long & cpu, long & pcie, double & ms_expert, double & ms_call) const;
     void split_stats(long long out[3]) const;
+    // cumulative over the stages: [cold experts routed, fetched on demand, their bytes, prefetched, their bytes,
+    // dynamic-split misses to the CPU] (the bench diffs them per arm)
+    void expert_counts(long long out[6]) const;
+    // a runtime MoE knob on every stage (runtime::MoeExec::set_option); false: unknown name or no MoE stage
+    bool set_moe_option(const std::string & name, double v);
     size_t kv_lent() const;
     const runtime::ExpertStore * experts() const;   // the last stage's (a drafter's layer is its last store layer)
     // B1: graph-mode requirements and the model's position-dependent kernels

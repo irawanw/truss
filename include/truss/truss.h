@@ -65,6 +65,18 @@ int truss_eval_argmax(truss_model * m, const int32_t * tokens, int n, int32_t * 
 int truss_spec_step(truss_model * m, int32_t next, int32_t * emitted, int * n_emitted, int32_t * new_next);
 int truss_drafts(const truss_model * m);            /* 0: opened without MTP */
 
+/* Runtime knobs, set between calls (no call running on any slot): one loaded model serves many bench arms
+   (tools/tk-bench/arms.py). "drafts" (1 .. the open value) and the decode-tier knobs of the routed experts, named as
+   their TRUSS_* env twins without the prefix, lower case: skip_weight, tail_skip, pcie_frac, hint_k, hint_min_rows,
+   adapt_every, adapt_swaps, adapt_min, adapt_decay. Every other option is load-time. -1: unknown name or bad value. */
+int truss_set_option(truss_model * m, const char * name, double value);
+/* cumulative over the stages since open: [cold experts routed, fetched on demand, their bytes, prefetched, their
+   bytes, dynamic-split misses served by the CPU tier] (diff two reads for one arm) */
+void truss_expert_counts(const truss_model * m, long long * out6);
+/* waits until the load's background work (page-locking the host expert copy, ~20 s after open) is done: a bench
+   measures after it, a server serves meanwhile */
+int truss_wait_ready(truss_model * m);
+
 /* Sequence slots (TRUSS_SLOTS=n at open): the model holds n independent sequences, each with truss_n_ctx()
    positions (n_ctx / n: the K/V memory is shared out, not added). truss_select makes one current; every other call
    (eval, spec steps, reset, checkpoint, position) acts on it. Switch only between calls. Slot 0 is current at open. */
