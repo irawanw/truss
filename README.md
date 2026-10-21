@@ -11,6 +11,8 @@ TRUSS now serves **PAW-763B-X3**, a 763B-parameter DeepSeek model (557B routed e
 cards plus CPU and NVMe, with the full 262,144-token context. The pack keeps 256 of the 384 experts per layer at 2-3
 bit. Files and model card: **[lackonendes/PAW-763B-X3](https://huggingface.co/lackonendes/PAW-763B-X3)**
 (215 GB). How to run it: **[docs/SERVING-DS41.md](docs/SERVING-DS41.md)**.
+_Upload status (2026-10-21): the experts file and the two n-gram tables are still being added to the Hugging Face repo;
+the model card there says when it is complete._
 
 | two RTX 3090s, 128 GB RAM, NVMe | measured |
 |---|---:|
