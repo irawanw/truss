@@ -23,6 +23,11 @@ cd "$REPO"
   curl -s -m 600 "http://127.0.0.1:8115/v1/chat/completions" -H 'Content-Type: application/json' \
        -d '{"model":"ds41-flash","max_tokens":4,"messages":[{"role":"user","content":"Hi"}]}' >/dev/null 2>&1 ) &
 
+# the served routing, for offline residency replays (plan D: hits vs VRAM expert budget); the last stage's layers
+# (14-39), ~2.5 KB per decode pass. TRUSS_ROUTE_TRACE=0: off
+RT=${TRUSS_ROUTE_TRACE:-$T/data/route_trace/serve_$(date +%m%d-%H%M%S).bin}
+if [ "$RT" != 0 ]; then mkdir -p "$(dirname "$RT")"; export TRUSS_ROUTE_TRACE="$RT"; else unset TRUSS_ROUTE_TRACE; fi
+
 exec python3 -m server.app "${DS41_ARGS[@]}" \
   --host 127.0.0.1 --port 8115 --name ds41-flash \
   --log "$H/logs/serve_8115-requests.log"
