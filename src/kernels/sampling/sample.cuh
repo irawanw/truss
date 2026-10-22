@@ -43,7 +43,7 @@ void ban(float * x, int n, int rows, const BanList & b, cudaStream_t stream);
 // Filler recency (10-22, "Hmm ... Hmm ... Hmm" loops): row r also takes fp[r][k] logits off token ft[r][k], k < nf[r]
 // (the host's per-row list: the next token of a filler word's token sequence whose prefix ends the row's context,
 // penalty x the filler's uses in the row's recent window). Both rules in one launch.
-constexpr int WORD_ROWS = 16, FILL_MAX = 12;
+constexpr int WORD_ROWS = 16, FILL_MAX = 24;
 struct WordPrev {
     int c[WORD_ROWS] = {};
     int nf[WORD_ROWS] = {};

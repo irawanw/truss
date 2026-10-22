@@ -17,7 +17,7 @@ WORD_REPEAT = float(os.environ.get("TRUSS_WORD_REPEAT", "8"))   # logits off a r
 # Filler recency (10-22: "Hmm 51200*1000 = 51,200,000? Hmm ..." x 43 at 67K; Flash-Next does it too): a filler word
 # loses WORD_FILLER logits per use of it in the last WORD_FILLER_WINDOW tokens of the reasoning (0: off). The first use
 # is free, so a "Hmm" now and then stays; a run of them gets expensive fast.
-WORD_FILLER = float(os.environ.get("TRUSS_WORD_FILLER", "1.5"))
+WORD_FILLER = float(os.environ.get("TRUSS_WORD_FILLER", "6"))
 WORD_FILLER_WINDOW = int(os.environ.get("TRUSS_WORD_FILLER_WINDOW", "64"))
 FILLERS = ("hmm", "hmmm", "maybe", "wait", "actually", "perhaps", "ok", "okay", "oh", "hm", "alright")
 _STRIP = " \tĠ▁"   # space, tab, GPT-2 byte-level space (Ġ), SentencePiece word start (▁)

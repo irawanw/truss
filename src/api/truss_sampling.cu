@@ -78,17 +78,22 @@ void word_rows(truss_model & m, const truss_sampling & sp, const int32_t * feed,
             const int L = (int) ctx.size();
             for (const auto & q : m.filler_seqs) {
                 const int ql = (int) q.size();
-                if (ql - 1 > L) continue;
-                bool pre = true;   // the context ends with the sequence's prefix
-                for (int j = 0; j < ql - 1 && pre; ++j) pre = ctx[L - (ql - 1) + j] == q[j];
-                if (!pre) continue;
                 int uses = 0;   // the sequence's uses in the window
                 for (int i = 0; i + ql <= L; ++i) {
                     int j = 0;
                     while (j < ql && ctx[i + j] == q[j]) ++j;
                     uses += j == ql;
                 }
-                if (uses && prev.nf[r] < sampling::FILL_MAX) {
+                if (!uses) continue;
+                // the word is chosen at its first token (" Hmm" = " H" + "mm": once " H" is out, "mm" is near certain),
+                // so the first token carries the penalty; the last one too when the context ends with the prefix
+                bool pre = ql - 1 <= L;   // the context ends with the sequence's prefix
+                for (int j = 0; j < ql - 1 && pre; ++j) pre = ctx[L - (ql - 1) + j] == q[j];
+                if (ql > 1 && prev.nf[r] < sampling::FILL_MAX) {
+                    prev.ft[r][prev.nf[r]] = q[0];
+                    prev.fp[r][prev.nf[r]++] = sp.filler * uses;
+                }
+                if (pre && prev.nf[r] < sampling::FILL_MAX) {
                     prev.ft[r][prev.nf[r]] = q[ql - 1];
                     prev.fp[r][prev.nf[r]++] = sp.filler * uses;
                 }

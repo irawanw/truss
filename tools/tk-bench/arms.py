@@ -318,7 +318,7 @@ class Bench:
               "routed / fetched / MB / CPU misses)")
         base_kl = None
         for name, R in self.res.items():
-            T = {k: v for k, v in R["tasks"].items() if k != "kl" and not k.startswith("recall")}
+            T = {k: v for k, v in R["tasks"].items() if "runs" in v}   # speed tasks only (kl, recall, loop have no runs)
             reps = []
             for r in range(self.a.repeat):
                 tok = sum(v["runs"][r]["tokens"] for v in T.values() if len(v["runs"]) > r)
