@@ -81,3 +81,19 @@ n_store - 1, not profiled, no CPU tier), the stage's `Hc` and `Head`. Per slot: 
 for slot switches. `on_commit` runs the block over every committed row from the previous position's hidden state;
 `draft` chains single-row steps (argmax or a sample of q), restores the indexer's open block after, stops below
 `DrafterFiles::min_p`. `TRUSS_MTP_CALIB=file` appends the block's FFN inputs of true-path commits.
+
+## Vision (image input) - in progress, plan: `docs/PLAN-20261022-flashnext-vision.md`
+
+Base model has a 27-block ViT (hidden 1152, 16 heads, MLP 4304, GELU-tanh, patch 16, temporal patch 2, 2x2 merge, 2D rotary,
+learned 48x48 pos-embed bilinearly resampled, no DeepStack) whose merger outputs 2560 = text hidden. The X3.1 pack is text-only.
+
+- `tools/tk-pack/flashnext_mmproj.py` writes `flashnext-mmproj-f16.gguf` (0.9 GB, arch `qwen4exp-mmproj`, 333 tensors named
+  `v.<HF name without model.visual.>`; matrices + conv kernel + pos_embed F16, biases/norms F32; hyperparameters in
+  `qwen4exp.vision.*`). Verified: 9 tensors read back equal to the safetensors (rel err <= 4e-7).
+  Run: `python3 tools/tk-pack/flashnext_mmproj.py --model-dir <HF dir> --out flashnext-mmproj-f16.gguf`.
+- `server/vision_pre.py`: image -> `pixel_values [N, 1536]` + `grid_thw`. Same patch order as HF `Qwen2VLImageProcessor`
+  (merge-window grouped); sizes multiples of 32, long side capped at 1344. N/4 image tokens reach the text model.
+- HF behaviour to copy (transformers `modeling_qwen4_exp.py`, `Qwen4ExpModel.forward`): image rows replace the embeddings at
+  `image_token_id` positions only; PLE and the n-gram tables still receive the original token ids (so image rows use the
+  `image_token_id` PLE row); position ids are 3D (`compute_3d_position_ids`).
+- Fixtures (ViT taps from HF on a 448x448 test image) live outside the repo in `ML_projects/flashnext/20261022_vision/fix/`.
