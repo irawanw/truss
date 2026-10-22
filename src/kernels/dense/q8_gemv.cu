@@ -59,6 +59,11 @@ struct MultiQ8 {
     float y16s[MULTI_MAX];
     int start[MULTI_MAX + 1];   // output prefix sums
     int n;
+    // grouped inputs (q8_gemv_grouped_a16, the mma kernel only): matrix i reads x + xoff[i] with row stride xstride
+    // and writes its rows with stride ystride[i]; 0 (every other caller): x itself, stride in, stride = its out
+    int xoff[MULTI_MAX];
+    int xstride;
+    int ystride[MULTI_MAX];
 };
 
 // A16: the activations are fp16 (xq is the half array [rows][in], xd unused): W8A16 without dequantizing the weights,
@@ -191,18 +196,19 @@ __global__ void __launch_bounds__(512) gemv_mma_a16_kernel(MultiQ8 m, int in, co
     float * wy[2] = { nullptr, nullptr };
     half * w16[2] = { nullptr, nullptr };
     float s16[2] = { 0.f, 0.f };
-    int wout[2] = { 0, 0 }, woo[2] = { 0, 0 };
+    int wout[2] = { 0, 0 }, woo[2] = { 0, 0 }, xseg = 0;
 #pragma unroll
     for (int j = 0; j < 2; ++j)
         if (o[j] < outs) {
             int seg = 0;
             while (o[j] >= m.start[seg + 1]) ++seg;
-            woo[j] = o[j] - m.start[seg], wout[j] = m.start[seg + 1] - m.start[seg];
+            woo[j] = o[j] - m.start[seg], wout[j] = m.ystride[seg] ? m.ystride[seg] : m.start[seg + 1] - m.start[seg];
             wq[j] = m.q[seg] + (size_t) woo[j] * in + 8 * q, wd[j] = m.d[seg] + (size_t) woo[j] * nb, wy[j] = m.y[seg];
             w16[j] = m.y16[seg], s16[j] = m.y16s[seg];
+            if (j == 0) xseg = seg;   // the tile's B operand: grouped launches keep a tile inside one matrix
         }
     const bool xrow = g < rows;   // B column g = window row g
-    const half * xr = x + (size_t) (xrow ? g : 0) * in + 8 * q;
+    const half * xr = x + m.xoff[xseg] + (size_t) (xrow ? g : 0) * (m.xstride ? m.xstride : in) + 8 * q;
     float acc[4] = { 0.f, 0.f, 0.f, 0.f };
 #pragma unroll 4
     for (int b = kb * S + ks; b < nb; b += P) {
@@ -547,6 +553,22 @@ void q8_gemv_multi_a16_cfg(const Q8Matrix * const * W, float * const * y, int n,
     m.n = n, m.start[0] = 0;
     for (int i = 0; i < n; ++i) m.q[i] = W[i]->q, m.d[i] = W[i]->d, m.y[i] = y[i], m.start[i + 1] = m.start[i] + W[i]->out;
     gemv_mma_a16_cfg(m, W[0]->in, x, rows, c, stream);
+    TRUSS_CUDA(cudaGetLastError());
+}
+
+void q8_gemv_grouped_a16(const Q8Matrix & W, int G, const half * x, int rows, float * y, cudaStream_t stream)
+{
+    const int K = W.in, R = G > 0 ? W.out / G : 0;
+    if (G < 1 || G > MULTI_MAX || W.out % G || R % 16 || K % 32 || rows < 1 || rows > GEMV_ROWS || !mma_on())
+        throw std::runtime_error("q8_gemv_grouped_a16: G <= " + std::to_string(MULTI_MAX) + ", R % 16, K % 32, rows <= " +
+                                 std::to_string(GEMV_ROWS) + ", TRUSS_GEMV_MMA on");
+    MultiQ8 m{};
+    m.n = G, m.start[0] = 0, m.xstride = G * K;
+    for (int i = 0; i < G; ++i) {
+        m.q[i] = W.q + (size_t) i * R * K, m.d[i] = W.d + (size_t) i * R * (K / 32), m.y[i] = y + (size_t) i * R;
+        m.start[i + 1] = m.start[i] + R, m.xoff[i] = i * K, m.ystride[i] = G * R;
+    }
+    gemv_mma_a16(m, K, x, rows, stream);
     TRUSS_CUDA(cudaGetLastError());
 }
 

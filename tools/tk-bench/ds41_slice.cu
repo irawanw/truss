@@ -6,6 +6,7 @@
 // estimates scale the per-layer numbers (layers 0-1 are window-only, so N >= 4 to include compressed + indexer layers).
 // TRUSS_BENCH_PROFRANGE=prefill|decode: cudaProfilerStart/Stop around that timed part (nsys --capture-range=cudaProfilerApi).
 // TRUSS_EXPERT_GB caps the resident experts to mimic the served residency (the rest go through the ring / CPU tier).
+// TRUSS_SLICE_ROWS=R: each decode step is an R-row chunk (a speculative verify window's shape: R = drafts + 1).
 // usage: TRUSS_EXPERT_OVERLAY=<experts>,<engram L1>,<engram L14> tk-bench-ds41-slice <dense.gguf> <ids.i32> <N>
 //          [T=2048] [S=64] [chunk=T] [usage.f32|-]
 #include "core/cuda_check.h"
@@ -44,7 +45,9 @@ int main(int argc, char ** argv)
         std::ifstream in(argv[2], std::ios::binary | std::ios::ate);
         const size_t have = (size_t) in.tellg() / 4;
         if (have < (size_t) T + S) throw std::runtime_error("ids file has " + std::to_string(have) + " tokens, need T + steps");
-        std::vector<int32_t> ids(T + S);
+        const int RW = std::getenv("TRUSS_SLICE_ROWS") ? std::max(1, std::atoi(std::getenv("TRUSS_SLICE_ROWS"))) : 1;
+        if (have < (size_t) T + (size_t) S * RW) throw std::runtime_error("ids file: need T + steps x rows tokens");
+        std::vector<int32_t> ids(T + S * RW);
         in.seekg(0);
         in.read((char *) ids.data(), ids.size() * 4);
         const auto file = gguf::File::open(argv[1]);
@@ -57,7 +60,7 @@ int main(int argc, char ** argv)
         if (argc > 7 && std::string(argv[7]) != "-")
             o.expert_usage = runtime::ExpertStore::load_usage(argv[7], fam->n_layer(), fam->n_expert());
         const double t_load = now_ms();
-        engine::Stage st(*fam, T + S, chunk, o, engine::StageSpec{ 0, N, -1, 1.0, nullptr, nullptr });
+        engine::Stage st(*fam, T + S * RW, chunk, o, engine::StageSpec{ 0, N, -1, 1.0, nullptr, nullptr });
         file->release_pages();
         std::printf("slice layers 0-%d on device %d: load %.1f s\n", N - 1, st.device(), (now_ms() - t_load) / 1e3);
         const char * name[6] = { "engram+hc+norm", "attention", "hc post+ffn mix+router", "moe a", "moe b", "moe c" };
@@ -95,7 +98,7 @@ int main(int argc, char ** argv)
             if (pass && range == "decode") cudaProfilerStart();
             for (int s = 0; s < S; ++s) {
                 const double t0 = now_ms();
-                st.run_chunk(ids.data() + T + s, T + s, 1, nullptr, false);
+                st.run_chunk(ids.data() + T + s * RW, T + s * RW, RW, nullptr, false);
                 TRUSS_CUDA(cudaStreamSynchronize(st.gpu().s));
                 ms.push_back(now_ms() - t0);
             }
@@ -105,8 +108,8 @@ int main(int argc, char ** argv)
             std::sort(v.begin(), v.end());
             double sum = 0;
             for (double x : ms) sum += x;
-            std::printf("decode %d steps: mean %.3f ms (%.3f per layer), median %.3f, min %.3f, max %.3f; "
-                        "x40 layers (est.) %.1f ms = %.1f tok/s before head and hand-off\n", S, sum / S, sum / S / N,
+            std::printf("decode %d steps of %d rows: mean %.3f ms (%.3f per layer), median %.3f, min %.3f, max %.3f; "
+                        "x40 layers (est.) %.1f ms = %.1f tok/s before head and hand-off\n", S, RW, sum / S, sum / S / N,
                         v[S / 2], v[0], v[S - 1], sum / S / N * 40, 1e3 / (sum / S / N * 40));
             sections("decode", S);
             const runtime::ExpertStore::Stats & es = st.moe() ? st.moe()->store().stats() : runtime::ExpertStore::Stats {};

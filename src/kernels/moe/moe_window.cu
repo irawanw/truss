@@ -70,12 +70,38 @@ template <> struct Tune<Lfm2> {            // swept 10-15 (TRACKER #164): decode
     using Down = Geom<8, 1, 2, 8>;         // 128 columns: 2x the down items (32 -> 64), 8 k-split warps over F = 1536
     static constexpr int GU_KSPLIT = 1;    // 2 / 4: no gain
 };
-template <> struct Tune<DsV41> {           // first guess = Lfm2's geometry (F 2304 ~ 1536); sweep pending
-    static constexpr int BLOCKS_PER_SM = 1;
-    using GateUp = Geom<8, 1, 2, 4>;       // 64 columns: 36 groups x 2 projections per slot
-    using Down = Geom<8, 1, 2, 8>;         // 128 columns: 40 groups over D = 5120
-    static constexpr int GU_KSPLIT = 1;
+// DS41_* (compile definitions): the 10-22 geometry sweep (tk-bench-ds41-slice, 4-row windows); defaults = served
+// 10-22 sweep, 6-layer all-resident slice, 4-row windows (MoE ms/layer): served 1 / 4 tiles 0.505; 2 blocks per SM
+// 0.482; GateUp 8 tiles 0.450; both 0.431 (-15%, step -6.9%); 16 tiles 0.432; Down 4 x 2 0.506, 16 tiles 0.450 but
+// step +8%; prefetch 4 0.518; GU k split 2 0.554
+#ifndef DS41_BPS
+#define DS41_BPS 2
+#endif
+#ifndef DS41_GU_WNT
+#define DS41_GU_WNT 8
+#endif
+#ifndef DS41_GU_PF
+#define DS41_GU_PF 2
+#endif
+#ifndef DS41_DN_WK
+#define DS41_DN_WK 8
+#endif
+#ifndef DS41_DN_PF
+#define DS41_DN_PF 2
+#endif
+#ifndef DS41_DN_WNT
+#define DS41_DN_WNT 8
+#endif
+#ifndef DS41_GU_KSPLIT
+#define DS41_GU_KSPLIT 1
+#endif
+template <> struct Tune<DsV41> {           // swept 10-22 (above)
+    static constexpr int BLOCKS_PER_SM = DS41_BPS;
+    using GateUp = Geom<8, 1, DS41_GU_PF, DS41_GU_WNT>;                 // 128 columns: 18 groups x 2 projections per slot
+    using Down = Geom<DS41_DN_WK, 8 / DS41_DN_WK, DS41_DN_PF, DS41_DN_WNT>;      // 128 columns: 40 groups over D = 5120
+    static constexpr int GU_KSPLIT = DS41_GU_KSPLIT;
 };
+
 template <> struct Tune<DSpark> {          // same dims as DsV41, top-3: same geometry
     static constexpr int BLOCKS_PER_SM = 1;
     using GateUp = Geom<8, 1, 2, 4>;

@@ -102,7 +102,7 @@ Deadlock-free without co-residency (items only wait on earlier queue items).
 
 **Tunables.** `Tune<FlashNext>`: `BLOCKS_PER_SM = 2` (3 was 13–17% slower, #28); `GateUp = Geom<8,1,2,8>`,
 `Down = Geom<4,2,2,8>` (WK k-split warps × WG column groups, PF k-slices in flight, WNT tiles per warp; cp3 tune log
-v6); `Plan::GU_KSPLIT = 1` (2 was 5% slower, #24). `Tune<DsV41>` = Lfm2's geometry, not yet swept (TRACKER #175:
+v6); `Plan::GU_KSPLIT = 1` (2 was 5% slower, #24). `Tune<DsV41>` swept 10-22 (`DS41_*` compile definitions, tk-bench-ds41-slice with `TRUSS_SLICE_ROWS=4`, 6 all-resident layers): 2 blocks per SM + GateUp 8 tiles, MoE 0.505 -> 0.431 ms per layer-window (-15%); earlier: Lfm2's geometry (TRACKER #175:
 1 row K2 157 µs / K3 171 µs per layer, 36-50% of 936 GB/s).
 
 **Speed.** 4 rows: K2 ~118–123 µs, K3 ~131, mixed ~130 per layer (#22). GU/D items run at the decode ceiling; losses

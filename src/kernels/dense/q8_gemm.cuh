@@ -75,6 +75,11 @@ void q8_gemv_multi(const Q8Matrix * const * W, float * const * y, int n, const i
 // converted in registers (no dequantized copy, so the same weight traffic as the Q8_1 path), fp32 accumulation.
 void q8_gemv_multi_a16(const Q8Matrix * const * W, float * const * y, int n, const half * x, int rows, cudaStream_t stream);
 void q8_gemv_a16(const Q8Matrix & W, const half * x, int rows, float * y, cudaStream_t stream);
+// q8_gemm_a16_grouped for decode rows (rows <= GEMV_ROWS) on the tensor-core gemv: the G blocks are G matrices of one
+// launch, block g reading row slice x[t][g K .. (g + 1) K) (x [rows][G K]) into y[t][g R ..) (y [rows][G R]). Reads
+// the int8 weights once: no dequantized fp16 copy (the grouped GEMM wrote and re-read 2 bytes per weight: 217 us vs
+// ~40 us per DS41 layer for wo_a at 4 rows, 10-22). R % 16 == 0 (a tile stays in one group), G <= MULTI_MAX.
+void q8_gemv_grouped_a16(const Q8Matrix & W, int G, const half * x, int rows, float * y, cudaStream_t stream);
 // Its k split: S warps per 16-output tile in a block, KB blocks per tile (KB > 1: the last block of a tile adds the
 // block partials in order). Chosen from the shape (in, total outputs of the launch) only, never from rows: a row's
 // result does not depend on the row count, but a matrix fused with others may differ from it alone in the last bits.

@@ -212,8 +212,13 @@ void AttnDs41::forward(engine::Gpu & g, int slot, const float * in, const half *
     half * yo16 = sc.alloc<half>((size_t) T * G * R);
     const int W_in = lin_.q8(w_.out_a).in;   // the grouped LoRA's K (the group's slice of the row)
     const bool grouped = T * G > dense::GEMV_ROWS;   // more rows than a gemv: the per-group GEMMs (#194)
+    // decode rows with fp16 activations: the grouped tensor-core gemv reads wo_a's int8 once (10-22: the grouped GEMM
+    // dequantized all of wo_a to fp16 per call, 217 us per layer at a 4-row window; TRUSS_DS41_WOA_GEMV=0: off)
+    static const bool woa_gemv = [] { const char * e = std::getenv("TRUSS_DS41_WOA_GEMV"); return !e || std::atoi(e); }();
+    const bool fused = woa_gemv && lin_.act() == Activations::FP16 && T <= dense::GEMV_ROWS && dense::mma_on() &&
+                       G <= dense::MULTI_MAX && R % 16 == 0;
     Linear::Act ia;   // the Q8_1 path's quantized stacked rows (the groups' slices)
-    if (grouped && lin_.act() != Activations::FP16) ia = lin_.quant(o16, T * G, W_in);
+    if (grouped && !fused && lin_.act() != Activations::FP16) ia = lin_.quant(o16, T * G, W_in);
     for (int r0 = 0; r0 < T; r0 += P) {
         const int rb = std::min(P, T - r0);
         const size_t m2 = sc.mark();
@@ -257,7 +262,9 @@ void AttnDs41::forward(engine::Gpu & g, int slot, const float * in, const half *
         sc.release(m2);
     }
     // grouped output LoRA: each row's group g of o (H D / G dims) through wo_a's block g (R outputs)
-    if (grouped && lin_.act() == Activations::FP16) {
+    if (fused) {
+        dense::q8_gemv_grouped_a16(lin_.q8(w_.out_a), G, o16, T, yo, g.s);
+    } else if (grouped && lin_.act() == Activations::FP16) {
         for (int r0 = 0; r0 < T; r0 += P) {
             const int rb = std::min(P, T - r0);
             dense::q8_gemm_a16_grouped(lin_.q8(w_.out_a), G, o16 + (size_t) r0 * H * D, rb, yo + (size_t) r0 * G * R,
