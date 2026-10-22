@@ -4,6 +4,8 @@
 # second runs layers 0-23; prompt chunks are pipelined across both).
 # Usage:  MODEL_DIR=/path/with/the/two/ggufs TOKENIZER=/path/tokenizer.json tools/serve/serve_flashnext_x31.sh
 # Optional: GPU=<index> (one GPU) or GPUS=<a>,<b> (two GPUs), PORT=8080 NCTX=262144 THREADS=<n>
+#           VIT=<mmproj gguf> to accept images, VIT_GPU=<index into CUDA_VISIBLE_DEVICES, default the last card>,
+#           IMAGES=1 to also allow local image paths (default: data URI and http(s) only)
 #           DRY=1 (print the command, do not start)
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -43,6 +45,13 @@ CMD=(python3 -m server.app
   --draft-vocab data/draft_vocab_en.bin --draft-min-p 0.5
   --host 127.0.0.1 --port "$PORT")
 
-echo "GPU(s) ${GPUS:-$GPU}, $THREADS CPU threads, context $NCTX, $DRAFTS drafts, port $PORT"
+if [ -n "${VIT:-}" ]; then   # image input: the ViT (mmproj) on its own card when there is one
+  [ -f "$VIT" ] || { echo "missing $VIT (hf download lackonendes/PAW-125B-FLASH-NEXT-X3.1 flashnext-mmproj-f16.gguf)" >&2; exit 1; }
+  if [ -z "${VIT_GPU:-}" ]; then [ -n "${GPUS:-}" ] && VIT_GPU=${GPUS##*,} || VIT_GPU=$GPU; fi
+  CMD+=(--mmproj "$VIT" --mmproj-device "$VIT_GPU")
+  [ -n "${IMAGES:-}" ] && CMD+=(--allow-local-images)
+fi
+
+echo "GPU(s) ${GPUS:-$GPU}, $THREADS CPU threads, context $NCTX, $DRAFTS drafts, port $PORT${VIT:+, ViT $VIT on device $VIT_GPU}"
 [ -n "${DRY:-}" ] && { echo "${CMD[@]}"; exit 0; }
 exec "${CMD[@]}"
