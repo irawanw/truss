@@ -34,6 +34,9 @@ int main(int argc, char ** argv)
         const int n_seq = std::atoi(argv[3]), ctx = std::atoi(argv[4]);
         const int dec = std::getenv("TRUSS_KL_DECODE") ? std::atoi(std::getenv("TRUSS_KL_DECODE")) : 0;
         if (dec < 0 || dec >= ctx) throw std::runtime_error("TRUSS_KL_DECODE must be in [0, ctx)");
+        const char * dump_path = std::getenv("TRUSS_KL_DUMP");
+        std::ofstream dump;
+        if (dump_path) dump.open(dump_path, std::ios::binary);
         std::vector<int32_t> ids((size_t) n_seq * ctx);
         std::ifstream(argv[2], std::ios::binary).read((char *) ids.data(), ids.size() * 4);
         const auto file = gguf::File::open(argv[1]);
@@ -72,6 +75,18 @@ int main(int argc, char ** argv)
             }
             TRUSS_CUDA(cudaMemcpyAsync(lg.data(), d_logits, lg.size() * 4, cudaMemcpyDeviceToHost, p.stream()));
             TRUSS_CUDA(cudaStreamSynchronize(p.stream()));
+            if (dump) {                                  // the engine's own logits, for a cross-engine comparison
+                for (int t = 0; t < ctx; ++t) {
+                    for (int v = 0; v < V; ++v) {
+                        const float f = lg[(size_t) t * V + v];
+                        uint32_t u;
+                        std::memcpy(&u, &f, 4);
+                        u += 0x7fff + ((u >> 16) & 1);    // bf16, round to nearest even
+                        const uint16_t h = (uint16_t) (u >> 16);
+                        dump.write((const char *) &h, 2);
+                    }
+                }
+            }
             for (int r = 0; r < n_ref; ++r) {
                 refs[r].read((char *) rb.data(), rb.size() * 2);
                 if (!refs[r]) throw std::runtime_error(std::string("short reference ") + argv[5 + r]);

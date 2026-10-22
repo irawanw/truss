@@ -327,9 +327,9 @@ def preflight(a):
     path needs and, with --mmproj, the vision symbols (a stale TRUSS_LIB cost a full load twice)."""
     import jinja2
     v = tuple(int(x) for x in jinja2.__version__.split(".")[:2] if x.isdigit())
-    if v < (3, 1):
-        raise SystemExit(f"jinja2 {jinja2.__version__} is too old for transformers (needs >= 3.1): "
-                         f"{os.environ.get('PYTHON', 'python3')} -m pip install -U 'jinja2>=3.1'")
+    if v < (3, 1):   # a warning: DS41 renders with its own encoder (no jinja) and serves on 3.0.3
+        print(f"warning: jinja2 {jinja2.__version__} is too old for transformers chat templates (needs >= 3.1): "
+              f"{os.environ.get('PYTHON', 'python3')} -m pip install -U 'jinja2>=3.1'", flush=True)
     if not a.mmproj:
         return
     if not os.path.exists(a.mmproj):
