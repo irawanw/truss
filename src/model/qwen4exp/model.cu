@@ -40,7 +40,10 @@ StageModel::StageModel(const Family & fam, int lb, int le, int n_ctx)
 {
 }
 
-StageModel::~StageModel() = default;
+StageModel::~StageModel()
+{
+    if (rope_sec_) cudaFree(rope_sec_);
+}
 
 void StageModel::add_tensors(engine::Stage & st)
 {
@@ -117,7 +120,15 @@ void StageModel::build(engine::Stage & st)
                                                         st.opts().direct_tables ? &fam_.file() : nullptr, st.max_rows());
     }
     const blocks::GdnDims gd{ c_.d_model, c_.ssm_groups, c_.ssm_v_heads, c_.ssm_state, c_.ssm_conv, c_.rms_eps };
-    const blocks::DsaDims dd{ c_.d_model, c_.rope_base, c_.rms_eps };
+    // mrope pair -> axis, exactly HF's apply_interleaved_mrope over dimension_sections (all 0 if the pack has none)
+    int sec[DsaShape::ROPE_DIMS / 2] = {};
+    if (c_.rope_sections.size() >= 3)
+        for (int dim = 1; dim < 3; ++dim)
+            for (int k = dim; k < (int) c_.rope_sections[dim] * 3 && k < (int) (sizeof(sec) / sizeof(int)); k += 3)
+                sec[k] = dim;
+    TRUSS_CUDA(cudaMalloc(&rope_sec_, sizeof(sec)));
+    TRUSS_CUDA(cudaMemcpy(rope_sec_, sec, sizeof(sec), cudaMemcpyHostToDevice));
+    const blocks::DsaDims dd{ c_.d_model, c_.rope_base, c_.rms_eps, rope_sec_ };
     for (int l = lb_; l < le_; ++l) {
         const Layer & L = w_.layers[l];
         gdn_.push_back(L.mixer == Mixer::GDN ? std::make_unique<blocks::Gdn>(lin, L.gdn, gd) : nullptr);
@@ -146,6 +157,13 @@ void StageModel::embed(engine::Stage & st, const engine::Chunk & c, float * res)
     float * emb = g.sc->alloc((size_t) c.T * c_.d_model);
     TRUSS_CUDA(cudaMemcpyAsync(ids, c.tokens, (size_t) c.T * 4, cudaMemcpyHostToDevice, g.s));
     dense::q8_rows(st.lin().q8(w_.token_embd), ids, c.T, emb, g.s);
+    if (c.x.img_n > 0) {   // HF: inputs_embeds[mask] = image_embeds (before the hyper-connection expand)
+        if (c.x.img_cols != c_.d_model || c.x.img_row0 < 0 || c.x.img_row0 + c.x.img_n > c.T)
+            throw std::invalid_argument("qwen4exp: image rows outside the chunk / wrong width");
+        TRUSS_CUDA(cudaMemcpy2DAsync(emb + (size_t) c.x.img_row0 * c_.d_model, sizeof(float) * c_.d_model, c.x.img,
+                                     sizeof(float) * c.x.img_cols, sizeof(float) * c.x.img_cols, c.x.img_n,
+                                     cudaMemcpyHostToDevice, g.s));
+    }
     hc_->expand(emb, c.T, res);
 }
 
@@ -172,7 +190,8 @@ void StageModel::layers(engine::Stage & st, const engine::Chunk & c, float * res
         pend_combine = false;
         st.prof().record(l, 1, g.s);
         if (gdn_[i]) gdn_[i]->forward(g, c.slot, mixed16, T, out, c.tentative);
-        else dsa_[i]->forward(g, c.slot, mixed16, c.pos0, T, out, c.tentative);
+        else dsa_[i]->forward(g, c.slot, mixed16, c.pos0, T, out, c.tentative,
+                              dsa::RopePos{ c.x.pos3, nullptr, c.x.pos3_stride, c.x.pos3_row0, c.x.rope_delta });
         st.prof().record(l, 2, g.s);
         hc_->mix(L.hc_ffn, res, T, mixed, mixed16, inject, out, inject);   // combine #1 fused into the norm (L3)
         moe_[i]->forward(g, mixed, mixed16, T, out, c.stream, st.moe_ws(), st.moe_rows());

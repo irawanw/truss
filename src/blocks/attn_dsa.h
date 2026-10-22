@@ -9,6 +9,7 @@
 #include "blocks/weights.h"
 #include "blocks/linear.h"
 #include "engine/block.h"
+#include "kernels/dsa/dsa_prepare.cuh"
 #include "kernels/dsa/dsa_prefill.cuh"
 
 #include <vector>
@@ -19,6 +20,7 @@ namespace truss::blocks {
 struct DsaDims {
     int d_model;
     float rope_base, eps;
+    const int * rope_sec = nullptr;   // device [ROPE_DIMS / 2]: mrope pair -> axis (null: text-only)
 };
 
 template <class Shape> class Dsa : public engine::Stateful {
@@ -27,7 +29,10 @@ public:
     static void add_tensors(Linear & lin, const DsaWeights & w);
     static size_t scratch_per_row();
     static size_t scratch_fixed(int T, int n_ctx);
-    void forward(engine::Gpu & g, int slot, const half * in16, int pos0, int T, float * out, bool tentative);
+    // rp: 3-D positions of a multimodal prompt (rp.pos3 / stride / row0) and the decode rope offset (rp.delta);
+    // default = text (1-D, pos0 + t). rp.sec is filled from d_.rope_sec.
+    void forward(engine::Gpu & g, int slot, const half * in16, int pos0, int T, float * out, bool tentative,
+                 const dsa::RopePos & rp = {});
 
     // the indexer's open block of a slot: a drafter's chain snapshots and restores it around its tentative rows
     float * partial(int slot) const { return s_[slot].idx_partial; }

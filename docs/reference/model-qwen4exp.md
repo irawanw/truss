@@ -105,3 +105,61 @@ the bilinear (align_corners) pos-embed taps, tokens in 2x2 merge-block order. At
 (correct, not fast: 28x28 patches = 550 ms; a tiled/cuBLAS version is the speed lever). Test: `build-vision/vit_check <mmproj> <fix dir>`
 (CMake target `vit_check`): patch+pos cos 1.000000, block0 1.000000, block13 0.999989, block26 0.999932, vit_out 0.999947
 (max|diff| 0.0066 on absmax 0.34). Change rule: rerun vit_check; fixtures from `scripts/p0_fixtures.py` (kept in the work dir).
+
+### Phase 3 design (image embeddings into the text model)
+
+Read from HF (base `transformers/models/qwen4_exp/modeling_qwen4_exp.py`, `config.json`):
+
+- `vision_config.deepstack_visual_indexes = []`: no DeepStack, so the merger output is the only image feature
+  (`inputs_embeds[mask] = image_embeds`). No per-layer visual injection.
+- PLE: `ple_input_ids = input_ids`, so an image row hashes the `image_token_id` (248056) row, exactly as TRUSS's
+  `ple_rows(c.tokens)` already does. No PLE change (the row is **not** zeroed).
+- mrope: `rope.dimension_sections = [11,11,10,0]`, `dimension_count = 64`, interleaved, `rope_theta = 1e7`. NEOX
+  pair `p` (dims `p`, `p+32`) takes axis `sec[p]`, a 32-entry table built at load: default t; H for
+  `p in slice(1,33,3)` = 1,4,..,31; W for `p in slice(2,30,3)` = 2,5,..,29. No image: every pair uses t.
+- One image per prompt (multi-image is out of scope). LLM grid `nh x nw` (= patch grid / 2). For image row `k` in
+  ViT merge-block order, with the image starting at `s` (row after `<|vision_start|>`):
+  `t = s`, `h = s + k/nw`, `w = s + k%nw`; text after the image continues at `s + max(nh,nw)`.
+  `rope_delta = max(pos3) + 1 - prompt_rows` (negative; 448x448 = 196 rows -> 14 positions).
+- The GGUF chat template already emits `<|vision_start|><|image_pad|><|vision_end|>` and `<|image_pad|>` = 248056;
+  the server expands that one token into `nh*nw` copies (HF's processor does the same).
+
+Engine plumbing (all dormant for text-only: `pos3 = NULL`, `rope_delta = 0`, `img_n = 0`):
+
+- `Chunk` gains `img` (host f32 `[img_n][img_cols]`, ViT output), `img_row0`, `img_n`, `img_cols`, `pos3`
+  (absolute `[3][T]`, `pos3[axis*T + t]`; NULL = 1-D), `rope_delta` (added to `pos0` **for rope only**; cache rows
+  and DSA block indices stay linear).
+- `StageModel::embed` overwrites `emb` rows with the image rows **before** `hc_->expand` (HF replaces
+  `inputs_embeds`), then PLE adds its row as for any token. No other model code changes.
+- `Dsa::forward` takes `(pos3, rope_delta)`; `rope_table` writes `theta = (double) pos * pow(base, -2p/64)` with
+  `pos = pos3 ? pos3[sec[p]*T + t] : pos0 + t + rope_delta`. The same position feeds `prepare_index`'s pooled key
+  at the block-start row. With `pos3 = NULL, rope_delta = 0` this is today's expression (text bit-identical).
+- `Pipeline`: `prompt()` takes an optional `ImageIn {embeds, row0, nh, nw, cols}`; it builds `pos3` per chunk
+  (sliced by absolute row), stores `rope_delta[slot]`, and passes both to every stage. `run()` passes the stored
+  delta. `reset()` / `restore()` keep it with `seq_pos_`. MTP drafts use `linear pos + delta` for their rope.
+- C API (additive; `truss_eval*` unchanged): `truss_eval_img_s(m, slot, tokens, n, embeds, n_emb, cols, img_row0,
+  nh, nw, logits)`, and `truss_vision_open/forward/close` for the ViT on a chosen device. `forward` takes host
+  `pixel_values` and writes host f32 rows: 2 MB per 448x448 image, and the D2H/H2D round trip avoids peer copies
+  when the ViT device differs from the front stage. Embeds stay f32 (the ViT output is f32; f16 would only add a
+  rounding + kernel for 2 MB).
+- `server/vision.py` (<250 lines): `image_url` content parts (data-URI or http(s), 20 MB cap, 10 s timeout; local
+  paths only with `--allow-local-images`), `vision_pre.preprocess`, ViT forward, expand `<|image_pad|>` to `nh*nw`
+  tokens, new eval. More than one image per request is an error for now.
+Files (Phase 3): `src/kernels/dsa/dsa_prepare.{cuh,cu}` (`RopePos`), `src/blocks/attn_dsa.{h,cu}` (`rope_sec`),
+`src/engine/{model.h,stage.h,stage_seq.cu,pipeline.h,pipeline.cu,pipeline_slots.cu}` (`ImageIn`/`ChunkExtra`, per-slot
+`rope_delta`), `src/model/qwen4exp/{model.h,model.cu,mtp.h,mtp.cu,mtp_draft.cu}` (device section table, image rows in
+`embed`, rope delta through the draft), `src/model/deepseek41/dspark*.{h,cu}` (interface), `src/api/truss_vision.cu`
+(new: `truss_vision_open/width/forward/close`), `src/api/{truss_c.cu,truss_sampling.cu,api_internal.h}` +
+`include/truss/truss.h` (`truss_eval_img{,argmax,sample}_s`), `server/vision.py` (new), `server/{app,engine,generate}.py`
+(`--mmproj`, `--mmproj-device`, `--allow-local-images`), `tests/server/vision_expand_test.py` +
+`tests/server/image_prompt_test.py` (host-only).
+
+Server behaviour: an `image_url` part (data URI, http(s), or a local path with `--allow-local-images`) goes through
+`Tower.rows` (`vision_pre` + `truss_vision_forward`) and `expand`; `generate(image=...)` reads the **whole** prompt in
+one `eval_img*` call and skips checkpoint/prefix reuse (the engine requires the image at position 0); decode calls are
+the ordinary `eval_*` with the slot's stored `rope_delta`. No `--mmproj` ⇒ an image request is a 400, not a silent
+`<|image_pad|>`.
+
+- Gates: (a) golden_ds41 7/7 + Flash-Next text-only 64-token bit-identical; (b) last-position logits vs HF,
+  KL <= 0.1, top-1 >= 85% over 64 positions; (c) 3 readable descriptions in TRACKER; (d) 448 and 1344 prefill ms
+  and peak VRAM. Chunk-crossing image: test with a small `--chunk` (row-indexed embeds/pos3).

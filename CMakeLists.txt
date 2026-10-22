@@ -115,10 +115,17 @@ add_library(truss_engine STATIC
   src/model/registry.cc)
 target_link_libraries(truss_engine PUBLIC truss_models truss_kernels truss_cpu)
 
+# ---- Flash-Next vision tower (docs/reference/model-qwen4exp.md "Vision")
+add_library(truss_vision STATIC src/model/qwen4exp/vision/vit.cu)
+target_include_directories(truss_vision PUBLIC src)
+target_link_libraries(truss_vision PUBLIC truss_formats CUDA::cudart CUDA::cublas)
+add_executable(vit_check tests/unit/vit_check.cu)
+target_link_libraries(vit_check PRIVATE truss_vision)
+
 # ---- public C API: libtruss.so (include/truss/truss.h), what server/ binds to
-add_library(truss SHARED src/api/truss_c.cu src/api/truss_sampling.cu)
+add_library(truss SHARED src/api/truss_c.cu src/api/truss_sampling.cu src/api/truss_vision.cu)
 target_include_directories(truss PUBLIC include)
-target_link_libraries(truss PRIVATE truss_engine)
+target_link_libraries(truss PRIVATE truss_engine truss_vision)
 set_target_properties(truss PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
 
 # ---- pack-time encoders (Viterbi), used by the pack converter
@@ -163,13 +170,6 @@ add_library(truss_kernels STATIC
   src/kernels/mtp/mtp_ops.cu)
 target_include_directories(truss_kernels PUBLIC src)
 target_link_libraries(truss_kernels PUBLIC CUDA::cublas)
-
-# ---- Flash-Next vision tower (docs/reference/model-qwen4exp.md "Vision")
-add_library(truss_vision STATIC src/model/qwen4exp/vision/vit.cu)
-target_include_directories(truss_vision PUBLIC src)
-target_link_libraries(truss_vision PUBLIC truss_formats CUDA::cudart CUDA::cublas)
-add_executable(vit_check tests/unit/vit_check.cu)
-target_link_libraries(vit_check PRIVATE truss_vision)
 
 # ---- tests (tests/unit: one binary per op, exit code = pass/fail)
 if(TRUSS_LLAMA_REF)

@@ -33,7 +33,8 @@ public:
     void flush(engine::Stage & st, int slot) override;
     void park(engine::Stage & st, int slot) override;
     void unpark(engine::Stage & st, int slot) override;
-    int draft(engine::Stage & st, int slot, int32_t next, int pos, int n, int32_t * out, const Sampling & s) override;
+    int draft(engine::Stage & st, int slot, int32_t next, int pos, int n, int32_t * out, const Sampling & s,
+              int rope_delta = 0) override;
     engine::Stateful * state() override { return this; }
 
     // Stateful (its DSA layer's state is forwarded)
@@ -50,7 +51,7 @@ private:
         float * pending_h = nullptr;      // hidden state [hc][d] of the last committed row
         bool has_pending = false;
         bool dc_on = false;               // a deferred commit of dc_T rows at dc_pos0
-        int dc_pos0 = 0, dc_T = 0;
+        int dc_pos0 = 0, dc_T = 0, dc_delta = 0;
         std::vector<int32_t> dc_tokens;
         bool ahead = false;               // draft() already computed the next commit's first row
         int32_t ahead_tok = -1;
@@ -58,8 +59,8 @@ private:
         float * res_keep = nullptr;       // the deferred rows while another slot uses the stage's buffers
     };
     void rows(engine::Stage & st, int slot, const float * h, const int * d_ids, int pos0, int T, bool stream,
-              bool logits, bool calib = false);
-    void commit(engine::Stage & st, int slot, const int32_t * tokens, int pos0, int T, bool stream);
+              bool logits, bool calib = false, int rope_delta = 0);
+    void commit(engine::Stage & st, int slot, const int32_t * tokens, int pos0, int T, bool stream, int rope_delta = 0);
 
     StageModel & sm_;
     const Config & c_;

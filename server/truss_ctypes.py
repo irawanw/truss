@@ -57,6 +57,39 @@ class Sampling(ctypes.Structure):   # truss_sampling; penalties off unless set (
         self.n_history = len(self._hist)
 
 
+class Vision:
+    """The vision tower from flashnext-mmproj-f16.gguf on one device: host pixel_values -> host f32 rows."""
+
+    def __init__(self, mmproj_path: str, device: int = 0, lib_path: str = _DEFAULT_LIB):
+        lib = ctypes.CDLL(os.path.abspath(lib_path))
+        p, c_int, f32p = ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_float)
+        lib.truss_vision_open.restype, lib.truss_vision_open.argtypes = p, [ctypes.c_char_p, c_int]
+        lib.truss_vision_close.restype, lib.truss_vision_close.argtypes = None, [p]
+        lib.truss_vision_width.restype, lib.truss_vision_width.argtypes = c_int, [p]
+        lib.truss_vision_forward.restype = c_int
+        lib.truss_vision_forward.argtypes = [p, f32p, c_int, c_int, f32p]
+        lib.truss_last_error.restype, lib.truss_last_error.argtypes = ctypes.c_char_p, []
+        self._lib = lib
+        self._v = lib.truss_vision_open(mmproj_path.encode(), device)
+        if not self._v:
+            raise TrussError(lib.truss_last_error().decode(errors="replace"))
+        self.width = lib.truss_vision_width(self._v)
+
+    def forward(self, pixel_values, gh: int, gw: int) -> np.ndarray:
+        px = np.ascontiguousarray(pixel_values, dtype=np.float32)
+        out = np.empty((gh * gw // 4, self.width), dtype=np.float32)
+        rc = self._lib.truss_vision_forward(self._v, px.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), gh, gw,
+                                            out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
+        if rc < 0:
+            raise TrussError(self._lib.truss_last_error().decode(errors="replace"))
+        return out[:rc]
+
+    def close(self):
+        if self._v:
+            self._lib.truss_vision_close(self._v)
+            self._v = None
+
+
 class Model:
     """mtp: MTP draft GGUF (enables spec_step); cpu_dir: CPU expert tier (needs expert_usage)."""
 
@@ -116,6 +149,14 @@ class Model:
             "truss_set_option": (c_int, [p, ctypes.c_char_p, ctypes.c_double]),
             "truss_expert_counts": (None, [p, ctypes.POINTER(ctypes.c_longlong)]),
             "truss_wait_ready": (c_int, [p]),
+            "truss_eval_img_s": (c_int, [p, c_int, i32p, c_int, f32p, c_int, c_int, c_int, c_int, c_int, f32p]),
+            "truss_eval_img_argmax_s": (c_int, [p, c_int, i32p, c_int, f32p, c_int, c_int, c_int, c_int, c_int, i32p]),
+            "truss_eval_img_sample_s": (c_int, [p, c_int, i32p, c_int, f32p, c_int, c_int, c_int, c_int, c_int,
+                                                ctypes.POINTER(Sampling), i32p]),
+            "truss_vision_open": (p, [ctypes.c_char_p, c_int]),
+            "truss_vision_close": (None, [p]),
+            "truss_vision_width": (c_int, [p]),
+            "truss_vision_forward": (c_int, [p, f32p, c_int, c_int, f32p]),
         }.items():
             fn = getattr(lib, name, None)
             if fn is not None:
@@ -136,10 +177,16 @@ class Model:
         self.drafts = lib.truss_drafts(self._m)
         self.slots = lib.truss_slots(self._m)   # TRUSS_SLOTS; n_ctx above is per slot
         self._emitted = (ctypes.c_int32 * 8)()
+        self._cur = 0
+        # vision bindings are optional (a text-only build still serves); eval_img* raise if they are missing
+        self.vision_ok = all(hasattr(lib, k) for k in
+                             ("truss_eval_img_s", "truss_eval_img_argmax_s", "truss_eval_img_sample_s",
+                              "truss_vision_open", "truss_vision_forward"))
 
     def select(self, slot: int):
         """Make sequence slot `slot` current (TRUSS_SLOTS); every other call acts on it."""
         self._check(self._lib.truss_select(self._m, slot))
+        self._cur = slot
 
     def _error(self) -> str:
         return self._lib.truss_last_error().decode(errors="replace")
@@ -190,6 +237,62 @@ class Model:
         self._check(self._lib.truss_eval(self._m, arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), len(arr),
                                          self._logits.ctypes.data_as(ctypes.POINTER(ctypes.c_float))))
         return self._logits
+
+    def _img_args(self, embeds):
+        e = np.ascontiguousarray(embeds, dtype=np.float32)
+        if e.ndim != 2:
+            raise ValueError("image embeds must be [rows, width]")
+        return e, e.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), e.shape[1]
+
+    def _eval_img_s(self, libfn, slot, tokens, embeds, img_row0, nh, nw, *extra):
+        arr = np.ascontiguousarray(tokens, dtype=np.int32)
+        e = np.ascontiguousarray(embeds, dtype=np.float32)
+        if e.ndim != 2:
+            raise ValueError("image embeds must be [rows, width]")
+        return arr, e, libfn(self._m, slot, arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), len(arr),
+                             e.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), e.shape[0], e.shape[1], img_row0, nh, nw,
+                             *extra)
+
+    def eval_img(self, tokens, embeds, img_row0: int, nh: int, nw: int) -> np.ndarray:
+        """Append a prompt containing one image; logits of the last token."""
+        lp = self._logits.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        arr, e, rc = self._eval_img_s(self._lib.truss_eval_img_s, self._cur, tokens, embeds, img_row0, nh, nw, lp)
+        self._check(rc)
+        return self._logits
+
+    def eval_img_s(self, slot: int, tokens, embeds, img_row0: int, nh: int, nw: int) -> np.ndarray:
+        lp = self._logits.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        arr, e, rc = self._eval_img_s(self._lib.truss_eval_img_s, slot, tokens, embeds, img_row0, nh, nw, lp)
+        self._check(rc)
+        return self._logits
+
+    def eval_img_argmax(self, tokens, embeds, img_row0: int, nh: int, nw: int) -> int:
+        out = ctypes.c_int32()
+        arr, e, rc = self._eval_img_s(self._lib.truss_eval_img_argmax_s, self._cur, tokens, embeds, img_row0, nh, nw,
+                                      ctypes.byref(out))
+        self._check(rc)
+        return out.value
+
+    def eval_img_argmax_s(self, slot: int, tokens, embeds, img_row0: int, nh: int, nw: int) -> int:
+        out = ctypes.c_int32()
+        arr, e, rc = self._eval_img_s(self._lib.truss_eval_img_argmax_s, slot, tokens, embeds, img_row0, nh, nw,
+                                      ctypes.byref(out))
+        self._check(rc)
+        return out.value
+
+    def eval_img_sample(self, tokens, embeds, img_row0: int, nh: int, nw: int, sp: Sampling) -> int:
+        out = ctypes.c_int32()
+        arr, e, rc = self._eval_img_s(self._lib.truss_eval_img_sample_s, self._cur, tokens, embeds, img_row0, nh, nw,
+                                      ctypes.byref(sp), ctypes.byref(out))
+        self._check(rc)
+        return out.value
+
+    def eval_img_sample_s(self, slot: int, tokens, embeds, img_row0: int, nh: int, nw: int, sp: Sampling) -> int:
+        out = ctypes.c_int32()
+        arr, e, rc = self._eval_img_s(self._lib.truss_eval_img_sample_s, slot, tokens, embeds, img_row0, nh, nw,
+                                      ctypes.byref(sp), ctypes.byref(out))
+        self._check(rc)
+        return out.value
 
     def eval_argmax(self, tokens) -> int:
         """Append tokens; returns the greedy next token."""

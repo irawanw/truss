@@ -175,6 +175,47 @@ int truss_eval_s(truss_model * m, int slot, const int32_t * tokens, int n, float
 
 int truss_eval(truss_model * m, const int32_t * tokens, int n, float * logits) { return truss_eval_s(m, m->cur, tokens, n, logits); }
 
+namespace {
+engine::ImageIn image_in(const float * embeds, int n_img, int cols, int img_row0, int nh, int nw)
+{
+    if (n_img <= 0 || nh <= 0 || nw <= 0 || nh * nw != n_img || cols <= 0)
+        throw std::invalid_argument("truss_eval_img: bad image grid/width");
+    return engine::ImageIn{ embeds, img_row0, n_img, cols, nh, nw };
+}
+}  // namespace
+
+int truss_eval_img_s(truss_model * m, int slot, const int32_t * tokens, int n, const float * embeds, int n_img,
+                     int cols, int img_row0, int nh, int nw, float * logits)
+{
+    return guarded(
+        [&] {
+            const engine::ImageIn img = image_in(embeds, n_img, cols, img_row0, nh, nw);
+            eval(*m, slot, tokens, n, [&] {
+                if (logits) TRUSS_CUDA(cudaMemcpyAsync(logits, m->logits, sizeof(float) * m->n_vocab,
+                                                       cudaMemcpyDeviceToHost, m->fwd->stream()));
+                sync(*m);
+            }, 0, &img);
+            return 0;
+        },
+        -1);
+}
+
+int truss_eval_img_argmax_s(truss_model * m, int slot, const int32_t * tokens, int n, const float * embeds,
+                            int n_img, int cols, int img_row0, int nh, int nw, int32_t * next)
+{
+    return guarded(
+        [&] {
+            const engine::ImageIn img = image_in(embeds, n_img, cols, img_row0, nh, nw);
+            eval(*m, slot, tokens, n, [&] {
+                sampling::argmax(m->logits, m->n_vocab, m->next, m->fwd->stream());
+                TRUSS_CUDA(cudaMemcpyAsync(next, m->next, sizeof(int), cudaMemcpyDeviceToHost, m->fwd->stream()));
+                sync(*m);
+            }, 0, &img);
+            return 0;
+        },
+        -1);
+}
+
 int truss_eval_step_s(truss_model * m, int slot, const int32_t * tokens, int n, int step, float * logits)
 {
     return guarded(

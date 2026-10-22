@@ -54,6 +54,15 @@ int truss_reset(truss_model * m);
 /* append tokens[0 .. n) and write the last token's next-token logits (n_vocab floats) to logits (NULL: skip) */
 int truss_eval(truss_model * m, const int32_t * tokens, int n, float * logits);
 
+/* append a prompt that contains one image: tokens as truss_eval, plus the ViT output (host f32 [n_img][cols],
+   n_img == nh * nw) which replaces the embeddings of the prompt rows [img_row0, img_row0 + n_img). nh x nw is the
+   image's grid in text tokens (= patch grid / 2). The 3-D rope positions and the decode offset are built here.
+   The image prompt must start at position 0 (do not mix it with a restored prefix). */
+int truss_eval_img_s(truss_model * m, int slot, const int32_t * tokens, int n, const float * embeds, int n_img,
+                     int cols, int img_row0, int nh, int nw, float * logits);
+int truss_eval_img_argmax_s(truss_model * m, int slot, const int32_t * tokens, int n, const float * embeds,
+                            int n_img, int cols, int img_row0, int nh, int nw, int32_t * next);
+
 /* the same, but only the argmax of those logits (greedy decoding without the logits copy) */
 int truss_eval_argmax(truss_model * m, const int32_t * tokens, int n, int32_t * next);
 
@@ -64,6 +73,14 @@ int truss_eval_argmax(truss_model * m, const int32_t * tokens, int n, int32_t * 
    decoding token for token. */
 int truss_spec_step(truss_model * m, int32_t next, int32_t * emitted, int * n_emitted, int32_t * new_next);
 int truss_drafts(const truss_model * m);            /* 0: opened without MTP */
+
+/* Vision tower (flashnext-mmproj-f16.gguf), for a multimodal eval. Open on `device`, then forward host pixel_values
+   ([gh*gw][3*2*16*16], server/vision_pre.py) and receive host f32 rows ([gh*gw/4][width], text-token order). */
+typedef struct truss_vision truss_vision;
+truss_vision * truss_vision_open(const char * mmproj_path, int device);
+void truss_vision_close(truss_vision * v);
+int truss_vision_width(const truss_vision * v);
+int truss_vision_forward(truss_vision * v, const float * pixel_values, int gh, int gw, float * out_rows);
 
 /* Runtime knobs, set between calls (no call running on any slot): one loaded model serves many bench arms
    (tools/tk-bench/arms.py). "drafts" (1 .. the open value) and the decode-tier knobs of the routed experts, named as
@@ -151,6 +168,9 @@ int truss_spec_step_sampled(truss_model * m, int32_t next, const truss_sampling 
                             int * n_emitted, int32_t * new_next);
 int truss_eval_sample_s(truss_model * m, int slot, const int32_t * tokens, int n, const truss_sampling * sp,
                         int32_t * next);
+int truss_eval_img_sample_s(truss_model * m, int slot, const int32_t * tokens, int n, const float * embeds,
+                            int n_img, int cols, int img_row0, int nh, int nw, const truss_sampling * sp,
+                            int32_t * next);
 int truss_spec_step_sampled_s(truss_model * m, int slot, int32_t next, const truss_sampling * sp, int32_t * emitted,
                               int * n_emitted, int32_t * new_next);
 

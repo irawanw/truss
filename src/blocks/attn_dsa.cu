@@ -49,8 +49,11 @@ template <class S> void Dsa<S>::alloc_slots(engine::Stage & st, int n_slots, int
 }
 
 template <class S>
-void Dsa<S>::forward(engine::Gpu & g, int slot, const half * in16, int pos0, int T, float * out, bool tentative)
+void Dsa<S>::forward(engine::Gpu & g, int slot, const half * in16, int pos0, int T, float * out, bool tentative,
+                     const dsa::RopePos & rp_in)
 {
+    dsa::RopePos rp = rp_in;
+    rp.sec = d_.rope_sec;
     Slot & L = s_[slot];
     Scratch & sc = *g.sc;
     const size_t m = sc.mark();
@@ -69,10 +72,10 @@ void Dsa<S>::forward(engine::Gpu & g, int slot, const half * in16, int pos0, int
         g.copy(L.partial_snap, L.idx_partial, partial_floats());
         g.copy(L.raw_ik, ik, (size_t) T * ID);
     }
-    dsa::rope_table<S>(pos0, T, d_.rope_base, cs, g.s);
+    dsa::rope_table<S>(pos0, T, d_.rope_base, cs, rp, g.s);
     dsa::prepare_qkv<S>(qfull, k, v, lin_.f32(w_.q_norm), lin_.f32(w_.k_norm), cs, pos0, T, d_.eps, q16, gate, L.kv, g.s);
     dsa::prepare_index<S>(iq, ik, lin_.f32(w_.idx_q_norm), lin_.f32(w_.idx_k_norm), cs, d_.rope_base, pos0, T, d_.eps,
-                          L.idx_partial, iq16, L.idx_k, g.s);
+                          L.idx_partial, iq16, L.idx_k, rp, g.s);
     const size_t ws_bytes = dsa::select_workspace_bytes<S>(T, pos0 + T);
     void * ws = sc.alloc<unsigned char>(ws_bytes);
     dsa::select<S>(iq16, L.idx_k, pos0, T, blocks, n_blocks, ws, ws_bytes, g.s);

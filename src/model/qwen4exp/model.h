@@ -88,6 +88,7 @@ private:
     const Mtp * mtp_;
     const int lb_, le_, n_ctx_;
     std::unique_ptr<blocks::Hc> hc_;
+    int * rope_sec_ = nullptr;   // device [ROPE_DIMS/2]: mrope pair -> axis (all 0: text)
     std::unique_ptr<blocks::PleTable> ple_table_;
     std::vector<std::unique_ptr<blocks::Gdn>> gdn_;               // [l - lb] (null on DSA layers)
     std::vector<std::unique_ptr<blocks::Dsa<DsaShape>>> dsa_;     // [l - lb] (null on GDN layers)

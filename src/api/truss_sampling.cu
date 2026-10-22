@@ -73,6 +73,28 @@ int truss_eval_sample_s(truss_model * m, int slot, const int32_t * tokens, int n
         -1);
 }
 
+int truss_eval_img_sample_s(truss_model * m, int slot, const int32_t * tokens, int n, const float * embeds,
+                            int n_img, int cols, int img_row0, int nh, int nw, const truss_sampling * sp,
+                            int32_t * next)
+{
+    return guarded(
+        [&] {
+            if (n_img <= 0 || nh <= 0 || nw <= 0 || nh * nw != n_img || cols <= 0)
+                throw std::invalid_argument("truss_eval_img_sample_s: bad image grid/width");
+            const sampling::SampleParams p = params_of(sp);
+            const engine::ImageIn img{ embeds, img_row0, n_img, cols, nh, nw };
+            eval(*m, slot, tokens, n, [&] {
+                penalize_rows(*m, *sp, nullptr, 0, 1);
+                ban_rows(*m, *sp, tokens, n, 1);
+                sampling::sample(m->logits, m->n_vocab, 1, p, m->counter[slot]++, m->next, m->fwd->stream());
+                TRUSS_CUDA(cudaMemcpyAsync(next, m->next, sizeof(int), cudaMemcpyDeviceToHost, m->fwd->stream()));
+                sync(*m);
+            }, 0, &img);
+            return 0;
+        },
+        -1);
+}
+
 int truss_eval_sample(truss_model * m, const int32_t * tokens, int n, const truss_sampling * sp, int32_t * next)
 {
     return truss_eval_sample_s(m, m->cur, tokens, n, sp, next);

@@ -14,13 +14,16 @@ constexpr int THREADS = 256, WARPS = THREADS / 32;
 
 unsigned grid(int64_t rows) { return (unsigned) ((rows + WARPS - 1) / WARPS); }
 
-template <class Shape> __global__ void rope_table_kernel(int pos0, int T, float base, float2 * cs)
+template <class Shape>
+__global__ void rope_table_kernel(int pos0, int T, float base, float2 * cs, const int * pos3, const int * sec,
+                                  int stride, int row0, int delta)
 {
     constexpr int HALF = Shape::ROPE_DIMS / 2;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * HALF) return;
     const int t = i / HALF, p = i % HALF;
-    const double theta = (double) (pos0 + t) * pow((double) base, -2.0 * p / Shape::ROPE_DIMS);
+    const int pos = pos3 ? pos3[sec[p] * stride + row0 + t] : pos0 + t + delta;
+    const double theta = (double) pos * pow((double) base, -2.0 * p / Shape::ROPE_DIMS);
     cs[i] = make_float2((float) cos(theta), (float) sin(theta));
 }
 
@@ -120,7 +123,8 @@ __global__ void qkv_kernel(const float * qfull, const float * k, const float * v
 template <class Shape>
 __global__ void index_kernel(const float * idx_q, const float * idx_k, const float * q_norm, const float * k_norm,
                              const float2 * cs, float rope_base, int pos0, int T, float eps, const float * partial,
-                             half * idx_q16, half * idx_k_cache)
+                             half * idx_q16, half * idx_k_cache, const int * pos3, const int * sec, int stride,
+                             int delta)
 {
     constexpr int IH = Shape::IH, ID = Shape::ID, E = ID / 32, R = Shape::RATIO, HALF = Shape::ROPE_DIMS / 2;
     const int64_t r = (int64_t) blockIdx.x * WARPS + threadIdx.x / 32;   // (token, head) of q, then completed block
@@ -145,8 +149,10 @@ __global__ void index_kernel(const float * idx_q, const float * idx_k, const flo
         }
         x[j] = acc * (1.f / R);
     }
-    // the block start may precede the chunk's rope table: its own fp64 angle
-    const double theta = (double) (R * b) * pow((double) rope_base, -2.0 * lane / Shape::ROPE_DIMS);
+    // the block start may precede the chunk's rope table: its own fp64 angle (3-D position of that absolute row)
+    const int bp = R * b;
+    const int pos = pos3 ? pos3[sec[lane] * stride + bp] : bp + delta;
+    const double theta = (double) pos * pow((double) rope_base, -2.0 * lane / Shape::ROPE_DIMS);
     const float2 rot = make_float2((float) cos(theta), (float) sin(theta));
     norm_rope_at<E, Shape::ROPE_DIMS>(x, k_norm, rot, eps);
 #pragma unroll
@@ -166,10 +172,12 @@ template <class Shape> __global__ void partial_kernel(const float * idx_k, int p
 
 }  // namespace
 
-template <class Shape> void rope_table(int pos0, int T, float base, float2 * cs, cudaStream_t stream)
+template <class Shape>
+void rope_table(int pos0, int T, float base, float2 * cs, const RopePos & rp, cudaStream_t stream)
 {
     const int n = T * Shape::ROPE_DIMS / 2;
-    rope_table_kernel<Shape><<<(n + 255) / 256, 256, 0, stream>>>(pos0, T, base, cs);
+    rope_table_kernel<Shape><<<(n + 255) / 256, 256, 0, stream>>>(pos0, T, base, cs, rp.pos3, rp.sec, rp.stride,
+                                                                rp.row0, rp.delta);
     TRUSS_CUDA(cudaGetLastError());
 }
 
@@ -197,13 +205,14 @@ void prepare_qkv(const float * qfull, const float * k, const float * v, const fl
 template <class Shape>
 void prepare_index(const float * idx_q, const float * idx_k, const float * q_norm, const float * k_norm,
                    const float2 * cs, float rope_base, int pos0, int T, float eps, float * partial, half * idx_q16,
-                   half * idx_k_cache, cudaStream_t stream)
+                   half * idx_k_cache, const RopePos & rp, cudaStream_t stream)
 {
     static_assert(Shape::ID % 32 == 0, "indexer head dim in lane strides");
     const int nb = (pos0 + T) / Shape::RATIO - pos0 / Shape::RATIO;
     const int64_t rows = (int64_t) T * Shape::IH + nb;
     index_kernel<Shape><<<grid(rows), THREADS, 0, stream>>>(idx_q, idx_k, q_norm, k_norm, cs, rope_base, pos0, T, eps,
-                                                            partial, idx_q16, idx_k_cache);
+                                                            partial, idx_q16, idx_k_cache, rp.pos3, rp.sec, rp.stride,
+                                                            rp.delta);
     const int n = (Shape::RATIO - 1) * Shape::ID;
     partial_kernel<Shape><<<(n + 255) / 256, 256, 0, stream>>>(idx_k, pos0, T, partial);
     TRUSS_CUDA(cudaGetLastError());
@@ -217,12 +226,12 @@ template <class Shape> void carry_partial(const float * idx_k, int pos0, int T, 
 }
 
 template void carry_partial<FlashNext>(const float *, int, int, float *, cudaStream_t);
-template void rope_table<FlashNext>(int, int, float, float2 *, cudaStream_t);
+template void rope_table<FlashNext>(int, int, float, float2 *, const RopePos &, cudaStream_t);
 template void prepare_qkv<FlashNext>(const float *, const float *, const float *, const float *, const float *,
                                      const float2 *, int, int, float, half *, float *, half *, half *, cudaStream_t);
 template void prepare_qkv<FlashNext>(const float *, const float *, const float *, const float *, const float *,
                                      const float2 *, int, int, float, half *, float *, const KvCache &, cudaStream_t);
 template void prepare_index<FlashNext>(const float *, const float *, const float *, const float *, const float2 *,
-                                       float, int, int, float, float *, half *, half *, cudaStream_t);
+                                       float, int, int, float, float *, half *, half *, const RopePos &, cudaStream_t);
 
 }  // namespace truss::dsa

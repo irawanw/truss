@@ -41,6 +41,8 @@ Pipeline::Pipeline(const Family & fam, int n_ctx, int max_chunk, const Options &
     rt::set_stage_device(1, dev);
     if (!front_.empty()) rt::set_stage_device(0, front_[0]->device());
     seq_pos_.assign(std::max(1, o.slots), 0);
+    rope_delta_.assign(seq_pos_.size(), 0);
+    rope_delta_ck_.assign(seq_pos_.size(), 0);
     round_ns_ = std::make_unique<std::atomic<long long>[]>(seq_pos_.size());
     for (size_t i = 0; i < seq_pos_.size(); ++i) round_ns_[i] = 0;
     seq_ctx_ = m_->seq_ctx();
@@ -75,7 +77,8 @@ void Pipeline::run(const int32_t * tokens, int T, const LayerHook & hook, const 
         Held<Stage> h(m, ticket);
         m.select(slot);
         m.settle();
-        m.run_chunk(tokens, pos, T, hook, false, next, next_T);
+        m.run_chunk(tokens, pos, T, hook, false, next, next_T, ChunkExtra{ nullptr, 0, 0, 0, nullptr, 0, 0,
+                                                                           rope_delta_[slot] });
         ticket = m.handed.load();
     });
     seq_pos_[slot] += T;
@@ -104,7 +107,8 @@ void Pipeline::verify(const int32_t * tokens, int T)
         Held<Stage> h(m, ticket);
         m.select(slot);
         m.settle();
-        m.run_chunk(tokens, pos, T, nullptr, true);
+        m.run_chunk(tokens, pos, T, nullptr, true, nullptr, 0,
+                    ChunkExtra{ nullptr, 0, 0, 0, nullptr, 0, 0, rope_delta_[slot] });
         ticket = m.handed.load();
     });
 }
@@ -142,12 +146,14 @@ void Pipeline::reset(int slot)
         m.reset();
     });
     seq_pos_.at(slot) = 0;
+    rope_delta_.at(slot) = 0;
 }
 void Pipeline::reset() { reset(active_); }
 
 void Pipeline::checkpoint(int slot)
 {
     const int pos = seq_pos_.at(slot);
+    rope_delta_ck_.at(slot) = rope_delta_.at(slot);
     each_stage([&](Stage & m) {
         Held<Stage> h(m, 0);
         m.select(slot);
@@ -166,7 +172,7 @@ int Pipeline::restore(int slot)
         m.settle();
         p = m.restore();
     });
-    if (p >= 0) seq_pos_.at(slot) = p;
+    if (p >= 0) seq_pos_.at(slot) = p, rope_delta_.at(slot) = rope_delta_ck_.at(slot);
     return p;
 }
 int Pipeline::restore() { return restore(active_); }

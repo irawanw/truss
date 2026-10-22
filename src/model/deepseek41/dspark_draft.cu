@@ -37,7 +37,8 @@ float conf_T()
 
 }  // namespace
 
-int DSpark::draft(engine::Stage & st, int slot, int32_t next, int pos, int n, int32_t * out, const Sampling & smp)
+int DSpark::draft(engine::Stage & st, int slot, int32_t next, int pos, int n, int32_t * out, const Sampling & smp,
+                  int /*rope_delta*/)
 {
     engine::require(pos >= 1, "DSpark draft needs a committed position");
     engine::require(n >= 1, "draft count");

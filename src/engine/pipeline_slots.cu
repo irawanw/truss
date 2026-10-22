@@ -66,7 +66,7 @@ int varlen_pick(const float * p, int cn, int nw, int & nw_drafted)
 }  // namespace
 
 void Pipeline::prompt(int slot, const int32_t * tokens, int n, int step, float * logits,
-                      const std::function<void()> & after, const std::function<void(int)> & done)
+                      const std::function<void()> & after, const std::function<void(int)> & done, const ImageIn * img)
 {
     require(n > 0 && step > 0, "run_prompt: no tokens");
     require(slot >= 0 && slot < (int) seq_pos_.size(), "prompt(): no such slot");
@@ -77,6 +77,43 @@ void Pipeline::prompt(int slot, const int32_t * tokens, int n, int step, float *
         nxt = nxt_T > 0 ? tokens + s + T : nullptr;
     };
     const int pos0 = seq_pos_[slot];
+    // 3-D rope positions of an image prompt (HF get_rope_index, one image): text before the image at t, the image rows
+    // t = s, h = s + k / nw, w = s + k % nw (merge-block order), text after at s + max(nh, nw); rope_delta for decode
+    std::vector<int> p3;
+    int delta = rope_delta_[slot];
+    if (img) {
+        require(pos0 == 0, "prompt(): an image prompt must start at position 0 (no prefix restore)");
+        require(img->n > 0 && img->nh > 0 && img->nw > 0 && img->nh * img->nw == img->n && img->cols > 0 &&
+                    img->row0 >= 0 && img->row0 + img->n <= n,
+                "prompt(): bad image rows");
+        const int is = img->row0, iw = img->nw, span = std::max(img->nh, img->nw);
+        p3.resize((size_t) 3 * n);
+        int mx = 0;
+        for (int t = 0; t < n; ++t) {
+            int vt, vh, vw;
+            if (t < is) vt = vh = vw = t;
+            else if (t < is + img->n) {
+                const int k = t - is;
+                vt = is, vh = is + k / iw, vw = is + k % iw;
+            } else vt = vh = vw = is + span + (t - is - img->n);
+            p3[t] = vt, p3[(size_t) n + t] = vh, p3[(size_t) 2 * n + t] = vw;
+            mx = std::max(mx, std::max(vt, std::max(vh, vw)));
+        }
+        delta = mx + 1 - n;   // HF: max(position_ids) + 1 - prompt length
+        rope_delta_[slot] = delta;
+    }
+    auto extra = [&](int s, int T) {   // this chunk's image rows and 3-D positions
+        ChunkExtra x;
+        x.pos3 = p3.empty() ? nullptr : p3.data(), x.pos3_stride = n, x.pos3_row0 = s, x.rope_delta = delta;
+        if (img) {
+            const int a = std::max(s, img->row0), b = std::min(s + T, img->row0 + img->n);
+            if (b > a) {
+                x.img = img->embeds + (size_t) (a - img->row0) * img->cols;
+                x.img_row0 = a - s, x.img_n = b - a, x.img_cols = img->cols;
+            }
+        }
+        return x;
+    };
     auto last_chunk = [&](int s, int T, long ticket) {   // the last stage's part of a chunk; the head after the last
         const int32_t * nx;
         int TT, nT;
@@ -84,7 +121,7 @@ void Pipeline::prompt(int slot, const int32_t * tokens, int n, int step, float *
         Held<Stage> h(*m_, ticket);
         m_->select(slot);
         m_->settle();
-        m_->run_chunk(tokens + s, pos0 + s, T, nullptr, false, nx, nT);
+        m_->run_chunk(tokens + s, pos0 + s, T, nullptr, false, nx, nT, extra(s, T));
         inject_fault("prompt-last", slot);   // this chunk's rows are taken; its head and later chunks never run
         if (s + T == n) {
             if (logits) m_->head(T - 1, 1, logits);
@@ -155,7 +192,7 @@ void Pipeline::prompt(int slot, const int32_t * tokens, int n, int step, float *
                     Held<Stage> h(f, 0);
                     f.select(slot);
                     f.settle();
-                    f.run_chunk(tokens + s, pos0 + s, T, nullptr, false, nx, nT);
+                    f.run_chunk(tokens + s, pos0 + s, T, nullptr, false, nx, nT, extra(s, T));
                     tk = f.handed.load();
                     {
                         std::lock_guard<std::mutex> l(qm);
@@ -237,6 +274,7 @@ int Pipeline::round(int slot, int32_t next, int nd, int32_t * win, float * logit
     rt::ctx().slot = slot, ++rt::ctx().round;
     TRUSS_RT(rt::kRound);
     const int pos = seq_pos_[slot];
+    const int rope_delta = rope_delta_[slot];
     round_ns_[slot] = -1;   // inside a round (the prompt of another slot gives way to it)
     struct Out {
         std::atomic<long long> & t;
@@ -279,7 +317,7 @@ int Pipeline::round(int slot, int32_t next, int nd, int32_t * win, float * logit
             Held<Stage> h(*m_, 0);
             m_->select(slot);
             inject_fault("round-draft", slot);
-            nw = m_->draft(next, pos, nd, win + 1, ds);
+            nw = m_->draft(next, pos, nd, win + 1, ds, rope_delta);
         }
         if (varlen_on()) {   // the confidence-scheduled verify: only the prefix the schedule pays for
             int cn = 0, nw_drafted = nw;
@@ -299,7 +337,8 @@ int Pipeline::round(int slot, int32_t next, int nd, int32_t * win, float * logit
             Held<Stage> h(*p, ticket);
             p->select(slot);
             p->settle();
-            p->run_chunk(win, pos, T, nullptr, true);
+            p->run_chunk(win, pos, T, nullptr, true, nullptr, 0,
+                         ChunkExtra{ nullptr, 0, 0, 0, nullptr, 0, 0, rope_delta });
             ++front_open;
             ticket = p->handed.load();
             handed = ticket;
@@ -322,7 +361,8 @@ int Pipeline::round(int slot, int32_t next, int nd, int32_t * win, float * logit
         {   // the last stage: its rows, the head, the caller's pick, the accept
             Held<Stage> h(*m_, ticket);
             m_->select(slot);
-            m_->run_chunk(win, pos, T, nullptr, true);
+            m_->run_chunk(win, pos, T, nullptr, true, nullptr, 0,
+                          ChunkExtra{ nullptr, 0, 0, 0, nullptr, 0, 0, rope_delta });
             last_open = true;
             m_->head(0, T, logits);
             inject_fault("round-pick", slot);
