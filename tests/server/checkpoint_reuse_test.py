@@ -15,6 +15,7 @@ import types
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from server import app  # noqa: E402
+from server.generate import CK_BACK  # noqa: E402
 
 
 class FakeModel:
@@ -87,8 +88,8 @@ def main():
 
     p1 = list(range(1, 1001)) + S
     g1, fed, rs, zs = request(e, p1)
-    check("first prompt", fed == 1003 + 4 and zs == 1 and e.ck_tokens == p1[:1000], f"fed {fed}, resets {zs}, "
-          f"checkpoint at {len(e.ck_tokens)}")   # 4 decode steps feed tokens; the checkpoint before <|im_start|>
+    check("first prompt", fed == 1003 + 4 and zs == 1 and e.ck_tokens == p1[:1000 - CK_BACK], f"fed {fed}, resets {zs}, "
+          f"checkpoint at {len(e.ck_tokens)}")   # 4 decode steps feed tokens; the checkpoint CK_BACK before <|im_start|>
     # the client re-sends the reply with its reasoning (the generated tokens) and a tool result: plain reuse (the
     # last generated token was never fed, so it is read with the tail)
     p2 = p1 + g1 + list(range(2001, 2051)) + S
@@ -103,9 +104,10 @@ def main():
           f"fed {fed} (prompt tail {len(p3) - ck}), restores {rs}, resets {zs}")
     check("sequence after restore", e.model.seq == p3 + g3[:-1], f"{len(e.model.seq)} tokens, prompt + generated")
     # the client aborted the reply and re-sent the same context with a notice before the generation prompt (oh-my-pi's
-    # loop guard, 10-22: "<system-interrupt ...>"): the prompt differs exactly at the checkpoint, restore there
-    ck = len(e.ck_tokens)
-    p5 = p3[:ck] + [6001, 6002, 6003] + S
+    # loop guard, 10-22: "\n\n<system-interrupt ...>"), which merges with the text token before the turn marker
+    # (">" + "\n\n" -> ">\n\n"): the prompt differs one token BEFORE the marker, and the checkpoint still holds
+    ck, im = len(e.ck_tokens), len(p3) - len(S)
+    p5 = p3[:im - 1] + [6000, 6001, 6002, 6003] + S
     g5, fed, rs, zs = request(e, p5)
     check("notice inserted at the checkpoint", fed == len(p5) - ck + 4 and rs == 1 and zs == 0,
           f"fed {fed} (prompt tail {len(p5) - ck}), restores {rs}, resets {zs}")

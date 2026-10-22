@@ -16,6 +16,7 @@ from server.reasoning import BAN_EOS_IN_THINK, BAN_MAX_TOKENS
 import os
 LOOP_GUARD = os.environ.get("TRUSS_LOOP_GUARD", "1") != "0"
 LOOP_EVERY, LOOP_MIN_PERIOD, LOOP_MAX_PERIOD, LOOP_COPIES, LOOP_COPIES_ANSWER = 64, 64, 1024, 3, 5
+CK_BACK = 4   # the prompt-end checkpoint sits this many tokens before the last turn marker
 LOOP_LONG_PERIOD = 200   # in the reasoning, 2 copies of a block this long count too
 # near-loops (no exact copy: "Let me run. Hmm." / "OK let me run now. Hmm." ...): the share of distinct 6-token
 # phrases in the last 512 reasoning tokens. Calibrated 10-21 on the agent's own reasoning blocks: near-loops 0.30 and
@@ -141,8 +142,12 @@ class EngineGenerate:
                     # checkpoint just before the prompt's last <|im_start|> (DS41: <｜Assistant｜>, engine.py) (~10 ms): the
                     # next request may resume there.
                     # Not at the prompt's end: its generation prompt ("...assistant\n<think>\n") tokenizes differently
-                    # once the reply follows it ("\n\n</think>"), but nothing before a special token can change.
+                    # once the reply follows it ("\n\n</think>"). The text before the special token can change too:
+                    # a client that inserts a note there (oh-my-pi's loop guard, 10-22: "\n\n<system-interrupt ...>")
+                    # merges the last text token with it (">" + "\n\n" -> ">\n\n"), and 111 of 111 such turns read
+                    # the whole prompt again. So CK_BACK tokens earlier.
                     cut = next((i for i in range(len(prompt_ids) - 1, reuse, -1) if prompt_ids[i] == self.im_start), 0)
+                    cut = max(0, cut - CK_BACK)
                     if cut > reuse:
                         slot.cached += prompt_ids[reuse:cut]
                         self.read(slot, prompt_ids[reuse:cut])

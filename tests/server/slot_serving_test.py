@@ -20,6 +20,7 @@ import types
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from server import app  # noqa: E402
+from server.generate import CK_BACK  # noqa: E402
 from server.truss_ctypes import TrussError  # noqa: E402
 
 IM = 99999   # <|im_start|>
@@ -205,10 +206,10 @@ def test_assignment():
     check("a prompt extending slot 0 goes to slot 0",
           e.slots[0].cached[:len(pa)] == pa and e.slots[1].cached[:3] == pb[:3],
           f"slot 0 {len(e.slots[0].cached)} tokens (A + continuation), slot 1 untouched at {len(e.slots[1].cached)}")
-    # restored to the checkpoint (120 tokens) and read the 8 tokens after it; a reset would have re-read all 128
+    # restored to the checkpoint (CK_BACK before 120) and read the tokens after it; a reset would have re-read all 128
     fed = sum(c[2] for c in new[:first + 1] if c[1] in ("eval", "eval_argmax"))
     check("and read only its tail", [c[1] for c in new[:first]] == ["restore", "eval", "checkpoint"]
-          and fed == len(pc) - 120, f"{new[:first + 1]}, {fed} tokens fed of {len(pc)}")
+          and fed == len(pc) - (120 - CK_BACK), f"{new[:first + 1]}, {fed} tokens fed of {len(pc)}")
     pd = prompt(4, 60)   # matches neither: the free slot with the fewest cached tokens, not the LRU one
     run(e, pd)
     check("a prompt matching neither takes the slot with the least cached", e.slots[1].cached[:3] == pd[:3],
@@ -251,10 +252,10 @@ def test_lcp_log():
     check("an empty server logs a zero lcp", any("lcp s0 0/ck 0, s1 0/ck 0" in l for l in e.progress_lines),
           next((l for l in e.progress_lines if "lcp " in l), "no lcp line"))
     e.progress_lines.clear()
-    # slot 0 holds 303 prompt tokens + its reply, checkpointed at 300: the new prompt shares the 303, not the reply
+    # slot 0 holds 303 prompt tokens + its reply, checkpointed CK_BACK before 300: the new prompt shares the 303, not the reply
     run(e, pa + [4001, 4002, IM, 7, 8])
     line = next((l for l in e.progress_lines if "lcp " in l), "")
-    check("the line says what each slot shared with the prompt", "lcp s0 303/ck 300, s1 0/ck 0" in line, line)
+    check("the line says what each slot shared with the prompt", f"lcp s0 303/ck {300 - CK_BACK}, s1 0/ck 0" in line, line)
 
 
 def test_slot_wait_503():
