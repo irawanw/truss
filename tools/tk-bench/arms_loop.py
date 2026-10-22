@@ -7,8 +7,13 @@ Prompts: the server's saved requests (TRUSS_REQ_LOG_DIR, .npz with the prompt id
 the prompt is read once (again per arm for env arms) and checkpointed; per arm, --loop-k samples of up to --loop-tokens
 tokens with the served sampling (temperature 1.0, top_p 1.0, min_p 0.05: server/app.py), each stopped at </think>,
 the end of the turn, or a loop. Loop = the server's loop guard (server/generate.py: exact copies or low variety).
-An arm `spec=0` samples one token per step instead of speculative rounds.
+An arm `spec=0` samples one token per step instead of speculative rounds; `word=8` adds the word-repeat penalty
+(server/words.py) until </think>. Besides the loop count each arm prints the reasoning's drift (10-22: a 14,512-token
+reasoning that slid into "Maybe maybe maybe." long before any guard fired): the mean variety (distinct 6-grams) of
+each sample's last 512 tokens and its most frequent word's share of the words.
 """
+import collections
+import re
 import glob
 import json
 import os
@@ -18,6 +23,7 @@ import numpy as np
 
 from server.generate import LOOP_LONG_PERIOD, LOOP_VARIETY, LOOP_VARIETY_WINDOW, loop_period, variety
 from server.truss_ctypes import Sampling
+from server.words import word_classes
 
 
 def looped(out):
@@ -50,6 +56,12 @@ def loop_task(b, a):
     if not files:
         raise SystemExit(f"loop task: no .npz prompts in {a.loop_dir} (copy them from TRUSS_REQ_LOG_DIR)")
     close = b.tok.token_id("</think>") if b.tok else -1
+    if any(arm.get("word") for arm in b.arms):
+        b.m.set_word_classes(word_classes(b.tok.tok, b.m.n_vocab))
+
+    def top_word(out):
+        w = re.findall(r"[a-z]+", b.tok.tok.decode(out).lower()) if b.tok else []
+        return collections.Counter(w).most_common(1)[0][1] / len(w) if w else 0.0
     for f in files:
         ids = [int(x) for x in np.load(f, allow_pickle=False)["prompt"]]
         name = os.path.basename(f)
@@ -68,18 +80,22 @@ def loop_task(b, a):
             if b.envs:
                 print(f"  {arm['name']}: read {read():.1f} s", flush=True)
             spec = arm.get("spec", True)
-            n_loop, lens, t = 0, [], time.time()
+            n_loop, lens, t, vars_, tops = 0, [], time.time(), [], []
             for k in range(a.loop_k):
                 b.m.restore()
                 sp = Sampling(1.0, 1.0, 0, 0.05, (hash(name) + 7919 * k) % (1 << 63))
+                if arm.get("word"):
+                    sp.set_word_repeat(arm["word"], close)
                 out, lp = sample(b.m, ids[-1], sp, spec, a.loop_tokens, b.stop, close)
                 n_loop += lp
                 lens.append(len(out))
+                vars_.append(variety(out[-LOOP_VARIETY_WINDOW:], w=min(len(out), LOOP_VARIETY_WINDOW)) if len(out) > 16 else 1.0)
+                tops.append(top_word(out))
             rec = b.res[arm["name"]]["tasks"].setdefault("loop", dict(loops=0, samples=0))
             rec["loops"] += n_loop
             rec["samples"] += a.loop_k
             print(f"  {arm['name']:>14}: looped {n_loop} of {a.loop_k} (mean {np.mean(lens):.0f} tokens per sample, "
-                  f"{time.time() - t:.0f} s)", flush=True)
+                  f"{time.time() - t:.0f} s), tail variety {np.mean(vars_):.2f}, top word {np.mean(tops):.3f}", flush=True)
     for name, R in b.res.items():
         r = R["tasks"].get("loop")
         if r:

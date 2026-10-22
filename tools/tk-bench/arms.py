@@ -54,7 +54,7 @@ CHAT_ASK = ("Write a Python module implementing a binary min-heap class with pus
 
 def parse_arm(s):
     name, _, body = s.rpartition(":") if ":" in s else ("", "", s)
-    knobs, env, spec = {}, {}, True
+    knobs, env, spec, word = {}, {}, True, 0.0
     if body != "base":
         for kv in filter(None, body.split(",")):
             k, v = kv.split("=", 1)
@@ -62,11 +62,13 @@ def parse_arm(s):
                 env[k] = v
             elif k == "spec":   # spec=0: plain sampling steps (the loop task, arms_loop.py)
                 spec = v != "0"
+            elif k == "word":   # word=8: the word-repeat penalty in the reasoning (the loop task; server/words.py)
+                word = float(v)
             elif k == "drafts" or k in KNOB_DEFAULT:
                 knobs[k] = float(v)
             else:
                 raise SystemExit(f"arm {s!r}: {k} is not a runtime knob (load-time options need their own run)")
-    return dict(name=name or body, knobs=knobs, env=env, spec=spec)
+    return dict(name=name or body, knobs=knobs, env=env, spec=spec, word=word)
 
 
 def served_value(k, drafts):

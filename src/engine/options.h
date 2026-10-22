@@ -28,6 +28,10 @@ struct Options {
     // test), the rest, the head and the drafter on the current device (TRACKER #154)
     int layer_split = 0, layer_split_device = -1;
     float layer_split_frac = 0.5f;
+    // More than two stages (10-22, the 4-GPU test): TRUSS_LAYER_SPLITS="8,14,20" stage boundaries, ascending, and
+    // TRUSS_SPLIT_DEVICES="0,1,2,3" one device per stage (layer order; the last runs the head and the drafter).
+    // Set, they replace layer_split / layer_split_device.
+    std::vector<int> layer_splits, split_devices;
     int slots = 1;                    // independent sequences (n_ctx / slots positions each)
     // called once the weights are on the device: the owner drops the model file's pages (TRACKER #72)
     std::function<void()> after_upload;

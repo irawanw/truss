@@ -137,15 +137,15 @@ void Pipeline::prompt(int slot, const int32_t * tokens, int n, int step, float *
         seq_pos_[slot] += n;
         return;
     }
-    // Layer split: the first stage runs on its own thread, a chunk ahead of the last one (the hand-off's handshake
-    // orders them), so both devices compute at once. Every row is what run() computes: the same output.
-    require(front_.size() == 1, "prompt(): more than two stages");
-    Stage & f = *front_[0];
+    // Layer split: every stage before the last runs on its own thread, a chunk ahead of the one after it (the
+    // hand-off's handshake orders them), so all devices compute at once. Every row is what run() computes: the same
+    // output. Stage i > 0 takes its hand-offs in the order stage i - 1 queued them (tickets[i - 1]).
+    const int F = (int) front_.size();
     std::mutex qm;
     std::condition_variable qcv;
-    std::deque<long> tickets;   // the hand-off ticket of each chunk the first stage has enqueued
+    std::vector<std::deque<long>> tickets((size_t) F);   // hand-off ticket of each chunk front stage i enqueued
     bool front_failed = false;
-    long front_handed = 0;      // the highest hand-off this request's first stage produced (its own to drain, C1)
+    std::vector<long> front_handed((size_t) F, 0);   // the highest hand-off this request's stage i produced (C1)
     // Strata's decode share: while another slot is decoding, the prompt gives way after each chunk - the first stage
     // waits until the last one has finished the chunks handed to it, then for TRUSS_DECODE_SHARE x that chunk's time
     static const double share = [] { const char * e = std::getenv("TRUSS_DECODE_SHARE"); return e ? std::atof(e) : 0.5; }();
@@ -161,64 +161,75 @@ void Pipeline::prompt(int slot, const int32_t * tokens, int n, int step, float *
             }
         return false;
     };
-    std::exception_ptr err;
+    std::vector<std::exception_ptr> errs((size_t) F);
     const auto t0 = std::chrono::steady_clock::now();
     double front_s = 0;
-    std::thread t([&] {
-        DeviceGuard g(f.device());
-        rt::ctx().slot = slot;   // thread-local: the front thread's records are this slot's front-stage work
-        try {
-            int k = 0;
-            for (int s = 0; s < n; s += step, ++k) {
-                int T, nT;
-                const int32_t * nx;
-                chunk(s, T, nx, nT);
-                if (share > 0 && k > 0 && others_decoding()) {   // give way: drain, then the decode window
-                    TRUSS_RT(rt::kGiveWay);
-                    double w;
+    std::vector<std::thread> threads;
+    for (int i = 0; i < F; ++i)
+        threads.emplace_back([&, i] {
+            Stage & f = *front_[(size_t) i];
+            DeviceGuard g(f.device());
+            rt::ctx().slot = slot;   // thread-local: the front thread's records are this slot's front-stage work
+            try {
+                int k = 0;
+                for (int s = 0; s < n; s += step, ++k) {
+                    int T, nT;
+                    const int32_t * nx;
+                    chunk(s, T, nx, nT);
+                    if (i == 0 && share > 0 && k > 0 && others_decoding()) {   // give way: drain, then the decode window
+                        TRUSS_RT(rt::kGiveWay);
+                        double w;
+                        {
+                            std::unique_lock<std::mutex> l(qm);
+                            qcv.wait(l, [&] { return main_done >= k || front_failed; });
+                            w = share * chunk_s;
+                        }
+                        std::this_thread::sleep_for(std::chrono::duration<double>(std::min(w, 5.0)));
+                    }
+                    long tin = 0;
                     {
                         std::unique_lock<std::mutex> l(qm);
-                        qcv.wait(l, [&] { return main_done >= k || front_failed; });
-                        w = share * chunk_s;
+                        if (i == 0) t_start[(size_t) k] = std::chrono::steady_clock::now();
+                        else {
+                            qcv.wait(l, [&] { return !tickets[(size_t) i - 1].empty() || front_failed; });
+                            require(!tickets[(size_t) i - 1].empty(), "the previous layer-split stage failed");
+                            tin = tickets[(size_t) i - 1].front();
+                            tickets[(size_t) i - 1].pop_front();
+                        }
                     }
-                    std::this_thread::sleep_for(std::chrono::duration<double>(std::min(w, 5.0)));
-                }
-                {
-                    std::lock_guard<std::mutex> l(qm);
-                    t_start[(size_t) k] = std::chrono::steady_clock::now();
-                }
-                long tk;
-                {
-                    Held<Stage> h(f, 0);
-                    f.select(slot);
-                    f.settle();
-                    f.run_chunk(tokens + s, pos0 + s, T, nullptr, false, nx, nT, extra(s, T));
-                    tk = f.handed.load();
+                    long tk;
+                    {
+                        Held<Stage> h(f, tin);
+                        f.select(slot);
+                        f.settle();
+                        f.run_chunk(tokens + s, pos0 + s, T, nullptr, false, nx, nT, extra(s, T));
+                        tk = f.handed.load();
+                        {
+                            std::lock_guard<std::mutex> l(qm);
+                            front_handed[(size_t) i] = tk;   // the hand-off exists: the next stage must take it
+                        }
+                        inject_fault("prompt-front", slot);
+                    }
                     {
                         std::lock_guard<std::mutex> l(qm);
-                        front_handed = tk;   // the hand-off exists: the last stage must take it even if we die now
+                        tickets[(size_t) i].push_back(tk);
                     }
-                    inject_fault("prompt-front", slot);
+                    qcv.notify_all();
                 }
+                TRUSS_RT(rt::kFrontDrain);
+                TRUSS_CUDA(cudaStreamSynchronize(f.stream()));
+                if (i == F - 1)
+                    front_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            } catch (...) {
+                errs[(size_t) i] = std::current_exception();
+                f.failures.fetch_add(1, std::memory_order_relaxed);   // the next stage's wait for a hand-off stops (H1)
                 {
                     std::lock_guard<std::mutex> l(qm);
-                    tickets.push_back(tk);
+                    front_failed = true;
                 }
                 qcv.notify_all();
             }
-            TRUSS_RT(rt::kFrontDrain);
-            TRUSS_CUDA(cudaStreamSynchronize(f.stream()));
-            front_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        } catch (...) {
-            err = std::current_exception();
-            f.failures.fetch_add(1, std::memory_order_relaxed);   // the last stage's wait for a hand-off stops (H1)
-            {
-                std::lock_guard<std::mutex> l(qm);
-                front_failed = true;
-            }
-            qcv.notify_all();
-        }
-    });
+        });
     std::exception_ptr err2;
     try {
         for (int s = 0; s < n; s += step) {
@@ -226,10 +237,10 @@ void Pipeline::prompt(int slot, const int32_t * tokens, int n, int step, float *
             long tk;
             {
                 std::unique_lock<std::mutex> l(qm);
-                qcv.wait(l, [&] { return !tickets.empty() || front_failed; });
-                require(!tickets.empty(), "the previous layer-split stage failed");
-                tk = tickets.front();
-                tickets.pop_front();
+                qcv.wait(l, [&] { return !tickets[(size_t) F - 1].empty() || front_failed; });
+                require(!tickets[(size_t) F - 1].empty(), "the previous layer-split stage failed");
+                tk = tickets[(size_t) F - 1].front();
+                tickets[(size_t) F - 1].pop_front();
             }
             last_chunk(s, T, tk);
             {
@@ -244,21 +255,26 @@ void Pipeline::prompt(int slot, const int32_t * tokens, int n, int step, float *
         err2 = std::current_exception();
         m_->failures.fetch_add(1, std::memory_order_relaxed);   // the first stage's wait for a take stops (H1)
     }
-    t.join();
-    // C1: hand-offs the first stage wrote that the last one never read; drained up to the highest hand-off THIS
-    // request produced (one belonging to another request would let its chunk read stale rows)
-    {
+    for (auto & t : threads) t.join();
+    // C1: hand-offs a stage wrote that the next one never read; drained up to the highest hand-off THIS request
+    // produced (one belonging to another request would let its chunk read stale rows)
+    for (int i = 0; i < F; ++i) {
         long up_to = 0;
         {
             std::lock_guard<std::mutex> l(qm);
-            up_to = front_handed;
+            up_to = front_handed[(size_t) i];
         }
+        Stage & nx = i + 1 < F ? *front_[(size_t) i + 1] : *m_;
         if (up_to > 0)
             try {
-                Held<Stage> h(*m_, 0);
-                m_->drain_handoffs(up_to);
+                DeviceGuard g(nx.device());
+                Held<Stage> h(nx, 0);
+                nx.drain_handoffs(up_to);
             } catch (...) {}   // the request's own error is the one the caller has to see
     }
+    std::exception_ptr err;
+    for (auto & e : errs)
+        if (e && !err) err = e;
     if (m_->prof().on() && !err && !err2)   // how balanced the stages are
         std::fprintf(stderr, "layer split prompt: %d tokens, first stage done at %.2f s, last at %.2f s\n", n, front_s,
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());

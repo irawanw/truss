@@ -42,8 +42,9 @@ class EngineDebug:
         self.log(f"{self.log_tag}: slot {slot.idx} STOP without a tool call at gen {n_gen} ({src}): ...{before[-120:]!r}")
 
     def save_request(self, prompt_ids, gen_ids, finish, n_gen, meta):
-        """TRUSS_REQ_LOG_DIR: the last 12 requests as .npz (prompt ids, generated ids as held by the engine, meta),
-        so a stopped reply can be replayed by /debug/probe."""
+        """TRUSS_REQ_LOG_DIR: the last TRUSS_REQ_LOG_KEEP (64) requests as .npz (prompt ids, generated ids as held by
+        the engine, meta), so a stopped reply can be replayed by /debug/probe and a looping prompt by the loop bench
+        (10-22: 12 kept, and the looping agent prompts were gone within an hour)."""
         d = os.environ.get("TRUSS_REQ_LOG_DIR")
         if not d:
             return
@@ -52,7 +53,7 @@ class EngineDebug:
             name = time.strftime("%Y%m%d-%H%M%S") + f"-{finish}-{n_gen}"
             np.savez(os.path.join(d, name + ".npz"), prompt=np.asarray(prompt_ids, dtype=np.int32),
                      gen=np.asarray(gen_ids[:n_gen], dtype=np.int32), meta=json.dumps(dict(meta, finish=finish)))
-            for old in sorted(os.listdir(d))[:-12]:
+            for old in sorted(os.listdir(d))[:-int(os.environ.get("TRUSS_REQ_LOG_KEEP", "64"))]:
                 os.remove(os.path.join(d, old))
         except OSError as e:
             print(f"save_request failed: {e}", flush=True)

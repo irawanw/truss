@@ -14,7 +14,32 @@ Pipeline::Pipeline(const Family & fam, int n_ctx, int max_chunk, const Options &
         o.kv_lend = false;
     }
     const int S = o.layer_split, L = fam.n_layer();
-    if (S <= 0 || S >= L) {
+    if (!o.layer_splits.empty()) {   // N stages (TRUSS_LAYER_SPLITS / TRUSS_SPLIT_DEVICES): one CPU pool, shared
+        const std::vector<int> & cut = o.layer_splits;
+        require(o.split_devices.size() == cut.size() + 1, "TRUSS_SPLIT_DEVICES: one device per stage");
+        int cur = 0;
+        TRUSS_CUDA(cudaGetDevice(&cur));
+        // the last stage's calls run without a device guard (each_stage, head, accept), as in the two-stage split
+        require(o.split_devices.back() == cur, "TRUSS_SPLIT_DEVICES: the last stage must be the current device (" +
+                                                   std::to_string(cur) + ")");
+        for (size_t i = 0; i < cut.size(); ++i)
+            require(cut[i] > (i ? cut[i - 1] : 0) && cut[i] < L, "TRUSS_LAYER_SPLITS: ascending, inside the model");
+        auto mu = std::make_shared<std::mutex>();
+        std::shared_ptr<cpu::ExpertPool> pool;
+        Stage * prev = nullptr;
+        for (size_t i = 0; i <= cut.size(); ++i) {
+            const int lb = i ? cut[i - 1] : 0, le = i < cut.size() ? cut[i] : L, d = o.split_devices[i];
+            DeviceGuard g(d);
+            auto st = std::make_unique<Stage>(fam, n_ctx, max_chunk, o, StageSpec{ lb, le, d, 1.0, pool, mu });
+            if (!pool && st->moe()) pool = st->moe()->shared_pool();
+            if (prev) st->prev = prev, prev->next = st.get();
+            prev = st.get();
+            std::fprintf(stderr, "layer split: layers %d-%d on device %d (%d experts resident)%s\n", lb, le - 1, d,
+                         st->n_hot(), i == cut.size() ? ", head and drafter" : "");
+            if (i < cut.size()) front_.push_back(std::move(st));
+            else m_ = std::move(st);
+        }
+    } else if (S <= 0 || S >= L) {
         m_ = std::make_unique<Stage>(fam, n_ctx, max_chunk, o, StageSpec{ 0, L, -1, 1.0, nullptr, nullptr });
     } else {
         int cur = 0;

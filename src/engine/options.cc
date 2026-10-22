@@ -1,6 +1,7 @@
 #include "engine/options.h"
 
 #include <cstdlib>
+#include <sstream>
 #include <string>
 #include <type_traits>
 
@@ -41,6 +42,16 @@ void apply_env(Options & o)
     f("TRUSS_LAYER_SPLIT", o.layer_split);             // two devices: layers [0, N) on TRUSS_LAYER_SPLIT_DEVICE
     f("TRUSS_LAYER_SPLIT_DEVICE", o.layer_split_device);
     f("TRUSS_LAYER_SPLIT_FRAC", o.layer_split_frac);
+    auto ints = [](const char * k, std::vector<int> & v) {   // "8,14,20"
+        if (const char * e = std::getenv(k)) {
+            v.clear();
+            std::stringstream ss(e);
+            for (std::string t; std::getline(ss, t, ',');)
+                if (!t.empty()) v.push_back(std::atoi(t.c_str()));
+        }
+    };
+    ints("TRUSS_LAYER_SPLITS", o.layer_splits);
+    ints("TRUSS_SPLIT_DEVICES", o.split_devices);
     f("TRUSS_SLOTS", o.slots);                 // sequence slots
     if (const char * e = std::getenv("TRUSS_PLE_DIRECT"); e && !std::atoi(e)) o.direct_tables = false;   // A/B
     if (const char * e = std::getenv("TRUSS_RING_GB")) o.ring_bytes_override = (size_t) (std::atof(e) * (1ull << 30));
