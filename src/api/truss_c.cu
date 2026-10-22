@@ -108,6 +108,21 @@ truss_model * truss_open(const char * gguf_path, int n_ctx, int max_chunk, const
 
 void truss_close(truss_model * m) { delete m; }
 
+int truss_set_filler_seqs(truss_model * m, const int32_t * seqs, const int32_t * lens, int n)
+{
+    return guarded(
+        [&] {
+            if (n < 0 || (n && (!seqs || !lens))) throw std::invalid_argument("truss_set_filler_seqs: arrays");
+            m->filler_seqs.clear();
+            for (int i = 0, at = 0; i < n; at += lens[i++]) {
+                if (lens[i] < 1 || lens[i] > 8) throw std::invalid_argument("truss_set_filler_seqs: 1..8 tokens each");
+                m->filler_seqs.emplace_back(seqs + at, seqs + at + lens[i]);
+            }
+            return 0;
+        },
+        -1);
+}
+
 int truss_set_word_classes(truss_model * m, const int32_t * cls, int n)
 {
     return guarded(

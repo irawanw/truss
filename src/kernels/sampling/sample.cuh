@@ -40,9 +40,15 @@ void ban(float * x, int n, int rows, const BanList & b, cudaStream_t stream);
 // letters of the token without its leading space, so "Maybe" and " maybe" share one; < 0: not penalized, see
 // truss_set_word_classes), prev.c[r] the class of the token row r follows (-1: none). x[r][v] -= pen for every v
 // with cls[v] == prev.c[r] >= 0, r in [0, rows): a word is not repeated back to back. Rows of a verify window follow different tokens, so each row has its own class.
-constexpr int WORD_ROWS = 16;
+// Filler recency (10-22, "Hmm ... Hmm ... Hmm" loops): row r also takes fp[r][k] logits off token ft[r][k], k < nf[r]
+// (the host's per-row list: the next token of a filler word's token sequence whose prefix ends the row's context,
+// penalty x the filler's uses in the row's recent window). Both rules in one launch.
+constexpr int WORD_ROWS = 16, FILL_MAX = 12;
 struct WordPrev {
     int c[WORD_ROWS] = {};
+    int nf[WORD_ROWS] = {};
+    int ft[WORD_ROWS][FILL_MAX] = {};
+    float fp[WORD_ROWS][FILL_MAX] = {};
 };
 void word_repeat(float * x, int n, int rows, const int * cls, const WordPrev & prev, float pen, cudaStream_t stream);
 

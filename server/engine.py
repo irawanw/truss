@@ -11,7 +11,7 @@ from server.truss_ctypes import Model
 from server.engine_debug import EngineDebug
 from server.generate import EngineGenerate
 from server.seq import FairGate, Slot, lcp, prefix_len
-from server.words import WORD_REPEAT, word_classes
+from server.words import WORD_REPEAT, filler_seqs, word_classes
 
 
 class Engine(EngineGenerate, EngineDebug):
@@ -55,7 +55,9 @@ class Engine(EngineGenerate, EngineDebug):
         self.think_close = self.chat.token_id("</think>")
         self.word_classes_set = False   # the word-repeat penalty's table (server/words.py), sampled reasoning only
         if WORD_REPEAT > 0 and hasattr(self.model, "set_word_classes"):
-            self.model.set_word_classes(word_classes(self.chat.tok, self.model.n_vocab))
+            cls = word_classes(self.chat.tok, self.model.n_vocab)
+            self.model.set_word_classes(cls)
+            self.model.set_filler_seqs(filler_seqs(self.chat.tok))
             self.word_classes_set = True
 
     def log(self, line: str):

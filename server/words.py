@@ -14,6 +14,12 @@ Tests: tests/server/word_repeat_test.py (host only).
 import os
 
 WORD_REPEAT = float(os.environ.get("TRUSS_WORD_REPEAT", "8"))   # logits off a repeated word in the reasoning; 0: off
+# Filler recency (10-22: "Hmm 51200*1000 = 51,200,000? Hmm ..." x 43 at 67K; Flash-Next does it too): a filler word
+# loses WORD_FILLER logits per use of it in the last WORD_FILLER_WINDOW tokens of the reasoning (0: off). The first use
+# is free, so a "Hmm" now and then stays; a run of them gets expensive fast.
+WORD_FILLER = float(os.environ.get("TRUSS_WORD_FILLER", "1.5"))
+WORD_FILLER_WINDOW = int(os.environ.get("TRUSS_WORD_FILLER_WINDOW", "64"))
+FILLERS = ("hmm", "hmmm", "maybe", "wait", "actually", "perhaps", "ok", "okay", "oh", "hm", "alright")
 _STRIP = " \tĠ▁"   # space, tab, GPT-2 byte-level space (Ġ), SentencePiece word start (▁)
 
 
@@ -23,6 +29,18 @@ def word_key(piece: str):
     if len(w) < 2 or len(piece) - len(w) > 1 or not (w.isascii() and w.isalpha()):
         return None
     return w.lower()
+
+
+def filler_seqs(tok):
+    """Every spelling of FILLERS as its token sequence (" Hmm" is " H" + "mm" in DeepSeek-V4.1's vocab, so a filler is
+    a sequence, not a token): word, " word", Word, " Word", deduplicated, for truss_set_filler_seqs."""
+    out = []
+    for w in FILLERS:
+        for v in (w, " " + w, w.capitalize(), " " + w.capitalize()):
+            ids = tok.encode(v, add_special_tokens=False)
+            if 1 <= len(ids) <= 8 and ids not in out:
+                out.append(ids)
+    return out
 
 
 def word_classes(tok, n_vocab: int):

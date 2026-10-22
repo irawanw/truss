@@ -55,6 +55,7 @@ struct truss_model {
     int * pen_hist = nullptr, * pen_host = nullptr;   // device / pinned [drafts + 1][TRUSS_PENALTY_CAP] row histories
     int * word_cls = nullptr;                // device [n_vocab] word class (truss_set_word_classes), host copy below
     std::vector<int> word_cls_host;
+    std::vector<std::vector<int>> filler_seqs;   // truss_set_filler_seqs
     std::unique_ptr<engine::Pipeline> fwd;         // last: its expert budget takes the memory left
 
     ~truss_model()

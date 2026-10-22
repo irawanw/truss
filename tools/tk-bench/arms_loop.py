@@ -23,7 +23,7 @@ import numpy as np
 
 from server.generate import LOOP_LONG_PERIOD, LOOP_VARIETY, LOOP_VARIETY_WINDOW, loop_period, variety
 from server.truss_ctypes import Sampling
-from server.words import word_classes
+from server.words import filler_seqs, word_classes
 
 
 def looped(out):
@@ -37,6 +37,8 @@ def sample(m, last, sp, spec, n_max, stops, close):
     nxt, out = m.eval_sample([last], sp), []
     check = 64
     while len(out) < n_max:
+        if sp.filler > 0:
+            sp.set_history(out[-64:])   # the filler window (this sample's own tokens; the prompt's are not reasoning)
         if spec:
             emitted, nxt = m.spec_step_sampled(nxt, sp)
         else:
@@ -56,8 +58,10 @@ def loop_task(b, a):
     if not files:
         raise SystemExit(f"loop task: no .npz prompts in {a.loop_dir} (copy them from TRUSS_REQ_LOG_DIR)")
     close = b.tok.token_id("</think>") if b.tok else -1
-    if any(arm.get("word") for arm in b.arms):
-        b.m.set_word_classes(word_classes(b.tok.tok, b.m.n_vocab))
+    if any(arm.get("word") or arm.get("filler") for arm in b.arms):
+        cls = word_classes(b.tok.tok, b.m.n_vocab)
+        b.m.set_word_classes(cls)
+        b.m.set_filler_seqs(filler_seqs(b.tok.tok))
 
     def top_word(out):
         w = re.findall(r"[a-z]+", b.tok.tok.decode(out).lower()) if b.tok else []
@@ -84,8 +88,9 @@ def loop_task(b, a):
             for k in range(a.loop_k):
                 b.m.restore()
                 sp = Sampling(1.0, 1.0, 0, 0.05, (hash(name) + 7919 * k) % (1 << 63))
-                if arm.get("word"):
-                    sp.set_word_repeat(arm["word"], close)
+                if arm.get("word") or arm.get("filler"):
+                    sp.set_word_repeat(arm.get("word", 0.0), close)
+                    sp.set_filler(arm.get("filler", 0.0), 64)
                 out, lp = sample(b.m, ids[-1], sp, spec, a.loop_tokens, b.stop, close)
                 n_loop += lp
                 lens.append(len(out))

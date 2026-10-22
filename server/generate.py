@@ -5,7 +5,7 @@ import time
 import numpy as np
 from server.chat import Detokenizer
 from server.truss_ctypes import PENALTY_CAP, Sampling, TrussError
-from server.words import WORD_REPEAT
+from server.words import WORD_FILLER, WORD_FILLER_WINDOW, WORD_REPEAT
 from server.reasoning import BAN_EOS_IN_THINK, BAN_MAX_TOKENS
 
 # The loop guard (TRUSS_LOOP_GUARD=0: off). A quantized model can fall into a verbatim loop: 10-21 the DS41 agent
@@ -92,6 +92,7 @@ class EngineGenerate:
             if (sp is not None and think_open and WORD_REPEAT > 0 and getattr(self, "word_classes_set", False)
                     and self.think_close is not None and self.think_close >= 0):
                 sp.set_word_repeat(WORD_REPEAT, self.think_close)   # server/words.py: no "maybe maybe" in the reasoning
+                sp.set_filler(WORD_FILLER, WORD_FILLER_WINDOW)   # and no "Hmm ... Hmm ... Hmm" (needs the history)
 
             def counted():   # the tokens the penalties see, from the engine's own sequence
                 if penalty_last_n < 0:
@@ -203,6 +204,8 @@ class EngineGenerate:
                             break
                         if not greedy and sp.penalized:
                             sp.set_history(counted())   # before nxt; the engine adds nxt and the drafts per row
+                        elif not greedy and sp.filler > 0:
+                            sp.set_history(slot.cached[-WORD_FILLER_WINDOW:])   # the filler window, before nxt
                         emitted, after = (self.call(slot, self.model.spec_step, nxt) if greedy
                                           else self.call(slot, self.model.spec_step_sampled, nxt, sp))
                         rounds.append((len(slot.cached) - n_prompt, list(emitted), after))   # stop diagnosis
@@ -219,8 +222,9 @@ class EngineGenerate:
                     out_ids.append(tok)
                     if tok == close_id:
                         in_think = False
-                        if sp is not None and sp.word_repeat > 0:
+                        if sp is not None and (sp.word_repeat > 0 or sp.filler > 0):
                             sp.set_word_repeat(0.0)   # the answer may repeat a word (the engine lifted it in-call)
+                            sp.set_filler(0.0)
                     if sp is not None and sp.n_ban and (tok == self.think_close or n_gen >= BAN_MAX_TOKENS):
                         # the reasoning block closed (the engine lifts the ban only inside the call that feeds
                         # </think>), or it ran so long that a stuck reply must still be able to end

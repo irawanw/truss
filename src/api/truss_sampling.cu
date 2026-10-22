@@ -53,7 +53,8 @@ void ban_rows(truss_model & m, const truss_sampling & sp, const int32_t * feed, 
 // (nfeed 0: history's last token), and stops at the first row whose fed tokens include word_lift, as the ban does.
 void word_rows(truss_model & m, const truss_sampling & sp, const int32_t * feed, int nfeed, int rows)
 {
-    if (!(sp.word_repeat > 0.f) || !m.word_cls) return;
+    const bool fill = sp.filler > 0.f && !m.filler_seqs.empty();
+    if ((!(sp.word_repeat > 0.f) && !fill) || !m.word_cls) return;
     if (rows > sampling::WORD_ROWS) throw std::invalid_argument("truss sampling: too many rows for word_repeat");
     int k = rows;
     if (sp.word_lift >= 0)
@@ -65,7 +66,34 @@ void word_rows(truss_model & m, const truss_sampling & sp, const int32_t * feed,
         const int i = r + nfeed - rows;
         const int32_t t = i >= 0 && i < nfeed ? feed[i] : (sp.history && sp.n_history > 0 ? sp.history[sp.n_history - 1] : -1);
         const int c = t >= 0 && t < V ? m.word_cls_host[t] : -1;
-        prev.c[r] = c <= -2 ? -c - 2 : c;   // a glued piece (<= -2) still names the word it spells
+        prev.c[r] = !(sp.word_repeat > 0.f) ? -1 : c <= -2 ? -c - 2 : c;   // a glued piece (<= -2) names its word
+    }
+    if (fill) {   // row r's context: (history, feed[0 .. r + nfeed - rows]); its window: the last filler_window of it
+        const int W = sp.filler_window > 0 ? sp.filler_window : 64, nh = sp.history ? std::max(0, sp.n_history) : 0;
+        std::vector<int32_t> ctx;
+        for (int r = 0; r < k; ++r) {
+            const int nfr = std::max(0, std::min(nfeed, r + nfeed - rows + 1)), total = nh + nfr;
+            ctx.clear();
+            for (int i = std::max(0, total - W); i < total; ++i) ctx.push_back(i < nh ? sp.history[i] : feed[i - nh]);
+            const int L = (int) ctx.size();
+            for (const auto & q : m.filler_seqs) {
+                const int ql = (int) q.size();
+                if (ql - 1 > L) continue;
+                bool pre = true;   // the context ends with the sequence's prefix
+                for (int j = 0; j < ql - 1 && pre; ++j) pre = ctx[L - (ql - 1) + j] == q[j];
+                if (!pre) continue;
+                int uses = 0;   // the sequence's uses in the window
+                for (int i = 0; i + ql <= L; ++i) {
+                    int j = 0;
+                    while (j < ql && ctx[i + j] == q[j]) ++j;
+                    uses += j == ql;
+                }
+                if (uses && prev.nf[r] < sampling::FILL_MAX) {
+                    prev.ft[r][prev.nf[r]] = q[ql - 1];
+                    prev.fp[r][prev.nf[r]++] = sp.filler * uses;
+                }
+            }
+        }
     }
     sampling::word_repeat(m.logits, m.n_vocab, k, m.word_cls, prev, sp.word_repeat, m.fwd->stream());
 }

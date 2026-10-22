@@ -118,18 +118,22 @@ __global__ void ban_kernel(float * xs, int n, BanList b)
 
 __global__ void word_repeat_kernel(float * xs, int n, const int * cls, WordPrev prev, float pen)
 {
-    const int c = prev.c[blockIdx.y];
-    if (c < 0) return;
-    float * x = xs + (size_t) blockIdx.y * n;
-    for (int v = blockIdx.x * blockDim.x + threadIdx.x; v < n; v += gridDim.x * blockDim.x)
-        if (cls[v] == c) x[v] -= pen;
+    const int r = blockIdx.y, c = prev.c[r], nf = prev.nf[r];
+    if (c < 0 && nf == 0) return;
+    float * x = xs + (size_t) r * n;
+    for (int v = blockIdx.x * blockDim.x + threadIdx.x; v < n; v += gridDim.x * blockDim.x) {
+        float s = c >= 0 && cls[v] == c ? pen : 0.f;
+        for (int k = 0; k < nf; ++k)
+            if (prev.ft[r][k] == v) s += prev.fp[r][k];
+        if (s != 0.f) x[v] -= s;
+    }
 }
 
 }  // namespace
 
 void word_repeat(float * x, int n, int rows, const int * cls, const WordPrev & prev, float pen, cudaStream_t stream)
 {
-    if (rows <= 0 || !(pen > 0.f) || !cls) return;
+    if (rows <= 0 || !cls) return;
     word_repeat_kernel<<<dim3(32, rows), 256, 0, stream>>>(x, n, cls, prev, pen);
     TRUSS_CUDA(cudaGetLastError());
 }

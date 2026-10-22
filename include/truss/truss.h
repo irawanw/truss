@@ -159,7 +159,16 @@ typedef struct truss_sampling {
        word_lift >= 0 ends it like ban_lift (e.g. </think>: reasoning only); -1: every row. 0: off. */
     float word_repeat;
     int32_t word_lift;
+    /* Filler recency (needs truss_set_filler_seqs): see there; the window is the history, then the row's fed tokens;
+       until word_lift. 0: off. */
+    float filler;
+    int filler_window;
 } truss_sampling;
+
+/* The filler words as token sequences (every spelling: " Hmm" = " H" "mm", "Hmm", " hmm", ...): n sequences,
+   lens[i] tokens each, concatenated in seqs. A row whose context ends with a sequence's prefix loses filler logits on
+   its last token per use of that sequence in the row's last filler_window tokens. */
+int truss_set_filler_seqs(truss_model * m, const int32_t * seqs, const int32_t * lens, int n);
 
 /* The word class of every token id (n = n_vocab), copied for word_repeat; call once after open. c >= 0: a token
    that starts word c (penalized when the previous token is word c); -(c + 2): a piece of word c glued to the token

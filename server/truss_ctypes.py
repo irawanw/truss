@@ -31,12 +31,13 @@ class Sampling(ctypes.Structure):   # truss_sampling; penalties off unless set (
                 ("presence_penalty", ctypes.c_float), ("penalty_last_n", ctypes.c_int),
                 ("history", ctypes.POINTER(ctypes.c_int32)), ("n_history", ctypes.c_int),
                 ("ban", ctypes.POINTER(ctypes.c_int32)), ("n_ban", ctypes.c_int), ("ban_lift", ctypes.c_int32),
-                ("word_repeat", ctypes.c_float), ("word_lift", ctypes.c_int32)]
+                ("word_repeat", ctypes.c_float), ("word_lift", ctypes.c_int32),
+                ("filler", ctypes.c_float), ("filler_window", ctypes.c_int)]
 
     def __init__(self, temperature, top_p, top_k, min_p, seed, repetition_penalty=1.0, frequency_penalty=0.0,
                  presence_penalty=0.0, penalty_last_n=64):
         super().__init__(temperature, top_p, top_k, min_p, seed, repetition_penalty, frequency_penalty,
-                         presence_penalty, penalty_last_n, None, 0, None, 0, -1, 0.0, -1)
+                         presence_penalty, penalty_last_n, None, 0, None, 0, -1, 0.0, -1, 0.0, 0)
         self._hist = None
         self._ban = None
 
@@ -54,6 +55,10 @@ class Sampling(ctypes.Structure):   # truss_sampling; penalties off unless set (
     def set_word_repeat(self, pen: float, lift: int = -1):
         """Logits taken off a word that repeats the previous token's word, until `lift` is fed; 0: off (truss.h)."""
         self.word_repeat, self.word_lift = float(pen), lift
+
+    def set_filler(self, pen: float, window: int = 64):
+        """Filler recency: logits off a filler word per use in the last `window` tokens (history + fed); 0: off."""
+        self.filler, self.filler_window = float(pen), int(window)
 
     def set_history(self, tokens):
         """The tokens the penalties count (the last PENALTY_CAP are kept); the array lives until the next call."""
@@ -153,6 +158,7 @@ class Model:
             "truss_round_trace_mark": (None, [c_int]),
             "truss_set_option": (c_int, [p, ctypes.c_char_p, ctypes.c_double]),
             "truss_set_word_classes": (c_int, [p, ctypes.POINTER(ctypes.c_int32), c_int]),
+            "truss_set_filler_seqs": (c_int, [p, ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32), c_int]),
             "truss_expert_counts": (None, [p, ctypes.POINTER(ctypes.c_longlong)]),
             "truss_wait_ready": (c_int, [p]),
             "truss_eval_img_s": (c_int, [p, c_int, i32p, c_int, f32p, c_int, c_int, c_int, c_int, c_int, f32p]),
@@ -404,6 +410,13 @@ class Model:
         """Every token's word class for Sampling.word_repeat (truss_set_word_classes; server/words.py builds it)."""
         a = np.ascontiguousarray(cls, dtype=np.int32)
         self._check(self._lib.truss_set_word_classes(self._m, a.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), len(a)))
+
+    def set_filler_seqs(self, seqs):
+        """The filler words' token sequences (server/words.py filler_seqs) for Sampling.set_filler."""
+        flat = np.ascontiguousarray([t for q in seqs for t in q], dtype=np.int32)
+        lens = np.ascontiguousarray([len(q) for q in seqs], dtype=np.int32)
+        i32p = ctypes.POINTER(ctypes.c_int32)
+        self._check(self._lib.truss_set_filler_seqs(self._m, flat.ctypes.data_as(i32p), lens.ctypes.data_as(i32p), len(seqs)))
 
     def set_option(self, name: str, value: float):
         """A runtime knob between calls (truss_set_option: drafts and the decode-tier knobs; tools/tk-bench/arms.py)."""
