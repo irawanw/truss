@@ -5,6 +5,8 @@ an OpenAI-compatible API. Two models run on it today:
 **[PAW-763B-X3](https://huggingface.co/lackonendes/PAW-763B-X3)** (DeepSeek-V4.1-Flash-1017, 763B parameters, two RTX 3090s)
 and **[PAW-125B-FLASH-NEXT-X3.1](https://huggingface.co/lackonendes/PAW-125B-FLASH-NEXT-X3.1)** (Qwen3.8 Flash-Next, 125B).
 
+_If this model is useful to you, support the work by following [@nawariokra](https://x.com/nawariokra) on X, or buy me a coffee on [Ko-fi](https://ko-fi.com/lackonendes)._
+
 ## PAW-763B-X3: DeepSeek-V4.1-Flash-1017 on two RTX 3090s (2026-10-21)
 
 TRUSS now serves **PAW-763B-X3**, a 763B-parameter DeepSeek model (557B routed experts, 197B n-gram tables) on two 24 GB
