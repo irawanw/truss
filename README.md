@@ -7,6 +7,9 @@ and **[PAW-125B-FLASH-NEXT-X3.1](https://huggingface.co/lackonendes/PAW-125B-FLA
 
 _If this model is useful to you, support the work by following [@nawariokra](https://x.com/nawariokra) on X, or buy me a coffee on [Ko-fi](https://ko-fi.com/lackonendes)._
 
+<a href="https://ko-fi.com/F4P3296XP7"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support me on Ko-fi" height="32"></a>
+
+
 ## PAW-763B-X3: DeepSeek-V4.1-Flash-1017 on two RTX 3090s (2026-10-21)
 
 TRUSS now serves **PAW-763B-X3**, a 763B-parameter DeepSeek model (557B routed experts, 197B n-gram tables) on two 24 GB
