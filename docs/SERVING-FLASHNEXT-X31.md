@@ -105,8 +105,9 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d "
 ```
 
 The picture is resized to a 32-pixel patch grid, long side at most 1344 (up to 1,764 image tokens; 448x448 is 196), and
-read before the text, so an image request never reuses a previous prefix. One RTX 3090, 448x448 image plus a short
-question: prefill about 2.0-2.4 s, then decode at the usual speed (thinking eats the first tokens, so allow 200+). A
+read before the text, so an image request never reuses a previous prefix. One RTX 3090: a 448x448 image plus a short
+question prefills in about 2.0-2.4 s, a 1344x1344 one (1,831 prompt tokens) in 4.6 s. Thinking eats the first tokens,
+so allow 200+. A
 server started without `VIT=` answers image requests with a 400 and serves text as before. The equivalent flags are
 `--mmproj <file> --mmproj-device <index> [--allow-local-images]`.
 
