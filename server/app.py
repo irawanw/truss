@@ -322,6 +322,30 @@ def make_app(engine: Engine) -> FastAPI:
     return app
 
 
+def preflight(a):
+    """Fail in a second, not after the model load (20+ min for the cold-expert copy): the Python pieces the request
+    path needs and, with --mmproj, the vision symbols (a stale TRUSS_LIB cost a full load twice)."""
+    import jinja2
+    v = tuple(int(x) for x in jinja2.__version__.split(".")[:2] if x.isdigit())
+    if v < (3, 1):
+        raise SystemExit(f"jinja2 {jinja2.__version__} is too old for transformers (needs >= 3.1): "
+                         f"{os.environ.get('PYTHON', 'python3')} -m pip install -U 'jinja2>=3.1'")
+    if not a.mmproj:
+        return
+    if not os.path.exists(a.mmproj):
+        raise SystemExit(f"--mmproj {a.mmproj}: no such file")
+    try:
+        import PIL  # noqa: F401
+    except ModuleNotFoundError:
+        raise SystemExit("--mmproj needs Pillow in this interpreter (the vision preprocessor imports PIL)")
+    import ctypes
+    from server.truss_ctypes import _DEFAULT_LIB
+    try:
+        getattr(ctypes.CDLL(os.path.abspath(_DEFAULT_LIB)), "truss_vision_open")
+    except (OSError, AttributeError):
+        raise SystemExit(f"{_DEFAULT_LIB} has no truss_vision_open: stale build (set TRUSS_LIB to the vision build)")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="GGUF (first shard)")
@@ -347,6 +371,7 @@ def main():
     ap.add_argument("--log-tag", default="truss serve")
     ap.add_argument("--dump-dir", default=None, help="keep the last 20 requests (prompt tail + reply) here as JSON")
     a = ap.parse_args()
+    preflight(a)
     engine = Engine(a)
     print(f"truss: model loaded, n_ctx {engine.model.n_ctx}, listening on {a.host}:{a.port}", flush=True)
     uvicorn.run(make_app(engine), host=a.host, port=a.port, log_level="warning")

@@ -43,6 +43,7 @@ StageModel::StageModel(const Family & fam, int lb, int le, int n_ctx)
 StageModel::~StageModel()
 {
     if (rope_sec_) cudaFree(rope_sec_);
+    if (pos3_dev_) cudaFree(pos3_dev_);
 }
 
 void StageModel::add_tensors(engine::Stage & st)
@@ -173,6 +174,17 @@ void StageModel::layers(engine::Stage & st, const engine::Chunk & c, float * res
     Scratch & sc = *g.sc;
     const int T = c.T;
     if (ple_table_) ple_table_->set_next(c.next, c.next_T);
+    // pos3 arrives as the host [3][stride] table of the whole prompt: DSA reads it in kernels, so stage this chunk's
+    // rows [row0, row0 + T) as a device [3][T] block and hand the kernels a row0 = 0 view of it
+    const int * pos3 = c.x.pos3;
+    int p3_stride = c.x.pos3_stride, p3_row0 = c.x.pos3_row0;
+    if (pos3) {
+        if (!pos3_dev_) TRUSS_CUDA(cudaMalloc(&pos3_dev_, sizeof(int) * 3 * st.max_rows()));
+        for (int a = 0; a < 3; ++a)
+            TRUSS_CUDA(cudaMemcpyAsync(pos3_dev_ + (size_t) a * T, pos3 + (size_t) a * p3_stride + p3_row0,
+                                       sizeof(int) * T, cudaMemcpyHostToDevice, g.s));
+        pos3 = pos3_dev_, p3_stride = T, p3_row0 = 0;
+    }
     const size_t base = sc.mark();
     // a layer's closing combine is folded into the next layer's first norm: out and inject sit at the same scratch
     // offsets every layer and are read by that first kernel before anything rewrites them
@@ -191,7 +203,7 @@ void StageModel::layers(engine::Stage & st, const engine::Chunk & c, float * res
         st.prof().record(l, 1, g.s);
         if (gdn_[i]) gdn_[i]->forward(g, c.slot, mixed16, T, out, c.tentative);
         else dsa_[i]->forward(g, c.slot, mixed16, c.pos0, T, out, c.tentative,
-                              dsa::RopePos{ c.x.pos3, nullptr, c.x.pos3_stride, c.x.pos3_row0, c.x.rope_delta });
+                              dsa::RopePos{ pos3, nullptr, p3_stride, p3_row0, c.x.rope_delta });
         st.prof().record(l, 2, g.s);
         hc_->mix(L.hc_ffn, res, T, mixed, mixed16, inject, out, inject);   // combine #1 fused into the norm (L3)
         moe_[i]->forward(g, mixed, mixed16, T, out, c.stream, st.moe_ws(), st.moe_rows());

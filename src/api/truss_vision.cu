@@ -7,6 +7,19 @@
 
 #include <memory>
 
+namespace {
+
+// The ViT's device must not leak into the caller: the server calls this from a thread pool whose thread may run the
+// text model's next call, and that model's streams (and its gpu.h guard, "the device current at construction") live
+// on another device. A leaked cudaSetDevice(1) then fails the model with "invalid resource handle".
+struct DevRestore {
+    int prev = -1;
+    DevRestore() { cudaGetDevice(&prev); }
+    ~DevRestore() { if (prev >= 0) cudaSetDevice(prev); }
+};
+
+}  // namespace
+
 struct truss_vision {
     std::unique_ptr<truss::gguf::File> file;
     std::unique_ptr<truss::qwen4exp::Vit> vit;
@@ -21,6 +34,7 @@ truss_vision * truss_vision_open(const char * mmproj_path, int device)
         [&]() -> truss_vision * {
             if (!mmproj_path) throw std::invalid_argument("truss_vision_open: no path");
             auto v = std::make_unique<truss_vision>();
+            const DevRestore restore;
             v->device = device;
             TRUSS_CUDA(cudaSetDevice(device));
             v->file = truss::gguf::File::open(mmproj_path);
@@ -42,6 +56,7 @@ int truss_vision_forward(truss_vision * v, const float * pixel_values, int gh, i
     return truss::api::guarded(
         [&] {
             if (!v || !pixel_values || !out_rows) throw std::invalid_argument("truss_vision_forward: null argument");
+            const DevRestore restore;
             TRUSS_CUDA(cudaSetDevice(v->device));
             const float * rows = v->vit->forward(pixel_values, gh, gw);
             const int n = gh * gw / 4, w = v->vit->out_hidden();

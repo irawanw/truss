@@ -152,7 +152,14 @@ Files (Phase 3): `src/kernels/dsa/dsa_prepare.{cuh,cu}` (`RopePos`), `src/blocks
 (new: `truss_vision_open/width/forward/close`), `src/api/{truss_c.cu,truss_sampling.cu,api_internal.h}` +
 `include/truss/truss.h` (`truss_eval_img{,argmax,sample}_s`), `server/vision.py` (new), `server/{app,engine,generate}.py`
 (`--mmproj`, `--mmproj-device`, `--allow-local-images`), `tests/server/vision_expand_test.py` +
-`tests/server/image_prompt_test.py` (host-only).
+`tests/server/image_prompt_test.py` (host-only), `tests/server/vision_api_test.py` (the slice model + ViT on two
+devices in one thread: the device hand-back and an image prompt end to end, seconds instead of a full load).
+
+`pos3` is a host `[3][n]` table (`Pipeline::prompt`, HF `get_rope_index`); `StageModel::layers` copies this chunk's
+rows into `pos3_dev_` (device `[3][T]`) and gives the DSA rope kernels a `row0 = 0` view of it - the kernels read
+device memory, and the ViT's device is restored after `truss_vision_forward` (a leaked `cudaSetDevice` broke the next
+model call on a pool thread). The server preflights jinja2 >= 3.1, Pillow, the `--mmproj` file and the
+`truss_vision_open` symbol before it loads weights.
 
 Server behaviour: an `image_url` part (data URI, http(s), or a local path with `--allow-local-images`) goes through
 `Tower.rows` (`vision_pre` + `truss_vision_forward`) and `expand`; `generate(image=...)` reads the **whole** prompt in
