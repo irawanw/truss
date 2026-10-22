@@ -164,6 +164,13 @@ add_library(truss_kernels STATIC
 target_include_directories(truss_kernels PUBLIC src)
 target_link_libraries(truss_kernels PUBLIC CUDA::cublas)
 
+# ---- Flash-Next vision tower (docs/reference/model-qwen4exp.md "Vision")
+add_library(truss_vision STATIC src/model/qwen4exp/vision/vit.cu)
+target_include_directories(truss_vision PUBLIC src)
+target_link_libraries(truss_vision PUBLIC truss_formats CUDA::cudart CUDA::cublas)
+add_executable(vit_check tests/unit/vit_check.cu)
+target_link_libraries(vit_check PRIVATE truss_vision)
+
 # ---- tests (tests/unit: one binary per op, exit code = pass/fail)
 if(TRUSS_LLAMA_REF)
     add_executable(moe_window_test tests/unit/moe_window_test.cu)

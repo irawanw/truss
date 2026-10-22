@@ -4,7 +4,7 @@
   python3 flashnext_mmproj.py --model-dir <HF dir with config.json + shard holding model.visual.*> --out flashnext-mmproj-f16.gguf
 
 Layout: arch "qwen4exp-mmproj"; every tensor `model.visual.X` is stored as `v.X` (HF names kept, so the engine and
-the HF reference line up). Matrices, the conv kernel [1152,3,2,16,16] and pos_embed [2304,1152] are F16; biases and
+the HF reference line up). Matrices, the conv kernel (flattened to [1152,1536], order C,T,ph,pw) and pos_embed [2304,1152] are F16; biases and
 LayerNorm weights are F32. Metadata `qwen4exp.vision.*` carries the hyperparameters (see docs/reference/model-qwen4exp.md).
 """
 import argparse
@@ -45,6 +45,8 @@ def main():
                 if idx[k] != sh:
                     continue
                 t = f.get_tensor(k).float().numpy()
+                if t.ndim > 2:
+                    t = t.reshape(t.shape[0], -1)             # conv kernel [1152,3,2,16,16] -> [1152,1536] (C,T,ph,pw): the reader allows 4 dims and the patch embed is a GEMM
                 is_mat = k.endswith("weight") and t.ndim >= 2        # pos_embed, qkv/proj/fc, conv kernel
                 w.add_tensor("v." + k[len("model.visual."):], t.astype(np.float16 if is_mat else np.float32))
                 n += 1

@@ -88,7 +88,7 @@ Base model has a 27-block ViT (hidden 1152, 16 heads, MLP 4304, GELU-tanh, patch
 learned 48x48 pos-embed bilinearly resampled, no DeepStack) whose merger outputs 2560 = text hidden. The X3.1 pack is text-only.
 
 - `tools/tk-pack/flashnext_mmproj.py` writes `flashnext-mmproj-f16.gguf` (0.9 GB, arch `qwen4exp-mmproj`, 333 tensors named
-  `v.<HF name without model.visual.>`; matrices + conv kernel + pos_embed F16, biases/norms F32; hyperparameters in
+  `v.<HF name without model.visual.>`; matrices + conv kernel (flattened to [1152,1536], order C,T,ph,pw) + pos_embed F16, biases/norms F32; hyperparameters in
   `qwen4exp.vision.*`). Verified: 9 tensors read back equal to the safetensors (rel err <= 4e-7).
   Run: `python3 tools/tk-pack/flashnext_mmproj.py --model-dir <HF dir> --out flashnext-mmproj-f16.gguf`.
 - `server/vision_pre.py`: image -> `pixel_values [N, 1536]` + `grid_thw`. Same patch order as HF `Qwen2VLImageProcessor`
@@ -97,3 +97,11 @@ learned 48x48 pos-embed bilinearly resampled, no DeepStack) whose merger outputs
   `image_token_id` positions only; PLE and the n-gram tables still receive the original token ids (so image rows use the
   `image_token_id` PLE row); position ids are 3D (`compute_3d_position_ids`).
 - Fixtures (ViT taps from HF on a 448x448 test image) live outside the repo in `ML_projects/flashnext/20261022_vision/fix/`.
+
+### Vision tower (`src/model/qwen4exp/vision/vit.{h,cu}`) - Phase 2 done
+`Vit(gguf::File mmproj, device)`; `forward(pixel_values host f32 [N][1536], gh, gw)` -> device f32 `[N/4][2560]`. Residual f32, GEMM
+inputs f16 (cuBLAS, f32 accumulate), LayerNorm/softmax/rotary f32; host tables for the 2D rotary (h,w; rotate_half over all 72 dims) and
+the bilinear (align_corners) pos-embed taps, tokens in 2x2 merge-block order. Attention is a simple per-(query,head) block kernel
+(correct, not fast: 28x28 patches = 550 ms; a tiled/cuBLAS version is the speed lever). Test: `build-vision/vit_check <mmproj> <fix dir>`
+(CMake target `vit_check`): patch+pos cos 1.000000, block0 1.000000, block13 0.999989, block26 0.999932, vit_out 0.999947
+(max|diff| 0.0066 on absmax 0.34). Change rule: rerun vit_check; fixtures from `scripts/p0_fixtures.py` (kept in the work dir).
