@@ -45,6 +45,11 @@ NVMe 97 GB in both setups. Two GPUs split the model by layers (layers 0-23 on on
 and the MTP drafter on the other; prompt chunks pipelined across both, no NVLink): 55% of the routed experts fit on the
 GPUs instead of about a third, which is where most of the 2x comes from. Decode varies by a few percent on a shared
 machine. Model card: [PAW-125B-FLASH-NEXT-X3.1](https://huggingface.co/lackonendes/PAW-125B-FLASH-NEXT-X3.1).
+
+Images: `flashnext-mmproj-f16.gguf` (0.84 GiB, the Qwen3.8-Flash-Next ViT) makes the same server a vision model.
+`VIT=` / `--mmproj` puts the encoder on a card of its own and the API takes `image_url` parts beside text: a 448x448
+picture is 196 prompt tokens, the long side is capped at 1,344. See
+[docs/SERVING-FLASHNEXT-X31.md](docs/SERVING-FLASHNEXT-X31.md#images-vision).
 Every number has a row in TRACKER.md (kept locally, internal-only, not in this repo) with the command that produced it.
 
 Tried on the two-GPU decode on 2026-10-13 (measured on a replay of 16 real agent requests, served
