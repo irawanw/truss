@@ -82,6 +82,34 @@ Endpoints: `/v1/chat/completions` and `/v1/completions` (streaming, tool calling
 thinking mode Qwen recommends `temperature 1.0, top_p 0.95, top_k 20`; for direct answers `temperature 0.7,
 top_p 0.8, top_k 20`. Requests are handled one at a time.
 
+### Images (vision)
+
+The vision encoder ships as `flashnext-mmproj-f16.gguf` (0.84 GiB: the Qwen3.8-Flash-Next ViT in f16). Pass the script
+`VIT=` and the server accepts images; put the ViT on a card of its own when you can:
+
+```sh
+hf download lackonendes/PAW-125B-FLASH-NEXT-X3.1 flashnext-mmproj-f16.gguf --local-dir /nvme/flashnext
+MODEL_DIR=/nvme/flashnext TOKENIZER=/nvme/flashnext/tokenizer.json GPUS=0,1 PORT=8080 \
+  VIT=/nvme/flashnext/flashnext-mmproj-f16.gguf VIT_GPU=1 tools/serve/serve_flashnext_x31.sh
+```
+
+`VIT_GPU` is an index into `CUDA_VISIBLE_DEVICES` (default: the last card). The ViT needs about 1.5 GiB. An image goes in
+as an `image_url` part, a data URI or an http(s) URL (local paths need `IMAGES=1`), one image per request:
+
+```sh
+curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d "{
+  \"messages\":[{\"role\":\"user\",\"content\":[
+    {\"type\":\"text\",\"text\":\"Describe this image.\"},
+    {\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,$(base64 -w0 pic.png)\"}}]}],
+  \"max_tokens\":256}"
+```
+
+The picture is resized to a 32-pixel patch grid, long side at most 1344 (up to 1,764 image tokens; 448x448 is 196), and
+read before the text, so an image request never reuses a previous prefix. One RTX 3090, 448x448 image plus a short
+question: prefill about 2.0-2.4 s, then decode at the usual speed (thinking eats the first tokens, so allow 200+). A
+server started without `VIT=` answers image requests with a 400 and serves text as before. The equivalent flags are
+`--mmproj <file> --mmproj-device <index> [--allow-local-images]`.
+
 ## What each setting does
 
 | setting | what it does |
@@ -95,6 +123,7 @@ top_p 0.8, top_k 20`. Requests are handled one at a time.
 | `TRUSS_KV_LEND=1` | lends unused KV memory to the expert cache while the context is short |
 | `TRUSS_ADMIT_IDLE=64`, `TRUSS_PCIE_FRAC=0.2`, `TRUSS_HINT_K=3` | expert-cache and PCIe tuning for decode |
 | `TRUSS_FETCH_PROMPT=96`, `TRUSS_SPLIT_ROWS=2048`, `--chunk 8192` | prompt (prefill) tuning: prompts of 96+ tokens use the streaming path, in 8,192-token chunks |
+| `VIT=...`, `VIT_GPU` | image input: loads the mmproj ViT (0.84 GiB) on its own card; `IMAGES=1` allows local image paths |
 
 ## Memory at 262,144 context
 

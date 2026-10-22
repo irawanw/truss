@@ -21,6 +21,24 @@ namespace truss::engine {
 
 class Stage;
 
+// Image rows of a prompt (ViT output, merge-block order): host f32 [n][cols], rows [row0, row0 + n) of the prompt
+// the embed replaces. nh x nw = n is the image's grid in LLM tokens (patch grid / 2).
+struct ImageIn {
+    const float * embeds = nullptr;
+    int row0 = 0, n = 0, cols = 0, nh = 0, nw = 0;
+};
+
+// The multimodal rows of a chunk (all default = the text path):
+//   img    host f32 [img_n][img_cols], the ViT output, replaces the embed rows [img_row0, img_row0 + img_n)
+//   pos3   absolute [3][pos3_stride] mrope positions, row pos3_row0 is this chunk's first row (nullptr: 1-D)
+//   rope_delta  added to pos0 for rope only (cache rows and DSA block indices stay linear)
+struct ChunkExtra {
+    const float * img = nullptr;
+    int img_row0 = 0, img_n = 0, img_cols = 0;
+    const int * pos3 = nullptr;
+    int pos3_stride = 0, pos3_row0 = 0, rope_delta = 0;
+};
+
 // one chunk of tokens on one stage
 struct Chunk {
     const int32_t * tokens = nullptr;          // host
@@ -30,6 +48,7 @@ struct Chunk {
     bool stream = false;                       // a prompt chunk in stream mode (else fetch-sized)
     const int32_t * next = nullptr;            // lookahead: the next chunk's tokens (prefetch of per-token tables)
     int next_T = 0;
+    ChunkExtra x;                              // image rows / 3-D positions (text: defaults)
 };
 using LayerHook = std::function<void(int layer, const float * res, int T)>;   // parity tests: residual after a layer
 
@@ -49,7 +68,9 @@ public:
         uint64_t counter = 0;
         float * q = nullptr;
     };
-    virtual int draft(Stage &, int slot, int32_t next, int pos, int n, int32_t * out, const Sampling & s) = 0;
+    // rope_delta: multimodal position offset of the drafts' rope (0 for text: rope position = pos + t)
+    virtual int draft(Stage &, int slot, int32_t next, int pos, int n, int32_t * out, const Sampling & s,
+                      int rope_delta = 0) = 0;
     // the model's per-draft confidence p_i (the acceptance probability of draft i, the DeepInfer recipe): the
     // varlen verify schedule uses them. nullptr: no confidence (the fixed-length schedule).
     virtual const float * draft_confidence(int * n) const { *n = 0; return nullptr; }

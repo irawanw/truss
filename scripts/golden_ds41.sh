@@ -4,7 +4,13 @@
 # back). ~5 min. Exit 0 only when every configuration is IDENTICAL. Required before any shared engine code merges.
 #   scripts/golden_ds41.sh [name]     -> $T/data/logs/golden_<name or time>
 set -uo pipefail
-source "$(dirname "$(readlink -f "$0")")/ds41_env.sh"
+# Paths only: sourcing ds41_env.sh leaked the served config into the slice (TRUSS_EXPERT_OVERLAY replaced DS41 expert
+# tensors inside the 8-layer Flash-Next model -> "open: qwen4exp: blk.0.ffn_gate_exps is 256 x 2304x5120"), and the
+# golden's own configuration is tests/golden/run.sh's. Keep the device order the golden was recorded with.
+T=${TRUSS_PORT_DIR:-$HOME/ML_projects/dsv41flash/20261019_truss_port}
+H=${TRUSS_HOME:-/mnt/hdd/ml/dsv41flash/20261019_truss_port}
+REPO=${TRUSS_REPO:-$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)}
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
 cd "$REPO"
 NAME=${1:-$(date +%m%d-%H%M%S)}
 O="$T/data/logs/golden_$NAME"

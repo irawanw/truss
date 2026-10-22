@@ -14,8 +14,18 @@
 
 namespace truss::dsa {
 
+// Multimodal (mrope) positions, dormant for text: pos3 [3][stride] are absolute per-row positions (row0 = this
+// chunk's first row in that array); sec [ROPE_DIMS / 2] device maps rotary pair p to its axis (all 0 = text).
+// pos3 == nullptr: 1-D, position = pos0 + t + delta. sec == nullptr: text-only, 1-D without a table.
+struct RopePos {
+    const int * pos3 = nullptr;
+    const int * sec = nullptr;
+    int stride = 0, row0 = 0, delta = 0;
+};
+
 // cs [T][ROPE_DIMS / 2] for positions pos0 .. pos0 + T - 1
-template <class Shape> void rope_table(int pos0, int T, float base, float2 * cs, cudaStream_t stream);
+template <class Shape> void rope_table(int pos0, int T, float base, float2 * cs, const RopePos & rp,
+                                       cudaStream_t stream);
 
 // qfull [T][H][2 D] (per head q | gate), k, v [T][HKV][D] raw -> q16 [T][H][D], gate [T][H][D],
 // k_cache / v_cache [n_ctx][HKV][D] rows pos0 .. pos0 + T - 1. q_norm, k_norm [D].
@@ -35,7 +45,7 @@ void prepare_qkv(const float * qfull, const float * k, const float * v, const fl
 template <class Shape>
 void prepare_index(const float * idx_q, const float * idx_k, const float * q_norm, const float * k_norm,
                    const float2 * cs, float rope_base, int pos0, int T, float eps, float * partial, half * idx_q16,
-                   half * idx_k_cache, cudaStream_t stream);
+                   half * idx_k_cache, const RopePos & rp, cudaStream_t stream);
 
 // partial <- the raw keys of the block open after cells pos0 .. pos0 + T - 1 that lie in that range (idx_k raw
 // [T][ID]); rows of cells before pos0 keep what partial held. prepare_index does this at the end of a chunk; a

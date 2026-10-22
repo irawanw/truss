@@ -99,7 +99,8 @@ public:
     void flush(engine::Stage &, int) override {}
     void park(engine::Stage &, int) override {}
     void unpark(engine::Stage &, int) override {}
-    int draft(engine::Stage & st, int slot, int32_t next, int pos, int n, int32_t * out, const Sampling & s) override;
+    int draft(engine::Stage & st, int slot, int32_t next, int pos, int n, int32_t * out, const Sampling & s,
+              int rope_delta = 0) override;
     // the per-draft confidence p_i of the last draft call (the acceptance probability of draft i)
     const float * draft_confidence(int * n) const override { *n = (int) conf_.size(); return conf_.data(); }
     engine::Stateful * state() override { return this; }

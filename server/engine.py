@@ -6,6 +6,7 @@ import threading
 import time
 from fastapi import HTTPException
 from server.chat import Chat
+from server.vision import Tower
 from server.truss_ctypes import Model
 from server.engine_debug import EngineDebug
 from server.generate import EngineGenerate
@@ -42,6 +43,8 @@ class Engine(EngineGenerate, EngineDebug):
                                      self.chat.token_id("<｜end▁of▁sentence｜>"))
                          if i is not None and i >= 0}
         self.name, self.log_path, self.log_tag = a.name, a.log, a.log_tag
+        self.allow_local_images = getattr(a, "allow_local_images", False)
+        self.vision = Tower(a.mmproj, a.mmproj_device) if getattr(a, "mmproj", None) else None
         self.dump_dir = a.dump_dir
         self.init_sequences(a.chunk)   # one record per sequence + the two fair gates (see below)
         self.im_start = self.chat.token_id("<|im_start|>")

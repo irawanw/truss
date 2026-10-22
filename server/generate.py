@@ -46,7 +46,7 @@ class EngineGenerate:
 
     def generate(self, prompt_ids, max_tokens, temperature, top_p, top_k, seed, stop_strings, min_p=0.0,
                  presence_penalty=0.0, frequency_penalty=0.0, repetition_penalty=1.0, penalty_last_n=64,
-                 think_open=False, note="", ignore_eos=False):
+                 think_open=False, note="", ignore_eos=False, image=None):
         """Yields (token id, text delta, finish reason or None); the last item has the finish reason.
         Penalties (sampled requests only; greedy ignores them): llama.cpp's formulas over the last penalty_last_n
         tokens of the sequence (prompt included, as llama-server and Strata count), or with penalty_last_n -1 over
@@ -64,8 +64,9 @@ class EngineGenerate:
         slot = self.acquire_slot(prompt_ids, note)
         try:
             max_tokens = max(0, min(max_tokens, self.model.n_ctx - n_prompt))
-            reuse = len(slot.cached) if 0 < len(slot.cached) < n_prompt and prompt_ids[:len(slot.cached)] == slot.cached else 0
-            ck = len(slot.ck_tokens)
+            reuse = 0 if image is not None else (
+                len(slot.cached) if 0 < len(slot.cached) < n_prompt and prompt_ids[:len(slot.cached)] == slot.cached else 0)
+            ck = 0 if image is not None else len(slot.ck_tokens)
             if not reuse and 0 < ck < n_prompt and prompt_ids[:ck] == slot.ck_tokens \
                     and self.call(slot, self.model.restore) == ck:
                 # the last prompt is a prefix but its reply is not (the client re-sent it without its reasoning, or
@@ -89,12 +90,24 @@ class EngineGenerate:
                     return slot.cached[n_prompt:]
                 return slot.cached[-max(1, min(penalty_last_n, PENALTY_CAP)):]
 
+            img_read = [image is not None]   # the prompt call is the only one that carries the image
+
             def step(tokens):
                 """Feed tokens on this slot, return the next token. The prompt's first read is the only call long
                 enough to be split: while another slot has a request it goes in as pieces of plain eval and only the
                 last piece is the step that samples, so the other stream gets its rounds in between. The head runs on
                 the last row of every call, so where the pieces fall cannot change the result."""
                 slot.cached += list(tokens)
+                if img_read[0]:
+                    img_read[0] = False
+                    if len(tokens) != n_prompt:
+                        raise ValueError("an image prompt must be read in one call")
+                    if sp is not None and sp.penalized:
+                        sp.set_history(counted())
+                    return (self.call(slot, self.model.eval_img_argmax, tokens, image.embeds, image.row0, image.nh,
+                                      image.nw) if greedy
+                            else self.call(slot, self.model.eval_img_sample, tokens, image.embeds, image.row0,
+                                           image.nh, image.nw, sp))
                 if self.prefill_piece > 0 and len(tokens) > self.prefill_piece and self.other_busy(slot):
                     self.read(slot, tokens[:-1])
                     tokens = tokens[-1:]
@@ -115,20 +128,23 @@ class EngineGenerate:
                                            daemon=True)
                 watcher.start()
             try:
-                # checkpoint just before the prompt's last <|im_start|> (DS41: <｜Assistant｜>, engine.py) (~10 ms): the
-                # next request may resume there.
-                # Not at the prompt's end: its generation prompt ("...assistant\n<think>\n") tokenizes differently
-                # once the reply follows it ("\n\n</think>"), but nothing before a special token can change.
-                cut = next((i for i in range(len(prompt_ids) - 1, reuse, -1) if prompt_ids[i] == self.im_start), 0)
-                if cut > reuse:
-                    slot.cached += prompt_ids[reuse:cut]
-                    self.read(slot, prompt_ids[reuse:cut])
-                    self.call(slot, self.model.checkpoint)
-                    slot.ck_tokens = list(prompt_ids[:cut])
-                    reuse_from = cut
+                if image is not None:   # one image per prompt: the whole prompt is one eval_img, no checkpoint
+                    nxt = step(prompt_ids)
                 else:
-                    reuse_from = reuse
-                nxt = step(prompt_ids[reuse_from:])
+                    # checkpoint just before the prompt's last <|im_start|> (DS41: <｜Assistant｜>, engine.py) (~10 ms): the
+                    # next request may resume there.
+                    # Not at the prompt's end: its generation prompt ("...assistant\n<think>\n") tokenizes differently
+                    # once the reply follows it ("\n\n</think>"), but nothing before a special token can change.
+                    cut = next((i for i in range(len(prompt_ids) - 1, reuse, -1) if prompt_ids[i] == self.im_start), 0)
+                    if cut > reuse:
+                        slot.cached += prompt_ids[reuse:cut]
+                        self.read(slot, prompt_ids[reuse:cut])
+                        self.call(slot, self.model.checkpoint)
+                        slot.ck_tokens = list(prompt_ids[:cut])
+                        reuse_from = cut
+                    else:
+                        reuse_from = reuse
+                    nxt = step(prompt_ids[reuse_from:])
             except TrussError:
                 slot.cached, slot.ck_tokens = [], []   # the engine's sequence is unknown now: the next request starts over
                 raise

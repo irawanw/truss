@@ -98,7 +98,8 @@ inline void check_slot(const truss_model & m, int slot)
 
 // append tokens in chunks; the last chunk's last row feeds the head (m.logits), then after() runs while the engine
 // still holds the last stage for this slot (it reads m.logits)
-inline void eval(truss_model & m, int slot, const int32_t * tokens, int n, const std::function<void()> & after, int step_max = 0)
+inline void eval(truss_model & m, int slot, const int32_t * tokens, int n, const std::function<void()> & after,
+                 int step_max = 0, const engine::ImageIn * img = nullptr)
 {
     check_slot(m, slot);
     if (n <= 0) throw std::invalid_argument("truss_eval: no tokens");
@@ -113,7 +114,7 @@ inline void eval(truss_model & m, int slot, const int32_t * tokens, int n, const
     m.prog_done[slot] = 0, m.prog_total[slot] = n;
     // in chunks with the PLE lookahead (the next chunk's trigram rows are read while this chunk computes); a layer
     // split runs its stages a chunk apart (Pipeline::prompt)
-    m.fwd->prompt(slot, tokens, n, step, m.logits, after, [&](int done) { m.prog_done[slot] = done; });
+    m.fwd->prompt(slot, tokens, n, step, m.logits, after, [&](int done) { m.prog_done[slot] = done; }, img);
 }
 
 inline void sync(truss_model & m) { TRUSS_CUDA(cudaStreamSynchronize(m.fwd->stream())); }

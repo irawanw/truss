@@ -16,7 +16,8 @@ namespace truss::qwen4exp {
 
 using engine::require;
 
-int MtpDrafter::draft(engine::Stage & st, int slot, int32_t next, int pos, int n, int32_t * out, const Sampling & smp)
+int MtpDrafter::draft(engine::Stage & st, int slot, int32_t next, int pos, int n, int32_t * out, const Sampling & smp,
+                      int rope_delta)
 {
     constexpr int W = moe::MAX_ROWS + 1;
     Slot & s = s_[slot];
@@ -49,13 +50,13 @@ int MtpDrafter::draft(engine::Stage & st, int slot, int32_t next, int pos, int n
             h[nc] = next;
             int * d_ids = g.sc->alloc<int>(nc + 1);
             TRUSS_CUDA(cudaMemcpyAsync(d_ids, h, sizeof(int32_t) * (nc + 1), cudaMemcpyHostToDevice, g.s));
-            rows(st, slot, mh, d_ids, s.dc_pos0 + skip, nc + 1, false, true, true);
+            rows(st, slot, mh, d_ids, s.dc_pos0 + skip, nc + 1, false, true, true, s.dc_delta);
             g.copy(s.pending_h, st.res() + (size_t) (T - 1) * row, row);
             s.has_pending = true;
             s.ahead = true, s.ahead_tok = next, s.ahead_pos = pos;
             merged = nc + 1;
         } else {
-            commit(st, slot, s.dc_tokens.data(), s.dc_pos0, T, false);
+            commit(st, slot, s.dc_tokens.data(), s.dc_pos0, T, false, s.dc_delta);
         }
     }
     g.copy(partial_snap_, dsa_->partial(slot), blocks::Dsa<DsaShape>::partial_floats());
@@ -66,7 +67,7 @@ int MtpDrafter::draft(engine::Stage & st, int slot, int32_t next, int pos, int n
     const int nv = hd.draft_rows();
     int made = 0;
     for (int i = 0; i < n; ++i) {
-        if (i > 0 || !merged) rows(st, slot, st.extra(0), draft_ids_ + i, pos + i, 1, false, true);
+        if (i > 0 || !merged) rows(st, slot, st.extra(0), draft_ids_ + i, pos + i, 1, false, true, false, rope_delta);
         sampling::argmax_prob(logits_, nv, hd.draft_map(), draft_ids_ + i + 1, draft_prob_ + i, g.s);
         if (ds_p)   // the guess becomes a sample of q (the argmax probability above still decides the stop)
             sampling::draft_sample(logits_, nv, hd.draft_map(), c_.n_vocab, *ds_p, smp.counter + i,

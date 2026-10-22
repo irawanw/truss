@@ -68,16 +68,17 @@ public:
     int slot() const { return slot_; }
     void settle();                             // the slot's deferred accept on this (front) stage
     void run_chunk(const int32_t * tokens, int pos0, int T, const LayerHook & hook, bool tentative,
-                   const int32_t * next_tokens = nullptr, int next_T = 0);
+                   const int32_t * next_tokens = nullptr, int next_T = 0, const ChunkExtra & x = {});
     void head(int first, int n, float * logits);
     void accept(int n);
     void checkpoint(int pos);
     int restore();
     void reset();
     bool window_open() const { return slots_[slot_].open; }
+    int rope_delta() const { return slots_[slot_].rope_delta; }   // the slot's multimodal rope offset
     void set_defer(int slot, int n) { slots_[slot].defer_n = n; }
     cudaEvent_t slot_done(int slot) const { return slots_[slot].done; }
-    int draft(int32_t next, int pos, int n, int32_t * out, const Drafter::Sampling & s);
+    int draft(int32_t next, int pos, int n, int32_t * out, const Drafter::Sampling & s, int rope_delta = 0);
     // the drafter's per-draft confidence p_i of the last draft call (null: none)
     const float * draft_confidence(int * n) const;
 
@@ -118,6 +119,7 @@ private:
         std::vector<int32_t> vw_tokens;
         int last_T = 0;                          // rows of res from the last run
         int defer_n = 0;                         // rows to accept before this slot's next work here (front stages)
+        int rope_delta = 0;                      // the slot's multimodal rope offset (0: text)
         cudaEvent_t done = nullptr;              // recorded behind its verify rows (front stages)
         Checkpoint ck;
     };

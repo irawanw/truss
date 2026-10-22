@@ -36,7 +36,7 @@ void Stage::commit_tokens(const int32_t * tokens, int n)
 // One chunk of the model at positions pos0 .. pos0 + T - 1 on this stage. tentative: a verify window (accept()
 // commits it). next: the following chunk's tokens, for blocks that prefetch per-token tables.
 void Stage::run_chunk(const int32_t * tokens, int pos0, int T, const LayerHook & hook, bool tentative,
-                      const int32_t * next_tokens, int next_T)
+                      const int32_t * next_tokens, int next_T, const ChunkExtra & x)
 {
     SlotState & ss = slots_[slot_];
     require(T > 0 && T <= max_chunk_, "chunk of " + std::to_string(T) + " tokens (max " + std::to_string(max_chunk_) + ")");
@@ -61,7 +61,8 @@ void Stage::run_chunk(const int32_t * tokens, int pos0, int T, const LayerHook &
     const bool split = moe_ && moe_->split_chunk(stream, T);   // E7: per-layer copies after the routing, no prefetch
     if (moe_) moe_->set_split(split);
     g_.sc->reset();
-    const Chunk c{ tokens, pos0, T, slot_, tentative, stream, next_tokens, next_T };
+    const Chunk c{ tokens, pos0, T, slot_, tentative, stream, next_tokens, next_T, x };
+    ss.rope_delta = x.rope_delta;
     const size_t row_bytes = sizeof(float) * (size_t) T * fam_.res_width();
     if (first_) {
         model_->embed(*this, c, cur_.res);
@@ -173,16 +174,16 @@ void Stage::reset()
 {
     for (Stateful * s : states_) s->reset(*this, slot_);
     SlotState & ss = slots_[slot_];
-    ss.last_T = 0, ss.open = false, ss.defer_n = 0;
+    ss.last_T = 0, ss.open = false, ss.defer_n = 0, ss.rope_delta = 0;
     kv_reserve(0, true);
 }
 
-int Stage::draft(int32_t nxt, int pos, int n, int32_t * out, const Drafter::Sampling & s)
+int Stage::draft(int32_t nxt, int pos, int n, int32_t * out, const Drafter::Sampling & s, int rope_delta)
 {
     Drafter * d = model_->drafter();
     require(d != nullptr, "draft() needs a drafter");
     require(!slots_[slot_].open, "draft() before accept()");
-    return d->draft(*this, slot_, nxt, pos, n, out, s);
+    return d->draft(*this, slot_, nxt, pos, n, out, s, rope_delta);
 }
 
 const float * Stage::draft_confidence(int * n) const

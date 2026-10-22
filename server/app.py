@@ -29,6 +29,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from server.tools import ToolStream, normalize_messages, parse_calls
+from server import vision
 from server.truss_ctypes import TrussError
 from server.engine import Engine
 from server.reasoning import ThinkSplitter, split_reasoning
@@ -157,6 +158,7 @@ def make_app(engine: Engine) -> FastAPI:
         # A client that owns its prompt (an agent that renders its own template, a bench replaying recorded ids)
         # gets those exact tokens, which is what makes a served measurement comparable to an in-process one.
         raw = body.get("prompt")
+        image = None
         if isinstance(raw, list):
             ids = raw_ids(raw, engine.model.n_vocab)   # F1: these ids go to the embedding table unchecked
         elif raw is not None:
@@ -170,6 +172,19 @@ def make_app(engine: Engine) -> FastAPI:
                 prompt = await anyio.to_thread.run_sync(
                     lambda: engine.chat.prompt(msgs, tools=tools, template_kwargs=kw))
             ids = await anyio.to_thread.run_sync(engine.chat.encode, prompt)
+            url = vision.image_url(msgs)
+            if url and getattr(engine, "vision", None) is None:
+                raise ValueError("this server has no vision model: start it with --mmproj")
+            if url:
+                if engine.ds41 is not None:
+                    raise ValueError("image input is not supported for deepseek41")
+
+                def rows():
+                    return engine.vision.rows(vision.load(url, engine.allow_local_images))
+
+                embeds, nh, nw = await anyio.to_thread.run_sync(rows)
+                ids, image = await anyio.to_thread.run_sync(
+                    lambda: vision.expand(engine.chat, ids, embeds, nh, nw))
         if (r := too_long(ids)) is not None:
             return r
         p = params(body)
@@ -181,6 +196,9 @@ def make_app(engine: Engine) -> FastAPI:
         p["note"] = (f"request: temperature {p['temperature']} top_p {p['top_p']} top_k {p['top_k']} "
                      f"min_p {p['min_p']}{pen}{' penalty_last_n ' + str(p['penalty_last_n']) if pen else ''}, "
                      f"{len(tools or [])} tools, thinking {'on' if thinking else 'off'}")
+        if image is not None:
+            p["image"] = image
+            p["note"] += f", image {image.nh}x{image.nw}"
         rid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
 
         if body.get("stream"):
@@ -304,6 +322,30 @@ def make_app(engine: Engine) -> FastAPI:
     return app
 
 
+def preflight(a):
+    """Fail in a second, not after the model load (20+ min for the cold-expert copy): the Python pieces the request
+    path needs and, with --mmproj, the vision symbols (a stale TRUSS_LIB cost a full load twice)."""
+    import jinja2
+    v = tuple(int(x) for x in jinja2.__version__.split(".")[:2] if x.isdigit())
+    if v < (3, 1):
+        raise SystemExit(f"jinja2 {jinja2.__version__} is too old for transformers (needs >= 3.1): "
+                         f"{os.environ.get('PYTHON', 'python3')} -m pip install -U 'jinja2>=3.1'")
+    if not a.mmproj:
+        return
+    if not os.path.exists(a.mmproj):
+        raise SystemExit(f"--mmproj {a.mmproj}: no such file")
+    try:
+        import PIL  # noqa: F401
+    except ModuleNotFoundError:
+        raise SystemExit("--mmproj needs Pillow in this interpreter (the vision preprocessor imports PIL)")
+    import ctypes
+    from server.truss_ctypes import _DEFAULT_LIB
+    try:
+        getattr(ctypes.CDLL(os.path.abspath(_DEFAULT_LIB)), "truss_vision_open")
+    except (OSError, AttributeError):
+        raise SystemExit(f"{_DEFAULT_LIB} has no truss_vision_open: stale build (set TRUSS_LIB to the vision build)")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="GGUF (first shard)")
@@ -314,6 +356,9 @@ def main():
                     "keeps the most-used experts in VRAM (decode speed)")
     ap.add_argument("--mtp", default=None, help="MTP draft block GGUF: greedy requests decode speculatively")
     ap.add_argument("--drafts", type=int, default=3, help="MTP drafts per round")
+    ap.add_argument("--mmproj", default=None, help="vision GGUF (flashnext-mmproj-f16.gguf): enables image input")
+    ap.add_argument("--mmproj-device", type=int, default=0, help="GPU for the vision tower (one GPU)")
+    ap.add_argument("--allow-local-images", action="store_true", help="accept local paths as image_url")
     ap.add_argument("--draft-vocab", default=None, help="int32 token ids the draft head scores (data/draft_vocab_en.bin)")
     ap.add_argument("--draft-min-p", type=float, default=0.5, help="drafting stops below this MTP probability")
     ap.add_argument("--cpu-dir", default=None, help="CPU expert tier (q4s files); needs --expert-usage")
@@ -326,6 +371,7 @@ def main():
     ap.add_argument("--log-tag", default="truss serve")
     ap.add_argument("--dump-dir", default=None, help="keep the last 20 requests (prompt tail + reply) here as JSON")
     a = ap.parse_args()
+    preflight(a)
     engine = Engine(a)
     print(f"truss: model loaded, n_ctx {engine.model.n_ctx}, listening on {a.host}:{a.port}", flush=True)
     uvicorn.run(make_app(engine), host=a.host, port=a.port, log_level="warning")

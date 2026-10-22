@@ -48,8 +48,10 @@ public:
     // ---- slot calls (different slots may run on different threads at once)
     // prompt(): tokens [0, n) appended to `slot` in chunks of `step`; with logits, the last row's logits go there and
     // after() runs, both while the last stage is still held for this slot
+    // img: image rows of this prompt (one image, contiguous); the engine builds the 3-D rope positions and the decode
+    // offset from row0 / nh / nw. Requires the prompt to start at position 0 (no prefix restore with an image).
     void prompt(int slot, const int32_t * tokens, int n, int step, float * logits, const std::function<void()> & after,
-                const std::function<void(int)> & done = nullptr);
+                const std::function<void(int)> & done = nullptr, const ImageIn * img = nullptr);
     // round(): up to nd drafts into win[1..] (win[0] = next), the verify window, its logits [nw + 1][n_vocab], then
     // pick(nw) - with the last stage held - returns how many rows to keep (1 .. nw + 1). Returns that count.
     int round(int slot, int32_t next, int nd, int32_t * win, float * logits, const Drafter::Sampling & ds,
@@ -104,6 +106,7 @@ private:
     std::vector<std::unique_ptr<Stage>> front_;    // a layer split's stages before the last (destroyed after m_)
     std::unique_ptr<Stage> m_;                     // the last stage (the whole model without a split)
     std::vector<int> seq_pos_{ 0 };
+    std::vector<int> rope_delta_{ 0 }, rope_delta_ck_{ 0 };   // per slot: multimodal rope offset (+ its checkpoint)
     std::unique_ptr<std::atomic<long long>[]> round_ns_;   // each slot's last round() end (steady clock ns)
     std::atomic<int> active_{ 0 };   // read by other threads' calls between select() and their work (review H2)
     int seq_ctx_ = 0;

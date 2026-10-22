@@ -63,7 +63,7 @@ void MtpDrafter::alloc_slots(engine::Stage & st, int n_slots, int seq_ctx, int s
 // The MTP block on T rows: hidden states h [T][hc][d], next tokens d_ids [T] (device) at MTP positions pos0 ..; its
 // residual in the stage's extra(1); logits of the last row into logits_ when asked. calib: TRUSS_MTP_CALIB capture.
 void MtpDrafter::rows(engine::Stage & st, int slot, const float * h, const int * d_ids, int pos0, int T, bool stream,
-                      bool logits, bool calib)
+                      bool logits, bool calib, int rope_delta)
 {
     engine::Gpu & g = st.gpu();
     Scratch & sc = *g.sc;
@@ -83,7 +83,7 @@ void MtpDrafter::rows(engine::Stage & st, int slot, const float * h, const int *
     float * inject = sc.alloc((size_t) T * nhc);
     half * mixed16 = sc.alloc<half>((size_t) T * dm);
     hc.mix(L.hc_attn, mres, T, mixed, mixed16, inject);
-    dsa_->forward(g, slot, mixed16, pos0, T, out, false);
+    dsa_->forward(g, slot, mixed16, pos0, T, out, false, dsa::RopePos{ nullptr, nullptr, 0, 0, rope_delta });
     hc.combine(mres, out, inject, T);
     hc.mix(L.hc_ffn, mres, T, mixed, mixed16, inject);
     if (calib && calib_f_) {   // the routed experts' input rows, true path only
@@ -99,7 +99,8 @@ void MtpDrafter::rows(engine::Stage & st, int slot, const float * h, const int *
 
 // After committing rows at positions pos0 .. pos0 + T - 1: the block at those positions, each from the previous
 // position's hidden state (pending for the first, the target's residual rows after)
-void MtpDrafter::commit(engine::Stage & st, int slot, const int32_t * tokens, int pos0, int T, bool stream)
+void MtpDrafter::commit(engine::Stage & st, int slot, const int32_t * tokens, int pos0, int T, bool stream,
+                        int rope_delta)
 {
     Slot & s = s_[slot];
     engine::Gpu & g = st.gpu();
@@ -125,7 +126,7 @@ void MtpDrafter::commit(engine::Stage & st, int slot, const int32_t * tokens, in
             src = h;
         }
         TRUSS_CUDA(cudaMemcpyAsync(d_ids, src, sizeof(int32_t) * n, cudaMemcpyHostToDevice, g.s));
-        rows(st, slot, mh, d_ids, pos0 + skip, n, stream, false, true);
+        rows(st, slot, mh, d_ids, pos0 + skip, n, stream, false, true, rope_delta);
         if (!staged) g.sync();
         g.sc->release(m);
     }
@@ -135,13 +136,13 @@ void MtpDrafter::commit(engine::Stage & st, int slot, const int32_t * tokens, in
 
 void MtpDrafter::on_commit(engine::Stage & st, const engine::Chunk & c)
 {
-    commit(st, c.slot, c.tokens, c.pos0, c.T, c.stream);
+    commit(st, c.slot, c.tokens, c.pos0, c.T, c.stream, c.x.rope_delta);
 }
 
-void MtpDrafter::on_accept(engine::Stage &, int slot, int n, const engine::Window & w)
+void MtpDrafter::on_accept(engine::Stage & st, int slot, int n, const engine::Window & w)
 {
     Slot & s = s_[slot];
-    s.dc_on = n > 0, s.dc_pos0 = w.pos0, s.dc_T = n;
+    s.dc_on = n > 0, s.dc_pos0 = w.pos0, s.dc_T = n, s.dc_delta = st.rope_delta();
     s.dc_tokens.assign(w.tokens, w.tokens + n);
 }
 
@@ -152,7 +153,7 @@ void MtpDrafter::flush(engine::Stage & st, int slot)
     s.dc_on = false;
     // a decode pass's commit fetches in ring mode; with two slots the store may be in stream mode now
     st.moe()->begin_ring();
-    commit(st, slot, s.dc_tokens.data(), s.dc_pos0, s.dc_T, false);
+    commit(st, slot, s.dc_tokens.data(), s.dc_pos0, s.dc_T, false, s.dc_delta);
 }
 
 // a deferred commit reads its rows from the stage's small buffer, which the other slot's calls overwrite: parked
