@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# One GPU job on GPUs 0 + 2 while the served DS41 (pm2 truss-ds41) is the self-iteration agent's own model:
+# One GPU job on our two GPUs (TRUSS_GPUS, default "1 3": the x16 cards, ours since 10-22; 0 and 2 are the
+# renter's) while the served DS41 (pm2 truss-ds41) is the self-iteration agent's own model:
 #   scripts/ds41_gpu_job.sh <log dir> <cmd...>
 # Stops truss-ds41 when it is online, runs <cmd> under run_watched2.sh (renter watchdog), then starts truss-ds41
 # again and RETURNS ONLY WHEN IT ANSWERS (health + a 4-token reply, <= 5 min), so the agent's next request finds its
@@ -8,6 +9,7 @@
 set -uo pipefail
 OUT=$1; shift
 WATCH=${TRUSS_WATCH:-$HOME/ML_projects/dsv41flash/20261018_poc/scripts/run_watched2.sh}
+read -r G1 G2 <<< "${TRUSS_GPUS:-1 3}"
 
 online=0
 if pm2 jlist 2>/dev/null | python3 -c 'import json,sys; sys.exit(0 if any(p["name"]=="truss-ds41" and p["pm2_env"]["status"]=="online" for p in json.load(sys.stdin)) else 1)'; then
@@ -33,11 +35,11 @@ trap back EXIT
 # the stopped server's CUDA contexts leave the GPUs a few seconds after it exits
 for _ in $(seq 120); do
   n=0
-  for G in 0 2; do
+  for G in $G1 $G2; do
     U="$(nvidia-smi -i "$G" --query-gpu=uuid --format=csv,noheader | tr -d ' ')"
     n=$((n + $(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader | tr -d ' ' | grep -cxF "$U" || true)))
   done
   [ $n = 0 ] && break
   sleep 0.5
 done
-bash "$WATCH" 0 2 "$OUT" "$@"
+bash "$WATCH" "$G1" "$G2" "$OUT" "$@"

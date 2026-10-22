@@ -53,6 +53,8 @@ struct truss_model {
     std::atomic<int> cur{ 0 };
     int * pen_cnt = nullptr;                 // device [drafts + 1][n_vocab] penalty counts, zero between calls
     int * pen_hist = nullptr, * pen_host = nullptr;   // device / pinned [drafts + 1][TRUSS_PENALTY_CAP] row histories
+    int * word_cls = nullptr;                // device [n_vocab] word class (truss_set_word_classes), host copy below
+    std::vector<int> word_cls_host;
     std::unique_ptr<engine::Pipeline> fwd;         // last: its expert budget takes the memory left
 
     ~truss_model()
@@ -67,6 +69,7 @@ struct truss_model {
         cudaFree(pen_cnt);
         cudaFree(pen_hist);
         if (pen_host) cudaFreeHost(pen_host);
+        cudaFree(word_cls);
     }
 };
 

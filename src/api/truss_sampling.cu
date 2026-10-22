@@ -1,5 +1,5 @@
 // The C API's device sampling and speculative steps (include/truss/truss.h): truss_eval_sample, truss_spec_step
-// (greedy) and truss_spec_step_sampled (Strata's sampled verify), with penalties and the token ban.
+// (greedy) and truss_spec_step_sampled (Strata's sampled verify), with penalties, the token ban and the word-repeat penalty.
 #include "api/api_internal.h"
 
 namespace truss::api {
@@ -49,6 +49,26 @@ void ban_rows(truss_model & m, const truss_sampling & sp, const int32_t * feed, 
             if (feed[t] == sp.ban_lift) { k = std::max(0, std::min(rows, t - (nfeed - rows))); break; }
     sampling::ban(m.logits, m.n_vocab, k, b, m.fwd->stream());
 }
+// The word-repeat penalty (truss_sampling::word_repeat) on rows [0, rows): row r follows feed[r + nfeed - rows]
+// (nfeed 0: history's last token), and stops at the first row whose fed tokens include word_lift, as the ban does.
+void word_rows(truss_model & m, const truss_sampling & sp, const int32_t * feed, int nfeed, int rows)
+{
+    if (!(sp.word_repeat > 0.f) || !m.word_cls) return;
+    if (rows > sampling::WORD_ROWS) throw std::invalid_argument("truss sampling: too many rows for word_repeat");
+    int k = rows;
+    if (sp.word_lift >= 0)
+        for (int t = 0; t < nfeed; ++t)
+            if (feed[t] == sp.word_lift) { k = std::max(0, std::min(rows, t - (nfeed - rows))); break; }
+    sampling::WordPrev prev;
+    const int V = (int) m.word_cls_host.size();
+    for (int r = 0; r < k; ++r) {
+        const int i = r + nfeed - rows;
+        const int32_t t = i >= 0 && i < nfeed ? feed[i] : (sp.history && sp.n_history > 0 ? sp.history[sp.n_history - 1] : -1);
+        const int c = t >= 0 && t < V ? m.word_cls_host[t] : -1;
+        prev.c[r] = c <= -2 ? -c - 2 : c;   // a glued piece (<= -2) still names the word it spells
+    }
+    sampling::word_repeat(m.logits, m.n_vocab, k, m.word_cls, prev, sp.word_repeat, m.fwd->stream());
+}
 }  // namespace truss::api
 
 using namespace truss::api;
@@ -64,6 +84,7 @@ int truss_eval_sample_s(truss_model * m, int slot, const int32_t * tokens, int n
             eval(*m, slot, tokens, n, [&] {
                 penalize_rows(*m, *sp, nullptr, 0, 1);
                 ban_rows(*m, *sp, tokens, n, 1);
+                word_rows(*m, *sp, tokens, n, 1);
                 sampling::sample(m->logits, m->n_vocab, 1, p, m->counter[slot]++, m->next, m->fwd->stream());
                 TRUSS_CUDA(cudaMemcpyAsync(next, m->next, sizeof(int), cudaMemcpyDeviceToHost, m->fwd->stream()));
                 sync(*m);
@@ -86,6 +107,7 @@ int truss_eval_img_sample_s(truss_model * m, int slot, const int32_t * tokens, i
             eval(*m, slot, tokens, n, [&] {
                 penalize_rows(*m, *sp, nullptr, 0, 1);
                 ban_rows(*m, *sp, tokens, n, 1);
+                word_rows(*m, *sp, tokens, n, 1);
                 sampling::sample(m->logits, m->n_vocab, 1, p, m->counter[slot]++, m->next, m->fwd->stream());
                 TRUSS_CUDA(cudaMemcpyAsync(next, m->next, sizeof(int), cudaMemcpyDeviceToHost, m->fwd->stream()));
                 sync(*m);
@@ -115,6 +137,7 @@ int truss_spec_step_sampled_s(truss_model * m, int slot, int32_t next, const tru
                 eval(*m, slot, &next, 1, [&] {
                     penalize_rows(*m, *sp, &next, 1, 1);
                     ban_rows(*m, *sp, &next, 1, 1);
+                    word_rows(*m, *sp, &next, 1, 1);
                     sampling::sample(m->logits, V, 1, p, ctr++, m->next, m->fwd->stream());
                     TRUSS_CUDA(cudaMemcpyAsync(new_next, m->next, sizeof(int), cudaMemcpyDeviceToHost, m->fwd->stream()));
                     { TRUSS_RT(rt::kPlainSync); rt::Wait w(*m->fwd->rt_last_stage()); sync(*m); }
@@ -130,6 +153,7 @@ int truss_spec_step_sampled_s(truss_model * m, int slot, int32_t next, const tru
                     ctr = c0 + nd;
                     penalize_rows(*m, *sp, win, nw + 1, nw + 1);
                     ban_rows(*m, *sp, win, nw + 1, nw + 1);
+                    word_rows(*m, *sp, win, nw + 1, nw + 1);
                     sampling::probs_inplace(m->logits, V, nw + 1, p, m->fwd->stream());
                     if (nw) TRUSS_CUDA(cudaMemcpyAsync(m->spec_drafts, win + 1, sizeof(int) * nw, cudaMemcpyHostToDevice,
                                                        m->fwd->stream()));
@@ -150,6 +174,7 @@ int truss_spec_step_sampled_s(truss_model * m, int slot, int32_t next, const tru
             const int keep = m->fwd->round(slot, next, nd, win, m->logits, engine::Drafter::Sampling{}, [&](int nw) {
                 penalize_rows(*m, *sp, win, nw + 1, nw + 1);
                 ban_rows(*m, *sp, win, nw + 1, nw + 1);
+                word_rows(*m, *sp, win, nw + 1, nw + 1);
                 sampling::sample(m->logits, V, nw + 1, p, ctr, m->spec_next, m->fwd->stream());
                 ctr += nw + 1;
                 TRUSS_CUDA(cudaMemcpyAsync(m->spec_host, m->spec_next, sizeof(int) * (nw + 1), cudaMemcpyDeviceToHost,

@@ -154,7 +154,17 @@ typedef struct truss_sampling {
     const int32_t * ban;
     int n_ban;
     int32_t ban_lift;
+    /* Word-repeat penalty (needs truss_set_word_classes): a row whose previous token is a word loses word_repeat
+       logits on every token of the same word class, so a word is not sampled twice in a row ("maybe maybe").
+       word_lift >= 0 ends it like ban_lift (e.g. </think>: reasoning only); -1: every row. 0: off. */
+    float word_repeat;
+    int32_t word_lift;
 } truss_sampling;
+
+/* The word class of every token id (n = n_vocab), copied for word_repeat; call once after open. c >= 0: a token
+   that starts word c (penalized when the previous token is word c); -(c + 2): a piece of word c glued to the token
+   before it (counts as word c when it is the previous token, never penalized); -1: not a word (server/words.py). */
+int truss_set_word_classes(truss_model * m, const int32_t * cls, int n);
 
 /* truss_eval, then a sample of the last token's next-token distribution in *next. The penalties count `history`
    as given: the caller includes `tokens` in it when they should count. */

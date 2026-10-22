@@ -102,6 +102,13 @@ def main():
     check("reply re-sent stripped", fed == len(p3) - ck + 4 and rs == 1 and zs == 0,
           f"fed {fed} (prompt tail {len(p3) - ck}), restores {rs}, resets {zs}")
     check("sequence after restore", e.model.seq == p3 + g3[:-1], f"{len(e.model.seq)} tokens, prompt + generated")
+    # the client aborted the reply and re-sent the same context with a notice before the generation prompt (oh-my-pi's
+    # loop guard, 10-22: "<system-interrupt ...>"): the prompt differs exactly at the checkpoint, restore there
+    ck = len(e.ck_tokens)
+    p5 = p3[:ck] + [6001, 6002, 6003] + S
+    g5, fed, rs, zs = request(e, p5)
+    check("notice inserted at the checkpoint", fed == len(p5) - ck + 4 and rs == 1 and zs == 0,
+          f"fed {fed} (prompt tail {len(p5) - ck}), restores {rs}, resets {zs}")
     # an unrelated prompt: reset
     g4, fed, rs, zs = request(e, list(range(7001, 7101)) + S)
     check("unrelated prompt", fed == 103 + 4 and zs == 1 and rs == 0, f"fed {fed}, restores {rs}, resets {zs}")

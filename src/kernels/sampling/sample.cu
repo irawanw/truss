@@ -116,7 +116,23 @@ __global__ void ban_kernel(float * xs, int n, BanList b)
     if (i < b.n && b.id[i] >= 0 && b.id[i] < n) xs[(size_t) blockIdx.x * n + b.id[i]] = BANNED;
 }
 
+__global__ void word_repeat_kernel(float * xs, int n, const int * cls, WordPrev prev, float pen)
+{
+    const int c = prev.c[blockIdx.y];
+    if (c < 0) return;
+    float * x = xs + (size_t) blockIdx.y * n;
+    for (int v = blockIdx.x * blockDim.x + threadIdx.x; v < n; v += gridDim.x * blockDim.x)
+        if (cls[v] == c) x[v] -= pen;
+}
+
 }  // namespace
+
+void word_repeat(float * x, int n, int rows, const int * cls, const WordPrev & prev, float pen, cudaStream_t stream)
+{
+    if (rows <= 0 || !(pen > 0.f) || !cls) return;
+    word_repeat_kernel<<<dim3(32, rows), 256, 0, stream>>>(x, n, cls, prev, pen);
+    TRUSS_CUDA(cudaGetLastError());
+}
 
 void ban(float * x, int n, int rows, const BanList & b, cudaStream_t stream)
 {

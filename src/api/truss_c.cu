@@ -108,6 +108,19 @@ truss_model * truss_open(const char * gguf_path, int n_ctx, int max_chunk, const
 
 void truss_close(truss_model * m) { delete m; }
 
+int truss_set_word_classes(truss_model * m, const int32_t * cls, int n)
+{
+    return guarded(
+        [&] {
+            if (!cls || n != m->n_vocab) throw std::invalid_argument("truss_set_word_classes: need n_vocab classes");
+            m->word_cls_host.assign(cls, cls + n);
+            if (!m->word_cls) TRUSS_CUDA(cudaMalloc(&m->word_cls, sizeof(int) * n));
+            TRUSS_CUDA(cudaMemcpy(m->word_cls, cls, sizeof(int) * n, cudaMemcpyHostToDevice));
+            return 0;
+        },
+        -1);
+}
+
 const char * truss_last_error(void) { return last_error.c_str(); }
 
 int truss_n_vocab(const truss_model * m) { return m->n_vocab; }

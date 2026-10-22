@@ -36,4 +36,14 @@ struct BanList {
 };
 void ban(float * x, int n, int rows, const BanList & b, cudaStream_t stream);
 
+// Word-repeat penalty (the reasoning's "maybe maybe maybe" loop): cls[v] is token v's word class (the lowercased
+// letters of the token without its leading space, so "Maybe" and " maybe" share one; < 0: not penalized, see
+// truss_set_word_classes), prev.c[r] the class of the token row r follows (-1: none). x[r][v] -= pen for every v
+// with cls[v] == prev.c[r] >= 0, r in [0, rows): a word is not repeated back to back. Rows of a verify window follow different tokens, so each row has its own class.
+constexpr int WORD_ROWS = 16;
+struct WordPrev {
+    int c[WORD_ROWS] = {};
+};
+void word_repeat(float * x, int n, int rows, const int * cls, const WordPrev & prev, float pen, cudaStream_t stream);
+
 }  // namespace truss::sampling

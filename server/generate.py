@@ -5,6 +5,7 @@ import time
 import numpy as np
 from server.chat import Detokenizer
 from server.truss_ctypes import PENALTY_CAP, Sampling, TrussError
+from server.words import WORD_REPEAT
 from server.reasoning import BAN_EOS_IN_THINK, BAN_MAX_TOKENS
 
 # The loop guard (TRUSS_LOOP_GUARD=0: off). A quantized model can fall into a verbatim loop: 10-21 the DS41 agent
@@ -67,8 +68,11 @@ class EngineGenerate:
             reuse = 0 if image is not None else (
                 len(slot.cached) if 0 < len(slot.cached) < n_prompt and prompt_ids[:len(slot.cached)] == slot.cached else 0)
             ck = 0 if image is not None else len(slot.ck_tokens)
-            if not reuse and 0 < ck < n_prompt and prompt_ids[:ck] == slot.ck_tokens \
-                    and self.call(slot, self.model.restore) == ck:
+            back = (self.call(slot, self.model.restore)
+                    if not reuse and 0 < ck < n_prompt and prompt_ids[:ck] == slot.ck_tokens else None)
+            if back is not None and back != ck:
+                self.log(f"{self.log_tag}: slot {slot.idx} checkpoint restore gave {back}, expected {ck}: full read")
+            if back is not None and back == ck:
                 # the last prompt is a prefix but its reply is not (the client re-sent it without its reasoning, or
                 # edited it): back to the end of that prompt instead of reading everything again
                 slot.cached, reuse = list(slot.ck_tokens), ck
@@ -84,6 +88,9 @@ class EngineGenerate:
             if (sp is not None and think_open and BAN_EOS_IN_THINK and self.think_close is not None
                     and self.think_close >= 0):
                 sp.set_ban(sorted(self.stop_ids), self.think_close)
+            if (sp is not None and think_open and WORD_REPEAT > 0 and getattr(self, "word_classes_set", False)
+                    and self.think_close is not None and self.think_close >= 0):
+                sp.set_word_repeat(WORD_REPEAT, self.think_close)   # server/words.py: no "maybe maybe" in the reasoning
 
             def counted():   # the tokens the penalties see, from the engine's own sequence
                 if penalty_last_n < 0:
@@ -207,6 +214,8 @@ class EngineGenerate:
                     out_ids.append(tok)
                     if tok == close_id:
                         in_think = False
+                        if sp is not None and sp.word_repeat > 0:
+                            sp.set_word_repeat(0.0)   # the answer may repeat a word (the engine lifted it in-call)
                     if sp is not None and sp.n_ban and (tok == self.think_close or n_gen >= BAN_MAX_TOKENS):
                         # the reasoning block closed (the engine lifts the ban only inside the call that feeds
                         # </think>), or it ran so long that a stuck reply must still be able to end

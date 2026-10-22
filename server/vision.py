@@ -2,16 +2,22 @@
 (truss_vision, host pixel_values -> host f32 text rows) and expand the template's single <|image_pad|> into the image
 token grid. One image per request (multi-image is out of scope); the caller must not combine it with a prefix restore.
 """
+from __future__ import annotations
+
 import base64
 import io
 import urllib.request
 from dataclasses import dataclass
 
 import numpy as np
-from PIL import Image
 
-from server import vision_pre
 from server.truss_ctypes import Vision
+
+try:   # Pillow only for image input: a text-only server (DS41's interpreter has no PIL) still imports this module
+    from PIL import Image
+    from server import vision_pre
+except ImportError:
+    Image = vision_pre = None
 
 MAX_BYTES = 20 << 20          # 20 MB fetch cap
 TIMEOUT = 10.0                # seconds
@@ -82,6 +88,8 @@ def load(url: str, allow_local: bool = False) -> Image.Image:
         raise ValueError("local image paths need --allow-local-images")
     if len(data) > MAX_BYTES:
         raise ValueError(f"image over the {MAX_BYTES} byte limit")
+    if Image is None:
+        raise ValueError("image input needs Pillow in the server's interpreter")
     img = Image.open(io.BytesIO(data))
     img.load()
     if img.width * img.height > MAX_PIXELS:
