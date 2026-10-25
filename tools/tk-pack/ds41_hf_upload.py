@@ -11,6 +11,9 @@ import os
 import time
 
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+# 10-25 (huggingface_hub 1.33.0, hf_xet 1.7.0): the xet uploader hung twice on the first large file (0 B/s, every
+# hf-xet thread in a futex wait, its HTTPS socket in CLOSE-WAIT); plain LFS upload runs at 20-30 MB/s
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 from huggingface_hub import HfApi   # noqa: E402
 
 T = os.path.expanduser("~/ML_projects/dsv41flash/20261019_truss_port/data")
