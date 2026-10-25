@@ -11,6 +11,9 @@
 // clamp 10 (moe::DsV41). Cold experts run on the CPU trellis tier (shape-generic since #181, on since #191)
 // or stream by PCIe.
 // A stage boundary must fall on an attention source layer (blocks/attn_ds41.h).
+// Image input (TRUSS_MMPROJ = ds41-mmproj-f16.gguf, docs/reference/model-deepseek41.md "Vision"): the prompt's image
+// span rows (all the placeholder id) take the vision tower's rows as embeddings (Chunk::x.img), route with the
+// image router bias (blk.L.bias_vl) and get no Engram lookup; positions stay 1-D.
 #pragma once
 #include "blocks/attn_ds41.h"
 #include "blocks/engram.h"
@@ -46,6 +49,10 @@ public:
     const DSparkWeights * dspark_weights() const { return dspark_w_.get(); }
     float drafter_min_p() const { return drafter_min_p_; }
     void release_drafter_pages() const { if (dspark_file_) dspark_file_->release_pages(); }
+    // image input (TRUSS_MMPROJ set): the placeholder id of image-span rows (-1: text only) and the image router bias
+    // of layer l over the pack's experts (blk.L.bias_vl renumbered by expert_keep)
+    int32_t image_token() const { return image_token_; }
+    const float * bias_vl(int l) const { return bias_vl_.empty() ? nullptr : bias_vl_.data() + (size_t) l * c_.n_expert; }
 
 private:
     Config c_;
@@ -54,6 +61,8 @@ private:
     std::unique_ptr<DSparkConfig> dspark_c_;
     std::unique_ptr<DSparkWeights> dspark_w_;
     float drafter_min_p_ = 0.f;
+    int32_t image_token_ = -1;
+    std::vector<float> bias_vl_;   // [n_layer][n_expert]
 };
 
 class StageModel : public engine::StageModel {
@@ -95,5 +104,8 @@ private:
     std::unique_ptr<blocks::Head> head_;
     std::unique_ptr<DSpark> dspark_;
 };
+
+// [begin, end) runs of image-span rows (token == image) in tokens[0 .. n), flattened; empty when image < 0
+std::vector<int> image_runs(const int32_t * tokens, int n, int32_t image);
 
 }  // namespace truss::deepseek41

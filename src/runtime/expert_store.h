@@ -3,7 +3,11 @@
 //   ring   one device region that holds either recently fetched cold experts (decode: a FIFO cache) or, during a
 //          prompt chunk, two whole-layer slots (every cold expert of layer l streams into slot l % 2 while layer l - 1
 //          computes) plus the chunk's own large buffers (spare(): scratch, MoE workspace, residual);
-//   host   every cold expert in pinned host memory, per layer [expert: gate | up | down] in expert order.
+//   host   every cold expert in pinned host memory, per layer [expert: gate | up | down] in expert order;
+//   far    (optional, TRUSS_FAR: docs/PLAN-20261024-ds41-nvme-tier.md) cold experts with NO host copy: read from the
+//          mapped pack on the NVMe into a FarCache slot (expert_far.h) when routed or hinted, copied to the ring from
+//          there. Prompt chunks never route to them (MoeExec masks their router bias), so the stream slots hold no far
+//          expert; decode copies one only once far_ready() holds its slot (fetch() waits for one it was not told of).
 //
 // Device layout: one arena [hot experts, first half of the layers][ring][hot experts, second half], each expert's
 // three projections contiguous. Every ProjView has the ring start as its base and shift 4: meta offsets count 32-byte
@@ -21,6 +25,7 @@
 #pragma once
 #include "formats/trellis_table.h"
 #include "kernels/moe/moe_weights.cuh"
+#include "runtime/expert_far.h"
 
 #include <cuda_runtime.h>
 
@@ -55,6 +60,12 @@ public:
         // E7 (E6 option c, D8): bytes of the ring kept free for the FIFO; after a prompt the rest (ring - pin_fill)
         // is refilled with the plan's next cold experts as pinned residents (0 = off: the ring is FIFO-only)
         size_t pin_fill = 0;
+        // the far tier: [layer][expert] = 1: no host copy, read from the NVMe (null: none). plan() never makes one
+        // hot and the stream slots leave them out (a prompt chunk does not route to them).
+        const std::vector<std::vector<uint8_t>> * far = nullptr;
+        size_t far_cache_bytes = 6ull << 30;   // its pinned slots
+        int far_threads = 8;                   // its NVMe reader threads
+        size_t far_piece_bytes = 1u << 20;     // a read cut in pieces for all readers (FarCache::Config)
     };
     // ring = max(ring_bytes, 2 x the largest cold layer + stream_extra), 256-aligned
     static size_t ring_size(const std::vector<ExpertLayer> & layers, const HotSet & hot, const Sizes & z);
@@ -73,6 +84,7 @@ public:
     // usage file: n_layer * n_expert little-endian float32, layer-major (flashnext_truss_usage.py writes it)
     static std::vector<float> load_usage(const std::string & path, int n_layer, int n_expert);
 
+    // fill must not list far experts (Sizes::far)
     ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet & hot, const Sizes & z,
                 std::vector<std::pair<int, int>> fill = {});
     ~ExpertStore();
@@ -100,7 +112,9 @@ public:
     // Pre-gated prefetch (after fetch(layer, ...), before acquire): start copying the experts `ids` predicts for
     // layer + 1, behind this layer's copies, so PCIe works while this layer and the next one's attention compute.
     // Never evicts an expert the last fetch() needs (stops instead); wrong guesses only cost bandwidth and ring room.
-    void prefetch_hint(int layer, const int * ids, int n);
+    // far_only (MoeOptions::hint_far_only): only the far guesses are acted on (their NVMe reads start a layer early;
+    // a far expert already in its slot is copied as before), host experts are left to fetch() and the CPU tier.
+    void prefetch_hint(int layer, const int * ids, int n, bool far_only = false);
     // Doorbell decode (qwen4exp::Forward): fetch(l, ids, n, nullptr) skips the wait on compute (the doorbell that
     // gave the ids already orders it), and signal(l, flag, seq) queues, behind every copy issued so far, a write of
     // seq to the device word flag, which a spin kernel on the compute stream waits for instead of acquire().
@@ -188,6 +202,21 @@ public:
         long admitted_claims = 0;                              // claims fully issued
     };
     const Stats & stats() const { return stats_; }
+
+    // The far tier (driver thread, ring mode). far_ready(): true when the far expert's bytes are in a slot, which it
+    // then holds for the next fetch() of the layer (released once that copy has run); else it queues the read as
+    // demand and waits until `deadline` at most (a past deadline: no wait). The caller skips an expert it got false
+    // for; its read goes on, so a later token finds it.
+    bool has_far() const { return far_ != nullptr; }
+    bool is_far(int l, int e) const { return !layers_[l].far.empty() && layers_[l].far[e]; }
+    bool far_ready(int l, int e, std::chrono::steady_clock::time_point deadline);
+    void far_skipped(long n) { far_st_.skipped += n; }
+    struct FarStats {
+        long routed = 0, ring_hits = 0, ready = 0, waited_ok = 0, skipped = 0, fetch_waits = 0;
+        double wait_ms = 0;
+    };
+    const FarStats & far_stats() const { return far_st_; }
+    std::string far_report() const;                               // "" without a far tier
     // the CPU tier's experts (the driver's decision, counted there)
     void add_cpu_experts(long n) { cpu_experts_.fetch_add(n, std::memory_order_relaxed); }
     long cpu_experts() const { return cpu_experts_.load(std::memory_order_relaxed); }
@@ -212,6 +241,8 @@ private:
         std::vector<uint8_t> adapt_set;                             // [expert] the adaptive tier admitted it
         const half * suh[3] = {}, * svh[3] = {};
         int n_expert = 0;
+        std::vector<uint8_t> far;                                   // [expert] far (no host copy); empty: none
+        std::vector<const uint8_t *> far_ptr;                       // [expert] its held FarCache slot, until copied
     };
     struct RingEntry {
         int layer, expert;
@@ -267,6 +298,25 @@ private:
                                                         // counter per routed expert)
     std::atomic<long> cpu_experts_{ 0 };                   // the CPU tier's experts (the driver's decision)
     std::vector<Layer> layers_;
+    std::unique_ptr<FarCache> far_;
+    FarStats far_st_;
+    const uint8_t * far_src(int l, int e);                      // a far expert's held slot (fetch(): waits for one)
+    void init_far(const std::vector<ExpertLayer> & layers, const Sizes & z);   // constructor: slots + FarCache
+    // A far slot is released once the copy that reads it has run: far_copied() records an event behind that copy and
+    // far_poll_release() (driver thread: far_ready(), far_src()'s wait) releases the slots whose events have passed.
+    // Not cudaLaunchHostFunc, and no cudaEventCreate after load: both take a context-wide driver write lock, and a
+    // blocking device-to-host copy on the thread that enqueues (the caller reading logits) holds that lock while the
+    // GPU waits for this very fetch (E2 bench hung 10-25 01:52 and 02:06, TRACKER 281). The events are made in
+    // init_far(); with all of them in flight the newest hold takes the expert and its event is recorded again.
+    struct FarHold {
+        cudaEvent_t ev;
+        std::vector<std::pair<int, int>> le;                    // (layer, expert) released when ev has passed
+    };
+    static constexpr int FAR_EVENTS = 512;
+    std::deque<FarHold> far_held_;                              // copy order = event order
+    std::vector<cudaEvent_t> far_ev_pool_;
+    void far_copied(int l, int e);                              // release its slot behind the copy just queued
+    void far_poll_release();
     uint8_t * base_ = nullptr;                                     // ring start
     size_t ring_ = 0, slot_ = 0;
     void * spare_ = nullptr;

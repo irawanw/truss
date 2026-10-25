@@ -20,6 +20,7 @@
 #include "runtime/expert_store.h"
 #include "runtime/moe_kernels.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -55,10 +56,22 @@ struct MoeOptions {
     float split_ms_row = 0.01f;
     bool doorbell = true;
     int hint_k = 4, hint_min_rows = 0;
+    bool hint_far_only = false;   // the hints start far experts' NVMe reads only (ExpertStore::prefetch_hint)
     int tail_skip = 0;          // Strata's route tail skip: a missed expert ranked >= this by weight in every row -> 0 (#192)
     float skip_weight = 0.f;    // PolyStrata #34 (D10): a missed expert under this share of its row's K routed weights in every row -> 0
     double budget_frac = 1.0;   // share of the free VRAM its experts take (layer-split stages sharing a device)
     bool last_stage = true;     // places the aux threads and writes TRUSS_ROUTE_TRACE (one stage does)
+    // the far tier (ExpertStore far experts): far_path = n_layer x n_expert uint8 file, "" = off. far_cache_bytes is the
+    // run's slot budget; a stage takes the share of it that its layers hold of the file's far experts. A decode layer
+    // waits up to far_wait_us for its routed far experts' reads, then skips the ones still missing (term 0, as
+    // tail_skip); prompt chunks route around them (their router bias is masked).
+    // far_drop: the far experts are routed around everywhere (decode too) and never read: the pack without them
+    // (E2's file benches as E1: the same experts at the same rates, top-6 over the rest)
+    std::string far_path;
+    size_t far_cache_bytes = 6000000000ull;
+    int far_threads = 8, far_wait_us = 2000;
+    int far_piece_kb = 1024;   // a far read cut in pieces of this many KiB for all readers (0: whole, one reader)
+    bool far_drop = false;
 };
 
 // one store layer as the stage sees it
@@ -109,6 +122,11 @@ public:
         bool fused_route_ok;                    // route == softmax top-k: the fused route+publish may replace it
         bool pre_routed = false;                // the block already routed (a fused projection+route): skip route()
         std::function<void()> shared;
+        // DS41 image rows: rows [vl[2i], vl[2i+1]) (host, n_vl runs) are routed again with bias_vl, the router bias
+        // of image-span tokens (the reference's Gate with image_mask); the far mask applies to it as to bias
+        const float * bias_vl = nullptr;
+        const int * vl = nullptr;
+        int n_vl = 0;
     };
     void run(const Call & c);
     // whether the block should compute pred_logits (the next layer's router on this input) for this call
@@ -186,6 +204,17 @@ private:
     MoeOptions o_;   // fixed after construction except the set_option() knobs
     engine::Profile * prof_;
     std::unique_ptr<ExpertStore> store_;
+    ExpertStore::HotSet far_;                   // [store layer][expert] far (o_.far_path); empty: no far tier
+    void load_far();                            // far_ from o_.far_path (model layers -> store layers)
+    // prompt chunks: the router's bias with the far experts at -1e30, per store layer (made on first use from the
+    // block's bias; nullptr: none yet). Selection = score + bias, so a chunk never routes to a far expert and picks
+    // the next one instead (E1's routing); a layer without a bias gets its far ids masked after routing.
+    std::vector<std::array<float *, 2>> far_bias_;              // per layer: the far-masked copies of up to two
+    std::vector<std::array<const float *, 2>> far_bias_src_;    // biases (text, image rows) and their sources
+    std::vector<uint8_t *> far_dev_;            // [store layer] far_ on the device (mask_far_ids)
+    double far_share_ = 0;                      // this stage's share of the far experts (its slot budget)
+    const float * far_masked_bias(int l, const float * bias);
+    static void mask_far_ids(int * ids, int n, const uint8_t * far_dev, cudaStream_t s);
     int n_hot_ = 0;
     bool all_resident_ = false;   // every expert of the stage on the device, no CPU tier: decode needs no copy plan
     void * window_ws_ = nullptr;
@@ -226,6 +255,11 @@ private:
     bool dbg_on_ = false;
     std::atomic<int> drv_cpu_{ -1 };
     FILE * route_trace_ = nullptr;
+    // the decode log line (serve(): every 10 s of decode, far tier or CPU tier): counters at the last line
+    std::chrono::steady_clock::time_point dlog_t_{}, dlog_last_{};
+    ExpertStore::FarStats dlog_far_{};
+    long dlog_calls_ = 0, dlog_cpu_ = 0, dlog_pcie_ = 0, dlog_n_ = 0;
+    void decode_log();
 
     // residency policies: Strata's dynamic split (cost fit), adaptive tier, idle-link admission, E7 split stats
     double cpu_ms_call_ = 0.12, cpu_ms_expert_ = 0.085, pcie_ms_byte_ = 1.0 / 13.5e6;

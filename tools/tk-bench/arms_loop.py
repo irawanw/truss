@@ -26,6 +26,12 @@ from server.truss_ctypes import Sampling
 from server.words import FILLERS, filler_seqs, word_classes
 
 
+def add_args(ap):
+    ap.add_argument("--loop-dir", default=os.path.expanduser("~/ML_projects/dsv41flash/20261019_truss_port/data/loop_prompts"))
+    ap.add_argument("--loop-k", type=int, default=8)
+    ap.add_argument("--loop-tokens", type=int, default=1024)
+
+
 def looped(out):
     if loop_period(out) or loop_period(out, min_p=LOOP_LONG_PERIOD, copies=2):
         return True

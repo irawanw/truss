@@ -110,7 +110,7 @@ void MoeExec::run_fetch(const Call & c, bool hint)
                 const int e = ids_host_[T * K_ + t * K_ + i];
                 if (!nt || !nt->is_cpu[l + 1][e]) h.push_back(e);
             }
-        store_->prefetch_hint(l, h.data(), (int) h.size());
+        store_->prefetch_hint(l, h.data(), (int) h.size(), o_.hint_far_only);
     }
     store_->acquire(l, g_.s);
     if (T <= moe::MAX_ROWS) k_.window(store_->weights(l), c.x, k_ids, c.wts, T, c.routed, window_ws_, g_.s);

@@ -28,9 +28,12 @@ using namespace store_detail;
 ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet & hot, const Sizes & z,
                          std::vector<std::pair<int, int>> fill)
 {
+    static const HotSet no_far;
+    const HotSet & far = z.far ? *z.far : no_far;
     fill_ = std::move(fill);
     const int L = (int) layers.size(), half_l = (L + 1) / 2;
     if ((int) hot.size() != L) throw std::invalid_argument("ExpertStore: hot set has the wrong layer count");
+    if (!far.empty() && (int) far.size() != L) throw std::invalid_argument("ExpertStore: far set has the wrong layer count");
     layers_.resize(L);
     TRUSS_CUDA(cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking));
     for (int s = 0; s < 2; ++s) {
@@ -60,11 +63,20 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
         Y.n_expert = E;
         Y.bytes.resize(E);
         for (int p = 0; p < 3; ++p) Y.part[p].resize(E);
+        if (!far.empty() && std::count(far[l].begin(), far[l].end(), 1)) {
+            Y.far = far[l];
+            Y.far.resize(E, 0);
+            Y.far_ptr.assign(E, nullptr);
+        }
         for (int e = 0; e < E; ++e) {
             Y.part[0][e] = 0;
             Y.part[1][e] = proj_bytes(*layers[l][0], e);
             Y.part[2][e] = Y.part[1][e] + proj_bytes(*layers[l][1], e);
             Y.bytes[e] = expert_bytes(layers[l], e);
+            if (!Y.far.empty() && Y.far[e]) {   // far: neither on the device nor in the host copy
+                if (hot[l][e]) throw std::invalid_argument("ExpertStore: a far expert is in the hot set");
+                continue;
+            }
             (hot[l][e] ? (l < half_l ? hot_lo : hot_hi) : Y.cold) += Y.bytes[e];
         }
     }
@@ -102,7 +114,7 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
     uint64_t keep_slot = 0, keep_key = 0;
     int keep_fd = -1;
     bool kept = false;
-    if (!keep.empty() && cold_keep_ids(layers, hot, host_region_bytes_, keep_slot, keep_key)) {
+    if (!keep.empty() && cold_keep_ids(layers, hot, far, host_region_bytes_, keep_slot, keep_key)) {
         keep_fd = cold_keep::get(keep, keep_slot, keep_key, host_region_bytes_);
         kept = keep_fd >= 0;
         if (!kept) keep_fd = memfd_create("truss-cold", MFD_CLOEXEC);
@@ -141,7 +153,10 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
         size_t cold_pos = 0;
         for (int e = 0; e < E; ++e) {
             uint8_t * at;
-            if (hot[l][e]) {
+            if (!Y.far.empty() && Y.far[e]) {   // cold (cold_off >= 0) but outside the slot: never streamed
+                Y.cold_off[e] = 0;
+                at = slot_dst;
+            } else if (hot[l][e]) {
                 uint8_t *& h = next_hot[l < half_l ? 0 : 1];
                 if (hot_run[l].experts.empty()) hot_run[l].dev = h;
                 hot_run[l].experts.push_back(e);
@@ -204,7 +219,7 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
                     const Layer & Y = layers_[l];
                     if (j % 2 == 0) {
                         for (int e = 0; e < Y.n_expert && !kept; ++e)
-                            if (Y.cold_off[e] >= 0) copy_part(l, e, host_region_ + region_at[l] + Y.cold_off[e], bounce);
+                            if (Y.cold_off[e] >= 0 && (Y.far.empty() || !Y.far[e])) copy_part(l, e, host_region_ + region_at[l] + Y.cold_off[e], bounce);
                     } else if (!hot_run[l].experts.empty()) {
                         if (!st) {
                             TRUSS_CUDA(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
@@ -292,7 +307,9 @@ ExpertStore::ExpertStore(const std::vector<ExpertLayer> & layers, const HotSet &
             Y.suh[p] = suh, Y.svh[p] = svh;
             device_bytes_ += 2 * sizeof(int32_t) * 2 * E + t.suh->bytes + t.svh->bytes;
         }
-    }}
+    }
+    init_far(layers, z);
+}
 
 ExpertStore::~ExpertStore()
 {
@@ -300,6 +317,9 @@ ExpertStore::~ExpertStore()
     if (reg_thread_.joinable()) reg_thread_.join();
     for (cudaEvent_t & e : prof_pool_) cudaEventDestroy(e);
     if (copy_) cudaStreamSynchronize(copy_);
+    for (const FarHold & h : far_held_) cudaEventDestroy(h.ev);   // their copies have run: the slots go with far_
+    for (cudaEvent_t e : far_ev_pool_) cudaEventDestroy(e);
+    far_.reset();   // its readers stop before their slots are freed
     for (void * p : device_) cudaFree(p);
     for (void * p : pinned_) cudaFreeHost(p);
     if (host_region_) {
@@ -353,6 +373,12 @@ void ExpertStore::begin_stream(cudaStream_t compute)
         else ++it;
     if (head_ < stream_end_) head_ = stream_end_;
     hinted_.clear();
+    if (far_) {   // a chunk routes to no far expert: drop the guesses and the holds the last decode step left
+        far_->drop_hints();
+        for (int l = 0; l < (int) layers_.size(); ++l)
+            for (int e = 0; e < (int) layers_[l].far_ptr.size(); ++e)
+                if (layers_[l].far_ptr[e]) layers_[l].far_ptr[e] = nullptr, far_->release(l, e);
+    }
     adm_.clear();
     claims_.clear(), adm_backlog_ = 0;   // landing_ events stay: their claims are gone from the ring (checked by offset)
     // E7: pinned residents leave with the ring; the next begin_ring() refills
@@ -389,7 +415,7 @@ size_t ExpertStore::prefetch_some(int l, const int * ids, int n)
     if (released_recorded_[s]) TRUSS_CUDA(cudaStreamWaitEvent(copy_, released_[s], 0));
     std::vector<uint8_t> want(Y.n_expert, 0);
     for (int i = 0; i < n; ++i)
-        if (ids[i] >= 0 && Y.cold_off[ids[i]] >= 0) want[ids[i]] = 1;
+        if (ids[i] >= 0 && Y.cold_off[ids[i]] >= 0 && !is_far(l, ids[i])) want[ids[i]] = 1;   // far: masked in chunks
     uint8_t * slot = base_ + s * slot_;
     size_t host_bytes = 0;
     // host copies coalesced over experts adjacent in the layer's cold layout (expert order)
@@ -452,30 +478,6 @@ void ExpertStore::acquire(int l, cudaStream_t compute)
     }
     TRUSS_CUDA(cudaStreamWaitEvent(compute, copied_[l % 2], 0));
     if (pw0) { const cudaEvent_t pw1 = prof_take(); TRUSS_CUDA(cudaEventRecord(pw1, compute)); wait_ev_.push_back({pw0, pw1}); }
-}
-
-void ExpertStore::prof_harvest()
-{
-    if (!stream_prof_) return;
-    for (auto & p : busy_ev_) {
-        cudaEventSynchronize(p.second);
-        float ms = 0;
-        cudaEventElapsedTime(&ms, p.first, p.second);
-        prof_busy_ms_ += ms;
-    }
-    for (auto & p : wait_ev_) {
-        cudaEventSynchronize(p.second);
-        float ms = 0;
-        cudaEventElapsedTime(&ms, p.first, p.second);
-        prof_wait_ms_ += ms;
-    }
-    busy_ev_.clear(); wait_ev_.clear(); prof_used_ = 0;   // all pairs synced: the pool is free again
-}
-
-void ExpertStore::stream_stats(double & busy_ms, double & wait_ms, bool reset) const
-{
-    busy_ms = prof_busy_ms_; wait_ms = prof_wait_ms_;
-    if (reset) prof_busy_ms_ = prof_wait_ms_ = 0;
 }
 
 void ExpertStore::release(int l, cudaStream_t compute)

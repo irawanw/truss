@@ -2,13 +2,16 @@
 """DeepSeek-V4.1-Flash-1017 routed experts (PAW X3.1 encodes) -> TRUSS expert overlay GGUF over ds41_dense.py's file
 (gguf::File::overlay: the engine reads blk.<L>.ffn_<p>_exps.* from here). Same four tensors per layer and projection
 as the Flash-Next overlay (flashnext/20261003_x31/scripts/b7_overlay.py): m3_trellis (I16, experts concatenated),
-m3_meta (I32 [n_expert][2]: K code, uint16 word offset; K codes 2 / 25 / 3 = K2 / K2.5 / K3, src/formats/trellis_k.h),
+m3_meta (I32 [n_expert][2]: K code, uint16 word offset; K codes 1 / 15 / 2 / 25 / 3 / 35 / 4 = K1 .. K4, src/formats/trellis_k.h),
 m3_suh / m3_svh (F16 [n_expert][in | out]).
 
 Experts are the pack's kept set renumbered: new id i of layer L = the i-th kept original id (ascending), the order
 ds41_dense.py uses for the router rows and `deepseek41.expert_keep`. Each kept expert must be in exactly one
 <root>/L<nn>/K*/ encode dir (a3_encode.py output: expert_ids.npy, trellis_<p>.npy [n][in/16][out/16][16K],
-suh_<p>.npy, svh_<p>.npy, DONE), at the K the kmap gives it.
+suh_<p>.npy, svh_<p>.npy, DONE), at the K the kmap gives it. Roots are merged: a layer's encodes may sit in several roots
+and one expert may be encoded at several K (an all-experts pack: K1 from S4, K2 / K2.5 / K3 from the served pack, K3.5
+from S2); the kmap picks the K, an encode at another K is ignored, the first root with the (K, expert) wins.
+A keep file of all True gives the all-experts pack (384 per layer); the dense file must be built from the same keep.
 
 The file is created once with its full header and length; each layer is written at its offset and read back, and
 recorded in <out>.layers.json (re-running skips recorded layers).
@@ -26,7 +29,7 @@ import torch
 
 ALIGN = 32
 GGML_F16, GGML_I16, GGML_I32 = 1, 25, 26
-KCODE = {2.0: 2, 2.5: 25, 3.0: 3, 3.5: 35, 4.0: 4}
+KCODE = {1.0: 1, 1.5: 15, 2.0: 2, 2.5: 25, 3.0: 3, 3.5: 35, 4.0: 4}
 D, F = 5120, 2304
 PROJ = (("gate", D, F), ("up", D, F), ("down", F, D))
 
@@ -72,49 +75,50 @@ def header(tensors, note):
 
 
 def find_layer(roots, L):
-    for r in roots:
-        d = os.path.join(r, f"L{L:02d}")
-        if os.path.isdir(d):
-            return d
-    raise SystemExit(f"L{L}: no encode dir under {roots}")
+    dirs = [os.path.join(r, f"L{L:02d}") for r in roots if os.path.isdir(os.path.join(r, f"L{L:02d}"))]
+    if not dirs:
+        raise SystemExit(f"L{L}: no encode dir under {roots}")
+    return dirs
 
 
 def pack_layer(f, L, ids, where, metas, kmap, roots, prefix="blk"):
-    enc = find_layer(roots, L)
-    groups, owner = {}, {}
-    for kd in sorted(os.listdir(enc)):
-        if not (kd.startswith("K") and os.path.isdir(os.path.join(enc, kd))):
-            continue
-        d = os.path.join(enc, kd)
-        if not os.path.exists(os.path.join(d, "DONE")):
-            raise SystemExit(f"L{L}: {kd} not DONE")
-        k = float(kd[1:])
-        groups[k] = d
-        for pos, e in enumerate(np.load(os.path.join(d, "expert_ids.npy")).tolist()):
-            if e in owner:
-                raise SystemExit(f"L{L}: expert {e} in two encode dirs")
-            owner[e] = (k, pos)
+    need = {float(kmap[L, e]) for e in ids}
+    groups, owner = {}, {}          # groups: K -> [encode dirs that hold it]; owner: (K, expert) -> (dir, position)
+    for enc in find_layer(roots, L):
+        for kd in sorted(os.listdir(enc)):
+            if not (kd.startswith("K") and os.path.isdir(os.path.join(enc, kd))):
+                continue
+            k, d = float(kd[1:]), os.path.join(enc, kd)
+            if k not in need:
+                continue
+            if not os.path.exists(os.path.join(d, "DONE")):
+                raise SystemExit(f"L{L}: {d} not DONE")
+            groups.setdefault(k, []).append(d)
+            for pos, e in enumerate(np.load(os.path.join(d, "expert_ids.npy")).tolist()):
+                owner.setdefault((k, e), (d, pos))
     for e in ids:
-        if e not in owner or owner[e][0] != float(kmap[L, e]):
-            raise SystemExit(f"L{L}: kept expert {e} missing or at a K other than the kmap's ({kmap[L, e]})")
+        if (float(kmap[L, e]), e) not in owner:
+            raise SystemExit(f"L{L}: kept expert {e} has no encode at K{kmap[L, e]:g} (the kmap's)")
     for p, fin, fout in PROJ:
         b = f"{prefix}.{L}.ffn_{p}_exps."
         # whole files, read sequentially (mmap + per-expert reads alternate between the K files: HDD seeks, ~22 MB/s)
-        tr = {k: np.load(f"{d}/trellis_{p}.npy") for k, d in groups.items()}
-        su = {k: np.load(f"{d}/suh_{p}.npy", mmap_mode="r") for k, d in groups.items()}
-        sv = {k: np.load(f"{d}/svh_{p}.npy", mmap_mode="r") for k, d in groups.items()}
+        dirs = {d for ds in groups.values() for d in ds}
+        tr = {d: np.load(f"{d}/trellis_{p}.npy") for d in dirs}
+        su = {d: np.load(f"{d}/suh_{p}.npy", mmap_mode="r") for d in dirs}
+        sv = {d: np.load(f"{d}/svh_{p}.npy", mmap_mode="r") for d in dirs}
         o, n = where[b + "m3_trellis"]
         f.seek(o)
         written = 0
         for e in ids:
-            k, pos = owner[e]
-            chunk = np.ascontiguousarray(tr[k][pos]).astype("<u2", copy=False).tobytes()
+            d, pos = owner[(float(kmap[L, e]), e)]
+            chunk = np.ascontiguousarray(tr[d][pos]).astype("<u2", copy=False).tobytes()
             f.write(chunk)
             written += len(chunk)
         if written != n:
             raise SystemExit(f"L{L} {p}: {written} trellis bytes, expected {n}")
-        suh = np.stack([su[owner[e][0]][owner[e][1]] for e in ids]).astype("<f2")
-        svh = np.stack([sv[owner[e][0]][owner[e][1]] for e in ids]).astype("<f2")
+        at = [owner[(float(kmap[L, e]), e)] for e in ids]
+        suh = np.stack([su[d][pos] for d, pos in at]).astype("<f2")
+        svh = np.stack([sv[d][pos] for d, pos in at]).astype("<f2")
         for name, data in (("m3_meta", metas[(L, p)].tobytes()), ("m3_suh", suh.tobytes()), ("m3_svh", svh.tobytes())):
             o2, n2 = where[b + name]
             if len(data) != n2:
@@ -123,8 +127,8 @@ def pack_layer(f, L, ids, where, metas, kmap, roots, prefix="blk"):
             f.write(data)
         f.flush()
         # read back: the last expert's tiles and the small tensors
-        k, pos = owner[ids[-1]]
-        last = np.ascontiguousarray(tr[k][pos]).astype("<u2", copy=False).tobytes()
+        d, pos = at[-1]
+        last = np.ascontiguousarray(tr[d][pos]).astype("<u2", copy=False).tobytes()
         f.seek(o + n - len(last))
         if f.read(len(last)) != last:
             raise SystemExit(f"L{L} {p}: trellis read-back differs")

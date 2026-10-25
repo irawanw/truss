@@ -33,6 +33,11 @@ export TRUSS_REQ_LOG_DIR=${TRUSS_REQ_LOG_DIR:-$D/req_log}
 RT=${TRUSS_ROUTE_TRACE:-$D/route_trace/serve_$(date +%m%d-%H%M%S).bin}
 if [ "$RT" != 0 ]; then mkdir -p "$(dirname "$RT")"; export TRUSS_ROUTE_TRACE="$RT"; else unset TRUSS_ROUTE_TRACE; fi
 
-exec python3 -m server.app "${DS41_ARGS[@]}" \
+# image input: TRUSS_MMPROJ=<ds41-mmproj-f16.gguf> (tools/tk-pack/ds41_mmproj.py) opens the vision tower on device
+# TRUSS_MMPROJ_DEVICE (default 0, the first stage's card) before the model; ~1.5 GB of that card's expert budget
+VIS=()
+if [ -n "${TRUSS_MMPROJ:-}" ]; then VIS=(--mmproj "$TRUSS_MMPROJ" --mmproj-device "${TRUSS_MMPROJ_DEVICE:-0}"); fi
+
+exec python3 -m server.app "${DS41_ARGS[@]}" "${VIS[@]}" \
   --host 127.0.0.1 --port 8115 --name ds41-flash \
   --log "$H/logs/serve_8115-requests.log"

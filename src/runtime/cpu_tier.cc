@@ -33,7 +33,7 @@ void MoeExec::load_cpu_tier_trellis(const ExpertStore::HotSet & hot, const std::
         std::vector<int> cold;
         double mass = 0;
         for (int e = 0; e < E; ++e)
-            if (!hot[l][e]) {
+            if (!hot[l][e] && !store_->is_far(l, e)) {   // far: no pinned bytes for the CPU to read
                 cold.push_back(e);
                 if (!usage.empty()) mass += usage[(size_t) l * E + e];
                 cpu::TrellisMat m[3];

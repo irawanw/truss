@@ -9,7 +9,7 @@ Plan and phases: `docs/PLAN-20261019-dsv41.md`. Math reference: the vendored off
 | file | from | contents |
 |---|---|---|
 | `ds41-dense.gguf` (9.1 GB) | `tools/tk-pack/ds41_dense.py`: HTTP ranges of the HF shards (dense tensors only, 9.85 GB) | Q8_0: attention (q_a, q_b, kv, output_a, output_b), shared expert, indexer q_b / proj / attn_k, ratio-1 compressor, Engram wkv, embedding, head (Q8_0 vs bf16 rel 0.54%). F32: norms, sinks, router rows of the kept experts + bias, mHC fn / base / scale, ratio-2 compressor kv / gate, Engram q / k. Metadata `deepseek41.*` incl. `expert_keep`, source layers, candidate settings, Engram hash layout (uint64 multipliers / primes / offsets, token_map padded to the vocab), tokens |
-| `ds41-experts.gguf` (~97 GB, HDD) | `tools/tk-pack/ds41_experts.py` from the X3.1 encodes | `blk.L.ffn_{gate,up,down}_exps.m3_{trellis,meta,suh,svh}`, 256 kept experts per layer renumbered in ascending original id; K codes 2 / 25 / 3 |
+| `ds41-experts.gguf` (~97 GB, HDD) | `tools/tk-pack/ds41_experts.py` from the X3.1 encodes | `blk.L.ffn_{gate,up,down}_exps.m3_{trellis,meta,suh,svh}`, 256 kept experts per layer renumbered in ascending original id; K codes 1 / 15 / 2 / 25 / 3 / 35 / 4 (served pack: 2 / 25 / 3) |
 
 The engine reads the experts as an overlay (`TRUSS_EXPERT_OVERLAY`, `gguf::File::overlay`). The Engram tables
 (2 x 384M rows) are their own files: `ds41-engram-L{1,14}.gguf` from `tools/tk-pack/ds41_engram.py`, int4 rows of
@@ -84,3 +84,27 @@ against dsref's mHC math on TRUSS's own sub-block outputs and against the PoC's 
 `HcSinkhorn::mix` passing base / scale swapped, KL 15 -> fixed; the kernel test called `sk_mix` directly).
 **Layer split.** Sources hand buffers to consumers by pointer, so a stage boundary must fall at a source layer
 (2, 8, 14 or 20 for this model); 20 splits the work roughly in half.
+
+## Vision (image input, 10-25)
+
+Ground truth: DeepSeek's own `inference/{vision.py,image_processor.py,model.py,engram.py}` in the HF repo. Work dir,
+fixtures and plan: `~/ML_projects/dsv41flash/20261025_vision/` (`PLAN.md`; TRACKER 288-289).
+
+| piece | where | what |
+|---|---|---|
+| mmproj | `tools/tk-pack/ds41_mmproj.py` -> `ds41-mmproj-f16.gguf` (0.971 GB, 309 tensors) | arch `deepseek41-mmproj`: `v.*` the ViT (32 blocks x 1024, 16 heads, SwiGLU 2816, RMSNorm, linear patch embed 14x14, no position embedding), `a.*` the aligner (3x3 unfold 9216 -> 5120, GELU erf, 5120), `span.{start,newline,end}` the learned span vectors, `blk.L.bias_vl` (40 x 384, original expert ids) and `mtp.I.bias_vl` the image router biases. Reads shards 1-2 locally, the per-layer biases by HTTP range |
+| tower | `src/model/deepseek41/vision/vit.{h,cu}` (`truss::deepseek41::Vit`, in `truss_vision`) | patches -> span rows `START + (lw rows + NEWLINE) x lh + END` (lh, lw = ceil(patch grid / 3)). 2D RoPE (16 freqs of the row, 16 of the column, rotate-half over 64 dims). Attention = cuBLAS strided-batched GEMMs over query chunks (~100 MB of scores). Workspace reserved at open (`reserve`), ~0.5 GB at the largest image (9,216 patches, span <= 1024) on top of the 0.97 GB weights |
+| C API | `src/api/truss_vision.cu` | dispatch by `general.architecture`; `truss_vision_rows(gh, gw)` = span rows (DS41) or gh*gw/4 (Flash-Next). The span goes to `truss_eval_img_s` as `nh = 1, nw = span`: 1-D positions, the pipeline's rope offset is then 0 and DS41 ignores pos3 anyway |
+| text model | `model.cu` (`Family` reads `TRUSS_MMPROJ`) | span rows' embeddings = the tower's rows (`embed`); every span row carries the placeholder id 129264, and the engine keys on it: the router re-routes those rows with `bias_vl` (renumbered through `expert_keep`; `blocks::Moe` vl runs -> `MoeExec::Call::vl`, far mask applied as to `bias`), Engram treats it as DEAD (n-grams reaching back to it pad from there on; span rows get no lookup: `engram_gate` row list). Text without the placeholder is bit-identical |
+| server | `server/vision_ds41.py`, `server/vision.py` `Tower`, `server/app.py`, `server/engine.py` | the reference's resize plan + grey pad + bf16 rounding in numpy; the encoder's one `<｜deepseek_image｜>` expands to the span. `--mmproj` opens the tower **before** the model (its card's expert budget shrinks by ~1.5 GB) and exports `TRUSS_MMPROJ`. `scripts/serve_ds41.sh`: `TRUSS_MMPROJ` / `TRUSS_MMPROJ_DEVICE` |
+
+Any number of images per request: `server/generate.py` feeds the prompt as one `eval_img` call per span not yet in
+the slot (`nh = 1`: the engine allows a 1-D image call at any position), records the spans per slot
+(`Slot.images` / `ck_images`: row, length, sha1 of the image bytes) and stops reuse / checkpoint restore at a cached
+span that is not the prompt's image there (`vision_ds41.reusable`); the tower runs only for spans being read and keeps
+the last 16 spans by digest (an agent re-sends its screenshots every turn). Limits: prompt chunks route around the
+far experts for image rows as for text (E2); the DSpark drafter routes image rows with its text bias (drafts only,
+verify is exact). Host test: `tests/server/ds41_image_reuse_test.py`. Tests: `build-vision/ds41_vit_check <mmproj> <fix dir>
+[--time]` (fixtures `scripts/v1_fixtures.py`): corn (33x47 patches) rows cos 0.999993 vs bf16-reference floor
+0.999358, carrots (51x74) 0.999985 vs 0.998601, span layout exact; 58 / 249 ms on a 3090. End to end:
+`scripts/v3_describe.py` (the reference's corn / carrots example).

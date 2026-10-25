@@ -2,7 +2,7 @@
 
 ---
 
-## `src/runtime/expert_store.h`, `expert_store.cu` (core, stream mode, load), `expert_store_plan.cu` (sizes, hot-set plan, page-locking), `cold_keep.{h,cc}` (kept cold copy), `expert_store_ring.cu` (decode ring, fetch, admission), `expert_store_util.h` — which experts live where
+## `src/runtime/expert_store.h`, `expert_store.cu` (core, stream mode, load), `expert_store_plan.cu` (sizes, hot-set plan, page-locking, stream profile), `cold_keep.{h,cc}` (kept cold copy), `expert_store_ring.cu` (decode ring, fetch, admission), `expert_store_far.cu` + `expert_far.{h,cc}` (far tier on the NVMe), `expert_store_util.h` — which experts live where
 
 **Hot-set ranking (TRACKER #90).** `plan()` ranks by `usage / bytes^Sizes::plan_alpha` (default 0: by usage). Per byte
 (alpha 1, the old rule) is the knapsack optimum for the profile's own counts, but on real 256K routing that set covered
@@ -116,6 +116,34 @@ prefill-only memory into the cache.
 
 **Limits / next.** Fetch is synchronous per layer (routing read back to the host); misses cost PCIe time on the
 critical path (~9.5 ms per token at 94 misses). Next: MTP windows, a CPU tier for misses.
+
+**Far tier (`expert_far.{h,cc}`, `expert_store_far.cu`, TRUSS_FAR; 10-24, docs/PLAN-20261024-ds41-nvme-tier.md).**
+A fourth tier below host: `Sizes::far` ([layer][expert] = 1) names cold experts that get **no host copy**. They stay in
+the mapped pack on the NVMe and are read on demand into a `FarCache`: `n_slots` pinned slots (`Sizes::far_cache_bytes`
+/ largest far expert), LRU over unheld slots, `far_threads` reader threads doing `gguf::read_direct` (O_DIRECT through
+a 4 MiB bounce buffer), a demand queue ahead of a hint queue (hints capped at 64, oldest dropped; a slot filled by a
+demand read is not evicted by a hint before its first acquire). Effects on the store:
+- `plan()` never makes a far expert hot; `ring_size()` and the stream slots leave them out; the cold copy, the cold
+  keeper's key, claims, admissions and the E7 refill skip them; the CPU tier never takes one (it has no bytes to read).
+- `far_ready(l, e, deadline)` (driver): true when the expert sits in a slot, which it holds for the layer's next
+  `fetch()`; else it queues the read as demand and waits until `deadline` at most. `ring_put` copies a far expert from
+  its held slot and records a pooled event behind that copy (`far_copied`); `far_poll_release()` releases the slots
+  whose events have passed (called by `far_ready` and while `far_src` waits). Never `cudaLaunchHostFunc` here: it
+  takes a context-wide driver write lock that a blocking device-to-host copy on the enqueuing thread holds while the
+  GPU waits for this fetch (10-25 E2 bench deadlock, TRACKER 281). `fetch()` of a far expert nobody
+  readied (fetch path, short prompts) waits for its read in 1 ms steps, releasing landed slots between them
+  (`fetch waits`); holds left unused (a skip rule dropped the
+  expert) are released at the end of the layer's `fetch()` and at `begin_stream()` (which also drops queued hints).
+- `prefetch_hint` copies a hinted far expert only if its slot is ready, else queues an NVMe hint read.
+- MoeExec: decode (`serve`) first queues every routed far expert that is not on the device, then waits up to
+  `TRUSS_FAR_WAIT_US` (2000) for all of them together and skips the rest (term 0, like `tail_skip`; their reads go on).
+  Prompt chunks (stream / split) route with the far experts' bias at -1e30 (`far_masked_bias`), so a chunk picks the
+  next experts (E1's routing) and the slots never need them; a layer without a bias has its far ids masked to -1.
+  `TRUSS_FAR_DROP=1` applies that mask on every call and makes no slots: the pack without its far set.
+- `far_report()` (printed when MoeExec is destroyed): far routed, already in the ring, slot ready, waited in time,
+  skipped, fetch waits, wait ms, then the cache's reads / evictions / hint drops / GB/s per reader.
+F1 (`20261019_truss_port/scripts/f1_far_sim.py`, DS41 reasoning routing): 6 GB of slots -> 2.94 misses/token for E2's
+far set (1.04 GB/s at 40 tok/s); LRU beat LFU with decay. Host test: `expert_far_test`. Not yet run on a GPU.
 
 ---
 

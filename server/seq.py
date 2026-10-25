@@ -113,9 +113,12 @@ class FairGate:
 class Slot:
     """One sequence in the engine, as the server sees it: the tokens it holds, where its checkpoint is, whether a
     request owns it, and when it was last used (the tie-break when a prompt matches neither). `pos` is the engine's
-    own position, recorded by Engine.call after every call, so it is never read off the wrong slot."""
-    __slots__ = ("idx", "cached", "ck_tokens", "busy", "last_used", "taken", "pos")
+    own position, recorded by Engine.call after every call, so it is never read off the wrong slot. `images` /
+    `ck_images`: the DS41 image spans (row0, n, digest) in `cached` / `ck_tokens`, whose ids alone (all the
+    placeholder) do not say which image the engine holds (server/vision_ds41.py reusable)."""
+    __slots__ = ("idx", "cached", "ck_tokens", "busy", "last_used", "taken", "pos", "images", "ck_images")
 
     def __init__(self, idx: int):
         self.idx, self.cached, self.ck_tokens = idx, [], []
+        self.images, self.ck_images = [], []
         self.busy, self.last_used, self.taken, self.pos = False, 0.0, 0.0, 0

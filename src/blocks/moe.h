@@ -40,9 +40,11 @@ public:
     {
     }
     static void add_tensors(Linear & lin, const MoeWeights & w);
-    // out [T][d] = routed experts (+ shared expert) of in [T][d] (fp32 and fp16 copies of the same rows)
+    // out [T][d] = routed experts (+ shared expert) of in [T][d] (fp32 and fp16 copies of the same rows); vl: n_vl
+    // host [begin, end) row runs routed with the image bias (set_bias_vl; DS41 image spans), nullptr = none
     void forward(engine::Gpu & g, const float * in, const half * in16, int T, float * out, bool stream, void * moe_ws,
-                 int moe_rows);
+                 int moe_rows, const int * vl = nullptr, int n_vl = 0);
+    void set_bias_vl(const float * dev) { bias_vl_ = dev; }   // device [n_expert], owned by the model
 
 private:
     Linear & lin_;
@@ -54,6 +56,7 @@ private:
     const runtime::MoeExec::RouteFn route_;
     const bool softmax_;
     engine::Profile * prof_;
+    const float * bias_vl_ = nullptr;
 };
 
 }  // namespace truss::blocks

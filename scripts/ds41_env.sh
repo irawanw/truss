@@ -14,17 +14,30 @@ REPO=${TRUSS_REPO:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && 
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 
-# where the model files are: TRUSS_MODEL_DIR = a download of the Hugging Face repo lackonendes/PAW-763B-X3 (flat layout,
-# docs/SERVING-DS41.md); unset = the development tree under $T/data
+# where the model files are: TRUSS_MODEL_DIR = a download of the Hugging Face repo lackonendes/PAW-763B-X3.1 or
+# PAW-763B-X3 (flat layout, docs/SERVING-DS41.md); unset = the development tree under $T/data
 if [ -n "${TRUSS_MODEL_DIR:-}" ]; then
   PK=$TRUSS_MODEL_DIR DR=$TRUSS_MODEL_DIR/drafter TK=$TRUSS_MODEL_DIR/tokenizer USAGE=$TRUSS_MODEL_DIR/usage_calib256.f32
+  if [ -f "$TRUSS_MODEL_DIR/far.u8" ]; then
+    # PAW-763B-X3.1 (pack E2: all 384 experts, the 128 rarest per layer "far", read from the NVMe on demand; image
+    # input). Default = E1: the far experts never routed (TRUSS_FAR_DROP=1, no NVMe reads, faster); TRUSS_FAR_DROP=0 =
+    # E2, KL 0.071 vs 0.203. No expert skipping (TRACKER 283-286); the measured serving settings of both.
+    USAGE=$TRUSS_MODEL_DIR/usage.f32
+    export TRUSS_FAR="$TRUSS_MODEL_DIR/far.u8" TRUSS_FAR_DROP=${TRUSS_FAR_DROP:-1} TRUSS_FAR_WAIT_US=${TRUSS_FAR_WAIT_US:-1000000}
+    export TRUSS_FAR_CACHE_GB=${TRUSS_FAR_CACHE_GB:-6} TRUSS_SKIP_WEIGHT=${TRUSS_SKIP_WEIGHT:-0} TRUSS_PCIE_FRAC=${TRUSS_PCIE_FRAC:-0.35}
+    export TRUSS_DRAFTS=${TRUSS_DRAFTS:-2} TRUSS_HINT_K=${TRUSS_HINT_K:-2} TRUSS_COLD_KEEP=${TRUSS_COLD_KEEP:-0}
+    [ -f "$TRUSS_MODEL_DIR/ds41-mmproj-f16.gguf" ] && export TRUSS_MMPROJ=${TRUSS_MMPROJ-$TRUSS_MODEL_DIR/ds41-mmproj-f16.gguf}
+  fi
 else
   PK=$T/data/pack DR=$T/data/drafter TK=$T/data/tokenizer USAGE=$T/data/bench_in/usage_calib256.f32
 fi
 mkdir -p "$H/logs"
 
 # the model: the served dense GGUF + the X3.1 expert/Engram overlays (#118), as data/e14g_cpu.sh and item 9
-export TRUSS_EXPERT_OVERLAY="$PK/ds41-experts.gguf,$PK/ds41-engram-L1.gguf,$PK/ds41-engram-L14.gguf,$PK/ds41-dense-x3.gguf"
+# a pack under test (docs: 20261019_truss_port/docs/PLAN-20261023-expert-score.md, Phase 0) may replace the overlay list,
+# the dense file and the usage table: TRUSS_EXPERT_OVERLAY / TRUSS_DENSE / TRUSS_USAGE (unset = the served files)
+export TRUSS_EXPERT_OVERLAY=${TRUSS_EXPERT_OVERLAY:-"$PK/ds41-experts.gguf,$PK/ds41-engram-L1.gguf,$PK/ds41-engram-L14.gguf,$PK/ds41-dense-x3.gguf"}
+USAGE=${TRUSS_USAGE:-$USAGE}
 export TRUSS_DSPARK_EXPERT_OVERLAY="$DR/ds41-dspark-experts.gguf"
 export TRUSS_LAYER_SPLIT=${TRUSS_LAYER_SPLIT:-20} TRUSS_LAYER_SPLIT_DEVICE=1   # a bench run may override the split
 # skip 0.10 (TRACKER #224, arms bench 8-9 KL seqs on the served path): 0.20 KL 0.104-0.107 (over the 0.0728 budget),
@@ -36,7 +49,7 @@ export TRUSS_CPU_TRELLIS=1 TRUSS_CPU_DYNAMIC=1 TRUSS_CPU_PIN=1 TRUSS_CPU_THREADS
 # setting is TRUSS_SKIP_WEIGHT=0.10 TRUSS_PCIE_FRAC=0.3
 export TRUSS_SKIP_WEIGHT=${TRUSS_SKIP_WEIGHT:-0.20} TRUSS_PCIE_FRAC=${TRUSS_PCIE_FRAC:-0.2} TRUSS_ADAPT_EVERY=1 TRUSS_ADAPT_SWAPS=8
 # item 9: the adaptive tier already prefetches, so the hint router only costs; item 7: the consumer layers' tail prefill
-export TRUSS_HINT_K=0 TRUSS_TAIL_PREFILL=134
+export TRUSS_HINT_K=${TRUSS_HINT_K:-0} TRUSS_HINT_FAR_ONLY=${TRUSS_HINT_FAR_ONLY:-0} TRUSS_TAIL_PREFILL=134
 # a short prompt runs as decode-path chunks (only its routed experts move) instead of a prompt chunk that streams
 # every cold expert layer. Measured 10-21 (warm server): the stream costs ~5.3 s + ~0.4 ms/token (2,769 tokens 6.4 s,
 # 5,195 tokens 7.4 s), the decode path ~43 ms/token (109 tokens 5.2 s, 387 tokens 16.6 s): it only wins below ~110
@@ -56,8 +69,8 @@ if [ "$TRUSS_COLD_KEEP" != 0 ] && ! python3 "$REPO/tools/cold_keeper.py" --socke
 fi
 
 # the model's open arguments (server/app.py flags; arms.py takes the same)
-DS41_ARGS=(--model "$PK/ds41-dense.gguf" --tokenizer "$TK/tokenizer.json"
+DS41_ARGS=(--model "${TRUSS_DENSE:-$PK/ds41-dense.gguf}" --tokenizer "$TK/tokenizer.json"
            --n-ctx 262144 --chunk 8192 --expert-usage "$USAGE"
-           --mtp "$DR/ds41-dspark-dense.gguf" --drafts 3 --draft-min-p 0)
+           --mtp "$DR/ds41-dspark-dense.gguf" --drafts ${TRUSS_DRAFTS:-3} --draft-min-p 0)
 # drafts 3 (TRACKER #223, arms bench 10-21): d2 38.6 / d3 41.9 / d4 42.0 / d5 38.7 tok/s; d3 the steadiest, 5x fewer
 # fetched bytes per pass than d5. The bench opens with --drafts-open 5 so arms can still try 4 and 5.

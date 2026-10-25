@@ -31,7 +31,7 @@ void Moe::add_tensors(Linear & lin, const MoeWeights & w)
 }
 
 void Moe::forward(engine::Gpu & g, const float * in, const half * in16, int T, float * out, bool stream, void * moe_ws,
-                  int moe_rows)
+                  int moe_rows, const int * vl, int n_vl)
 {
     Scratch & sc = *g.sc;
     const size_t m = sc.mark();
@@ -59,8 +59,8 @@ void Moe::forward(engine::Gpu & g, const float * in, const half * in16, int T, f
     float * pl = hint ? sc.alloc((size_t) T * E) : nullptr;
     // B2: the lone-router fast path (one T == 1 row, nothing batched with it): projection + route in one launch,
     // bit-identical logits/ids/wts. Anything else (shared gate, hint, prefill/verify rows) keeps the old path.
-    const bool fuse_route = T == 1 && !has_shared && !hint && dm >= 2048 && dm % 128 == 0 && E % 32 == 0 && E <= 1024
-                            && K <= 32 && K <= E && route_ == route_sigmoid_bias;
+    const bool fuse_route = T == 1 && !has_shared && !hint && n_vl == 0 && dm >= 2048 && dm % 128 == 0 && E % 32 == 0
+                            && E <= 1024 && K <= 32 && K <= E && route_ == route_sigmoid_bias;
     if (fuse_route) {
         ffn::route_sigmoid_gemv(lin_.f32(w_.router), dm, w_.exp_bias ? lin_.f32(w_.exp_bias) : nullptr, in, E, K,
                                 logits, ids, wts, exec_.route_arrive(), g.s);
@@ -77,6 +77,10 @@ void Moe::forward(engine::Gpu & g, const float * in, const half * in16, int T, f
     runtime::MoeExec::Call c{ sl_, in, T, logits, pl, bias, pbias, ids, wts, has_shared || scaled ? routed : out, stream,
                               moe_ws, moe_rows, route_, softmax_, fuse_route,
                               has_shared ? std::function<void()>(shared) : std::function<void()>() };
+    if (n_vl > 0) {
+        if (!bias_vl_) throw std::runtime_error("Moe: image rows without an image router bias (set_bias_vl)");
+        c.bias_vl = bias_vl_, c.vl = vl, c.n_vl = n_vl;
+    }
     exec_.run(c);
     if (gated) ffn::shared_add(routed, y, sg, T, dm, out, g.s);
     else if (has_shared || scaled) ffn::scaled_add(routed, d_.route_scale, has_shared ? y : nullptr, T, dm, out, g.s);

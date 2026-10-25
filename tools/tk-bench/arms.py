@@ -43,6 +43,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 from server.truss_ctypes import Model  # noqa: E402
+import kl_tail  # noqa: E402
 
 # runtime knobs: the served value comes from the TRUSS_* env twin, else runtime::MoeOptions's default
 KNOB_DEFAULT = dict(skip_weight=0.0, tail_skip=0, pcie_frac=-1.0, hint_k=4, hint_min_rows=0, adapt_every=0,
@@ -339,18 +340,17 @@ class Bench:
             S = R["summary"]
             kl = R["tasks"].get("kl")
             if kl and kl["n"]:
-                S["kl"], S["top1"] = float(np.mean(kl["kl"])), 100 * kl["agree"] / kl["n"]
+                S.update(kl_tail.summary(kl))
                 base_kl = S["kl"] if base_kl is None else base_kl
             if not runs:   # only recall / kl ran
                 print(f"{name:>14}:" + "".join(f"  {k} {100 * v['top1']:.1f}%" for k, v in R["tasks"].items() if k.startswith("recall"))
-                      + (f"  KL {S['kl']:.4f} ({S['kl'] - base_kl:+.4f}) top-1 {S['top1']:.1f}%" if "kl" in S else "")
-                      + ("  HEALTH FAIL" if R["health"] else "  ok"))
+                      + kl_tail.fmt(S, base_kl) + ("  HEALTH FAIL" if R["health"] else "  ok"))
                 continue
             print(f"{name:>14}: spec {S['spec_tps']:5.1f} [{S['spread'][0]:.1f}-{S['spread'][1]:.1f}]  plain "
                   f"{S['plain_tps']:5.1f}  {S['tokens_per_pass']:.2f} tok/pass  per pass {cnt[0]:.0f}/{cnt[1]:.1f}/"
                   f"{cnt[2] / 1e6:.0f}/{cnt[5]:.1f}  ties {S['ties']} disagree {S['disagree']}"
                   + "".join(f"  {k} {100 * v['top1']:.1f}%" for k, v in R["tasks"].items() if k.startswith("recall"))
-                  + (f"  KL {S['kl']:.4f} ({S['kl'] - base_kl:+.4f}) top-1 {S['top1']:.1f}%" if "kl" in S else "")
+                  + kl_tail.fmt(S, base_kl)
                   + ("  " + " ".join(f"PP[{k}] {v:.0f}" for k, v in S["prefill"].items()))
                   + ("  HEALTH FAIL" if R["health"] else "  ok"))
         first = next(iter(self.res.values()))
@@ -430,9 +430,8 @@ def main():
     ap.add_argument("--tasks", default="chat,code,long,recall,kl")
     ap.add_argument("--recall", type=int, default=256, help="copied tokens teacher-forced in the recall task")
     ap.add_argument("--recall-min", type=float, default=0.90)
-    ap.add_argument("--loop-dir", default=os.path.expanduser("~/ML_projects/dsv41flash/20261019_truss_port/data/loop_prompts"))
-    ap.add_argument("--loop-k", type=int, default=8)
-    ap.add_argument("--loop-tokens", type=int, default=1024)
+    for mod in ("arms_loop", "arms_r1", "arms_plan", "arms_gap"):   # the loop, r1, plan and gap tasks' options
+        __import__(mod).add_args(ap)
     ap.add_argument("--tokens", type=int, default=128, help="spec tokens per prompt task")
     ap.add_argument("--repeat", type=int, default=2, help="speed repeats per arm (the check runs on the first)")
     ap.add_argument("--no-check", action="store_true")
@@ -475,8 +474,8 @@ def main():
     for t in tasks:
         if t == "kl":
             b.kl_task()
-        elif t == "loop":   # loop rate on saved long agent prompts (tools/tk-bench/arms_loop.py)
-            __import__("arms_loop").loop_task(b, a)
+        elif t in ("loop", "r1", "plan", "gap"):   # arms_loop.py, arms_r1.py, arms_plan.py, arms_gap.py (see each)
+            getattr(__import__("arms_" + t), t + "_task")(b, a)
         elif t.startswith("recall"):   # recall (~21K), recall60, recall90: the copy source ~N K tokens back; a
             # trailing i (recall90i): the context read turn by turn as the server builds an agent's (read_turns)
             b.recall_task(recall_prompt(a, tok, int(t[6:].rstrip("i") or 0)), a.recall, t)

@@ -68,7 +68,7 @@ class Sampling(ctypes.Structure):   # truss_sampling; penalties off unless set (
 
 
 class Vision:
-    """The vision tower from flashnext-mmproj-f16.gguf on one device: host pixel_values -> host f32 rows."""
+    """The vision tower of an mmproj gguf (Flash-Next or DS41, truss.h) on one device: host pixel_values -> host f32 rows."""
 
     def __init__(self, mmproj_path: str, device: int = 0, lib_path: str = _DEFAULT_LIB):
         lib = ctypes.CDLL(os.path.abspath(lib_path))
@@ -76,6 +76,7 @@ class Vision:
         lib.truss_vision_open.restype, lib.truss_vision_open.argtypes = p, [ctypes.c_char_p, c_int]
         lib.truss_vision_close.restype, lib.truss_vision_close.argtypes = None, [p]
         lib.truss_vision_width.restype, lib.truss_vision_width.argtypes = c_int, [p]
+        lib.truss_vision_rows.restype, lib.truss_vision_rows.argtypes = c_int, [p, c_int, c_int]
         lib.truss_vision_forward.restype = c_int
         lib.truss_vision_forward.argtypes = [p, f32p, c_int, c_int, f32p]
         lib.truss_last_error.restype, lib.truss_last_error.argtypes = ctypes.c_char_p, []
@@ -87,7 +88,7 @@ class Vision:
 
     def forward(self, pixel_values, gh: int, gw: int) -> np.ndarray:
         px = np.ascontiguousarray(pixel_values, dtype=np.float32)
-        out = np.empty((gh * gw // 4, self.width), dtype=np.float32)
+        out = np.empty((max(self._lib.truss_vision_rows(self._v, gh, gw), 0), self.width), dtype=np.float32)
         rc = self._lib.truss_vision_forward(self._v, px.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), gh, gw,
                                             out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
         if rc < 0:
@@ -165,6 +166,10 @@ class Model:
             "truss_eval_img_argmax_s": (c_int, [p, c_int, i32p, c_int, f32p, c_int, c_int, c_int, c_int, c_int, i32p]),
             "truss_eval_img_sample_s": (c_int, [p, c_int, i32p, c_int, f32p, c_int, c_int, c_int, c_int, c_int,
                                                 ctypes.POINTER(Sampling), i32p]),
+            "truss_eval_imgs_s": (c_int, [p, c_int, i32p, c_int, f32p, c_int, c_int, i32p, i32p, f32p]),
+            "truss_eval_imgs_argmax_s": (c_int, [p, c_int, i32p, c_int, f32p, c_int, c_int, i32p, i32p, i32p]),
+            "truss_eval_imgs_sample_s": (c_int, [p, c_int, i32p, c_int, f32p, c_int, c_int, i32p, i32p,
+                                                 ctypes.POINTER(Sampling), i32p]),
             "truss_vision_open": (p, [ctypes.c_char_p, c_int]),
             "truss_vision_close": (None, [p]),
             "truss_vision_width": (c_int, [p]),
@@ -264,6 +269,46 @@ class Model:
         return arr, e, libfn(self._m, slot, arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), len(arr),
                              e.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), e.shape[0], e.shape[1], img_row0, nh, nw,
                              *extra)
+
+    def _eval_imgs_s(self, libfn, slot, tokens, spans, *extra):
+        """spans: [(rows f32 [n][width], row0 in this call)], in order (DS41 1-D images, truss_eval_imgs_s)."""
+        arr = np.ascontiguousarray(tokens, dtype=np.int32)
+        e = np.ascontiguousarray(np.concatenate([r for r, _ in spans]), dtype=np.float32)
+        r0 = np.array([a for _, a in spans], dtype=np.int32)
+        ln = np.array([r.shape[0] for r, _ in spans], dtype=np.int32)
+        i32 = ctypes.POINTER(ctypes.c_int32)
+        rc = libfn(self._m, slot, arr.ctypes.data_as(i32), len(arr), e.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                   e.shape[1], len(spans), r0.ctypes.data_as(i32), ln.ctypes.data_as(i32), *extra)
+        self._check(rc)
+        return arr, e, r0, ln
+
+    def eval_imgs(self, tokens, spans):
+        self._eval_imgs_s(self._lib.truss_eval_imgs_s, self._cur, tokens, spans,
+                          self._logits.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
+
+    def eval_imgs_s(self, slot: int, tokens, spans):
+        self._eval_imgs_s(self._lib.truss_eval_imgs_s, slot, tokens, spans,
+                          self._logits.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
+
+    def eval_imgs_argmax(self, tokens, spans) -> int:
+        out = ctypes.c_int32()
+        self._eval_imgs_s(self._lib.truss_eval_imgs_argmax_s, self._cur, tokens, spans, ctypes.byref(out))
+        return out.value
+
+    def eval_imgs_argmax_s(self, slot: int, tokens, spans) -> int:
+        out = ctypes.c_int32()
+        self._eval_imgs_s(self._lib.truss_eval_imgs_argmax_s, slot, tokens, spans, ctypes.byref(out))
+        return out.value
+
+    def eval_imgs_sample(self, tokens, spans, sp: Sampling) -> int:
+        out = ctypes.c_int32()
+        self._eval_imgs_s(self._lib.truss_eval_imgs_sample_s, self._cur, tokens, spans, ctypes.byref(sp), ctypes.byref(out))
+        return out.value
+
+    def eval_imgs_sample_s(self, slot: int, tokens, spans, sp: Sampling) -> int:
+        out = ctypes.c_int32()
+        self._eval_imgs_s(self._lib.truss_eval_imgs_sample_s, slot, tokens, spans, ctypes.byref(sp), ctypes.byref(out))
+        return out.value
 
     def eval_img(self, tokens, embeds, img_row0: int, nh: int, nw: int) -> np.ndarray:
         """Append a prompt containing one image; logits of the last token."""

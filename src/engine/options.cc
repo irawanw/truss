@@ -25,6 +25,7 @@ void apply_env(Options & o)
     f("TRUSS_ADAPT_DECAY", m.adapt_decay);
     f("TRUSS_HINT_K", m.hint_k);               // pre-gated prefetch width
     f("TRUSS_HINT_MIN_ROWS", m.hint_min_rows);
+    f("TRUSS_HINT_FAR_ONLY", m.hint_far_only); // 1: the hints only start far experts' NVMe reads
     f("TRUSS_TAIL_SKIP", m.tail_skip);         // route tail skip rank (0 off; CPU tier decode only, #192)
     f("TRUSS_SKIP_WEIGHT", m.skip_weight);     // weight-share skip: missed expert under this share of its row's K weights, every row (PolyStrata #34, D10)
     f("TRUSS_ADMIT_IDLE", m.admit_idle);       // admission on the idle link, experts per pass
@@ -34,6 +35,14 @@ void apply_env(Options & o)
     f("TRUSS_SPLIT_ROWS", m.split_rows);       // E7: short prompt chunks split cold experts CPU / PCIe
     f("TRUSS_SPLIT_T", m.split_t);
     f("TRUSS_SPLIT_MS_ROW", m.split_ms_row);
+    // the far tier (docs/PLAN-20261024-ds41-nvme-tier.md): TRUSS_FAR = the far set, n_layer x n_expert uint8 (1: read
+    // from the NVMe, no host copy; model layers, expert order); unset: no far tier, the engine as before
+    if (const char * e = std::getenv("TRUSS_FAR")) m.far_path = e;
+    if (const char * e = std::getenv("TRUSS_FAR_CACHE_GB")) m.far_cache_bytes = (size_t) (std::atof(e) * 1e9);
+    f("TRUSS_FAR_THREADS", m.far_threads);
+    f("TRUSS_FAR_PIECE_KB", m.far_piece_kb);   // far read pieces (0: one reader per expert)
+    f("TRUSS_FAR_WAIT_US", m.far_wait_us);     // decode: how long a layer waits for its far reads before skipping
+    f("TRUSS_FAR_DROP", m.far_drop);           // 1: never route to the far set (E2's file as E1)
     f("TRUSS_KV_LEND", o.kv_lend);             // E6
     f("TRUSS_PREFILL_ROWS", o.prefill_rows);
     f("TRUSS_KV_INT8", o.kv_int8);             // Strata's int8 KV

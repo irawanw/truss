@@ -33,6 +33,26 @@ void MoeExec::serve(const Job & j, Bell & b)
     // row's K routed weights. Either rule may mark an expert. CPU tier only: a skipped entry is masked (-1) like a CPU
     // one but gets no CPU slot, so the joined CPU rows hold nothing for it.
     uint8_t skip[8 * 16] = {};
+    // the far tier: a routed far expert that is not on the device is copied once its NVMe read sits in a slot. First
+    // every missing read is queued (demand), then the layer waits up to far_wait_us for all of them together; the
+    // ones still missing are skipped (term 0, as below) and their reads go on, so a later token finds them.
+    if (store_->has_far()) {
+        int pend[8 * 16], np = 0;
+        for (int i = 0; i < n; ++i) {
+            const int e = b.ids[i];
+            if (!store_->is_far(l, e) || store_->on_device(l, e)) continue;
+            bool dup = false;
+            for (int q = 0; q < np; ++q) dup |= b.ids[pend[q]] == e;
+            if (!dup && !store_->far_ready(l, e, std::chrono::steady_clock::time_point::min())) pend[np++] = i;
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(o_.far_wait_us);
+        for (int q = 0; q < np; ++q) {
+            const int e = b.ids[pend[q]];
+            if (store_->far_ready(l, e, deadline)) continue;
+            for (int i2 = pend[q]; i2 < n; ++i2) skip[i2] |= b.ids[i2] == e;
+            store_->far_skipped(1);
+        }
+    }
     if (ct && (o_.tail_skip > 0 || o_.skip_weight > 0.f))
         for (int i = 0; i < n; ++i) {
             const int e = b.ids[i];
@@ -149,7 +169,7 @@ void MoeExec::serve(const Job & j, Bell & b)
                 const int e = b.pred[t * K + i];
                 if (!nt || !nt->is_cpu[l + 1][e]) h.push_back(e);
             }
-        store_->prefetch_hint(l, h.data(), (int) h.size());
+        store_->prefetch_hint(l, h.data(), (int) h.size(), o_.hint_far_only);
     }
     if (admit_idle_ > 0 && n_cpu > 0 && layers_[l].cpu_ok && admit_pass_ < admit_idle_) {
         // claim slots for the CPU's experts most worth keeping (after fetch(): its experts are protected)
@@ -201,6 +221,35 @@ void MoeExec::serve(const Job & j, Bell & b)
             ts_pool_ = 0;
         }
     }
+    ++dlog_n_;
+    if (store_->has_far() || ct) decode_log();
+}
+
+// One stderr line per stage every 10 s of decode (the pm2 log): FFN calls, how the misses went (CPU tier / PCIe), and
+// the far tier's reads - wait ms per second of wall time is the share of the stage's time spent stalled on the NVMe.
+void MoeExec::decode_log()
+{
+    const auto now = std::chrono::steady_clock::now();
+    const bool idle = now - dlog_last_ > std::chrono::seconds(2);   // a pause (no request, a prompt): a new window
+    dlog_last_ = now;
+    if (idle) {
+        dlog_t_ = now, dlog_calls_ = dlog_n_, dlog_cpu_ = dyn_cpu_, dlog_pcie_ = dyn_pcie_;
+        if (store_->has_far()) dlog_far_ = store_->far_stats();
+        return;
+    }
+    const double s = std::chrono::duration<double>(now - dlog_t_).count();
+    if (s < 10.0) return;
+    char far[256] = "";
+    if (store_->has_far()) {
+        const ExpertStore::FarStats & f = store_->far_stats(), & p = dlog_far_;
+        std::snprintf(far, sizeof far, ", far routed %ld (ring %ld, slot %ld, waited %ld, skipped %ld), wait %.0f ms = "
+                                       "%.0f ms/s", f.routed - p.routed, f.ring_hits - p.ring_hits, f.ready - p.ready,
+                      f.waited_ok - p.waited_ok, f.skipped - p.skipped, f.wait_ms - p.wait_ms, (f.wait_ms - p.wait_ms) / s);
+        dlog_far_ = f;
+    }
+    std::fprintf(stderr, "decode layers %d-%d: %.1f s, %ld FFN calls, misses cpu %ld pcie %ld%s\n", layers_.front().model_layer,
+                 layers_.back().model_layer, s, dlog_n_ - dlog_calls_, dyn_cpu_ - dlog_cpu_, dyn_pcie_ - dlog_pcie_, far);
+    dlog_t_ = now, dlog_calls_ = dlog_n_, dlog_cpu_ = dyn_cpu_, dlog_pcie_ = dyn_pcie_;
 }
 
 // add one call (n experts, t ms) to the weighted sums and refit cpu_ms_call + cpu_ms_expert * n; the slope keeps its

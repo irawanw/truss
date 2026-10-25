@@ -7,6 +7,9 @@
 //   device  rows -> fp16 [T][buckets x 256] -> wkv (Q8_0) -> [T][(hc + 1) d] -> kernels/ds41 engram_gate
 // Per slot: the last max_ngram - 1 committed tokens (commit(); reset() clears), so a chunk hashes its first rows
 // across the chunk boundary; a verify window's rows use the window's own tokens and commit only what is accepted.
+// Image spans (dead_token, the image placeholder id every span row carries): as the reference's DEAD, an n-gram that
+// reaches back to one is padded from there on, and the span rows themselves get no lookup (gate 0: res untouched,
+// no table rows read).
 #pragma once
 #include "blocks/linear.h"
 #include "blocks/weights.h"
@@ -30,6 +33,7 @@ struct EngramDims {
     const int64_t * offsets;       // [buckets]
     const int64_t * token_map;     // [n_vocab]
     int64_t n_vocab;
+    int32_t dead_token = -1;       // image placeholder id (vision on), -1: none
     int buckets() const { return (max_ngram - 1) * heads; }
 };
 

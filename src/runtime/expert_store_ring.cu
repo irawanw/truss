@@ -148,7 +148,11 @@ bool ExpertStore::ring_put(int l, int e, bool hint, bool copy, bool adapt)
     Y.ring_at[e] = off;
     Y.ref[e] = 0;
     uint8_t * at = real(off);
-    if (copy) TRUSS_CUDA(cudaMemcpyAsync(at, Y.host + Y.cold_off[e], Y.bytes[e], cudaMemcpyHostToDevice, copy_));
+    if (copy) {
+        const bool far = is_far(l, e);
+        TRUSS_CUDA(cudaMemcpyAsync(at, far ? far_src(l, e) : Y.host + Y.cold_off[e], Y.bytes[e], cudaMemcpyHostToDevice, copy_));
+        if (far) far_copied(l, e);
+    }
     for (int p = 0; p < 3; ++p) Y.ring_meta_host[(size_t) p * 2 * Y.n_expert + 2 * e + 1] = unit_offset(at + Y.part[p][e], base_, l);
     Y.meta_dirty = true;   // uploaded once at the next fetch/hint/acquire of this layer (1.A)
     if (!copy) return true;
@@ -174,7 +178,7 @@ void ExpertStore::admit(const std::vector<std::pair<int, int>> & le, cudaStream_
     std::vector<uint8_t> touched(layers_.size(), 0);
     for (const auto & [l, e] : le) {
         Layer & Y = layers_.at(l);
-        if (Y.cold_off[e] < 0 || Y.ring_at[e] >= 0) continue;
+        if (Y.cold_off[e] < 0 || Y.ring_at[e] >= 0 || is_far(l, e)) continue;   // far: no host copy to admit from
         ring_put(l, e, false, true, true);   // the adaptive tier's copy: its own counter
         if (adapt_reuse_on_ && Y.adapt_set.empty()) {
             Y.adapt_set.assign(Y.n_expert, 0);
@@ -228,7 +232,7 @@ void ExpertStore::pin_step()
     while (fill_pos_ < fill_.size()) {
         const auto [l, e] = fill_[fill_pos_];
         Layer & Y = layers_[l];
-        if (Y.cold_off[e] < 0 || Y.ring_at[e] >= 0) { ++fill_pos_; continue; }   // hot, or already in the ring
+        if (Y.cold_off[e] < 0 || Y.ring_at[e] >= 0 || is_far(l, e)) { ++fill_pos_; continue; }   // hot, in the ring, far
         const int64_t need = (int64_t) align_up(Y.bytes[e]);
         if (pin_bytes_ + (size_t) need > pin_budget_ || ring_hi_ - need < 0) break;   // the FIFO's share is reached
         const int64_t off = ring_hi_ - need;
@@ -275,6 +279,7 @@ bool ExpertStore::fetch(int l, const int * ids, int n, cudaStream_t compute)
         if (e < 0 || e >= Y.n_expert) throw std::out_of_range("ExpertStore::fetch: expert id " + std::to_string(e));
         if (Y.cold_off[e] < 0 || std::find(need.begin(), need.end(), e) != need.end()) continue;
         if (Y.ring_at[e] >= 0) Y.ref[e] = 1;   // a ring hit: CLOCK's second chance
+        if (is_far(l, e)) ++far_st_.routed, far_st_.ring_hits += Y.ring_at[e] >= 0;
         need.push_back(e);
     }
     stats_.experts_asked += (long) need.size();
@@ -316,6 +321,9 @@ bool ExpertStore::fetch(int l, const int * ids, int n, cudaStream_t compute)
                                        sizeof(int32_t) * 2 * Y.n_expert, cudaMemcpyHostToDevice, copy_));
         Y.meta_dirty = false;
     }
+    if (!Y.far_ptr.empty())   // a slot far_ready() held for an expert the caller then dropped (a skip rule)
+        for (int e = 0; e < Y.n_expert; ++e)
+            if (Y.far_ptr[e]) Y.far_ptr[e] = nullptr, far_->release(l, e);
     TRUSS_CUDA(cudaEventRecord(copied_[l % 2], copy_));
     if (changed) {   // admit_step() holds back while these demand copies run
         TRUSS_CUDA(cudaEventRecord(demand_ev_, copy_));
@@ -328,7 +336,7 @@ bool ExpertStore::claim(int l, int e)
 {
     if (mode_ != Mode::RING) return false;
     Layer & Y = layers_.at(l);
-    if (Y.cold_off[e] < 0 || Y.ring_at[e] >= 0) return false;
+    if (Y.cold_off[e] < 0 || Y.ring_at[e] >= 0 || is_far(l, e)) return false;   // a claim copies from the host copy
     if (!ring_put(l, e, true, false)) return false;
     Y.pend[e] = 1;
     claims_.push_back({ l, e, Y.ring_at[e], 0 });
@@ -420,7 +428,7 @@ bool ExpertStore::admit_step()
     return true;
 }
 
-void ExpertStore::prefetch_hint(int l, const int * ids, int n)
+void ExpertStore::prefetch_hint(int l, const int * ids, int n, bool far_only)
 {
     const int next = l + 1;
     if (mode_ != Mode::RING || next >= (int) layers_.size()) return;
@@ -429,9 +437,22 @@ void ExpertStore::prefetch_hint(int l, const int * ids, int n)
     for (int i = 0; i < n; ++i) {
         const int e = ids[i];
         if (e < 0 || e >= Y.n_expert || Y.cold_off[e] < 0 || Y.ring_at[e] >= 0) continue;
+        if (far_only && !is_far(next, e)) continue;
         if (std::find(seen.begin(), seen.end(), e) != seen.end()) continue;
         seen.push_back(e);
-        if (!ring_put(next, e, true)) break;   // the next slot holds an expert this layer still reads
+        if (is_far(next, e)) {   // far: to the GPU only if its slot is ready; else start the NVMe read for later
+            if (!far_) continue;   // far_drop: never routed, never read
+            if (!Y.far_ptr[e] && !(Y.far_ptr[e] = far_->acquire(next, e))) {
+                far_->want(next, e, false);
+                continue;
+            }
+            if (!ring_put(next, e, true)) {   // refused before its copy: the slot is still held here
+                far_->release(next, e), Y.far_ptr[e] = nullptr;
+                break;
+            }
+        } else if (!ring_put(next, e, true)) {
+            break;   // the next slot holds an expert this layer still reads
+        }
         if (hinted_.size() < layers_.size()) hinted_.resize(layers_.size());
         hinted_[next].push_back(e);
     }

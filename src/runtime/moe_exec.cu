@@ -39,7 +39,14 @@ MoeExec::MoeExec(engine::Gpu & g, const MoeKernels & k, std::vector<MoeLayer> la
         std::fprintf(stderr, "VRAM: %.2f GiB total, %.2f GiB in use before the experts; routed experts get %.2f GiB "
                              "(margin %.2f)\n", total_b / gb, (total_b - free_b) / gb, budget / gb, MARGIN / gb);
     }
+    load_far();
     ExpertStore::Sizes z;
+    if (!far_.empty()) {
+        z.far = &far_;
+        z.far_cache_bytes = o_.far_drop ? 0 : (size_t) (o_.far_cache_bytes * far_share_);   // drop: no slots
+        z.far_threads = o_.far_threads;
+        z.far_piece_bytes = (size_t) o_.far_piece_kb << 10;
+    }
     z.ring_bytes = o_.ring_bytes;
     z.plan_alpha = o_.plan_alpha;
     z.stream_extra = stream_extra;
@@ -49,6 +56,9 @@ MoeExec::MoeExec(engine::Gpu & g, const MoeKernels & k, std::vector<MoeLayer> la
     engine::load_mark("expert plan");
     std::vector<std::pair<int, int>> fill;
     if (z.pin_fill) fill = ExpertStore::fill_order(tables, hot, usage, z.plan_alpha);
+    if (!far_.empty())   // the refill copies from the host copy, which far experts are not in
+        fill.erase(std::remove_if(fill.begin(), fill.end(), [&](const auto & x) { return far_[x.first][x.second] != 0; }),
+                   fill.end());
     store_ = std::make_unique<ExpertStore>(tables, hot, z, std::move(fill));
     engine::load_mark("expert store (hot upload + cold copy; page-locking continues in the background)");
     if (!o_.cpu_dir.empty()) load_cpu_tier(hot, usage);
@@ -85,6 +95,7 @@ MoeExec::~MoeExec()
 {
     if (g_.device >= 0) cudaSetDevice(g_.device);
     if (route_trace_) std::fclose(route_trace_);
+    if (store_ && store_->has_far()) std::fprintf(stderr, "%s\n", store_->far_report().c_str());
     if (driver_.joinable()) {
         {
             std::lock_guard<std::mutex> l(dq_mu_);
@@ -102,6 +113,8 @@ MoeExec::~MoeExec()
                           (void *) b.doorbell, (void *) b.cpu_done, (void *) b.plan, (void *) b.need_copy })
             if (p) cudaFreeHost(p);
     if (ids_host_) cudaFreeHost(ids_host_);
+    for (uint8_t * p : far_dev_) cudaFree(p);
+    for (auto & a : far_bias_) for (float * p : a) if (p) cudaFree(p);
     if (cpu_tier_)
         for (void * p : { (void *) cpu_tier_->x, (void *) cpu_tier_->w, (void *) cpu_tier_->y, (void *) cpu_tier_->ids })
             if (p) cudaFreeHost(p);
@@ -148,8 +161,22 @@ void MoeExec::run(const Call & c)
     const bool door = !resident && !c.stream && o_.doorbell && T <= cpu::MAX_ROWS;   // no host sync: the driver serves this FFN
     const bool cpu_on = cpu_tier_ && layers_[l].cpu_ok;
     static const bool route_publish = [] { const char * e = std::getenv("TRUSS_ROUTE_PUBLISH"); return e && std::atoi(e); }();
-    const bool fused = door && route_publish && c.fused_route_ok;
-    if (!fused && !c.pre_routed) c.route(c.logits, c.bias, T, E_, K_, c.ids, c.wts, g_.s);   // fused launches do it
+    const bool fused = door && route_publish && c.fused_route_ok && !(o_.far_drop && !far_.empty());   // it has no mask
+    // a prompt chunk with a far tier (every call with far_drop): the far experts' bias is masked, so the router picks
+    // the next experts instead
+    const bool far_chunk = (c.stream || o_.far_drop) && !far_.empty() && !far_[l].empty();
+    const float * bias = far_chunk ? far_masked_bias(l, c.bias) : c.bias;
+    if (!fused && !c.pre_routed) c.route(c.logits, bias, T, E_, K_, c.ids, c.wts, g_.s);   // fused launches do it
+    if (far_chunk && (c.pre_routed || !bias)) mask_far_ids(c.ids, T * K_, far_dev_[l], g_.s);   // no bias to mask
+    if (c.n_vl > 0) {   // image rows: the same rule over their rows with the image bias
+        require(!fused && !c.pre_routed && c.bias_vl, "MoeExec: image rows need the plain route with bias_vl");
+        const float * bv = far_chunk ? far_masked_bias(l, c.bias_vl) : c.bias_vl;
+        for (int i = 0; i < c.n_vl; ++i) {
+            const int a = c.vl[2 * i], b = c.vl[2 * i + 1];
+            require(0 <= a && a < b && b <= T, "MoeExec: image rows out of the call's rows");
+            c.route(c.logits + (size_t) a * E_, bv, b - a, E_, K_, c.ids + (size_t) a * K_, c.wts + (size_t) a * K_, g_.s);
+        }
+    }
     if (route_counts_) ffn::count(c.ids, T * K_, route_counts_ + (size_t) l * E_, g_.s);
     bool shared_done = false;
     auto shared = [&] {
@@ -238,6 +265,7 @@ bool MoeExec::set_option(const std::string & name, double v)
     else if (name == "pcie_frac") o_.pcie_frac = (float) v;
     else if (name == "hint_k") o_.hint_k = (int) v;
     else if (name == "hint_min_rows") o_.hint_min_rows = (int) v;
+    else if (name == "hint_far_only") o_.hint_far_only = v != 0;
     else if (name == "adapt_every") {
         o_.adapt_every = (int) v;
         if (o_.adapt_every > 0 && route_usage_.empty()) route_usage_.assign((size_t) n_store() * E_, 0.f);
@@ -334,6 +362,79 @@ void MoeExec::kv_reserve(int upto, bool shrink, int n_ctx)
     for (const auto & [j, row] : kv_seg_) store_->reclaim(j, (size_t) R * row);
     if (R > kv_reserved_) store_->fence(g_.s);   // copies into the reclaimed rows land before the caches are written
     kv_reserved_ = R;
+}
+
+// ---- the far tier (ExpertStore far experts, docs/PLAN-20261024-ds41-nvme-tier.md) ----
+
+namespace {
+__global__ void mask_far_kernel(int * ids, int n, const uint8_t * far)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n && ids[i] >= 0 && far[ids[i]]) ids[i] = -1;   // -1: the expert kernels skip the pair (term 0)
+}
+}  // namespace
+
+void MoeExec::mask_far_ids(int * ids, int n, const uint8_t * far_dev, cudaStream_t s)
+{
+    mask_far_kernel<<<(n + 255) / 256, 256, 0, s>>>(ids, n, far_dev);
+    TRUSS_CUDA(cudaGetLastError());
+}
+
+void MoeExec::load_far()
+{
+    if (o_.far_path.empty()) return;
+    FILE * f = std::fopen(o_.far_path.c_str(), "rb");
+    require(f != nullptr, "TRUSS_FAR: cannot open " + o_.far_path);
+    std::vector<uint8_t> m;
+    for (int ch; (ch = std::fgetc(f)) != EOF;) m.push_back((uint8_t) ch);
+    std::fclose(f);
+    require(!m.empty() && m.size() % E_ == 0, "TRUSS_FAR: " + o_.far_path + " is not n_layer x " + std::to_string(E_) + " bytes");
+    const int n_layer = (int) (m.size() / E_);
+    long total = 0, mine = 0;
+    for (uint8_t v : m) total += v != 0;
+    far_.assign(n_store(), {});
+    for (int l = 0; l < n_store(); ++l) {
+        const int ml = layers_[l].model_layer;
+        if (ml >= n_layer || !layers_[l].cpu_ok) continue;   // a drafter's layer: never far
+        far_[l].assign(m.begin() + (size_t) ml * E_, m.begin() + (size_t) (ml + 1) * E_);
+        for (uint8_t & v : far_[l]) v = v != 0, mine += v;
+    }
+    if (!mine) {   // none on this stage
+        far_.clear();
+        return;
+    }
+    far_share_ = (double) mine / (double) total;
+    far_dev_.assign(n_store(), nullptr);
+    far_bias_.assign(n_store(), { nullptr, nullptr });
+    far_bias_src_.assign(n_store(), { nullptr, nullptr });
+    for (int l = 0; l < n_store(); ++l) {
+        if (far_[l].empty()) far_[l].assign(E_, 0);
+        TRUSS_CUDA(cudaMalloc(&far_dev_[l], E_));
+        TRUSS_CUDA(cudaMemcpy(far_dev_[l], far_[l].data(), E_, cudaMemcpyHostToDevice));
+    }
+    std::fprintf(stderr, "far tier: %ld of %ld far experts on this stage (%s), %.2f GB of slots\n", mine, total,
+                 o_.far_path.c_str(), o_.far_drop ? 0.0 : o_.far_cache_bytes * far_share_ / 1e9);   // drop: none
+}
+
+const float * MoeExec::far_masked_bias(int l, const float * bias)
+{
+    if (!bias) return nullptr;
+    auto & src = far_bias_src_[l];
+    int k = 0;
+    while (k < 2 && src[k] && src[k] != bias) ++k;
+    require(k < 2, "MoeExec: more than two selection biases on one layer");
+    if (src[k] != bias) {   // once per (layer, bias): the block's biases are weights, they do not change
+        std::vector<float> h(E_);
+        TRUSS_CUDA(cudaMemcpyAsync(h.data(), bias, sizeof(float) * E_, cudaMemcpyDeviceToHost, g_.s));
+        TRUSS_CUDA(cudaStreamSynchronize(g_.s));
+        for (int e = 0; e < E_; ++e)
+            if (far_[l][e]) h[e] = -1e30f;
+        if (!far_bias_[l][k]) TRUSS_CUDA(cudaMalloc(&far_bias_[l][k], sizeof(float) * E_));
+        TRUSS_CUDA(cudaMemcpyAsync(far_bias_[l][k], h.data(), sizeof(float) * E_, cudaMemcpyHostToDevice, g_.s));
+        TRUSS_CUDA(cudaStreamSynchronize(g_.s));   // h leaves scope
+        src[k] = bias;
+    }
+    return far_bias_[l][k];
 }
 
 }  // namespace truss::runtime

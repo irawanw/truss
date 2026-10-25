@@ -4,6 +4,19 @@
 #include "api/api_internal.h"
 
 namespace truss::api {
+// truss_eval_imgs_*: n_img 1-D images, rows [rows0[i], rows0[i] + lens[i]) of the call, embeds concatenated
+std::vector<engine::ImageIn> images_in(const float * embeds, int cols, int n_img, const int * rows0, const int * lens)
+{
+    if (!embeds || cols <= 0 || n_img <= 0 || !rows0 || !lens) throw std::invalid_argument("truss_eval_imgs: bad images");
+    std::vector<engine::ImageIn> v;
+    size_t at = 0;
+    for (int i = 0; i < n_img; ++i) {
+        if (lens[i] <= 0) throw std::invalid_argument("truss_eval_imgs: empty image");
+        v.push_back(engine::ImageIn{ embeds + at * cols, rows0[i], lens[i], cols, 1, lens[i] });
+        at += (size_t) lens[i];
+    }
+    return v;
+}
 thread_local std::string last_error;
 }
 using namespace truss::api;
@@ -223,6 +236,39 @@ int truss_eval_img_s(truss_model * m, int slot, const int32_t * tokens, int n, c
                                                        cudaMemcpyDeviceToHost, m->fwd->stream()));
                 sync(*m);
             }, 0, &img);
+            return 0;
+        },
+        -1);
+}
+
+
+int truss_eval_imgs_s(truss_model * m, int slot, const int32_t * tokens, int n, const float * embeds, int cols,
+                      int n_img, const int * rows0, const int * lens, float * logits)
+{
+    return guarded(
+        [&] {
+            const auto imgs = images_in(embeds, cols, n_img, rows0, lens);
+            eval(*m, slot, tokens, n, [&] {
+                if (logits) TRUSS_CUDA(cudaMemcpyAsync(logits, m->logits, sizeof(float) * m->n_vocab,
+                                                       cudaMemcpyDeviceToHost, m->fwd->stream()));
+                sync(*m);
+            }, 0, imgs.data(), n_img);
+            return 0;
+        },
+        -1);
+}
+
+int truss_eval_imgs_argmax_s(truss_model * m, int slot, const int32_t * tokens, int n, const float * embeds, int cols,
+                             int n_img, const int * rows0, const int * lens, int32_t * next)
+{
+    return guarded(
+        [&] {
+            const auto imgs = images_in(embeds, cols, n_img, rows0, lens);
+            eval(*m, slot, tokens, n, [&] {
+                sampling::argmax(m->logits, m->n_vocab, m->next, m->fwd->stream());
+                TRUSS_CUDA(cudaMemcpyAsync(next, m->next, sizeof(int), cudaMemcpyDeviceToHost, m->fwd->stream()));
+                sync(*m);
+            }, 0, imgs.data(), n_img);
             return 0;
         },
         -1);

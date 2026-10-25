@@ -57,7 +57,9 @@ int truss_eval(truss_model * m, const int32_t * tokens, int n, float * logits);
 /* append a prompt that contains one image: tokens as truss_eval, plus the ViT output (host f32 [n_img][cols],
    n_img == nh * nw) which replaces the embeddings of the prompt rows [img_row0, img_row0 + n_img). nh x nw is the
    image's grid in text tokens (= patch grid / 2). The 3-D rope positions and the decode offset are built here.
-   The image prompt must start at position 0 (do not mix it with a restored prefix). */
+   The image prompt must start at position 0 (do not mix it with a restored prefix). nh == 1 (a model with 1-D
+   positions, DS41's image span): the rows only replace embeddings, and the call may start anywhere in the sequence
+   (one call per image of a prompt, after a restored prefix). */
 int truss_eval_img_s(truss_model * m, int slot, const int32_t * tokens, int n, const float * embeds, int n_img,
                      int cols, int img_row0, int nh, int nw, float * logits);
 int truss_eval_img_argmax_s(truss_model * m, int slot, const int32_t * tokens, int n, const float * embeds,
@@ -65,6 +67,15 @@ int truss_eval_img_argmax_s(truss_model * m, int slot, const int32_t * tokens, i
 
 /* the same, but only the argmax of those logits (greedy decoding without the logits copy) */
 int truss_eval_argmax(truss_model * m, const int32_t * tokens, int n, int32_t * next);
+
+/* append tokens that hold n_img 1-D images (DS41's image spans, truss_vision_rows each): image i replaces the
+   embeddings of rows [rows0[i], rows0[i] + lens[i]) of this call, in order and not overlapping; embeds = the images'
+   rows concatenated ([sum lens][cols]). One call for any number of images (each prompt call in stream mode pays a
+   fixed expert-streaming cost), at any position of the sequence. */
+int truss_eval_imgs_s(truss_model * m, int slot, const int32_t * tokens, int n, const float * embeds, int cols,
+                      int n_img, const int32_t * rows0, const int32_t * lens, float * logits);
+int truss_eval_imgs_argmax_s(truss_model * m, int slot, const int32_t * tokens, int n, const float * embeds, int cols,
+                             int n_img, const int32_t * rows0, const int32_t * lens, int32_t * next);
 
 /* Greedy speculative decoding (opened with params.mtp). `next` is the token after the sequence (e.g. from
    truss_eval_argmax). One round: MTP drafts after `next`, one verify pass over [next, drafts], keep the matching
@@ -74,12 +85,18 @@ int truss_eval_argmax(truss_model * m, const int32_t * tokens, int n, int32_t * 
 int truss_spec_step(truss_model * m, int32_t next, int32_t * emitted, int * n_emitted, int32_t * new_next);
 int truss_drafts(const truss_model * m);            /* 0: opened without MTP */
 
-/* Vision tower (flashnext-mmproj-f16.gguf), for a multimodal eval. Open on `device`, then forward host pixel_values
-   ([gh*gw][3*2*16*16], server/vision_pre.py) and receive host f32 rows ([gh*gw/4][width], text-token order). */
+/* Vision tower, for a multimodal eval. Open on `device`, then forward host pixel_values and receive host f32 rows
+   ([truss_vision_rows(gh, gw)][width]); the forward returns that row count.
+   - flashnext-mmproj-f16.gguf: pixel_values [gh*gw][3*2*16*16] (server/vision_pre.py), rows [gh*gw/4] in text-token
+     order; pass nh = gh/2, nw = gw/2 to truss_eval_img_s.
+   - ds41-mmproj-f16.gguf (opened with its workspace reserved, ~1.5 GB: open it before the model on that card):
+     pixel_values [gh*gw][3*14*14] (server/vision_ds41.py, gh x gw the patch grid), rows = the whole image span
+     START + (row of tokens + NEWLINE) x lines + END. DS41 positions are 1-D: pass nh = 1, nw = rows (no rope offset). */
 typedef struct truss_vision truss_vision;
 truss_vision * truss_vision_open(const char * mmproj_path, int device);
 void truss_vision_close(truss_vision * v);
 int truss_vision_width(const truss_vision * v);
+int truss_vision_rows(const truss_vision * v, int gh, int gw);
 int truss_vision_forward(truss_vision * v, const float * pixel_values, int gh, int gw, float * out_rows);
 
 /* Runtime knobs, set between calls (no call running on any slot): one loaded model serves many bench arms
@@ -190,6 +207,9 @@ int truss_eval_sample_s(truss_model * m, int slot, const int32_t * tokens, int n
 int truss_eval_img_sample_s(truss_model * m, int slot, const int32_t * tokens, int n, const float * embeds,
                             int n_img, int cols, int img_row0, int nh, int nw, const truss_sampling * sp,
                             int32_t * next);
+int truss_eval_imgs_sample_s(truss_model * m, int slot, const int32_t * tokens, int n, const float * embeds, int cols,
+                             int n_img, const int32_t * rows0, const int32_t * lens, const truss_sampling * sp,
+                             int32_t * next);
 int truss_spec_step_sampled_s(truss_model * m, int slot, int32_t next, const truss_sampling * sp, int32_t * emitted,
                               int * n_emitted, int32_t * new_next);
 
