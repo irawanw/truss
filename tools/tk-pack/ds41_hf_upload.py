@@ -61,7 +61,8 @@ def main():
     api = HfApi(token=os.environ["HF_TOKEN"])
     api.create_repo(a.repo, repo_type="model", exist_ok=True)
     have = {f.path: f.size for f in api.list_repo_tree(a.repo, recursive=True) if hasattr(f, "size")}
-    todo = list(FILES_X31 if a.set == "x3.1" else FILES) + ([(a.readme, "README.md")] if a.readme else [])
+    readme = [(os.path.abspath(a.readme), "README.md")] if a.readme else []
+    todo = list(FILES_X31 if a.set == "x3.1" else FILES) + readme
     for src, _ in todo:   # every file before the first byte goes up
         path = src if os.path.isabs(src) else os.path.join(a.pack, src)
         if not os.path.isfile(path):
