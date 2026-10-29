@@ -76,8 +76,8 @@ inline int32_t unit_offset(const uint8_t * at, const uint8_t * base, int layer)
 
 // The kept cold copy's ids (cold_keep.h): slot = where every layer's projections come from (file identity + offset,
 // expert count), key = slot + the cold expert set + the copy's size. False if a projection is in no open mapping.
-inline bool cold_keep_ids(const std::vector<ExpertLayer> & layers, const ExpertStore::HotSet & hot, size_t bytes,
-                          uint64_t & slot, uint64_t & key)
+inline bool cold_keep_ids(const std::vector<ExpertLayer> & layers, const ExpertStore::HotSet & hot,
+                          const ExpertStore::HotSet & far, size_t bytes, uint64_t & slot, uint64_t & key)
 {
     uint64_t h = 1469598103934665603ull;
     auto mix = [&](uint64_t v) {
@@ -93,7 +93,7 @@ inline bool cold_keep_ids(const std::vector<ExpertLayer> & layers, const ExpertS
     mix(bytes);
     for (size_t l = 0; l < hot.size(); ++l)
         for (size_t e = 0; e < hot[l].size(); ++e)
-            if (!hot[l][e]) mix(l << 32 | e);
+            if (!hot[l][e] && (far.empty() || !far[l][e])) mix(l << 32 | e);   // the host copy's experts
     key = h;
     return true;
 }

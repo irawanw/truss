@@ -95,9 +95,11 @@ add_library(truss_engine STATIC
   src/blocks/attn_ds41.cu
   src/blocks/engram.cu
   src/runtime/cold_keep.cc
+  src/runtime/expert_far.cc
   src/runtime/expert_store.cu
   src/runtime/expert_store_plan.cu
   src/runtime/expert_store_ring.cu
+  src/runtime/expert_store_far.cu
   src/runtime/doorbell.cu
   src/runtime/moe_exec.cu
   src/runtime/moe_paths.cu
@@ -116,11 +118,13 @@ add_library(truss_engine STATIC
 target_link_libraries(truss_engine PUBLIC truss_models truss_kernels truss_cpu)
 
 # ---- Flash-Next vision tower (docs/reference/model-qwen4exp.md "Vision")
-add_library(truss_vision STATIC src/model/qwen4exp/vision/vit.cu)
+add_library(truss_vision STATIC src/model/qwen4exp/vision/vit.cu src/model/deepseek41/vision/vit.cu)
 target_include_directories(truss_vision PUBLIC src)
 target_link_libraries(truss_vision PUBLIC truss_formats CUDA::cudart CUDA::cublas)
 add_executable(vit_check tests/unit/vit_check.cu)
 target_link_libraries(vit_check PRIVATE truss_vision)
+add_executable(ds41_vit_check tests/unit/ds41_vit_check.cu)   # DS41 tower (docs/reference/model-deepseek41.md "Vision")
+target_link_libraries(ds41_vit_check PRIVATE truss_vision)
 
 # ---- public C API: libtruss.so (include/truss/truss.h), what server/ binds to
 add_library(truss SHARED src/api/truss_c.cu src/api/truss_sampling.cu src/api/truss_vision.cu)
@@ -203,6 +207,8 @@ add_executable(penalty_rows_test tests/unit/penalty_rows_test.cc)
 target_link_libraries(penalty_rows_test PRIVATE truss_kernels)
 add_executable(ple_reader_test tests/unit/ple_reader_test.cc)
 target_link_libraries(ple_reader_test PRIVATE truss_models)
+add_executable(expert_far_test tests/unit/expert_far_test.cc src/runtime/expert_far.cc)   # host only, no CUDA
+target_link_libraries(expert_far_test PRIVATE truss_formats Threads::Threads)
 add_executable(read_direct_test tests/unit/read_direct_test.cc)
 target_link_libraries(read_direct_test PRIVATE truss_models)
 add_executable(gemv_multi_test tests/unit/gemv_multi_test.cu)

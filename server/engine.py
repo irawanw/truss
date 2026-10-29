@@ -25,6 +25,12 @@ class Engine(EngineGenerate, EngineDebug):
         chat = {}
         tok_thread = threading.Thread(target=lambda: chat.setdefault("c", Chat(a.tokenizer, None)), daemon=True)
         tok_thread.start()
+        # the vision tower opens first: on its card the model then sizes its expert budget around the tower's weights
+        # and workspace (DS41 reserves its workspace at open). TRUSS_MMPROJ hands the same file to the text model
+        # (DS41 reads its image router bias and placeholder id there; other families ignore it).
+        self.vision = Tower(a.mmproj, a.mmproj_device) if getattr(a, "mmproj", None) else None
+        if self.vision:
+            os.environ["TRUSS_MMPROJ"] = os.path.abspath(a.mmproj)
         self.model = Model(a.model, a.n_ctx, a.chunk, a.expert_usage, mtp=a.mtp, drafts=a.drafts, cpu_dir=a.cpu_dir,
                            cpu_share=a.cpu_share, cpu_threads=a.cpu_threads, draft_vocab=a.draft_vocab,
                            draft_min_p=a.draft_min_p)
@@ -45,7 +51,8 @@ class Engine(EngineGenerate, EngineDebug):
                          if i is not None and i >= 0}
         self.name, self.log_path, self.log_tag = a.name, a.log, a.log_tag
         self.allow_local_images = getattr(a, "allow_local_images", False)
-        self.vision = Tower(a.mmproj, a.mmproj_device) if getattr(a, "mmproj", None) else None
+        if self.vision:
+            self.vision.ds41 = self.ds41 is not None   # which preprocessing and span layout (server/vision_ds41.py)
         self.dump_dir = a.dump_dir
         self.init_sequences(a.chunk)   # one record per sequence + the two fair gates (see below)
         self.im_start = self.chat.token_id("<|im_start|>")
@@ -96,6 +103,7 @@ class Engine(EngineGenerate, EngineDebug):
         self.engine_slots = self.n_slots > 1 and hasattr(self.model, "spec_step_sampled_s")
         self.prefill_piece = 0 if self.engine_slots else int(os.environ.get("TRUSS_PREFILL_PIECE", chunk))
         self.last_rounds = 0
+        self.pending_options = []   # (name, value) for truss_set_option, applied by the next call()
 
     @property
     def cached(self):
@@ -124,7 +132,15 @@ class Engine(EngineGenerate, EngineDebug):
         """Every engine call goes through here, so no call can run on another slot's sequence. With several slots the
         engine's slot-explicit call (`<name>_s`) runs WITHOUT a server lock: the engine holds each GPU stage only while
         this slot's work is enqueued there, so two requests' rounds overlap on the two GPUs, and a long prompt gives
-        way to the other slot's rounds (TRUSS_DECODE_SHARE). One slot: the fair lock and select(), as before."""
+        way to the other slot's rounds (TRUSS_DECODE_SHARE). One slot: the fair lock and select(), as before.
+        Knobs queued by POST /debug/option are applied here, between two engine calls of the request thread."""
+        while self.pending_options:
+            name, value = self.pending_options.pop(0)
+            try:
+                self.model.set_option(name, value)
+                self.log(f"truss: option {name} = {value}")
+            except Exception as e:   # a bad name or value must not fail the request it lands in
+                self.log(f"truss: option {name} = {value} refused: {e}")
         if self.engine_slots:
             out = getattr(self.model, fn.__name__ + "_s")(slot.idx, *args)
             slot.pos = self.model.position_s(slot.idx)

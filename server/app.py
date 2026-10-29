@@ -29,7 +29,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from server.tools import ToolStream, normalize_messages, parse_calls
-from server import vision
+from server import vision, vision_ds41
 from server.truss_ctypes import TrussError
 from server.engine import Engine
 from server.reasoning import ThinkSplitter, split_reasoning
@@ -126,6 +126,15 @@ def make_app(engine: Engine) -> FastAPI:
         body = await req.json()
         return await anyio.to_thread.run_sync(lambda: engine.probe(body["file"], int(body.get("window", 400))))
 
+    @app.post("/debug/option")
+    async def debug_option(req: Request):
+        """A decode knob (truss_set_option: drafts, skip_weight, pcie_frac, hint_k, hint_far_only, ...) changed live,
+        to compare settings in the pm2 log without a reload: {"name": "hint_k", "value": 6}. It is applied before the
+        next engine call (Engine.call), so a request in flight switches between two of its rounds."""
+        body = await req.json()
+        engine.pending_options.append((str(body["name"]), float(body["value"])))
+        return {"queued": [n for n, _ in engine.pending_options]}
+
     @app.get("/v1/models")
     def models():
         return {"object": "list", "data": [{"id": engine.name, "object": "model", "owned_by": "truss"}]}
@@ -146,7 +155,8 @@ def make_app(engine: Engine) -> FastAPI:
         kw = dict(body.get("chat_template_kwargs") or {})
         # the OpenAI-style top-level reasoning_effort (omp's --thinking) reaches the template unless the kwargs set it;
         # DeepSeek-V4.1 knows low / high / max (50 / 75 / 100), the X3 template knows low / medium / xhigh
-        eff = body.get("reasoning_effort")
+        # TRUSS_REASONING_EFFORT: the server's default when the request names none (unset: the template's, "high")
+        eff = body.get("reasoning_effort", os.environ.get("TRUSS_REASONING_EFFORT"))
         if eff is not None and "reasoning_effort" not in kw:
             efforts = ({"minimal": "low", "low": "low", "medium": "high", "high": "high",
                         "xhigh": "max", "max": "max"} if engine.ds41 is not None else
@@ -161,7 +171,7 @@ def make_app(engine: Engine) -> FastAPI:
         # A client that owns its prompt (an agent that renders its own template, a bench replaying recorded ids)
         # gets those exact tokens, which is what makes a served measurement comparable to an in-process one.
         raw = body.get("prompt")
-        image = None
+        image, spans = None, None
         if isinstance(raw, list):
             ids = raw_ids(raw, engine.model.n_vocab)   # F1: these ids go to the embedding table unchecked
         elif raw is not None:
@@ -175,15 +185,21 @@ def make_app(engine: Engine) -> FastAPI:
                 prompt = await anyio.to_thread.run_sync(
                     lambda: engine.chat.prompt(msgs, tools=tools, template_kwargs=kw))
             ids = await anyio.to_thread.run_sync(engine.chat.encode, prompt)
-            url = vision.image_url(msgs)
-            if url and getattr(engine, "vision", None) is None:
+            urls = vision.image_urls(msgs)
+            if urls and getattr(engine, "vision", None) is None:
                 raise ValueError("this server has no vision model: start it with --mmproj")
-            if url:
-                if engine.ds41 is not None:
-                    raise ValueError("image input is not supported for deepseek41")
+            if urls and engine.ds41 is not None:   # every image; spans sized now, rows computed when fed (generate)
+                def load_all():
+                    out = []
+                    for u in urls:
+                        data = vision.fetch(u, engine.allow_local_images)
+                        out.append((data, vision.decode(data)))
+                    return vision_ds41.expand(engine.chat, ids, out)
 
+                ids, spans = await anyio.to_thread.run_sync(load_all)
+            elif urls:
                 def rows():
-                    pic = vision.load(url, engine.allow_local_images)
+                    pic = vision.load(urls[0], engine.allow_local_images)
                     return (*engine.vision.rows(pic), vision.pixels_key(pic))
 
                 embeds, nh, nw, key = await anyio.to_thread.run_sync(rows)
@@ -203,6 +219,9 @@ def make_app(engine: Engine) -> FastAPI:
         if image is not None:
             p["image"] = image
             p["note"] += f", image {image.nh}x{image.nw}"
+        if spans:
+            p["spans"] = spans
+            p["note"] += f", {len(spans)} image{'s' if len(spans) > 1 else ''} (" + " ".join(str(x.n) for x in spans) + " rows)"
         rid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
 
         if body.get("stream"):
@@ -233,6 +252,7 @@ def make_app(engine: Engine) -> FastAPI:
                             yield chunk({field: d})
                 yield chunk({"role": "assistant", "content": ""})
                 n_gen, items = 0, tokens(req, ids, p, keepalive=5.0)
+                sent = time.monotonic()   # the last chunk out
                 while True:
                     try:
                         item = await items.__anext__()
@@ -242,11 +262,21 @@ def make_app(engine: Engine) -> FastAPI:
                         yield "data: " + json.dumps({"error": {"code": 500, "message": str(e), "type": "server_error"}}) + "\n\n"
                         break
                     if item is KEEPALIVE:
+                        sent = time.monotonic()
                         yield chunk({"content": ""})
                         continue
                     tok, delta, finish = item
                     n_gen += tok is not None
-                    for c in out(split.push(tok, delta) if ds41 else split.push(delta)):
+                    pieces = list(out(split.push(tok, delta) if ds41 else split.push(delta)))
+                    if pieces:
+                        sent = time.monotonic()
+                    elif time.monotonic() - sent >= 5.0:
+                        # tokens arrive but the splitter holds them (a DS41 call's arguments are sent whole when
+                        # the call closes): a 9K-token write is minutes of silence, and omp dropped it as a stalled
+                        # stream (10-25). An empty delta keeps the client's stall timer fed
+                        sent = time.monotonic()
+                        pieces = [chunk({"content": ""})]
+                    for c in pieces:
                         yield c
                     if finish:
                         for c in out(split.flush()):
@@ -360,7 +390,8 @@ def main():
                     "keeps the most-used experts in VRAM (decode speed)")
     ap.add_argument("--mtp", default=None, help="MTP draft block GGUF: greedy requests decode speculatively")
     ap.add_argument("--drafts", type=int, default=3, help="MTP drafts per round")
-    ap.add_argument("--mmproj", default=None, help="vision GGUF (flashnext-mmproj-f16.gguf): enables image input")
+    ap.add_argument("--mmproj", default=None,
+                    help="vision GGUF (flashnext-mmproj-f16.gguf / ds41-mmproj-f16.gguf): enables image input")
     ap.add_argument("--mmproj-device", type=int, default=0, help="GPU for the vision tower (one GPU)")
     ap.add_argument("--allow-local-images", action="store_true", help="accept local paths as image_url")
     ap.add_argument("--draft-vocab", default=None, help="int32 token ids the draft head scores (data/draft_vocab_en.bin)")

@@ -96,7 +96,7 @@ class EngineDebug:
         try:
             self.call(slot, self.model.reset)
             slot.cached, slot.ck_tokens = [], []
-            slot.img = slot.ck_img = None
+            slot.images, slot.ck_images = [], []
             n = len(gen)
             j0 = max(0, n - window)
             logits = self.call(slot, self.model.eval, prompt + gen[:j0])

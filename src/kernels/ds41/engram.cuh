@@ -16,9 +16,10 @@ namespace truss::ds41 {
 constexpr int ENGRAM_Q4_ROW = 144, ENGRAM_DIM = 256;
 
 void engram_dequant_q4(const uint8_t * rows, int n, half * out, cudaStream_t stream);
-// res [T][hc][d] in place (rows res_ld floats apart); kv [T][(hc + 1) d]; qk [hc][d]
+// res [T][hc][d] in place (rows res_ld floats apart); kv [T][(hc + 1) d]; qk [hc][d]; rows (device [T], may be null):
+// kv row t gates res row rows[t] (the other res rows are untouched: image rows)
 void engram_gate(float * res, int res_ld, const float * kv, const float * qk, int T, int hc, int d, float eps,
-                 cudaStream_t stream);
+                 cudaStream_t stream, const int * rows = nullptr);
 void mul(const float * a, const float * b, int n, float * y, cudaStream_t stream);
 
 }  // namespace truss::ds41

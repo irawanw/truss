@@ -2,13 +2,23 @@
 
 Our own inference engine for **trellis-quantized MoE models on one or two RTX 3090s** (Ampere, sm_86), served through
 an OpenAI-compatible API. Two models run on it today:
-**[PAW-763B-X3](https://huggingface.co/lackonendes/PAW-763B-X3)** (DeepSeek-V4.1-Flash-1017, 763B parameters, two RTX 3090s)
-and **[PAW-125B-FLASH-NEXT-X3.1](https://huggingface.co/lackonendes/PAW-125B-FLASH-NEXT-X3.1)** (Qwen3.8 Flash-Next, 125B).
+**[PAW-763B-X3.1](https://huggingface.co/lackonendes/PAW-763B-X3.1)** (DeepSeek-V4.1-Flash-1017, 763B parameters, all 384
+experts, image input, two RTX 3090s) and **[PAW-125B-FLASH-NEXT-X3.1](https://huggingface.co/lackonendes/PAW-125B-FLASH-NEXT-X3.1)** (Qwen3.8 Flash-Next, 125B).
 
 _If this model is useful to you, support the work by following [@nawariokra](https://x.com/nawariokra) on X, or buy me a coffee on [Ko-fi](https://ko-fi.com/lackonendes)._
 
 <a href="https://ko-fi.com/F4P3296XP7"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support me on Ko-fi" height="32"></a>
 
+
+## PAW-763B-X3.1: all 384 experts and image input (2026-10-25)
+
+**[lackonendes/PAW-763B-X3.1](https://huggingface.co/lackonendes/PAW-763B-X3.1)** (277 GB) keeps all 384 routed experts
+per layer: the 128 rarest per layer stay on the NVMe and are read on demand (the far tier, `src/runtime/expert_far.*`).
+Served with them (E2) its KL against the original checkpoint is **0.071** with no expert skipping (20-24 tok/s decode
+in an agent session); routing around them (E1, the default) decodes faster at KL 0.203. It also takes **images**:
+DeepSeek's own vision tower runs on the engine (`src/model/deepseek41/vision/`, `ds41-mmproj-f16.gguf`), any number of
+images per request, matching DeepSeek's reference at cosine 0.99999. Run it with `TRUSS_MODEL_DIR=<download>
+scripts/serve_ds41.sh` ([docs/SERVING-DS41.md](docs/SERVING-DS41.md)); model card: [docs/hf/PAW-763B-X3.1.md](docs/hf/PAW-763B-X3.1.md).
 
 ## PAW-763B-X3: DeepSeek-V4.1-Flash-1017 on two RTX 3090s (2026-10-21)
 

@@ -1,5 +1,6 @@
 // ExpertStore sizing and the hot-set plan (static members): how many experts of which layers stay resident in a
-// VRAM budget, and the usage file reader. Also the background page-locking of the cold copy (start/wait_pinned).
+// VRAM budget, and the usage file reader. Also the background page-locking of the cold copy (start/wait_pinned) and
+// the stream profile's harvest.
 #include "runtime/expert_store.h"
 #include "runtime/expert_store_util.h"
 
@@ -24,7 +25,7 @@ size_t ExpertStore::ring_size(const std::vector<ExpertLayer> & layers, const Hot
     for (size_t l = 0; l < layers.size(); ++l) {
         size_t cold = 0;
         for (int e = 0; e < layers[l][0]->n_expert; ++e)
-            if (!hot[l][e]) cold += expert_bytes(layers[l], e);
+            if (!hot[l][e] && !(z.far && (*z.far)[l][e])) cold += expert_bytes(layers[l], e);   // far: not in a slot
         slot = std::max(slot, align_up(cold));
     }
     return align_up(std::max(z.ring_bytes, 2 * slot + z.stream_extra));
@@ -46,12 +47,13 @@ ExpertStore::HotSet ExpertStore::plan(const std::vector<ExpertLayer> & layers, s
 {
     const int L = (int) layers.size(), n_expert = layers.empty() ? 0 : layers[0][0]->n_expert;
     HotSet hot(L, std::vector<uint8_t>(n_expert, 0));
+    auto far = [&](int l, int e) { return z.far && (*z.far)[l][e]; };   // never hot
     if (device_bytes(layers, hot, z) > budget)
         throw std::runtime_error("ExpertStore::plan: " + std::to_string(budget >> 20) + " MiB cannot hold even the ring (" +
                                  std::to_string(device_bytes(layers, hot, z) >> 20) + " MiB)");
     if (usage.empty()) {   // the same count in every layer, index order
         for (int n = 0; n < n_expert; ++n) {
-            for (auto & h : hot) h[n] = 1;
+            for (int l = 0; l < L; ++l) hot[l][n] = !far(l, n);
             if (device_bytes(layers, hot, z) > budget) {
                 for (auto & h : hot) h[n] = 0;
                 break;
@@ -68,14 +70,15 @@ ExpertStore::HotSet ExpertStore::plan(const std::vector<ExpertLayer> & layers, s
         fixed += fixed_bytes(layers[l]);
         for (int e = 0; e < n_expert; ++e) {
             size[(size_t) l * n_expert + e] = expert_bytes(layers[l], e);
-            cold_all[l] += size[(size_t) l * n_expert + e];
+            if (!far(l, e)) cold_all[l] += size[(size_t) l * n_expert + e];
         }
     }
     std::vector<double> score(size.size());
     for (size_t i = 0; i < size.size(); ++i) score[i] = usage[i] / std::pow((double) size[i], z.plan_alpha);
     auto better = [&](int a, int b) { return score[a] > score[b]; };
-    std::vector<int> order(size.size());
-    for (size_t i = 0; i < order.size(); ++i) order[i] = (int) i;
+    std::vector<int> order;
+    for (size_t i = 0; i < size.size(); ++i)
+        if (!far((int) i / n_expert, (int) i % n_expert)) order.push_back((int) i);
     std::stable_sort(order.begin(), order.end(), better);
     std::vector<std::vector<int>> by_layer(L);
     for (int i : order) by_layer[i / n_expert].push_back(i);
@@ -97,7 +100,7 @@ ExpertStore::HotSet ExpertStore::plan(const std::vector<ExpertLayer> & layers, s
             used += usage[i];
         };
         for (int l = 0; l < L; ++l)
-            for (int j = 0; j < floor; ++j) take(by_layer[l][j]);
+            for (int j = 0; j < floor && j < (int) by_layer[l].size(); ++j) take(by_layer[l][j]);
         if (total(hot_bytes) > budget) return -1;
         for (int i : order) {
             const int l = i / n_expert;
@@ -195,6 +198,31 @@ void ExpertStore::wait_pinned()
 {
     start_pinning();
     if (reg_thread_.joinable()) reg_thread_.join();
+}
+
+// TRUSS_STREAM_PROFILE (moved from expert_store.cu with the far tier, file size)
+void ExpertStore::prof_harvest()
+{
+    if (!stream_prof_) return;
+    for (auto & p : busy_ev_) {
+        cudaEventSynchronize(p.second);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, p.first, p.second);
+        prof_busy_ms_ += ms;
+    }
+    for (auto & p : wait_ev_) {
+        cudaEventSynchronize(p.second);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, p.first, p.second);
+        prof_wait_ms_ += ms;
+    }
+    busy_ev_.clear(); wait_ev_.clear(); prof_used_ = 0;   // all pairs synced: the pool is free again
+}
+
+void ExpertStore::stream_stats(double & busy_ms, double & wait_ms, bool reset) const
+{
+    busy_ms = prof_busy_ms_; wait_ms = prof_wait_ms_;
+    if (reset) prof_busy_ms_ = prof_wait_ms_ = 0;
 }
 
 }  // namespace truss::runtime

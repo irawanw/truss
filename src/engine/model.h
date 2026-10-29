@@ -32,11 +32,15 @@ struct ImageIn {
 //   img    host f32 [img_n][img_cols], the ViT output, replaces the embed rows [img_row0, img_row0 + img_n)
 //   pos3   absolute [3][pos3_stride] mrope positions, row pos3_row0 is this chunk's first row (nullptr: 1-D)
 //   rope_delta  added to pos0 for rope only (cache rows and DSA block indices stay linear)
+//   flat   1-D images (nh == 1: DS41's spans) of the whole call, rows absolute in the call; flat_row0 = this chunk's
+//          first row in the call. A model copies the rows of each image that fall in [flat_row0, flat_row0 + T)
 struct ChunkExtra {
     const float * img = nullptr;
     int img_row0 = 0, img_n = 0, img_cols = 0;
     const int * pos3 = nullptr;
     int pos3_stride = 0, pos3_row0 = 0, rope_delta = 0;
+    const ImageIn * flat = nullptr;
+    int n_flat = 0, flat_row0 = 0;
 };
 
 // one chunk of tokens on one stage

@@ -1,7 +1,8 @@
-"""Image input for Flash-Next: fetch an OpenAI `image_url` part, preprocess it (server/vision_pre.py), run the ViT
+"""Image input (Flash-Next here; DS41's preprocessing and span: server/vision_ds41.py): fetch an OpenAI `image_url` part, preprocess it (server/vision_pre.py), run the ViT
 (truss_vision, host pixel_values -> host f32 text rows) and expand the template's single <|image_pad|> into the image
 token grid. One image per request (multi-image is out of scope). A prompt may reuse a slot's sequence (or checkpoint)
 only where that sequence holds the same image (ImageIn.span: place, rows and pixel hash) at the same place.
+DS41 (1-D positions) takes every image of a prompt and reuses cached spans: server/vision_ds41.py.
 """
 from __future__ import annotations
 
@@ -54,8 +55,9 @@ def pixels_key(image) -> str:
     return h.hexdigest()
 
 
-def image_url(messages):
-    """The first image part's URL (or local path) in the messages, or None."""
+def image_urls(messages):
+    """Every image part's URL (or local path) in the messages, in prompt order."""
+    out = []
     for m in messages or []:
         content = m.get("content") if isinstance(m, dict) else None
         if not isinstance(content, list):
@@ -70,17 +72,43 @@ def image_url(messages):
             if isinstance(v, dict):
                 v = v.get("url")
             if isinstance(v, str) and v:
-                return v
-    return None
+                out.append(v)
+    return out
+
+
+def image_url(messages):
+    """The first image part's URL (or local path) in the messages, or None."""
+    urls = image_urls(messages)
+    return urls[0] if urls else None
 
 
 class Tower:
-    """The mmproj ViT on one device; host image -> host f32 rows [nh*nw][width]."""
+    """The mmproj ViT on one device; host image -> host f32 rows [nh*nw][width] (Flash-Next) or, with ds41 (set by
+    the engine for a deepseek41 model), the whole image span [span][5120] with nh = 1, nw = span (server/vision_ds41.py).
+    span_rows() caches DS41 spans by image digest: an agent re-sends its screenshots with every turn."""
+
+    CACHE = 16   # DS41 spans kept (<= 21 MB each)
 
     def __init__(self, mmproj: str, device: int = 0):
         self.vit = Vision(mmproj, device)
+        self.ds41 = False
+        self._spans = {}   # digest -> rows, insertion order = LRU order
+
+    def span_rows(self, image, digest: str) -> np.ndarray:
+        rows = self._spans.pop(digest, None)
+        if rows is None:
+            rows = self.rows(image)[0]
+        self._spans[digest] = rows
+        while len(self._spans) > self.CACHE:
+            self._spans.pop(next(iter(self._spans)))
+        return rows
 
     def rows(self, image) -> tuple[np.ndarray, int, int]:
+        if self.ds41:
+            from server import vision_ds41
+            px, gh, gw = vision_ds41.preprocess(image)
+            rows = self.vit.forward(px, gh, gw)
+            return rows, 1, rows.shape[0]
         px, (_, gh, gw) = vision_pre.preprocess(image)
         return self.vit.forward(px, gh, gw), gh // 2, gw // 2
 
@@ -88,8 +116,8 @@ class Tower:
         self.vit.close()
 
 
-def load(url: str, allow_local: bool = False) -> Image.Image:
-    """Decode a data URI, an http(s) URL, or (only with allow_local) a local path."""
+def fetch(url: str, allow_local: bool = False) -> bytes:
+    """The bytes of a data URI, an http(s) URL, or (only with allow_local) a local path."""
     if url.startswith("data:"):
         header, _, payload = url.partition(",")
         if ";base64" not in header:
@@ -109,6 +137,10 @@ def load(url: str, allow_local: bool = False) -> Image.Image:
         raise ValueError("local image paths need --allow-local-images")
     if len(data) > MAX_BYTES:
         raise ValueError(f"image over the {MAX_BYTES} byte limit")
+    return data
+
+
+def decode(data: bytes) -> Image.Image:
     if Image is None:
         raise ValueError("image input needs Pillow in the server's interpreter")
     img = Image.open(io.BytesIO(data))
@@ -116,6 +148,11 @@ def load(url: str, allow_local: bool = False) -> Image.Image:
     if img.width * img.height > MAX_PIXELS:
         raise ValueError(f"image is {img.width}x{img.height} (limit {MAX_PIXELS} pixels)")
     return img.convert("RGB")
+
+
+def load(url: str, allow_local: bool = False) -> Image.Image:
+    """Decode a data URI, an http(s) URL, or (only with allow_local) a local path."""
+    return decode(fetch(url, allow_local))
 
 
 def expand(chat, ids, embeds: np.ndarray, nh: int, nw: int, key: str = "") -> tuple[list[int], ImageIn]:

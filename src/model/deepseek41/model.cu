@@ -30,6 +30,37 @@ Family::Family(const gguf::File & f, const engine::DrafterFiles & d) : c_(Config
             engine::require(w_.layers[l].engram.table != nullptr,
                             "deepseek41: no Engram table for layer " + std::to_string(l)
                                 + " (add ds41-engram-L" + std::to_string(l) + ".gguf to TRUSS_EXPERT_OVERLAY)");
+    if (const char * mm = std::getenv("TRUSS_MMPROJ"); mm && *mm) {   // image input: the text model's part of it
+        const auto v = gguf::File::open(mm);
+        engine::require(v->get_string("general.architecture") == "deepseek41-mmproj", std::string("TRUSS_MMPROJ ") + mm
+                            + " is not a deepseek41-mmproj gguf (tools/tk-pack/ds41_mmproj.py)");
+        image_token_ = (int32_t) v->get_int("deepseek41.vision.image_token_id");
+        bias_vl_.resize((size_t) c_.n_layer * c_.n_expert);
+        for (int l = 0; l < c_.n_layer; ++l) {
+            const gguf::Tensor & t = v->at("blk." + std::to_string(l) + ".bias_vl");
+            engine::require(t.type == gguf::Type::F32 && t.bytes % 4 == 0, "deepseek41: bias_vl is not f32");
+            const float * b = (const float *) t.data;
+            const int64_t n_src = (int64_t) (t.bytes / 4);
+            for (int e = 0; e < c_.n_expert; ++e) {
+                const int64_t src = c_.expert_keep[(size_t) l * c_.n_expert + e];
+                engine::require(src >= 0 && src < n_src, "deepseek41: expert_keep id past bias_vl");
+                bias_vl_[(size_t) l * c_.n_expert + e] = b[src];
+            }
+        }
+        std::fprintf(stderr, "deepseek41: image input on (%s): image token %d, image router bias for %d layers\n", mm,
+                     image_token_, c_.n_layer);
+    }
+}
+
+std::vector<int> image_runs(const int32_t * tokens, int n, int32_t image)
+{
+    std::vector<int> v;
+    if (image < 0) return v;
+    for (int t = 0; t < n; ++t)
+        if (tokens[t] == image && (t == 0 || tokens[t - 1] != image)) v.push_back(t);
+        else if (tokens[t] != image && t > 0 && tokens[t - 1] == image) v.push_back(t);
+    if (v.size() % 2) v.push_back(n);
+    return v;
 }
 
 std::unique_ptr<engine::StageModel> Family::stage(int lb, int le, int n_ctx) const
@@ -146,10 +177,11 @@ void StageModel::build(engine::Stage & st)
         if (ei >= 0) {
             const auto & e = c_.engram;
             const int B = e.buckets();
-            const blocks::EngramDims ed { c_.hc, c_.d_model, e.heads, e.head_dim, e.max_ngram, e.pad_id, c_.rms_eps,
-                                          e.multipliers.data() + (size_t) ei * e.max_ngram,
-                                          e.primes.data() + (size_t) ei * B, e.offsets.data() + (size_t) ei * B,
-                                          e.token_map.data(), (int64_t) e.token_map.size() };
+            blocks::EngramDims ed { c_.hc, c_.d_model, e.heads, e.head_dim, e.max_ngram, e.pad_id, c_.rms_eps,
+                                    e.multipliers.data() + (size_t) ei * e.max_ngram,
+                                    e.primes.data() + (size_t) ei * B, e.offsets.data() + (size_t) ei * B,
+                                    e.token_map.data(), (int64_t) e.token_map.size() };
+            ed.dead_token = fam_.image_token();
             engram_.push_back(std::make_unique<blocks::Engram>(lin, L.engram, ed, *L.engram.table));
             engram_.back()->build(g);
         } else {
@@ -185,6 +217,11 @@ void StageModel::bind_experts(engine::Stage & st)
         const blocks::MoeWeights * next = l + 1 < le_ ? &w_.layers[l + 1].moe : nullptr;
         moe_.push_back(std::make_unique<blocks::Moe>(st.lin(), *st.moe(), l - lb_, l, w_.layers[l].moe, md, next,
                                                      &blocks::route_sqrtsoftplus_bias, false, &st.prof()));
+        if (const float * bv = fam_.bias_vl(l)) {
+            float * p = st.gpu().alloc<float>(c_.n_expert);
+            TRUSS_CUDA(cudaMemcpy(p, bv, sizeof(float) * c_.n_expert, cudaMemcpyHostToDevice));
+            moe_.back()->set_bias_vl(p);
+        }
     }
 }
 
@@ -196,6 +233,16 @@ void StageModel::embed(engine::Stage & st, const engine::Chunk & c, float * res)
     float * emb = sc.alloc((size_t) c.T * c_.d_model);
     TRUSS_CUDA(cudaMemcpyAsync(ids, c.tokens, (size_t) c.T * 4, cudaMemcpyHostToDevice, g.s));
     dense::q8_rows(st.lin().q8(w_.token_embd), ids, c.T, emb, g.s);
+    for (int i = 0; i < c.x.n_flat; ++i) {   // the reference's merge_image_embeddings: span rows = the tower's rows
+        const engine::ImageIn & im = c.x.flat[i];
+        engine::require(im.cols == c_.d_model, "deepseek41: image rows are not d_model wide");
+        const int a = std::max(im.row0, c.x.flat_row0), b = std::min(im.row0 + im.n, c.x.flat_row0 + c.T);
+        if (b <= a) continue;
+        TRUSS_CUDA(cudaMemcpyAsync(emb + (size_t) (a - c.x.flat_row0) * c_.d_model,
+                                   im.embeds + (size_t) (a - im.row0) * im.cols,
+                                   sizeof(float) * (size_t) (b - a) * c_.d_model, cudaMemcpyHostToDevice, g.s));
+    }
+    engine::require(c.x.img_n == 0, "deepseek41: image rows must come as 1-D images (nh 1)");
     hc::SkDims k = sk_dims();
     k.coef_ld = k.res_ld;
     hc::sk_expand(emb, c.T, k, res, res + (size_t) c_.hc * c_.d_model, g.s);
@@ -292,6 +339,9 @@ void StageModel::layers(engine::Stage & st, const engine::Chunk & c, float * res
     const bool dspark = dd.f && lb_ <= 37 && le_ >= 40;   // the stage that owns the three DSpark target layers
     if (dspark) dd.hidden.resize((size_t) T * 3 * d);
     const int tail_n = tail_rows_cfg();   // the tail prefill (item 7): the consumer layers run on the last n rows
+    const std::vector<int> vl_all = image_runs(c.tokens, T, fam_.image_token());   // image rows: their router bias
+    const std::vector<int> vl_tail = tail_n > 0 && T > tail_n ? image_runs(c.tokens + (T - tail_n), tail_n, fam_.image_token())
+                                                              : std::vector<int>();
     const auto is_consumer = [&](int l) {   // the layers that read the candidate source's compressed KV
         return c_.compress_ratio[l] > 0 && l > c_.candidate_source && c_.kv_source_of(l) == c_.candidate_source;
     };
@@ -329,7 +379,8 @@ void StageModel::layers(engine::Stage & st, const engine::Chunk & c, float * res
         hc_ffn_[i]->collapse(g, res_l, A, NM, Tl, y, nullptr);
         ffn_norm_[i]->forward(g, y, Tl, x, x16);   // fp32 for the router, fp16 for the projections
         dump(g, "moe_in", l, x, Tl, d, d);
-        moe_[i]->forward(g, x, x16, Tl, out, c.stream, st.moe_ws(), st.moe_rows());
+        const std::vector<int> & vl = tail ? vl_tail : vl_all;
+        moe_[i]->forward(g, x, x16, Tl, out, c.stream, st.moe_ws(), st.moe_rows(), vl.data(), (int) vl.size() / 2);
         dump(g, "moe_out", l, out, Tl, d, d);
         hc_ffn_[i]->post(g, res_l, out, F, NM, Tl);
         TRUSS_CUDA(cudaMemcpy2DAsync(row_coef, (size_t) W * 4, F, (size_t) NM * 4, (size_t) NM * 4, T,

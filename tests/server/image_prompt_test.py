@@ -74,8 +74,8 @@ out, calls, ic = gen(e, p, img)
 check("first turn: image prefix call", ic == [("read", cut, emb.shape, 10, 3, 2)], str(ic))
 check("first turn: then checkpoint, then text", names(calls)[:4] == ["reset", "eval_img", "checkpoint", "eval_argmax"],
       str(names(calls)[:4]))
-check("first turn: checkpoint holds the image", e.slots[0].ck_img == img.span and len(e.slots[0].ck_tokens) == cut,
-      str((e.slots[0].ck_img, len(e.slots[0].ck_tokens))))
+check("first turn: checkpoint holds the image", e.slots[0].ck_images == [img.span] and len(e.slots[0].ck_tokens) == cut,
+      str((e.slots[0].ck_images, len(e.slots[0].ck_tokens))))
 check("first turn: sequence", m.seq[0] == p + out[:-1], f"{len(m.seq[0])} tokens")
 
 # 2. the next turn continues the whole sequence, the same picture re-sent: only the new tokens are read

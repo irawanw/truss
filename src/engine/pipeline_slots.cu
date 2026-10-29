@@ -66,7 +66,8 @@ int varlen_pick(const float * p, int cn, int nw, int & nw_drafted)
 }  // namespace
 
 void Pipeline::prompt(int slot, const int32_t * tokens, int n, int step, float * logits,
-                      const std::function<void()> & after, const std::function<void(int)> & done, const ImageIn * img)
+                      const std::function<void()> & after, const std::function<void(int)> & done, const ImageIn * img,
+                      int n_img)
 {
     require(n > 0 && step > 0, "run_prompt: no tokens");
     require(slot >= 0 && slot < (int) seq_pos_.size(), "prompt(): no such slot");
@@ -81,11 +82,19 @@ void Pipeline::prompt(int slot, const int32_t * tokens, int n, int step, float *
     // t = s, h = s + k / nw, w = s + k % nw (merge-block order), text after at s + max(nh, nw); rope_delta for decode
     std::vector<int> p3;
     int delta = rope_delta_[slot];
-    if (img) {
-        require(pos0 == 0, "prompt(): an image prompt must start at position 0 (no prefix restore)");
-        require(img->n > 0 && img->nh > 0 && img->nw > 0 && img->nh * img->nw == img->n && img->cols > 0 &&
-                    img->row0 >= 0 && img->row0 + img->n <= n,
+    if (!img) n_img = 0;
+    for (int i = 0; i < n_img; ++i) {
+        const ImageIn & g = img[i];
+        require(g.n > 0 && g.nh > 0 && g.nw > 0 && g.nh * g.nw == g.n && g.cols > 0 && g.row0 >= 0 && g.row0 + g.n <= n,
                 "prompt(): bad image rows");
+        require(g.nh == 1 || n_img == 1, "prompt(): several images are 1-D only (nh 1)");
+        require(i == 0 || g.row0 >= img[i - 1].row0 + img[i - 1].n, "prompt(): images out of order or overlapping");
+    }
+    const bool flat = n_img > 0 && img[0].nh == 1;
+    // nh == 1: rows of a model with 1-D positions (DS41's image spans, any number per call): no 3-D positions, any
+    // start position
+    if (n_img > 0 && !flat) {
+        require(pos0 == 0, "prompt(): an image prompt must start at position 0 (no prefix restore)");
         const int is = img->row0, iw = img->nw, span = std::max(img->nh, img->nw);
         p3.resize((size_t) 3 * n);
         int mx = 0;
@@ -105,7 +114,9 @@ void Pipeline::prompt(int slot, const int32_t * tokens, int n, int step, float *
     auto extra = [&](int s, int T) {   // this chunk's image rows and 3-D positions
         ChunkExtra x;
         x.pos3 = p3.empty() ? nullptr : p3.data(), x.pos3_stride = n, x.pos3_row0 = s, x.rope_delta = delta;
-        if (img) {
+        if (flat) {
+            x.flat = img, x.n_flat = n_img, x.flat_row0 = s;
+        } else if (n_img > 0) {
             const int a = std::max(s, img->row0), b = std::min(s + T, img->row0 + img->n);
             if (b > a) {
                 x.img = img->embeds + (size_t) (a - img->row0) * img->cols;

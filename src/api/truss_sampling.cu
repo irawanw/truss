@@ -150,6 +150,26 @@ int truss_eval_img_sample_s(truss_model * m, int slot, const int32_t * tokens, i
         -1);
 }
 
+int truss_eval_imgs_sample_s(truss_model * m, int slot, const int32_t * tokens, int n, const float * embeds, int cols,
+                             int n_img, const int * rows0, const int * lens, const truss_sampling * sp, int32_t * next)
+{
+    return guarded(
+        [&] {
+            const auto imgs = images_in(embeds, cols, n_img, rows0, lens);
+            const sampling::SampleParams p = params_of(sp);
+            eval(*m, slot, tokens, n, [&] {
+                penalize_rows(*m, *sp, nullptr, 0, 1);
+                ban_rows(*m, *sp, tokens, n, 1);
+                word_rows(*m, *sp, tokens, n, 1);
+                sampling::sample(m->logits, m->n_vocab, 1, p, m->counter[slot]++, m->next, m->fwd->stream());
+                TRUSS_CUDA(cudaMemcpyAsync(next, m->next, sizeof(int), cudaMemcpyDeviceToHost, m->fwd->stream()));
+                sync(*m);
+            }, 0, imgs.data(), n_img);
+            return 0;
+        },
+        -1);
+}
+
 int truss_eval_sample(truss_model * m, const int32_t * tokens, int n, const truss_sampling * sp, int32_t * next)
 {
     return truss_eval_sample_s(m, m->cur, tokens, n, sp, next);

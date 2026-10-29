@@ -80,15 +80,20 @@ void Engram::hash(int slot, const int32_t * tokens, int pos0, int T, int32_t * i
     for (int t = 0; t < T; ++t) {
         const int pos = pos0 + t;
         uint64_t rolling = 0;
+        bool blocked = false;   // the sequence start or an image token is behind: pad from here on (the reference's DEAD)
         for (int s = 0; s < N; ++s) {
-            int64_t tok;
-            if (pos < s) tok = d_.pad_id;   // before the sequence start (blocked stays blocked: pos < s grows with s)
-            else if (t - s >= 0) tok = mapped(tokens[t - s]);
-            else {
-                const int back = s - t;      // 1 = the newest committed token
-                if (back > (int) h.size()) throw std::runtime_error("Engram: history shorter than the n-gram");
-                tok = mapped(h[h.size() - back]);
+            if (pos < s) blocked = true;   // before the sequence start
+            int32_t raw = 0;
+            if (!blocked) {
+                if (t - s >= 0) raw = tokens[t - s];
+                else {
+                    const int back = s - t;      // 1 = the newest committed token
+                    if (back > (int) h.size()) throw std::runtime_error("Engram: history shorter than the n-gram");
+                    raw = h[h.size() - back];
+                }
+                blocked = d_.dead_token >= 0 && raw == d_.dead_token;
             }
+            const int64_t tok = blocked ? d_.pad_id : mapped(raw);
             const uint64_t p = (uint64_t) tok * (uint64_t) d_.multipliers[s];
             rolling = s == 0 ? p : rolling ^ p;
             if (s == 0) continue;
@@ -141,9 +146,21 @@ void Engram::read_rows(const int32_t * ids, size_t n, uint8_t * dst)
 void Engram::forward(engine::Gpu & g, int slot, const int32_t * tokens, int pos0, int T, float * res, int res_ld)
 {
     const int B = d_.buckets(), D = d_.d_model, hc = d_.hc;
-    const size_t n = (size_t) T * B, RB = ds41::ENGRAM_Q4_ROW;
-    std::vector<int32_t> ids(n);
+    std::vector<int32_t> ids((size_t) T * B);
     hash(slot, tokens, pos0, T, ids.data());
+    // image rows get no lookup: keep the other rows' ids (live, in order) and gate only those rows
+    std::vector<int32_t> live;
+    if (d_.dead_token >= 0)
+        for (int t = 0; t < T; ++t)
+            if (tokens[t] != d_.dead_token) live.push_back(t);
+    const bool some_dead = d_.dead_token >= 0 && (int) live.size() < T;
+    if (some_dead) {
+        if (live.empty()) return;
+        for (size_t i = 0; i < live.size(); ++i)
+            std::memmove(ids.data() + i * B, ids.data() + (size_t) live[i] * B, sizeof(int32_t) * B);
+        T = (int) live.size();
+    }
+    const size_t n = (size_t) T * B, RB = ds41::ENGRAM_Q4_ROW;
     if (n > pinned_rows_) {
         // the previous call's copy has finished (each call syncs before returning the rows' buffer below)
         if (pinned_) TRUSS_CUDA(cudaFreeHost(pinned_));
@@ -157,10 +174,13 @@ void Engram::forward(engine::Gpu & g, int slot, const int32_t * tokens, int pos0
     uint8_t * drows = sc.alloc<uint8_t>(n * RB);
     half * x16 = sc.alloc<half>(n * d_.head_dim);
     float * kv = sc.alloc((size_t) T * (hc + 1) * D);
+    int * rows = some_dead ? sc.alloc<int>(T) : nullptr;
     TRUSS_CUDA(cudaMemcpyAsync(drows, pinned_, n * RB, cudaMemcpyHostToDevice, g.s));
+    if (rows) TRUSS_CUDA(cudaMemcpyAsync(rows, live.data(), sizeof(int) * T, cudaMemcpyHostToDevice, g.s));
     ds41::engram_dequant_q4(drows, (int) n, x16, g.s);
     lin_.lin(w_.wkv, x16, T, kv);
-    ds41::engram_gate(res, res_ld, kv, qk_, T, hc, D, d_.eps, g.s);
+    ds41::engram_gate(res, res_ld, kv, qk_, T, hc, D, d_.eps, g.s, rows);
+    if (rows) TRUSS_CUDA(cudaStreamSynchronize(g.s));   // live leaves scope with the copy maybe in flight
     sc.release(m);
 }
 

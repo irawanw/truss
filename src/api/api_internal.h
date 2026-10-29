@@ -103,7 +103,7 @@ inline void check_slot(const truss_model & m, int slot)
 // append tokens in chunks; the last chunk's last row feeds the head (m.logits), then after() runs while the engine
 // still holds the last stage for this slot (it reads m.logits)
 inline void eval(truss_model & m, int slot, const int32_t * tokens, int n, const std::function<void()> & after,
-                 int step_max = 0, const engine::ImageIn * img = nullptr)
+                 int step_max = 0, const engine::ImageIn * img = nullptr, int n_img = 1)
 {
     check_slot(m, slot);
     if (n <= 0) throw std::invalid_argument("truss_eval: no tokens");
@@ -118,9 +118,12 @@ inline void eval(truss_model & m, int slot, const int32_t * tokens, int n, const
     m.prog_done[slot] = 0, m.prog_total[slot] = n;
     // in chunks with the PLE lookahead (the next chunk's trigram rows are read while this chunk computes); a layer
     // split runs its stages a chunk apart (Pipeline::prompt)
-    m.fwd->prompt(slot, tokens, n, step, m.logits, after, [&](int done) { m.prog_done[slot] = done; }, img);
+    m.fwd->prompt(slot, tokens, n, step, m.logits, after, [&](int done) { m.prog_done[slot] = done; }, img, n_img);
 }
 
 inline void sync(truss_model & m) { TRUSS_CUDA(cudaStreamSynchronize(m.fwd->stream())); }
+
+// truss_eval_imgs_*: the 1-D images of a call (truss_c.cu)
+std::vector<engine::ImageIn> images_in(const float * embeds, int cols, int n_img, const int * rows0, const int * lens);
 
 }  // namespace truss::api

@@ -51,7 +51,7 @@ public:
     // img: image rows of this prompt (one image, contiguous); the engine builds the 3-D rope positions and the decode
     // offset from row0 / nh / nw. Requires the prompt to start at position 0 (no prefix restore with an image).
     void prompt(int slot, const int32_t * tokens, int n, int step, float * logits, const std::function<void()> & after,
-                const std::function<void(int)> & done = nullptr, const ImageIn * img = nullptr);
+                const std::function<void(int)> & done = nullptr, const ImageIn * img = nullptr, int n_img = 1);
     // round(): up to nd drafts into win[1..] (win[0] = next), the verify window, its logits [nw + 1][n_vocab], then
     // pick(nw) - with the last stage held - returns how many rows to keep (1 .. nw + 1). Returns that count.
     int round(int slot, int32_t next, int nd, int32_t * win, float * logits, const Drafter::Sampling & ds,
