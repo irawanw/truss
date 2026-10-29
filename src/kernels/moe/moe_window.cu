@@ -351,9 +351,13 @@ __device__ __forceinline__ void gemv_item(const half * __restrict__ A, int a_str
             for (int t = 0; t < WNT; ++t) {
                 FragB f0, f1;
                 codec.tile(bw[t / Codec::TILES_PER_VEC], t % Codec::TILES_PER_VEC, f0, f1);
+#if TRUSS_MMA_F32ACC
+                mma_w_f32(f0, f1, act_lo, act_hi, acc[t]);
+#else
                 mma_w(f0, f1, act_lo, act_hi, ch[t]);
+#endif
             }
-            if ((d + 1) % FOLD == 0 || i + 1 == myn) {
+            if (!TRUSS_MMA_F32ACC && ((d + 1) % FOLD == 0 || i + 1 == myn)) {
                 #pragma unroll
                 for (int t = 0; t < WNT; ++t)
                     #pragma unroll

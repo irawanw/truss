@@ -107,6 +107,13 @@ inline size_t gemv_smem(int n, int k_slices)
 }
 
 // One item (part, column group, k part): P_part[kp][t][group columns].
+// E18 gate 1 (brief "Past failures to avoid"): compile-time bisect of the item's inner work, built in separate build
+// dirs so the bottleneck is proven before arithmetic changes. 0 = production; 1 = loads only (the decode replaced by
+// a cheap use of the words); 2 = decode from registers, no weight loads; 3 = no mma/fold.
+#ifndef TD_BISECT
+#define TD_BISECT 0
+#endif
+
 template <class Codec, int NB>
 __device__ __forceinline__ void td_item(const List & L, int item)
 {
@@ -143,9 +150,14 @@ __device__ __forceinline__ void td_item(const List & L, int item)
     for (int d = 0; d < G::PF; ++d)
         if (d < myn) {
 #pragma unroll
+#if TD_BISECT == 2
+            // registers: words from a cheap register pattern, no global weight loads
+            for (int l = 0; l < LOADS; ++l)
+                pf[d][l] = (uint32_t) (d * 7919u + l * 104729u + (uint32_t) lane * 31u) | 1u;
+#else
             for (int l = 0; l < LOADS; ++l) pf[d][l] = ld_b(d, l);
+#endif
         }
-
     // The item's activations (n rows x its k range) are staged in shared memory once, behind the first weight
     // loads: per-slice L2 reads of A were a stall of the loop. Row stride padded by 4 words so the 8 batch rows of a
     // warp read hit 32 distinct banks.
@@ -196,17 +208,40 @@ __device__ __forceinline__ void td_item(const List & L, int item)
             }
             if (i + G::PF < myn) {
 #pragma unroll
+#if TD_BISECT == 2
+                for (int l = 0; l < LOADS; ++l)
+                    pf[d][l] = (uint32_t) ((i + G::PF) * 7919u + l * 104729u + (uint32_t) lane * 31u) | 1u;
+#else
                 for (int l = 0; l < LOADS; ++l) pf[d][l] = ld_b(i + G::PF, l);
+#endif
             }
 #pragma unroll
             for (int t = 0; t < G::WNT; ++t) {
                 FragB f0, f1;
+#if TD_BISECT == 1
+                // loads only: the decode replaced by a cheap use of the words
+                const uint32_t wc = bw[t / Codec::TILES_PER_VEC] + (uint32_t) t;
+                f0[0] = f0[1] = f1[0] = f1[1] = __half2half2(__ushort_as_half((uint16_t) wc));
+#else
                 codec.tile(bw[t / Codec::TILES_PER_VEC], t % Codec::TILES_PER_VEC, f0, f1);
-#pragma unroll
+#endif
+#if TD_BISECT == 3
+                // no mma/fold: consume the decode cheaply into the accumulator
+                for (int h = 0; h < NB; ++h) {
+                    acc[t][h][0].x += __low2float(f0[0]) + __low2float(f1[0]);
+                    acc[t][h][1].y += __high2float(f0[1]) + __high2float(f1[1]);
+                }
+#else
                 for (int h = 0; h < NB; ++h)
+#if TRUSS_MMA_F32ACC
+                    mma_w_f32(f0, f1, *(const half2 *) &alo[h], *(const half2 *) &ahi[h], acc[t][h]);
+#else
                     mma_w(f0, f1, *(const half2 *) &alo[h], *(const half2 *) &ahi[h], ch[t][h]);
+#endif
+#endif
             }
-            if ((d + 1) % G::FOLD == 0 || i + 1 == myn) {
+#if TD_BISECT != 3
+            if (!TRUSS_MMA_F32ACC && ((d + 1) % G::FOLD == 0 || i + 1 == myn)) {
 #pragma unroll
                 for (int t = 0; t < G::WNT; ++t)
 #pragma unroll
@@ -218,6 +253,7 @@ __device__ __forceinline__ void td_item(const List & L, int item)
                             ch[t][h][f] = hzero;
                         }
             }
+#endif
         }
     }
 

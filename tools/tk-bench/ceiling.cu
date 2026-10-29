@@ -202,6 +202,11 @@ int main()
     run_decode<lab::V2Pair<2>, 8, NO_MMA>("no-mma", sms, d_out);
     run_decode<lab::V2Pair<3>, 8, FULL>("full", sms, d_out);
     run_decode<lab::V2Pair<4>, 8, FULL>("full", sms, d_out);
+    run_decode<Mul1Frac<3>, 8, FULL>("full", sms, d_out);       // 3.5 bpw: DS41 dense (code 35)
+    run_decode<Mul1Frac<3>, 8, NO_MMA>("no-mma", sms, d_out);
+    run_decode<Mul1Frac<3>, 4, FULL>("full", sms, d_out);
+    run_decode<Mul1Frac<2>, 8, FULL>("full", sms, d_out);       // 2.5 bpw: DS41 experts (code 25, 20%)
+    run_decode<Mul1Frac<2>, 8, NO_MMA>("no-mma", sms, d_out);
 
     const size_t bytes = (size_t) 1 << 30;
     char * buf;
