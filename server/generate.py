@@ -66,20 +66,34 @@ class EngineGenerate:
         slot = self.acquire_slot(prompt_ids, note)
         try:
             max_tokens = max(0, min(max_tokens, self.model.n_ctx - n_prompt))
-            reuse = 0 if image is not None else (
-                len(slot.cached) if 0 < len(slot.cached) < n_prompt and prompt_ids[:len(slot.cached)] == slot.cached else 0)
-            ck = 0 if image is not None else len(slot.ck_tokens)
+            span = image.span if image is not None else None
+
+            def fits(n, held):
+                """A sequence holding image `held` (a span, or None) can serve this prompt's first n tokens: the same
+                image at the same place in both (equal ids cannot tell two pictures of one size apart), and this
+                prompt's image wholly inside them: an image is read only from position 0 (the engine places its 3-D
+                rope rows there), so a prompt whose image lies past the reused part reads everything again."""
+                inside = lambda sp: sp if sp is not None and sp[0] < n else None
+                return inside(span) == inside(held) and (span is None or span[0] + span[1] <= n)
+
+            c = len(slot.cached)
+            reuse = c if 0 < c < n_prompt and prompt_ids[:c] == slot.cached and fits(c, slot.img) else 0
+            ck = len(slot.ck_tokens)
             back = (self.call(slot, self.model.restore)
-                    if not reuse and 0 < ck < n_prompt and prompt_ids[:ck] == slot.ck_tokens else None)
+                    if not reuse and 0 < ck < n_prompt and prompt_ids[:ck] == slot.ck_tokens and fits(ck, slot.ck_img)
+                    else None)
             if back is not None and back != ck:
                 self.log(f"{self.log_tag}: slot {slot.idx} checkpoint restore gave {back}, expected {ck}: full read")
             if back is not None and back == ck:
                 # the last prompt is a prefix but its reply is not (the client re-sent it without its reasoning, or
                 # edited it): back to the end of that prompt instead of reading everything again
-                slot.cached, reuse = list(slot.ck_tokens), ck
+                slot.cached, slot.img, reuse = list(slot.ck_tokens), slot.ck_img, ck
             if not reuse:
                 self.call(slot, self.model.reset)   # an unrelated prompt: this slot's sequence starts over
                 slot.cached, slot.ck_tokens = [], []   # reset drops the engine's checkpoint too
+                slot.img = slot.ck_img = None
+            else:
+                image = None   # the sequence already holds it (fits): the rest of the prompt is text
             greedy = temperature <= 0
             # sampled requests sample on the device and speculate too (Strata's sampled verify)
             sp = None if greedy else Sampling(temperature, top_p if top_p and top_p > 0 else 1.0, top_k or 0, min_p or 0.0,
@@ -136,29 +150,40 @@ class EngineGenerate:
                                            daemon=True)
                 watcher.start()
             try:
-                if image is not None:   # one image per prompt: the whole prompt is one eval_img, no checkpoint
-                    nxt = step(prompt_ids)
+                # checkpoint just before the prompt's last <|im_start|> (DS41: <｜Assistant｜>, engine.py) (~10 ms): the
+                # next request may resume there.
+                # Not at the prompt's end: its generation prompt ("...assistant\n<think>\n") tokenizes differently
+                # once the reply follows it ("\n\n</think>"). The text before the special token can change too:
+                # a client that inserts a note there (oh-my-pi's loop guard, 10-22: "\n\n<system-interrupt ...>")
+                # merges the last text token with it (">" + "\n\n" -> ">\n\n"), and 111 of 111 such turns read
+                # the whole prompt again. So CK_BACK tokens earlier.
+                cut = next((i for i in range(len(prompt_ids) - 1, reuse, -1) if prompt_ids[i] == self.im_start), 0)
+                cut = max(0, cut - CK_BACK)
+                if image is not None:   # (reuse 0) the image's rows are read in the call from position 0
+                    slot.img = span
+                    if cut >= span[0] + span[1]:   # the image, then the checkpoint, then the tail as text
+                        img_read[0] = False
+                        slot.cached += prompt_ids[:cut]
+                        self.call(slot, self.model.eval_img, prompt_ids[:cut], image.embeds, image.row0, image.nh,
+                                  image.nw)
+                        self.call(slot, self.model.checkpoint)
+                        slot.ck_tokens, slot.ck_img = list(prompt_ids[:cut]), span
+                        nxt = step(prompt_ids[cut:])
+                    else:   # the image runs into the last turn: one call, no checkpoint
+                        nxt = step(prompt_ids)
                 else:
-                    # checkpoint just before the prompt's last <|im_start|> (DS41: <｜Assistant｜>, engine.py) (~10 ms): the
-                    # next request may resume there.
-                    # Not at the prompt's end: its generation prompt ("...assistant\n<think>\n") tokenizes differently
-                    # once the reply follows it ("\n\n</think>"). The text before the special token can change too:
-                    # a client that inserts a note there (oh-my-pi's loop guard, 10-22: "\n\n<system-interrupt ...>")
-                    # merges the last text token with it (">" + "\n\n" -> ">\n\n"), and 111 of 111 such turns read
-                    # the whole prompt again. So CK_BACK tokens earlier.
-                    cut = next((i for i in range(len(prompt_ids) - 1, reuse, -1) if prompt_ids[i] == self.im_start), 0)
-                    cut = max(0, cut - CK_BACK)
                     if cut > reuse:
                         slot.cached += prompt_ids[reuse:cut]
                         self.read(slot, prompt_ids[reuse:cut])
                         self.call(slot, self.model.checkpoint)
-                        slot.ck_tokens = list(prompt_ids[:cut])
+                        slot.ck_tokens, slot.ck_img = list(prompt_ids[:cut]), slot.img
                         reuse_from = cut
                     else:
                         reuse_from = reuse
                     nxt = step(prompt_ids[reuse_from:])
             except TrussError:
                 slot.cached, slot.ck_tokens = [], []   # the engine's sequence is unknown now: the next request starts over
+                slot.img = slot.ck_img = None
                 raise
             finally:
                 watch_stop.set()

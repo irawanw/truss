@@ -180,11 +180,12 @@ def make_app(engine: Engine) -> FastAPI:
                     raise ValueError("image input is not supported for deepseek41")
 
                 def rows():
-                    return engine.vision.rows(vision.load(url, engine.allow_local_images))
+                    pic = vision.load(url, engine.allow_local_images)
+                    return (*engine.vision.rows(pic), vision.pixels_key(pic))
 
-                embeds, nh, nw = await anyio.to_thread.run_sync(rows)
+                embeds, nh, nw, key = await anyio.to_thread.run_sync(rows)
                 ids, image = await anyio.to_thread.run_sync(
-                    lambda: vision.expand(engine.chat, ids, embeds, nh, nw))
+                    lambda: vision.expand(engine.chat, ids, embeds, nh, nw, key))
         if (r := too_long(ids)) is not None:
             return r
         p = params(body)

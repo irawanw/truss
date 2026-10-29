@@ -1,12 +1,14 @@
 """Image input for Flash-Next: fetch an OpenAI `image_url` part, preprocess it (server/vision_pre.py), run the ViT
 (truss_vision, host pixel_values -> host f32 text rows) and expand the template's single <|image_pad|> into the image
-token grid. One image per request (multi-image is out of scope); the caller must not combine it with a prefix restore.
+token grid. One image per request (multi-image is out of scope). A prompt may reuse a slot's sequence (or checkpoint)
+only where that sequence holds the same image (ImageIn.span: place, rows and pixel hash) at the same place.
 """
 from __future__ import annotations
 
 import base64
 import io
 import urllib.request
+import hashlib
 from dataclasses import dataclass
 
 import numpy as np
@@ -31,6 +33,25 @@ class ImageIn:
     row0: int                 # first prompt row replaced
     nh: int
     nw: int
+    key: str = ""             # the image's identity: a hash of its decoded pixels (pixels_key); "" = of the embeds
+
+    def __post_init__(self):
+        if not self.key:
+            self.key = hashlib.blake2b(np.ascontiguousarray(self.embeds).tobytes(), digest_size=16).hexdigest()
+
+    @property
+    def span(self) -> tuple[int, int, str]:
+        """(first row, rows, identity): what a slot's sequence must hold at the same place to be reused"""
+        return self.row0, self.nh * self.nw, self.key
+
+
+def pixels_key(image) -> str:
+    """The identity of a decoded image (the RGB pixels and size): the same picture re-sent every turn of a
+    conversation gets the same key, whatever the ViT's run-to-run float noise"""
+    h = hashlib.blake2b(digest_size=16)
+    h.update(f"{image.width}x{image.height}".encode())
+    h.update(image.tobytes())
+    return h.hexdigest()
 
 
 def image_url(messages):
@@ -97,7 +118,7 @@ def load(url: str, allow_local: bool = False) -> Image.Image:
     return img.convert("RGB")
 
 
-def expand(chat, ids, embeds: np.ndarray, nh: int, nw: int) -> tuple[list[int], ImageIn]:
+def expand(chat, ids, embeds: np.ndarray, nh: int, nw: int, key: str = "") -> tuple[list[int], ImageIn]:
     """Replace the template's one <|image_pad|> with nh*nw copies and return the rows' placement."""
     pad = chat.token_id("<|image_pad|>")
     if pad is None:
@@ -109,4 +130,4 @@ def expand(chat, ids, embeds: np.ndarray, nh: int, nw: int) -> tuple[list[int], 
     if embeds.shape[0] != n:
         raise ValueError(f"ViT rows {embeds.shape[0]} != image grid {nh}x{nw}")
     row0 = at[0]
-    return ids[:row0] + [pad] * n + ids[row0 + 1:], ImageIn(embeds, row0, nh, nw)
+    return ids[:row0] + [pad] * n + ids[row0 + 1:], ImageIn(embeds, row0, nh, nw, key)
