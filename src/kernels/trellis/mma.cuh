@@ -28,7 +28,8 @@ __device__ __forceinline__ void mma_w(const FragB & f0, const FragB & f1, half2 
 }
 
 // fp32 accumulator of one tile x 8 rows: c[0], c[1] = (column lane/4, rows 2q, 2q+1); c[2], c[3] = column lane/4 + 8
-// (prefill GEMM: long K sums stay in fp32; on GA102 fp32 accumulation runs at the same tensor rate as fp16)
+// (prefill GEMM: long K sums stay in fp32). GeForce GA102 runs fp32 accumulation at HALF the fp16 tensor rate unless
+// the card is unlocked (gpu_unlock, 10-29: 149.8 TFLOPS for both on this box's 3090s, unlock_bench).
 __device__ __forceinline__ void mma_w_f32(const FragB & f0, const FragB & f1, half2 act_lo, half2 act_hi, float (&c)[4])
 {
     const uint32_t * p0 = reinterpret_cast<const uint32_t *>(&f0);
@@ -38,6 +39,18 @@ __device__ __forceinline__ void mma_w_f32(const FragB & f0, const FragB & f1, ha
     asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(p0[0]), "r"(p1[0]), "r"(p0[1]), "r"(p1[1]), "r"(b0), "r"(b1));
+}
+
+// The decode GEMVs' accumulation: TRUSS_MMA_F32ACC=1 (compile time) accumulates every k slice straight into the fp32
+// accumulators (a float2 [2] per tile, the layout of mma_w_f32's c), instead of fp16 partials folded into them every
+// FOLD slices - no fold, no fp16 rounding of the partial sums. It pays only on an unlocked card (see mma_w_f32).
+#ifndef TRUSS_MMA_F32ACC
+#define TRUSS_MMA_F32ACC 0
+#endif
+
+__device__ __forceinline__ void mma_w_f32(const FragB & f0, const FragB & f1, half2 act_lo, half2 act_hi, float2 (&c)[2])
+{
+    mma_w_f32(f0, f1, act_lo, act_hi, *reinterpret_cast<float (*)[4]>(&c[0]));
 }
 
 // Generic m16n8k16 fp16 x fp16 -> fp32 with fragments as ldmatrix produces them: a = {(rows 0-7, k 0-7),

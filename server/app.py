@@ -145,11 +145,14 @@ def make_app(engine: Engine) -> FastAPI:
         body = await req.json()
         kw = dict(body.get("chat_template_kwargs") or {})
         # the OpenAI-style top-level reasoning_effort (omp's --thinking) reaches the template unless the kwargs set it;
-        # DeepSeek-V4.1 knows low / high / max (50 / 75 / 100), the other names map to the nearest
+        # DeepSeek-V4.1 knows low / high / max (50 / 75 / 100), the X3 template knows low / medium / xhigh
         eff = body.get("reasoning_effort")
         if eff is not None and "reasoning_effort" not in kw:
-            kw["reasoning_effort"] = {"minimal": "low", "low": "low", "medium": "high", "high": "high",
-                                      "xhigh": "max", "max": "max"}.get(str(eff), eff)
+            efforts = ({"minimal": "low", "low": "low", "medium": "high", "high": "high",
+                        "xhigh": "max", "max": "max"} if engine.ds41 is not None else
+                       {"minimal": "low", "low": "low", "medium": "medium", "high": "xhigh",
+                        "xhigh": "xhigh", "max": "xhigh"})
+            kw["reasoning_effort"] = efforts.get(str(eff), eff)
         thinking = kw.get("enable_thinking", True) is not False
         tools = body.get("tools") or None
         if body.get("tool_choice") == "none":
